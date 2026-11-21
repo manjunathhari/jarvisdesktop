@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Sample India A</title>
+<item><title>Monsoon reaches Kerala early</title><link>https://a.example/monsoon</link>
+<description><![CDATA[<p>The <b>southwest monsoon</b> arrived three days early &amp; brought heavy rain.</p><img src="x.jpg"/>]]></description>
+<pubDate>Sat, 21 Nov 2026 03:00:00 +0530</pubDate></item>
+<item><title>Bengaluru metro line opens</title><link>https://a.example/metro</link>
+<description>New Yellow Line services start today.</description></item>
+<item><title>Cricket: India win series</title><link>https://a.example/cricket</link>
+<description>India clinched the series 3-1.</description></item>
+</channel></rss>

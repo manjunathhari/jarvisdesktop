@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Sample World</title>
+<item><title>Climate summit agrees new targets</title><link>https://w.example/climate</link>
+<description>Delegates reached agreement late on Friday.</description></item>
+<item><title>Markets rally in Asia</title><link>https://w.example/markets</link>
+<description>Stocks rose across the region.</description></item>
+</channel></rss>
