@@ -12,6 +12,8 @@ use std::time::Duration;
 pub const LISTEN_TIMEOUT: Duration = Duration::from_secs(8);
 pub const FOLLOW_UP_WINDOW: Duration = Duration::from_secs(10);
 const MAX_HISTORY: usize = 6;
+/// How many channels to try in a row when live video refuses to play.
+pub const MAX_VIDEO_SKIPS: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +56,8 @@ pub enum Event {
         timer: Timer,
         id: u64,
     },
+    /// The live video player reported that the channel won't play here.
+    VideoFailed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,6 +156,7 @@ pub struct Coordinator {
     reply_so_far: String,
     retried: bool,
     timer_id: u64,
+    video_skips: u8,
 }
 
 impl Coordinator {
@@ -164,6 +169,7 @@ impl Coordinator {
             reply_so_far: String::new(),
             retried: false,
             timer_id: 0,
+            video_skips: 0,
         }
     }
 
@@ -234,6 +240,24 @@ impl Coordinator {
                 }
             }
             Event::ActionFailed(msg) => fx.push(Effect::Speak(msg)),
+            Event::VideoFailed => {
+                if self.video_skips < MAX_VIDEO_SKIPS {
+                    self.video_skips += 1;
+                    fx.push(Effect::Dispatch {
+                        action: Action::new("next_channel", serde_json::json!({})),
+                        depth: 1,
+                    });
+                } else {
+                    self.video_skips = 0;
+                    fx.push(Effect::Speak(
+                        "None of the live channels will play right now.".into(),
+                    ));
+                    fx.push(Effect::Dispatch {
+                        action: Action::new("close_panel", serde_json::json!({ "which": "video" })),
+                        depth: 1,
+                    });
+                }
+            }
             Event::Timeout { timer, id } => {
                 let live = id == self.timer_id
                     && matches!(
@@ -271,6 +295,7 @@ impl Coordinator {
             return;
         }
         fx.push(Effect::Heard(text.clone()));
+        self.video_skips = 0;
         match local_command(&text) {
             Some(LocalCommand::StopTalking) => {
                 fx.push(Effect::StopSpeaking);
@@ -403,6 +428,58 @@ mod tests {
         );
         assert_eq!(greeting(20, "Manj"), "Good evening, Manj. How can I help?");
         assert_eq!(greeting(2, "Manj"), "Good evening, Manj. How can I help?");
+    }
+
+    // ── video that won't play ────────────────────────────────────
+
+    fn dispatched(fx: &[Effect]) -> Vec<String> {
+        fx.iter()
+            .filter_map(|e| match e {
+                Effect::Dispatch { action, .. } => Some(action.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_channel_that_wont_play_is_skipped_automatically() {
+        let mut c = Coordinator::new("Manj");
+        let fx = c.step(Event::VideoFailed);
+        assert_eq!(dispatched(&fx), vec!["next_channel"]);
+        assert!(fx.contains(&Effect::Dispatch {
+            action: Action::new("next_channel", json!({})),
+            depth: 1
+        }));
+    }
+
+    #[test]
+    fn after_too_many_failures_jarvis_gives_up_and_says_so() {
+        let mut c = Coordinator::new("Manj");
+        for _ in 0..MAX_VIDEO_SKIPS {
+            assert_eq!(
+                dispatched(&c.step(Event::VideoFailed)),
+                vec!["next_channel"]
+            );
+        }
+        let fx = c.step(Event::VideoFailed);
+        assert_eq!(
+            spoken(&fx),
+            vec!["None of the live channels will play right now."]
+        );
+        assert_eq!(dispatched(&fx), vec!["close_panel"]);
+    }
+
+    #[test]
+    fn a_new_request_resets_the_skip_count() {
+        let mut c = Coordinator::new("Manj");
+        for _ in 0..MAX_VIDEO_SKIPS {
+            c.step(Event::VideoFailed);
+        }
+        c.step(Event::Utterance("put on WION".into()));
+        assert_eq!(
+            dispatched(&c.step(Event::VideoFailed)),
+            vec!["next_channel"]
+        );
     }
 
     #[test]

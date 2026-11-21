@@ -56,6 +56,10 @@ function render(view: ScreenView) {
       f.title = p.title;
       f.allow = "autoplay; encrypted-media; picture-in-picture";
       f.referrerPolicy = "strict-origin-when-cross-origin";
+      // Ask the YouTube player to report events (errors) back to us.
+      f.addEventListener("load", () =>
+        f.contentWindow?.postMessage(JSON.stringify({ event: "listening", id: 1, channel: "widget" }), "*"),
+      );
       box.append(f, el("p", "cap", p.title));
       sec.append(box);
       wall.append(sec);
@@ -76,6 +80,23 @@ function render(view: ScreenView) {
   }
   if (!nextVideo) videoSrc = "";
 }
+
+// A channel that refuses to play inside the app (embedding disabled, offline,
+// wrong id) is reported once; Rust then switches to the next channel.
+let reportedFor = "";
+window.addEventListener("message", (e) => {
+  if (!/^https:\/\/www\.youtube\.com$/.test(e.origin)) return;
+  let msg: { event?: string; info?: unknown };
+  try {
+    msg = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
+  } catch {
+    return;
+  }
+  if (msg?.event === "onError" && videoSrc && reportedFor !== videoSrc) {
+    reportedFor = videoSrc;
+    invoke("video_failed");
+  }
+});
 
 // ── stand-in voice: the system voice via the web view. Used only until
 // George's voice (Kokoro, in Rust) is downloaded and loaded.

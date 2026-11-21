@@ -8,7 +8,10 @@ use serde_json::json;
 use std::sync::Mutex;
 
 pub fn embed_url(channel_id: &str) -> String {
-    format!("https://www.youtube.com/embed/live_stream?channel={channel_id}&autoplay=1")
+    // enablejsapi lets the screen hear the player's error events (e.g. embedding disabled).
+    format!(
+        "https://www.youtube.com/embed/live_stream?channel={channel_id}&autoplay=1&enablejsapi=1"
+    )
 }
 
 fn squash(s: &str) -> String {
@@ -153,7 +156,7 @@ mod tests {
     fn embed_url_uses_the_channel_live_stream() {
         assert_eq!(
             embed_url("UC123"),
-            "https://www.youtube.com/embed/live_stream?channel=UC123&autoplay=1"
+            "https://www.youtube.com/embed/live_stream?channel=UC123&autoplay=1&enablejsapi=1"
         );
     }
 

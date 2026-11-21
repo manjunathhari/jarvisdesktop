@@ -84,6 +84,12 @@ fn say(text: String, jarvis: State<'_, Handle>) {
     jarvis.send(Event::Utterance(text));
 }
 
+/// The live player said this channel won't play here; try the next one.
+#[tauri::command]
+fn video_failed(jarvis: State<'_, Handle>) {
+    jarvis.send(Event::VideoFailed);
+}
+
 /// Emergency exit (Esc key): closes immediately.
 #[tauri::command]
 fn quit(app: AppHandle) {
@@ -236,6 +242,7 @@ pub fn run() {
             tap,
             say,
             quit,
+            video_failed,
             typed_input_enabled,
             needs_key,
             save_key
