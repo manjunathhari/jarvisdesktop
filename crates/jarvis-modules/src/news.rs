@@ -14,6 +14,24 @@ use tokio::sync::RwLock;
 pub const CARDS_PER_PANEL: usize = 6;
 const SUMMARY_CHARS: usize = 280;
 
+/// What JARVIS says when the wall appears: two Indian headlines and one
+/// international (or two international when only world news was asked for).
+fn briefing(india: &[Card], world: &[Card]) -> String {
+    let line = |c: &Card| format!("From {}: {}.", c.source, c.title.trim_end_matches('.'));
+    let mut parts = vec!["Here's the latest.".to_string()];
+    parts.extend(india.iter().take(2).map(line));
+    if india.is_empty() {
+        parts.extend(world.iter().take(2).map(line));
+    } else if let Some(w) = world.first() {
+        parts.push(format!(
+            "And internationally, {}",
+            line(w).replacen("From", "from", 1)
+        ));
+    }
+    parts.push("Say a number to hear more.".into());
+    parts.join(" ")
+}
+
 /// Parse one feed into cards.
 pub fn parse_feed(source: &FeedSource, bytes: &[u8]) -> Result<Vec<Card>, String> {
     let feed = feed_rs::parser::parse(bytes).map_err(|e| e.to_string())?;
@@ -256,7 +274,7 @@ impl NewsModule {
         } else {
             self.headlines(Region::World, topic, CARDS_PER_PANEL).await
         };
-        let Some(top) = india.first().or(world.first()).cloned() else {
+        if india.is_empty() && world.is_empty() {
             return Err(ActionError::Failed(match topic {
                 Some(t) => format!("I couldn't find any news about {t} right now."),
                 None => {
@@ -264,6 +282,8 @@ impl NewsModule {
                 }
             }));
         };
+        let india_spoken: Vec<Card> = india.iter().take(2).cloned().collect();
+        let world_spoken: Vec<Card> = world.iter().take(2).cloned().collect();
         let mut updates = Vec::new();
         if !india.is_empty() {
             updates.push(PanelUpdate::Show(Panel {
@@ -290,11 +310,7 @@ impl NewsModule {
         };
         Ok(ModuleOutput {
             updates,
-            speech: Some(format!(
-                "Here's the latest. The top story, from {}: {}.",
-                top.source,
-                top.title.trim_end_matches('.')
-            )),
+            speech: Some(briefing(&india_spoken, &world_spoken)),
             follow_up,
         })
     }
@@ -443,8 +459,13 @@ mod tests {
         assert_eq!(cards_in(&out, Slot::Secondary).len(), 4);
         assert_eq!(cards_in(&out, Slot::Side).len(), 2);
         assert_eq!(out.follow_up, vec![Action::new("play_live_tv", json!({}))]);
-        let speech = out.speech.unwrap();
-        assert!(speech.contains("Monsoon reaches Kerala early"), "{speech}");
+        assert_eq!(
+            out.speech.unwrap(),
+            "Here's the latest. From Paper A: Monsoon reaches Kerala early. \
+             From Paper B: Parliament session begins. \
+             And internationally, from World Wire: Climate summit agrees new targets. \
+             Say a number to hear more."
+        );
     }
 
     #[tokio::test]
@@ -481,6 +502,24 @@ mod tests {
             .await
             .unwrap();
         assert!(out.follow_up.is_empty());
+    }
+
+    #[tokio::test]
+    async fn world_only_briefing_reads_international_headlines() {
+        let m = module(fixture());
+        let out = m
+            .handle(
+                &Action::new("show_news", json!({"region": "world"})),
+                &ScreenState::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out.speech.unwrap(),
+            "Here's the latest. From World Wire: Climate summit agrees new targets. \
+             From World Wire: Markets rally in Asia. \
+             Say a number to hear more."
+        );
     }
 
     #[tokio::test]
