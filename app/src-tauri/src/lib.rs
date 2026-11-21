@@ -160,8 +160,12 @@ async fn prepare_voice(app: AppHandle, slot: VoiceSlot, models_dir: PathBuf) {
             tracing::info!("George's voice is ready");
             status("ready", 100);
         }
-        other => {
-            tracing::warn!(?other, "couldn't load the voice; using the stand-in voice");
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "couldn't load the voice; using the stand-in voice");
+            status("unavailable", 0);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "voice loader crashed; using the stand-in voice");
             status("unavailable", 0);
         }
     }
