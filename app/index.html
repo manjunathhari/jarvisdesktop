@@ -11,6 +11,15 @@
 
     <div id="overlay" hidden></div>
 
+    <form id="setup" hidden>
+      <h1>One-time setup</h1>
+      <p>Paste your Anthropic API key. JARVIS keeps it in Windows Credential Manager and won't ask again.</p>
+      <input id="setupkey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…" />
+      <p id="setuperror" role="alert"></p>
+      <button type="submit">Save key</button>
+      <p class="hint">No key yet? Create one at console.anthropic.com → API keys.</p>
+    </form>
+
     <footer id="presence">
       <p id="heard"></p>
       <p id="said"></p>

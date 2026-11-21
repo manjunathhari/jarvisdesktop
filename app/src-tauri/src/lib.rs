@@ -1,5 +1,7 @@
 //! The JARVIS window: wires the Rust parts together and relays events to the UI.
 
+mod key;
+
 use chrono::Timelike;
 use jarvis_brain::ClaudeBrain;
 use jarvis_core::action::Registry;
@@ -64,17 +66,28 @@ fn quit(app: AppHandle) {
     app.exit(0);
 }
 
+/// Typing stays on until the microphone arrives (Milestone B).
 #[tauri::command]
 fn typed_input_enabled() -> bool {
-    cfg!(debug_assertions) || std::env::var_os("JARVIS_TYPED_INPUT").is_some()
+    true
 }
 
-/// Milestone A reads the key from the environment. T13 moves it to
-/// Windows Credential Manager.
+/// First run: the UI asks for the key once if none is stored.
+#[tauri::command]
+fn needs_key() -> bool {
+    key::load().is_none()
+}
+
+/// Save the pasted key to Credential Manager, then restart so the brain picks it up.
+#[tauri::command]
+fn save_key(key: String, app: AppHandle) -> Result<(), String> {
+    let k = key::clean_key(&key)?;
+    key::save(&k)?;
+    app.restart();
+}
+
 fn brain() -> Option<Arc<dyn Brain>> {
-    let key = std::env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .filter(|k| !k.trim().is_empty())?;
+    let key = key::load()?;
     let model = std::env::var("JARVIS_MODEL").ok();
     Some(Arc::new(ClaudeBrain::new(key, model, USER_NAME)))
 }
@@ -101,7 +114,7 @@ pub fn run() {
 
             let brain = brain();
             if brain.is_none() {
-                tracing::warn!("ANTHROPIC_API_KEY not set; only local commands will work");
+                tracing::warn!("no Anthropic key stored yet; only local commands will work");
             }
             let ui = Arc::new(TauriUi(app.handle().clone()));
             let (handle, fut) = runtime(USER_NAME, brain, Arc::new(registry), ui);
@@ -124,7 +137,9 @@ pub fn run() {
             tap,
             say,
             quit,
-            typed_input_enabled
+            typed_input_enabled,
+            needs_key,
+            save_key
         ])
         .run(tauri::generate_context!())
         .expect("error while running JARVIS");

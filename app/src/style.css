@@ -110,6 +110,46 @@ html, body {
 #overlay h1 { font: 600 var(--s3) / 1.15 var(--display); margin: 0 0 0.6em; text-wrap: balance; }
 #overlay p.body { font-size: var(--s1); line-height: 1.55; margin: 0; color: var(--ink); }
 
+/* first-run setup: the one screen with a button */
+#setup {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  background: var(--void);
+  display: grid;
+  place-content: center;
+  justify-items: start;
+  gap: 0.9rem;
+  padding: var(--gap) max(var(--gap), calc((100vw - 40rem) / 2));
+}
+#setup > * { width: 100%; }
+#setup button { width: auto; }
+#setup[hidden] { display: none; }
+#setup h1 { margin: 0; font: 600 var(--s3) / 1.15 var(--display); }
+#setup p { margin: 0; color: var(--ash); max-width: 52ch; }
+#setup input {
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--ash);
+  color: var(--ink);
+  font: inherit;
+  padding: 0.6em 0.8em;
+  border-radius: 0.4rem;
+}
+#setup input:focus { outline: 2px solid var(--arc); outline-offset: 2px; }
+#setup button {
+  font: 600 var(--s0) var(--text);
+  color: var(--void);
+  background: var(--arc);
+  border: 0;
+  border-radius: 0.4rem;
+  padding: 0.55em 1.2em;
+  cursor: pointer;
+}
+#setup button:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
+#setuperror { color: var(--ink) !important; min-height: 1.45em; }
+#setup .hint { font-size: var(--s-1); }
+
 /* ── presence: orb + captions ───────────────────────────── */
 
 #presence {

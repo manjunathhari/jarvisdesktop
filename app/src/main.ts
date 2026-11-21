@@ -111,9 +111,27 @@ listen<string>("jarvis://status", (e) => {
 });
 listen<boolean>("jarvis://mic", (e) => (document.body.dataset.mic = e.payload ? "on" : "off"));
 
+// First run: ask for the key once, then JARVIS restarts itself.
+if (await invoke<boolean>("needs_key")) {
+  const setup = $<HTMLFormElement>("setup");
+  const input = $<HTMLInputElement>("setupkey");
+  const err = $("setuperror");
+  setup.hidden = false;
+  input.focus();
+  setup.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    err.textContent = "";
+    try {
+      await invoke("save_key", { key: input.value });
+    } catch (msg) {
+      err.textContent = String(msg);
+    }
+  });
+}
+
 // Tapping anywhere wakes JARVIS (except inside the video, which keeps its own controls).
 document.addEventListener("pointerdown", (e) => {
-  if ((e.target as HTMLElement).closest("#devtype")) return;
+  if ((e.target as HTMLElement).closest("#devtype, #setup")) return;
   invoke("tap");
 });
 // Esc always closes JARVIS, whatever is on screen.
