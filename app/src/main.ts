@@ -147,8 +147,18 @@ listen<string>("jarvis://heard", (e) => {
   heard.textContent = e.payload;
   said.textContent = "";
 });
+// Turn the live TV down while JARVIS is listening, thinking or speaking, so
+// you can hear George and the microphone hears you, not the TV.
+function setTvVolume(volume: number) {
+  const f = wall.querySelector<HTMLIFrameElement>('[data-slot="primary"] iframe');
+  f?.contentWindow?.postMessage(JSON.stringify({ event: "command", func: "setVolume", args: [volume] }), "*");
+}
+const TV_DUCKED = 8;
+const TV_NORMAL = 100;
+
 listen<string>("jarvis://status", (e) => {
   document.body.dataset.mode = e.payload;
+  setTvVolume(["listening", "thinking", "follow_up"].includes(e.payload) ? TV_DUCKED : TV_NORMAL);
   if (e.payload === "listening" && !heard.textContent) heard.textContent = "Listening…";
   if (e.payload === "idle") heard.textContent = "";
 });

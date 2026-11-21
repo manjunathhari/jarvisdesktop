@@ -117,7 +117,16 @@ async fn run(
                         let forward = async {
                             let think = brain.think(req, btx);
                             let relay = async {
+                                let started = std::time::Instant::now();
+                                let mut first = true;
                                 while let Some(ev) = brx.recv().await {
+                                    if std::mem::take(&mut first) {
+                                        tracing::info!(
+                                            brain_first_reply_ms =
+                                                started.elapsed().as_millis() as u64,
+                                            "brain"
+                                        );
+                                    }
                                     let _ = tx.send(match ev {
                                         BrainEvent::Speech(s) => Event::BrainSpeech(s),
                                         BrainEvent::Action(a) => Event::BrainAction(a),

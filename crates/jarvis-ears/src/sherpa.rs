@@ -24,7 +24,7 @@ impl SileroVad {
             silero_vad: SileroVadModelConfig {
                 model: s(model),
                 threshold: 0.5,
-                min_silence_duration: 0.6,
+                min_silence_duration: 0.45,
                 min_speech_duration: 0.25,
                 window_size: WINDOW as i32,
                 max_speech_duration: 15.0,
