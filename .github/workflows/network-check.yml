@@ -1,0 +1,40 @@
+name: Server network check (P0-8)
+# Scans the server from the public internet (a GitHub runner, outside the tailnet).
+# Pass: only TCP 22, 80, 443 open; SSH offers public-key login only.
+# The server address is the repository secret SERVER_IP, masked in logs.
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/network-check.yml']
+  schedule:
+    - cron: "17 3 * * 1"   # weekly, Monday 08:47 IST
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install nmap
+        run: sudo apt-get update -q && sudo apt-get install -y -q nmap
+      - name: Full TCP scan
+        env:
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+        run: |
+          test -n "$SERVER_IP" || { echo "SERVER_IP secret not set"; exit 1; }
+          sudo nmap -Pn -sS -p- -T4 --open -oG scan.txt "$SERVER_IP" > /dev/null
+          open=$(grep -oE '[0-9]+/open' scan.txt | cut -d/ -f1 | sort -n | paste -sd, -)
+          echo "Open TCP ports: ${open:-none}"
+          [ "$open" = "22,80,443" ] || { echo "FAIL: expected exactly 22,80,443"; exit 1; }
+          echo "PASS: only 22, 80, 443 are open"
+      - name: SSH refuses passwords
+        env:
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+        run: |
+          methods=$(ssh -v -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                    -o ConnectTimeout=10 "nobody@$SERVER_IP" true 2>&1 \
+                    | grep -m1 'Authentications that can continue' | sed 's/.*continue: //')
+          echo "SSH offers: $methods"
+          [ "$methods" = "publickey" ] || { echo "FAIL: SSH offers more than publickey"; exit 1; }
+          echo "PASS: SSH accepts keys only"
