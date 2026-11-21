@@ -1,0 +1,12 @@
+{
+  "id": "0b8f7c1e-3a8e-4d4f-9a55-2f6f1c3d9e01",
+  "person_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+  "description": "Be at the airport by 07:00",
+  "due_at": "2026-11-21T10:00:00Z",
+  "event_id": null,
+  "state": "EXPECTED",
+  "visibility": "FAMILY_SHARED",
+  "source_ref": "msg-7f3a",
+  "created_at": "2026-11-21T10:00:00Z",
+  "updated_at": "2026-11-21T10:00:00Z"
+}

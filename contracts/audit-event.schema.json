@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/audit-event.schema.json",
+  "title": "Audit event",
+  "description": "One append-only audit row: a creation or a state change, applied or rejected (ADR-008).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "seq",
+    "id",
+    "occurred_at",
+    "actor_kind",
+    "actor_id",
+    "entity_type",
+    "entity_id",
+    "action",
+    "outcome",
+    "reason",
+    "details"
+  ],
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "actor_kind": {
+      "enum": [
+        "PERSON",
+        "AGENT",
+        "SYSTEM"
+      ]
+    },
+    "actor_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "entity_type": {
+      "enum": [
+        "task",
+        "commitment"
+      ]
+    },
+    "entity_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "action": {
+      "enum": [
+        "CREATE",
+        "TRANSITION"
+      ]
+    },
+    "from_state": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "to_state": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "outcome": {
+      "enum": [
+        "APPLIED",
+        "REJECTED"
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "correlation_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "details": {
+      "type": "object"
+    }
+  }
+}

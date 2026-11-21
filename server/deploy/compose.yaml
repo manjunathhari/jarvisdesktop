@@ -1,0 +1,142 @@
+# JARVIS on the (shared, temporary) server — ADR-009, spec §10.
+#
+# Deployed as Docker project "jarvis" (Hostinger Docker manager or plain `docker compose`).
+# The image is built and published by CI (server.yml) as ghcr.io/manjunathhari/jarvis-server:<commit>.
+# JARVIS_REF is the only environment value; it is not secret. Secrets are files in
+# /etc/jarvis/secrets (root:10001, 0440), created by deploy/harden/harden.sh.
+#
+# No service publishes a port. Everything sits on an internal network with no internet route.
+#
+# On every `up`, the one-shot `init` service bootstraps roles, applies migrations and (with
+# JARVIS_SMOKE_ON_INIT=1) prints "SMOKE PASS/FAIL" lines for P0-1 … P0-5; core and scheduler
+# start only if it succeeds.
+
+name: jarvis
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+x-app: &app
+  image: ghcr.io/manjunathhari/jarvis-server:${JARVIS_REF:?set JARVIS_REF to a commit of manjunathhari/jarvisdesktop}
+  restart: unless-stopped
+  depends_on:
+    postgres: { condition: service_healthy }
+    init: { condition: service_completed_successfully }
+  networks: [jarvis_internal]
+  read_only: true
+  tmpfs: [/tmp]
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  logging: *logging
+  environment:
+    JARVIS_DB_HOST: postgres
+    JARVIS_DB_NAME: jarvis
+    TZ: Asia/Kolkata
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_superuser_password
+      TZ: Asia/Kolkata
+    secrets: [pg_superuser_password]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    networks: [jarvis_internal]
+    mem_limit: 1g
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  init:
+    <<: *app
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+    command: ["init"]
+    environment:
+      JARVIS_DB_HOST: postgres
+      JARVIS_DB_NAME: jarvis
+      JARVIS_PROCESS: init
+      JARVIS_SMOKE_ON_INIT: ${JARVIS_SMOKE_ON_INIT:-1}
+      TZ: Asia/Kolkata
+    secrets: [pg_superuser_password, pg_owner_password, pg_app_password]
+    mem_limit: 256m
+
+  core:
+    <<: *app
+    command: ["serve"]
+    environment:
+      JARVIS_DB_HOST: postgres
+      JARVIS_DB_NAME: jarvis
+      JARVIS_PROCESS: core
+      TZ: Asia/Kolkata
+    secrets: [pg_app_password]
+    mem_limit: 512m
+
+  scheduler:
+    <<: *app
+    entrypoint: ["jarvis-scheduler"]
+    command: []
+    environment:
+      JARVIS_DB_HOST: postgres
+      JARVIS_DB_NAME: jarvis
+      JARVIS_PROCESS: scheduler
+      TZ: Asia/Kolkata
+    secrets: [pg_app_password]
+    mem_limit: 256m
+
+  # K5: local daily dumps only (same container as the existing Postgres 16 on this server).
+  backup:
+    image: prodrigestivill/postgres-backup-local:17
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: jarvis
+      POSTGRES_USER: jarvis_owner
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_owner_password
+      POSTGRES_EXTRA_OPTS: "-Z1"   # all schemas (ledger, audit, ops), gzip level 1
+      SCHEDULE: "@daily"
+      BACKUP_KEEP_DAYS: 7
+      BACKUP_KEEP_WEEKS: 4
+      BACKUP_KEEP_MONTHS: 3
+      TZ: Asia/Kolkata
+    secrets: [pg_owner_password]
+    volumes: [backups:/backups]
+    networks: [jarvis_internal]
+    mem_limit: 256m
+    logging: *logging
+
+  # Phase 2 placeholders: defined so the shape is fixed, never started in Phase 0.
+  gateway:
+    <<: *app
+    profiles: [phase2]
+    entrypoint: ["python", "-c", "raise SystemExit('gateway arrives in Phase 2')"]
+    command: []
+    secrets: [pg_app_password]
+  workers:
+    <<: *app
+    profiles: [phase2]
+    entrypoint: ["python", "-c", "raise SystemExit('workers arrive in Phase 2')"]
+    command: []
+    secrets: [pg_app_password]
+
+networks:
+  jarvis_internal:
+    internal: true
+
+volumes:
+  pgdata:
+  backups:
+
+secrets:
+  pg_superuser_password: { file: /etc/jarvis/secrets/pg_superuser_password }
+  pg_owner_password: { file: /etc/jarvis/secrets/pg_owner_password }
+  pg_app_password: { file: /etc/jarvis/secrets/pg_app_password }

@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** 4 — Implementation: Milestone A complete (branch `milestone-a`); next Milestone B
+**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): running on the shared server; P0-1…P0-6 pass; P0-8 pass; P0-7 deferred (Manj); reviews done — PR #2 ready to merge.**
 **Started:** 2026-11-21
 
 ## Known so far
@@ -47,9 +47,36 @@ Verified on device: news wall, briefing, Al Jazeera live, George voice, tap-to-t
 
 ### Desktop backlog (tweaks)
 1. Voice barge-in: Windows Voice Clarity via Communications Signal Processing Mode (raw WASAPI capture with
-   AudioCategory_Communications); fallback pure-Rust AEC3 (`sonora-aec3`) with George's audio as reference. Needs ADR-006.
+   AudioCategory_Communications); fallback pure-Rust AEC3 (`sonora-aec3`) with George's audio as reference. Needs its own ADR (next free number, 010+; 006–009 are the server).
 2. "Hey Jarvis" wake word (sherpa-onnx KWS; keyword file needs BPE tokenisation).
 3. Global hotkey to summon/talk (e.g. Ctrl+Shift+J); bring window to front on wake.
 4. Latency: read the new timing logs; swap Whisper small.en → Moonshine base if transcription dominates.
 5. Verify feed URLs; orb pulses with George; start at login; auto-update (Tauri updater + signing key).
 6. Later: desktop Brain becomes a client of the v2 server core (Phase 2).
+
+## 2026-11-21 — Architecture v2 Phase 0 (server foundations) started
+Kick-off decisions (Manj):
+- K1 Server: existing Hostinger KVM 2, Mumbai, **shared** (pubmedgemini, Ollama, Traefik, standalone Postgres 16 stay). gemma-lab projects deleted from it.
+- K2 Repo: this repo, server under `server/`.
+- K3 Database: dedicated Postgres 17 container for JARVIS; existing Postgres 16 untouched.
+- K5 Recovery: losing data OK, losing JARVIS not — rebuild from repo; shared server temporary, move out once functioning; local backups only for now.
+- K4 Stack: Python 3.12, uv, psycopg 3 + plain SQL, Alembic, pytest, ruff, mypy; FastAPI from Phase 2.
+- `milestone-a` merged into `main` (PR #1).
+
+Design: `.10x/specs/2026-11-21-phase-0-foundations-design.md`, ADR-006…009 (Proposed).
+
+### Needs Manj
+- Review spec + ADR-006…009.
+- ~~Backup storage~~ — decided: data loss acceptable; local daily backups + Hostinger weekly; JARVIS rebuildable from repo. Shared server is temporary; JARVIS moves out once functioning (K5).
+- Repo is public: confirm OK for server code (no secrets/addresses will be committed), or make it private.
+- Later, at hardening: Tailscale sign-in on server and PC; Hostinger 2FA.
+
+### Phase 0 task list (after approval)
+- [x] T0.1 CI path filters + `server/` skeleton + server.yml
+- [x] T0.2 Contracts (JSON Schema + pydantic + examples + tests)
+- [x] T0.3 Migrations: roles, ledger, audit, ops, allowed_transition, transition(); P0-1…P0-6 green in CI
+- [x] T0.4 Job queue + scheduler heartbeat
+- [x] T0.5 Hardening: Tailscale (+ Tailscale SSH), SSH key-only + fail2ban, Hostinger firewall 22/80/443 — done 21 Nov. **P0-8 PASS** 21 Nov (external scan: only 22/80/443 open; SSH publickey only). Re-runs weekly.
+- [x] T0.6 Deployed via Hostinger Docker manager (image from GHCR); P0-1…P0-5 SMOKE PASS on the live server, 21 Nov
+- [x] T0.7 Local daily backups running; rebuild/move runbook `server/deploy/README.md`. P0-7 restore drill deferred by Manj (Hostinger weekly backup suffices until the build grows).
+- [x] T0.8 QA + security review (`.10x/reviews/2026-11-21-*`), no blocking issues — awaiting Manj's merge of PR #2

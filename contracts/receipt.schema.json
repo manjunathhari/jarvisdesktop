@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/receipt.schema.json",
+  "title": "Receipt",
+  "description": "Evidence that an action happened, verified at the source (Architecture v2 \u00a79). STUB: shape may grow before it is used.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "task_id",
+    "action_id",
+    "kind",
+    "evidence"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "task_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "action_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "kind": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "evidence": {
+      "type": "object"
+    },
+    "verified_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "verified_by": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

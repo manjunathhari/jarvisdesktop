@@ -1,0 +1,13 @@
+{
+  "seq": 0,
+  "id": "0b8f7c1e-3a8e-4d4f-9a55-2f6f1c3d9e01",
+  "occurred_at": "2026-11-21T10:00:00Z",
+  "actor_kind": "ROBOT",
+  "actor_id": "x",
+  "entity_type": "task",
+  "entity_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+  "action": "TRANSITION",
+  "outcome": "APPLIED",
+  "reason": "x",
+  "details": {}
+}

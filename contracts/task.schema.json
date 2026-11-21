@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/task.schema.json",
+  "title": "Task",
+  "description": "One unit of work with an owner and a definition of done (Architecture v2 \u00a710).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "title",
+    "definition_of_done",
+    "state",
+    "visibility",
+    "source_ref",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "definition_of_done": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "owner_person_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "state": {
+      "enum": [
+        "DETECTED",
+        "INTERPRETED",
+        "PROPOSED",
+        "APPROVAL_PENDING",
+        "READY",
+        "IN_PROGRESS",
+        "COMPLETED",
+        "BLOCKED",
+        "DEFERRED",
+        "CANCELLED",
+        "FAILED",
+        "EXPIRED",
+        "SUPERSEDED"
+      ]
+    },
+    "due_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "visibility": {
+      "enum": [
+        "PRIVATE",
+        "SELECTED_PERSON",
+        "SELECTED_GROUP",
+        "FAMILY_SHARED",
+        "ORGANIZATION_SHARED"
+      ]
+    },
+    "source_ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

@@ -1,0 +1,53 @@
+[project]
+name = "jarvis-server"
+version = "0.1.0"
+description = "JARVIS server: ledger, audit trail, state machine and job queue (Architecture v2)"
+requires-python = ">=3.12"
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "psycopg-pool>=3.2",
+    "alembic>=1.14",
+    "sqlalchemy>=2.0",
+    "pydantic>=2.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "jsonschema>=4.23",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "types-jsonschema",
+]
+
+[project.scripts]
+jarvis-core = "jarvis_server.core_main:main"
+jarvis-scheduler = "jarvis_server.scheduler_main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jarvis_server"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF"]
+ignore = ["S101"]  # assert is fine in tests
+
+[tool.ruff.lint.per-file-ignores]
+"migrations/**" = ["S608", "E501"]   # static SQL by design; long SQL lines allowed
+"tests/**" = ["S105", "S106", "S608"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

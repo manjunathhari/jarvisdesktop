@@ -1,7 +1,9 @@
 name: CI
 on:
   push:
+    paths-ignore: ['server/**', 'contracts/**', '.10x/**', '.github/workflows/server.yml']
   pull_request:
+    paths-ignore: ['server/**', 'contracts/**', '.10x/**', '.github/workflows/server.yml']
 
 jobs:
   test:

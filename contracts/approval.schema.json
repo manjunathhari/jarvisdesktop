@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/approval.schema.json",
+  "title": "Approval",
+  "description": "A request for permission with an expiry (Architecture v2 \u00a713.1). STUB: shape may grow before it is used.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "task_id",
+    "requested_from_person_id",
+    "tier",
+    "expires_at",
+    "decision"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "task_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "requested_from_person_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "tier": {
+      "enum": [
+        "READ_ONLY",
+        "REVERSIBLE",
+        "IRREVERSIBLE"
+      ]
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "decision": {
+      "enum": [
+        "PENDING",
+        "APPROVED",
+        "DENIED",
+        "EXPIRED"
+      ]
+    },
+    "decided_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    }
+  }
+}

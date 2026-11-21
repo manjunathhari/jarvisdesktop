@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "message_id": "0b8f7c1e-3a8e-4d4f-9a55-2f6f1c3d9e01",
+  "node_id": "desktop-manj",
+  "session_id": null,
+  "sent_at": "2026-11-21T10:00:00Z",
+  "kind": "utterance",
+  "payload": {
+    "text": "what's on Thursday?"
+  }
+}
