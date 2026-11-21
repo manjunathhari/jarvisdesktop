@@ -102,6 +102,7 @@ services:
       POSTGRES_DB: jarvis
       POSTGRES_USER: jarvis_owner
       POSTGRES_PASSWORD_FILE: /run/secrets/pg_owner_password
+      POSTGRES_EXTRA_OPTS: "-Z1"   # all schemas (ledger, audit, ops), gzip level 1
       SCHEDULE: "@daily"
       BACKUP_KEEP_DAYS: 7
       BACKUP_KEEP_WEEKS: 4

@@ -137,6 +137,24 @@ def test_app_role_cannot_set_state_directly(app: Conn) -> None:
     app.execute("UPDATE ledger.task SET title = 'Renamed' WHERE id = %s", (task_id,))
 
 
+def test_app_role_cannot_set_commitment_state_directly(app: Conn) -> None:
+    c = ledger.create_commitment(
+        app, TEST, person_id=MANJ, description="Protected state", source_ref="test"
+    )
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        app.execute("UPDATE ledger.commitment SET state = 'FULFILLED' WHERE id = %s", (c.id,))
+
+
+def test_no_ledger_state_column_is_updatable_by_app(app: Conn) -> None:
+    rows = app.execute(
+        "SELECT table_name FROM information_schema.column_privileges"
+        " WHERE grantee = 'jarvis_app' AND table_schema = 'ledger'"
+        " AND column_name IN ('state', 'id', 'created_at', 'updated_at')"
+        " AND privilege_type = 'UPDATE'"
+    ).fetchall()
+    assert rows == []
+
+
 def test_app_role_cannot_call_internal_audit_writer(app: Conn) -> None:
     with pytest.raises(psycopg.errors.InsufficientPrivilege):
         app.execute(

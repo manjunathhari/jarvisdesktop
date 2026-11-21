@@ -3,6 +3,7 @@
 jarvis-core init        bootstrap + migrate (+ smoke if JARVIS_SMOKE_ON_INIT=1), one-shot
 jarvis-core bootstrap   create roles and database (superuser; once per server)
 jarvis-core migrate     apply migrations (owner role)
+jarvis-core downgrade   undo the newest migration (owner role; take a dump first)
 jarvis-core serve       run the core loop: heartbeat + job queue (app role)
 jarvis-core smoke       check P0-1 … P0-5 against the live database (app role)
 """
@@ -73,7 +74,9 @@ def serve(poll_seconds: float = 2.0) -> None:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     parser = argparse.ArgumentParser(prog="jarvis-core")
-    parser.add_argument("command", choices=["init", "bootstrap", "migrate", "serve", "smoke"])
+    parser.add_argument(
+        "command", choices=["init", "bootstrap", "migrate", "downgrade", "serve", "smoke"]
+    )
     args = parser.parse_args(argv)
 
     if args.command == "init":
@@ -88,6 +91,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "migrate":
         migrate.upgrade(config.owner_dsn())
         log.info("migrations at head")
+    elif args.command == "downgrade":
+        migrate.downgrade(config.owner_dsn(), "-1")
+        log.info("newest migration undone")
     elif args.command == "serve":
         serve()
     else:
