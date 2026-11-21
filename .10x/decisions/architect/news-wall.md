@@ -37,3 +37,9 @@ Per spec §4 table. Coordinator owns timeouts (brain 8 s, listen silence 5 s, fo
 ## Boundaries
 - Frontend: no network calls except embedded YouTube player; CSP restricts everything else.
 - Only `jarvis-brain` talks to Anthropic; only `jarvis-modules` fetch feeds.
+
+## Update 2026-11-21 — listening (ADR-005)
+- New `jarvis-ears` crate: cpal capture → 16 kHz mono → gate (ignore while George speaks) → Silero VAD → Whisper small.en → `Event::Utterance`.
+- App maps coordinator `Status` to mic on/off (Listening/FollowUp on; else off).
+- Voice exposes `is_speaking()` for the gate.
+- Model files fetched individually from Hugging Face with progress ("Getting my hearing ready, N%").

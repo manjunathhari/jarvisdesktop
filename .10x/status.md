@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** 3 — Planning Complete. Next: T1 (implementation not started)
+**Phase:** 4 — Implementation: Milestone A complete (branch `milestone-a`); next Milestone B
 **Started:** 2026-11-21
 
 ## Known so far
@@ -22,10 +22,34 @@
 
 - Spec APPROVED by user 2026-11-21 (voice default A accepted). Push to GitHub approved.
 
+## Target PC (reported 2026-11-21)
+- Windows 11 Home 25H2 (build 26200), i7-13620H 10C/16T, 23.7 GB RAM, 122 GB free
+- GPU: Intel UHD only (no NVIDIA driver found) → Whisper runs on CPU; start with small English model, measure latency in T9
+- Mic: Realtek microphone array; WebView2 157 present
+- Dev tools not yet installed (Git, Node, Rust, VS C++ Build Tools) — winget steps given
+
+## Needs the user
+- Milestone A ran on the Windows PC (2026-11-21). Feedback: voice is robotic; needed exit; terminal annoying → installer + key setup shipped (build 1).
+- Decide next: Milestone B (voice first) vs Architecture v2 Phase 0/1 (see project docs).
+- Approve web lookups so feed URLs / channel IDs can be verified.
+
 ## Open questions
-- Does the target PC have an NVIDIA GPU? (sets Whisper model size)
+
 
 ## Task list (news-wall) — see decisions/engineering-manager/news-wall.md
-- [ ] Milestone A: T1 scaffold+CI · T2 core types · T3 coordinator · T4 news · T5 live_tv · T6 ClaudeBrain · T7 brain evals · T8 Tauri UI
-- [ ] Milestone B: T9 ears/STT · T10 wake word · T11 TTS spike+voice · T12 model downloads
+- [x] Milestone A: T1 scaffold+CI · T2 core types · T3 coordinator · T4 news · T5 live_tv · T6 ClaudeBrain · T7 brain evals · T8 Tauri UI (81 tests green)
+- [ ] Milestone B: [x] T9 ears/STT (tap-to-talk; awaiting on-device check) · [ ] T10 wake word · [x] T11 voice (George, Kokoro) · [x] T12 model download (voice) — verified on the user's PC 2026-11-21 (sounds good, speed fine, latency acceptable)
 - [ ] Milestone C: T13 Windows platform · T14 end-to-end + latency · T15 QA/security + installer
+
+## 2026-11-21 evening — handover to Architecture v2 Phase 0
+Desktop node is now in "small tweaks as we go" mode (user decision). Latest installer: build 10.
+Verified on device: news wall, briefing, Al Jazeera live, George voice, tap-to-talk listening, own window, exit.
+
+### Desktop backlog (tweaks)
+1. Voice barge-in: Windows Voice Clarity via Communications Signal Processing Mode (raw WASAPI capture with
+   AudioCategory_Communications); fallback pure-Rust AEC3 (`sonora-aec3`) with George's audio as reference. Needs ADR-006.
+2. "Hey Jarvis" wake word (sherpa-onnx KWS; keyword file needs BPE tokenisation).
+3. Global hotkey to summon/talk (e.g. Ctrl+Shift+J); bring window to front on wake.
+4. Latency: read the new timing logs; swap Whisper small.en → Moonshine base if transcription dominates.
+5. Verify feed URLs; orb pulses with George; start at login; auto-update (Tauri updater + signing key).
+6. Later: desktop Brain becomes a client of the v2 server core (Phase 2).

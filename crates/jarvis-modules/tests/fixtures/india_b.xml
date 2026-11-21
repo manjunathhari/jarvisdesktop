@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Sample India B</title>
+<item><title>Parliament session begins</title><link>https://b.example/parliament</link>
+<description>The winter session opened on Monday.</description></item>
+<item><title>Monsoon reaches Kerala early</title><link>https://a.example/monsoon</link>
+<description>Duplicate link of a story from source A.</description></item>
+</channel></rss>

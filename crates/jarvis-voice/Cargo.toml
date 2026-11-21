@@ -1,0 +1,25 @@
+[package]
+name = "jarvis-voice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+futures = "0.3"
+tar = "0.4"
+bzip2 = "0.5"
+rodio = { version = "0.20", default-features = false }
+
+# The Kokoro engine (sherpa-onnx) is built on Windows only: its build downloads
+# prebuilt libraries. Version 1.x keeps espeak-ng so any word can be pronounced.
+[target.'cfg(windows)'.dependencies]
+sherpa-onnx = "=1.13.2"
+sherpa-onnx-sys = "=1.13.2"  # must match sherpa-onnx exactly
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "fs"] }
+tempfile = "3"

@@ -1,0 +1,64 @@
+# JARVIS news sources. Edit freely; JARVIS reads this at start-up.
+#
+# NOTE (2026-11-21): addresses below are from public documentation but were
+# NOT yet live-checked from the build machine. Verify each on first run;
+# a broken feed is skipped silently and logged.
+
+[[feeds]]
+name = "The Hindu"
+url = "https://www.thehindu.com/news/national/feeder/default.rss"
+region = "india"
+
+[[feeds]]
+name = "NDTV"
+url = "https://feeds.feedburner.com/ndtvnews-top-stories"
+region = "india"
+
+[[feeds]]
+name = "India Today"
+url = "https://www.indiatoday.in/rss/home"
+region = "india"
+
+[[feeds]]
+name = "Times of India"
+url = "https://timesofindia.indiatimes.com/rssfeedstopstories.cms"
+region = "india"
+
+[[feeds]]
+name = "BBC"
+url = "https://feeds.bbci.co.uk/news/world/rss.xml"
+region = "world"
+
+[[feeds]]
+name = "Al Jazeera"
+url = "https://www.aljazeera.com/xml/rss/all.xml"
+region = "world"
+
+[[feeds]]
+name = "The Guardian"
+url = "https://www.theguardian.com/world/rss"
+region = "world"
+
+# Live TV: official YouTube channels. The first is the default.
+# Al Jazeera first: confirmed playing on the user's PC (2026-11-21); NDTV refused to embed.
+# Channel IDs to be verified on first run (the player shows "offline" if wrong).
+
+[[channels]]
+name = "Al Jazeera English"
+youtube_channel_id = "UCNye-wNBqNL5ZzHSJj3l8Bg"
+
+[[channels]]
+name = "NDTV 24x7"
+youtube_channel_id = "UCZFMm1mMw0F81Z37aaEzTUA"
+
+[[channels]]
+name = "India Today"
+youtube_channel_id = "UCYPvAwZP8pZhSMW8qs7cVCw"
+
+[[channels]]
+name = "WION"
+youtube_channel_id = "UC_gUM8rL-Lrg6O3adPW9K1g"
+
+[[channels]]
+name = "DW News"
+youtube_channel_id = "UCknLrEdhRCp1aegoMqRaCZg"

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en-GB">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JARVIS</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body data-mode="idle" data-mic="on">
+    <main id="wall" aria-live="polite"></main>
+
+    <div id="overlay" hidden></div>
+
+    <form id="setup" hidden>
+      <h1>One-time setup</h1>
+      <p>Paste your Anthropic API key. JARVIS keeps it in Windows Credential Manager and won't ask again.</p>
+      <input id="setupkey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…" />
+      <p id="setuperror" role="alert"></p>
+      <button type="submit">Save key</button>
+      <p class="hint">No key yet? Create one at console.anthropic.com → API keys.</p>
+    </form>
+
+    <footer id="presence">
+      <p id="heard"></p>
+      <p id="said"></p>
+      <button id="orb" aria-label="Tap to talk to JARVIS"><span></span></button>
+      <p id="voicestatus" hidden></p>
+      <form id="devtype" hidden>
+        <input id="devinput" autocomplete="off" placeholder="Type what you'd say, then Enter" />
+      </form>
+    </footer>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

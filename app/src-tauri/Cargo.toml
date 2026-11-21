@@ -1,0 +1,29 @@
+[package]
+name = "jarvis-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "jarvis_app"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+jarvis-core.workspace = true
+jarvis-brain.workspace = true
+jarvis-modules.workspace = true
+jarvis-voice.workspace = true
+jarvis-ears.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
