@@ -9,7 +9,7 @@ use crate::screen::{PanelUpdate, ScreenState, ScreenView};
 use serde::Serialize;
 use std::time::Duration;
 
-pub const LISTEN_TIMEOUT: Duration = Duration::from_secs(8);
+pub const LISTEN_TIMEOUT: Duration = Duration::from_secs(10);
 pub const FOLLOW_UP_WINDOW: Duration = Duration::from_secs(10);
 const MAX_HISTORY: usize = 6;
 /// How many channels to try in a row when live video refuses to play.

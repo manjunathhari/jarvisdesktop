@@ -104,6 +104,57 @@ fn unpack(archive: &Path, into: &Path) -> Result<(), String> {
         .map_err(|e| format!("couldn't unpack the voice: {e}"))
 }
 
+/// One file of a model fetched individually (e.g. from Hugging Face).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelFile {
+    pub url: &'static str,
+    pub name: &'static str,
+}
+
+/// Make sure every file is in `models_dir/dir_name`; download any set that
+/// isn't complete. `percent` runs 0–100 across all files.
+pub async fn ensure_files(
+    models_dir: &Path,
+    dir_name: &str,
+    files: &[ModelFile],
+    dl: &dyn Download,
+    percent: &(dyn Fn(u8) + Send + Sync),
+) -> Result<PathBuf, String> {
+    let dir = models_dir.join(dir_name);
+    if dir.join(COMPLETE_MARKER).is_file() {
+        return Ok(dir);
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let n = files.len().max(1) as u64;
+    let last = std::sync::atomic::AtomicU8::new(0);
+    for (i, f) in files.iter().enumerate() {
+        let target = dir.join(f.name);
+        if target.is_file() {
+            continue; // finished on an earlier attempt
+        }
+        let part = dir.join(format!("{}.part", f.name));
+        let report = |done: u64, total: Option<u64>| {
+            if let Some(t) = total.filter(|t| *t > 0) {
+                let p = ((i as u64 * 100 + done.min(t) * 100 / t) / n) as u8;
+                if p > last.load(std::sync::atomic::Ordering::Relaxed) {
+                    last.store(p, std::sync::atomic::Ordering::Relaxed);
+                    percent(p);
+                }
+            }
+        };
+        if let Err(e) = dl.download(f.url, &part, &report).await {
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+        std::fs::rename(&part, &target).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(dir.join(COMPLETE_MARKER), b"ok").map_err(|e| e.to_string())?;
+    if last.load(std::sync::atomic::Ordering::Relaxed) < 100 {
+        percent(100);
+    }
+    Ok(dir)
+}
+
 pub struct HttpDownload {
     client: reqwest::Client,
 }
@@ -268,6 +319,111 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("no internet"));
         assert!(!is_ready(tmp.path()));
+    }
+
+    // ── individual files ─────────────────────────────────────────
+
+    const FILES: &[ModelFile] = &[
+        ModelFile {
+            url: "https://x/encoder",
+            name: "encoder.onnx",
+        },
+        ModelFile {
+            url: "https://x/decoder",
+            name: "decoder.onnx",
+        },
+    ];
+
+    /// Writes the URL itself as the file's content; fails for listed URLs.
+    struct UrlEcho {
+        fail: Vec<&'static str>,
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl Download for UrlEcho {
+        async fn download(
+            &self,
+            url: &str,
+            dest: &Path,
+            progress: Progress<'_>,
+        ) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail.contains(&url) {
+                return Err(format!("couldn't fetch {url}"));
+            }
+            progress(1, Some(2));
+            std::fs::write(dest, url).map_err(|e| e.to_string())?;
+            progress(2, Some(2));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn fetches_each_file_and_reports_overall_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = UrlEcho {
+            fail: vec![],
+            calls: AtomicUsize::new(0),
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let dir = ensure_files(tmp.path(), "whisper", FILES, &dl, &move |p| {
+            s.lock().unwrap().push(p)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("decoder.onnx")).unwrap(),
+            "https://x/decoder"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.last(), Some(&100));
+        assert!(
+            seen.contains(&25) && seen.contains(&50) && seen.contains(&75),
+            "{seen:?}"
+        );
+        assert!(
+            seen.windows(2).all(|w| w[0] <= w[1]),
+            "never goes backwards: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_file_sets_are_not_fetched_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = UrlEcho {
+            fail: vec![],
+            calls: AtomicUsize::new(0),
+        };
+        ensure_files(tmp.path(), "whisper", FILES, &dl, &|_| {})
+            .await
+            .unwrap();
+        ensure_files(tmp.path(), "whisper", FILES, &dl, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 2, "two files, once each");
+    }
+
+    #[tokio::test]
+    async fn a_failed_file_leaves_the_set_incomplete_and_retries_next_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = UrlEcho {
+            fail: vec!["https://x/decoder"],
+            calls: AtomicUsize::new(0),
+        };
+        assert!(ensure_files(tmp.path(), "whisper", FILES, &bad, &|_| {})
+            .await
+            .is_err());
+        assert!(!tmp.path().join("whisper").join("decoder.onnx").exists());
+        assert!(!tmp.path().join("whisper").join(".complete").exists());
+        let good = UrlEcho {
+            fail: vec![],
+            calls: AtomicUsize::new(0),
+        };
+        let dir = ensure_files(tmp.path(), "whisper", FILES, &good, &|_| {})
+            .await
+            .unwrap();
+        assert!(dir.join("decoder.onnx").is_file());
     }
 
     #[tokio::test]

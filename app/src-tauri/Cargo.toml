@@ -17,6 +17,7 @@ jarvis-core.workspace = true
 jarvis-brain.workspace = true
 jarvis-modules.workspace = true
 jarvis-voice.workspace = true
+jarvis-ears.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

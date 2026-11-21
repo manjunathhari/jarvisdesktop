@@ -14,6 +14,7 @@ const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as 
 const wall = $("wall");
 const overlay = $("overlay");
 const heard = $("heard");
+const input = document.getElementById("devinput") as HTMLInputElement | null;
 const said = $("said");
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string) {
@@ -123,6 +124,16 @@ listen<ScreenView>("jarvis://screen", (e) => render(e.payload));
 listen<string>("jarvis://speak", (e) => speak(e.payload));
 listen<string>("jarvis://caption", (e) => (said.textContent = e.payload));
 const voiceStatus = $("voicestatus");
+listen<{ state: string; percent: number }>("jarvis://ears_status", ({ payload }) => {
+  const text: Record<string, string> = {
+    downloading: `Getting my hearing ready, ${payload.percent}%`,
+    loading: "Loading my hearing…",
+    no_mic: "I can't find a microphone. You can still type.",
+  };
+  voiceStatus.textContent = text[payload.state] ?? "";
+  voiceStatus.hidden = !text[payload.state];
+  if (payload.state === "ready") input?.setAttribute("placeholder", "Speak, or type here and press Enter");
+});
 listen<{ state: string; percent: number }>("jarvis://voice_status", ({ payload }) => {
   const text: Record<string, string> = {
     downloading: `Getting my voice ready, ${payload.percent}%`,
@@ -138,6 +149,7 @@ listen<string>("jarvis://heard", (e) => {
 });
 listen<string>("jarvis://status", (e) => {
   document.body.dataset.mode = e.payload;
+  if (e.payload === "listening" && !heard.textContent) heard.textContent = "Listening…";
   if (e.payload === "idle") heard.textContent = "";
 });
 listen<boolean>("jarvis://mic", (e) => (document.body.dataset.mic = e.payload ? "on" : "off"));

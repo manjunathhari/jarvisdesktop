@@ -1859,6 +1859,7 @@ dependencies = [
  "chrono",
  "jarvis-brain",
  "jarvis-core",
+ "jarvis-ears",
  "jarvis-modules",
  "jarvis-voice",
  "keyring",
@@ -1896,6 +1897,16 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "jarvis-ears"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "sherpa-onnx",
+ "sherpa-onnx-sys",
  "tracing",
 ]
 

@@ -6,7 +6,7 @@ use chrono::Timelike;
 use jarvis_brain::ClaudeBrain;
 use jarvis_core::action::Registry;
 use jarvis_core::brain::Brain;
-use jarvis_core::coordinator::Event;
+use jarvis_core::coordinator::{Event, Mode};
 use jarvis_core::runtime::{runtime, Handle, Ui, UiEvent};
 use jarvis_modules::{HttpFetch, LiveTvModule, NewsModule, ScreenModule, SourcesConfig};
 use jarvis_voice::Voice;
@@ -23,9 +23,17 @@ const NEWS_REFRESH: Duration = Duration::from_secs(5 * 60);
 /// stand-in voice speaks.
 type VoiceSlot = Arc<Mutex<Option<Voice>>>;
 
+/// The microphone and the ears, once their models are ready.
+struct Listening {
+    ears: jarvis_ears::Ears,
+    mic: jarvis_ears::capture::Mic,
+}
+type EarsSlot = Arc<Mutex<Option<Listening>>>;
+
 struct TauriUi {
     app: AppHandle,
     voice: VoiceSlot,
+    ears: EarsSlot,
 }
 
 impl Ui for TauriUi {
@@ -50,7 +58,15 @@ impl Ui for TauriUi {
                 app.emit("jarvis://stop_speaking", ())
             }
             UiEvent::Heard(s) => app.emit("jarvis://heard", s),
-            UiEvent::Status(m) => app.emit("jarvis://status", m),
+            UiEvent::Status(m) => {
+                // The mic is on only while JARVIS is waiting for you to speak.
+                let on = matches!(m, Mode::Listening | Mode::FollowUp);
+                if let Some(l) = self.ears.lock().ok().as_deref().and_then(Option::as_ref) {
+                    l.mic.set_active(on);
+                    l.ears.set_listening(on);
+                }
+                app.emit("jarvis://status", m)
+            }
             UiEvent::Mic(on) => app.emit("jarvis://mic", on),
             UiEvent::Quit => {
                 // Let "Goodbye" play before the window closes.
@@ -184,6 +200,127 @@ async fn prepare_voice(app: AppHandle, slot: VoiceSlot, models_dir: PathBuf) {
     }
 }
 
+/// Download the listening models the first time, load them, open the mic.
+#[cfg(windows)]
+async fn prepare_ears(
+    app: AppHandle,
+    slot: EarsSlot,
+    voice: VoiceSlot,
+    models_dir: PathBuf,
+    jarvis: Handle,
+) {
+    use jarvis_ears::models::*;
+    use jarvis_ears::sherpa::{SileroVad, Whisper};
+    use jarvis_ears::{capture::start_microphone, Ears};
+    use jarvis_voice::model::{ensure_files, HttpDownload, ModelFile};
+
+    let status = |state: &'static str, percent: u8| {
+        let _ = app.emit("jarvis://ears_status", VoiceStatus { state, percent });
+    };
+    let dl = HttpDownload::default();
+    let whisper_files = [
+        ModelFile {
+            url: WHISPER_ENCODER_URL,
+            name: WHISPER_ENCODER,
+        },
+        ModelFile {
+            url: WHISPER_DECODER_URL,
+            name: WHISPER_DECODER,
+        },
+        ModelFile {
+            url: WHISPER_TOKENS_URL,
+            name: WHISPER_TOKENS,
+        },
+    ];
+    let progress = |p: u8| status("downloading", p);
+    let dirs = async {
+        let w = ensure_files(&models_dir, WHISPER_DIR, &whisper_files, &dl, &progress).await?;
+        let v = ensure_files(
+            &models_dir,
+            VAD_DIR,
+            &[ModelFile {
+                url: VAD_URL,
+                name: VAD_FILE,
+            }],
+            &dl,
+            &|_| {},
+        )
+        .await?;
+        Ok::<_, String>((w, v))
+    };
+    let (whisper_dir, vad_dir) = match dirs.await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "listening models unavailable; typing still works");
+            status("unavailable", 0);
+            return;
+        }
+    };
+    status("loading", 100);
+    let loaded = tokio::task::spawn_blocking(move || {
+        Ok::<_, String>((
+            SileroVad::load(&vad_dir.join(VAD_FILE))?,
+            Whisper::load(&whisper_dir)?,
+        ))
+    })
+    .await;
+    let (vad, whisper) = match loaded {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "couldn't load the listening models");
+            status("unavailable", 0);
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "listening loader crashed");
+            status("unavailable", 0);
+            return;
+        }
+    };
+    // Never listen to George.
+    let speaking = Arc::new(move || {
+        voice
+            .lock()
+            .ok()
+            .and_then(|v| v.as_ref().map(|v| v.is_speaking()))
+            .unwrap_or(false)
+    });
+    let ears = Ears::start(
+        Box::new(vad),
+        Box::new(whisper),
+        speaking,
+        Box::new(move |text| {
+            tracing::info!(%text, "heard");
+            jarvis.send(Event::Utterance(text));
+        }),
+    );
+    let feed = ears.clone();
+    match start_microphone(move |chunk| feed.push_audio(chunk)) {
+        Ok(mic) => {
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(Listening { ears, mic });
+            }
+            tracing::info!("listening is ready");
+            status("ready", 100);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "no microphone; typing still works");
+            status("no_mic", 0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+async fn prepare_ears(
+    _app: AppHandle,
+    _slot: EarsSlot,
+    _voice: VoiceSlot,
+    _models_dir: PathBuf,
+    _jarvis: Handle,
+) {
+    let _: Option<Listening> = None;
+}
+
 /// Other platforms keep the stand-in voice for now.
 #[cfg(not(windows))]
 async fn prepare_voice(_app: AppHandle, _slot: VoiceSlot, _models_dir: PathBuf) {
@@ -218,19 +355,26 @@ pub fn run() {
                 tracing::warn!("no Anthropic key stored yet; only local commands will work");
             }
             let voice: VoiceSlot = Arc::new(Mutex::new(None));
+            let ears: EarsSlot = Arc::new(Mutex::new(None));
             let ui = Arc::new(TauriUi {
                 app: app.handle().clone(),
                 voice: voice.clone(),
+                ears: ears.clone(),
             });
+            let (handle, fut) = runtime(USER_NAME, brain, Arc::new(registry), ui);
+            tauri::async_runtime::spawn(fut);
             match app.path().app_local_data_dir() {
                 Ok(dir) => {
-                    let handle = app.handle().clone();
-                    tauri::async_runtime::spawn(prepare_voice(handle, voice, dir.join("models")));
+                    let (app_handle, jarvis) = (app.handle().clone(), handle.clone());
+                    let models = dir.join("models");
+                    tauri::async_runtime::spawn(async move {
+                        // Voice first (George), then hearing; one download at a time.
+                        prepare_voice(app_handle.clone(), voice.clone(), models.clone()).await;
+                        prepare_ears(app_handle, ears, voice, models, jarvis).await;
+                    });
                 }
                 Err(e) => tracing::warn!(error = %e, "no data folder; using the stand-in voice"),
             }
-            let (handle, fut) = runtime(USER_NAME, brain, Arc::new(registry), ui);
-            tauri::async_runtime::spawn(fut);
             app.manage(handle);
 
             // Keep headlines warm so "bring me the news" never waits on the network.

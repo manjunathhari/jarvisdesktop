@@ -10,7 +10,7 @@ pub mod speaker;
 #[cfg(windows)]
 pub mod kokoro;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 
@@ -38,6 +38,7 @@ pub type OutFactory = Box<dyn FnOnce() -> Result<Box<dyn AudioOut>, String> + Se
 pub struct Voice {
     tx: mpsc::Sender<(u64, String)>,
     epoch: Arc<AtomicU64>,
+    speaking: Arc<AtomicBool>,
 }
 
 impl Voice {
@@ -45,6 +46,8 @@ impl Voice {
         let (tx, rx) = mpsc::channel::<(u64, String)>();
         let epoch = Arc::new(AtomicU64::new(0));
         let current = epoch.clone();
+        let speaking = Arc::new(AtomicBool::new(false));
+        let playing = speaking.clone();
         thread::Builder::new()
             .name("jarvis-voice".into())
             .spawn(move || {
@@ -61,14 +64,32 @@ impl Voice {
                         continue;
                     }
                     match engine.synth(&text) {
-                        Ok(audio) if !stale() => out.play(audio, &stale),
+                        Ok(audio) if !stale() => {
+                            playing.store(true, Ordering::SeqCst);
+                            out.play(audio, &stale);
+                            playing.store(false, Ordering::SeqCst);
+                        }
                         Ok(_) => {}
                         Err(err) => tracing::warn!(error = %err, "couldn't synthesise a sentence"),
                     }
                 }
             })
             .expect("spawn voice thread");
-        Self { tx, epoch }
+        Self {
+            tx,
+            epoch,
+            speaking,
+        }
+    }
+
+    /// Is JARVIS's voice playing right now? (The ears ignore the mic meanwhile.)
+    pub fn is_speaking(&self) -> bool {
+        self.speaking.load(Ordering::SeqCst)
+    }
+
+    /// The same signal, shareable with another thread.
+    pub fn speaking_flag(&self) -> Arc<AtomicBool> {
+        self.speaking.clone()
     }
 
     /// Queue a sentence.
@@ -188,6 +209,25 @@ mod tests {
         v.stop();
         v.speak("again");
         wait_for(&log, |l| l.finished.contains(&5));
+    }
+
+    #[test]
+    fn reports_when_it_is_speaking() {
+        let (v, log) = voice(200, None);
+        assert!(!v.is_speaking());
+        v.speak("hello");
+        thread::sleep(Duration::from_millis(80));
+        assert!(v.is_speaking(), "speaking during playback");
+        wait_for(&log, |l| l.finished.len() == 1);
+        thread::sleep(Duration::from_millis(20));
+        assert!(!v.is_speaking(), "quiet afterwards");
+        let flag = v.speaking_flag();
+        v.speak("again");
+        thread::sleep(Duration::from_millis(80));
+        assert!(
+            flag.load(std::sync::atomic::Ordering::SeqCst),
+            "shared flag follows too"
+        );
     }
 
     #[test]
