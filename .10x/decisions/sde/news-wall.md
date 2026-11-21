@@ -24,3 +24,11 @@ Branch `milestone-a`. 81 tests (core 33, modules 30, brain 18), clippy -D warnin
 - Offline live stream is not auto-detected yet (needs a player event); "next channel" by voice works.
 - Eval set is ~10 phrasings/action vs the planned ~30.
 - TDD note: the screen model's first tests were written alongside the code; they were proven by breaking the code and watching them fail. Everything after was strict test-first.
+
+## Update 2026-11-21 (after first run on the user's PC)
+User feedback: no way to exit; having to use the terminal every time is annoying.
+- Exit: local command "shut down / exit / quit / goodbye" (spoken goodbye, then close) + Esc key closes immediately.
+- No terminal: `release.yml` builds an NSIS installer (3.6 MB) on every push and publishes a GitHub pre-release.
+- T13 pulled forward: first-run setup screen asks for the Anthropic key once; stored via `keyring` in Windows Credential Manager; app restarts to load it. Env var still honoured for development.
+- Typing box enabled in installed builds until the microphone (Milestone B).
+- Installer is unsigned → SmartScreen warning on first install (code signing deferred).

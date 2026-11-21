@@ -29,7 +29,8 @@
 - Dev tools not yet installed (Git, Node, Rust, VS C++ Build Tools) — winget steps given
 
 ## Needs the user
-- Run Milestone A on the Windows PC (README) and `jarvis-eval` with the API key.
+- Milestone A ran on the Windows PC (2026-11-21). Feedback: voice is robotic; needed exit; terminal annoying → installer + key setup shipped (build 1).
+- Decide next: Milestone B (voice first) vs Architecture v2 Phase 0/1 (see project docs).
 - Approve web lookups so feed URLs / channel IDs can be verified.
 
 ## Open questions
