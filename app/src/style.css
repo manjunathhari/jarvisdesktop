@@ -216,6 +216,9 @@ body[data-mode="thinking"] #orb span {
 body[data-mode="follow_up"] #orb span { opacity: 0.75; animation: none; }
 body[data-mode="mic_off"] #orb span { opacity: 0.4; border-color: var(--ash); box-shadow: none; animation: none; }
 
+#voicestatus { margin: 0.4rem 0 0; color: var(--ash); font-size: var(--s-1); }
+#voicestatus[hidden] { display: none; }
+
 /* dev-only typed input */
 #devtype { pointer-events: auto; margin-top: 0.8rem; }
 #devinput {

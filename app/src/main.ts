@@ -77,8 +77,8 @@ function render(view: ScreenView) {
   if (!nextVideo) videoSrc = "";
 }
 
-// ── voice (Milestone A stand-in: the system voice via the web view).
-// Milestone B replaces this with the local open-source voice in Rust.
+// ── stand-in voice: the system voice via the web view. Used only until
+// George's voice (Kokoro, in Rust) is downloaded and loaded.
 const synth = window.speechSynthesis;
 let voice: SpeechSynthesisVoice | undefined;
 function pickVoice() {
@@ -100,6 +100,16 @@ function speak(text: string) {
 // ── wiring
 listen<ScreenView>("jarvis://screen", (e) => render(e.payload));
 listen<string>("jarvis://speak", (e) => speak(e.payload));
+listen<string>("jarvis://caption", (e) => (said.textContent = e.payload));
+const voiceStatus = $("voicestatus");
+listen<{ state: string; percent: number }>("jarvis://voice_status", ({ payload }) => {
+  const text: Record<string, string> = {
+    downloading: `Getting my voice ready, ${payload.percent}%`,
+    loading: "Loading my voice…",
+  };
+  voiceStatus.textContent = text[payload.state] ?? "";
+  voiceStatus.hidden = !text[payload.state];
+});
 listen("jarvis://stop_speaking", () => synth?.cancel());
 listen<string>("jarvis://heard", (e) => {
   heard.textContent = e.payload;

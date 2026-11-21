@@ -9,22 +9,46 @@ use jarvis_core::brain::Brain;
 use jarvis_core::coordinator::Event;
 use jarvis_core::runtime::{runtime, Handle, Ui, UiEvent};
 use jarvis_modules::{HttpFetch, LiveTvModule, NewsModule, ScreenModule, SourcesConfig};
-use std::sync::Arc;
+use jarvis_voice::Voice;
+use serde::Serialize;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const USER_NAME: &str = "Manj";
 const NEWS_REFRESH: Duration = Duration::from_secs(5 * 60);
 
-struct TauriUi(AppHandle);
+/// George's voice once it is downloaded and loaded; until then the UI's
+/// stand-in voice speaks.
+type VoiceSlot = Arc<Mutex<Option<Voice>>>;
+
+struct TauriUi {
+    app: AppHandle,
+    voice: VoiceSlot,
+}
 
 impl Ui for TauriUi {
     fn emit(&self, ev: UiEvent) {
-        let app = &self.0;
+        let app = &self.app;
         let r = match ev {
             UiEvent::Screen(v) => app.emit("jarvis://screen", v),
-            UiEvent::Speak(s) => app.emit("jarvis://speak", s),
-            UiEvent::StopSpeaking => app.emit("jarvis://stop_speaking", ()),
+            UiEvent::Speak(s) => {
+                let _ = app.emit("jarvis://caption", &s);
+                match self.voice.lock().ok().as_deref().and_then(Option::as_ref) {
+                    Some(v) => {
+                        v.speak(&s);
+                        Ok(())
+                    }
+                    None => app.emit("jarvis://speak", s),
+                }
+            }
+            UiEvent::StopSpeaking => {
+                if let Some(v) = self.voice.lock().ok().as_deref().and_then(Option::as_ref) {
+                    v.stop();
+                }
+                app.emit("jarvis://stop_speaking", ())
+            }
             UiEvent::Heard(s) => app.emit("jarvis://heard", s),
             UiEvent::Status(m) => app.emit("jarvis://status", m),
             UiEvent::Mic(on) => app.emit("jarvis://mic", on),
@@ -92,6 +116,66 @@ fn brain() -> Option<Arc<dyn Brain>> {
     Some(Arc::new(ClaudeBrain::new(key, model, USER_NAME)))
 }
 
+#[derive(Clone, Serialize)]
+struct VoiceStatus {
+    state: &'static str,
+    percent: u8,
+}
+
+/// Download George's voice the first time, load it, and switch to it.
+#[cfg(windows)]
+async fn prepare_voice(app: AppHandle, slot: VoiceSlot, models_dir: PathBuf) {
+    use jarvis_voice::model::{self, HttpDownload, GEORGE, KOKORO_URL};
+    use jarvis_voice::{kokoro::Kokoro, speaker::Speaker, AudioOut};
+
+    let status = |state: &'static str, percent: u8| {
+        let _ = app.emit("jarvis://voice_status", VoiceStatus { state, percent });
+    };
+    let last = std::sync::atomic::AtomicU8::new(255);
+    let files = match model::ensure(&models_dir, KOKORO_URL, &HttpDownload::default(), &|p| {
+        if last.swap(p, std::sync::atomic::Ordering::Relaxed) != p {
+            status("downloading", p);
+        }
+    })
+    .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, "voice download failed; using the stand-in voice");
+            status("unavailable", 0);
+            return;
+        }
+    };
+    status("loading", 100);
+    let loaded = tokio::task::spawn_blocking(move || Kokoro::load(&files, GEORGE)).await;
+    match loaded {
+        Ok(Ok(engine)) => {
+            let voice = Voice::start(
+                Box::new(engine),
+                Box::new(|| Speaker::open().map(|s| Box::new(s) as Box<dyn AudioOut>)),
+            );
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(voice);
+            }
+            tracing::info!("George's voice is ready");
+            status("ready", 100);
+        }
+        other => {
+            tracing::warn!(?other, "couldn't load the voice; using the stand-in voice");
+            status("unavailable", 0);
+        }
+    }
+}
+
+/// Other platforms keep the stand-in voice for now.
+#[cfg(not(windows))]
+async fn prepare_voice(_app: AppHandle, _slot: VoiceSlot, _models_dir: PathBuf) {
+    let _ = VoiceStatus {
+        state: "unavailable",
+        percent: 0,
+    };
+}
+
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -116,7 +200,18 @@ pub fn run() {
             if brain.is_none() {
                 tracing::warn!("no Anthropic key stored yet; only local commands will work");
             }
-            let ui = Arc::new(TauriUi(app.handle().clone()));
+            let voice: VoiceSlot = Arc::new(Mutex::new(None));
+            let ui = Arc::new(TauriUi {
+                app: app.handle().clone(),
+                voice: voice.clone(),
+            });
+            match app.path().app_local_data_dir() {
+                Ok(dir) => {
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(prepare_voice(handle, voice, dir.join("models")));
+                }
+                Err(e) => tracing::warn!(error = %e, "no data folder; using the stand-in voice"),
+            }
             let (handle, fut) = runtime(USER_NAME, brain, Arc::new(registry), ui);
             tauri::async_runtime::spawn(fut);
             app.manage(handle);
