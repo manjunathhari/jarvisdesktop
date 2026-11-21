@@ -32,3 +32,12 @@ User feedback: no way to exit; having to use the terminal every time is annoying
 - T13 pulled forward: first-run setup screen asks for the Anthropic key once; stored via `keyring` in Windows Credential Manager; app restarts to load it. Env var still honoured for development.
 - Typing box enabled in installed builds until the microphone (Milestone B).
 - Installer is unsigned → SmartScreen warning on first install (code signing deferred).
+
+## T11/T12 — George's voice (2026-11-21)
+- User chose Kokoro `bm_george` (British male) after listening to samples.
+- Engine: sherpa-onnx **1.13.2** (pinned with sherpa-onnx-sys 1.13.2). v2.x drops espeak-ng (lexicon-only), which risks mispronouncing names in headlines; v1.13 keeps espeak-ng → any word works. Licence note: espeak-ng is GPL-3; fine for personal use/public source; revisit (v2 + lexicon) if JARVIS is ever distributed closed-source.
+- Model: official `kokoro-en-v0_19` pack (~330 MB model, speaker id 9), downloaded once into %LOCALAPPDATA%\in.mhsurgery.jarvis\models with progress + integrity check (required files, .complete marker), staged unpack.
+- Voice worker: ordered sentence queue, epoch-based instant interruption, synth errors skip a sentence; rodio playback polls for cancellation.
+- Stand-in web voice speaks until George is ready; UI shows "Getting my voice ready, N%".
+- Engine compiled on Windows only (its build downloads prebuilt libs, blocked in the cloud workspace). Verified by the Windows CI build; not yet heard on the device.
+- Installer build 5: 7.9 MB.
