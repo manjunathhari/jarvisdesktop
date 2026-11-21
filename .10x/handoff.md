@@ -3,7 +3,7 @@
 
 **Remaining Phase 0**
 - **P0-8:** PASS 21 Nov (network-check.yml; weekly re-run).
-- **P0-7 (T0.7):** first daily dump lands after midnight IST in volume `jarvis_backups`. Drill plan: deploy a one-shot Docker project via the connector that mounts that volume (external), restores the newest dump into a scratch Postgres 17 and compares the P0-1 smoke ticket and its 7 audit rows; read the result from its logs. Write the rebuild/move runbook (`server/deploy/README.md`).
+- **P0-7:** deferred by Manj until the build goes big (Hostinger weekly backup suffices for now). Still write the rebuild/move runbook (`server/deploy/README.md`).
 - **T0.8:** QA + security review → `.10x/reviews/`; mark PR #2 ready; Manj approves merge.
 
 **How to deploy a new version:** push to `phase-0-foundations`/`main` → CI publishes `ghcr.io/manjunathhari/jarvis-server:<commit>` → connector `vps_docker_create` with content = raw GitHub URL of `server/deploy/compose.yaml` at that commit and environment `JARVIS_REF=<commit>` → read `vps_docker_logs` for SMOKE lines.

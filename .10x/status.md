@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): running on the shared server; P0-1…P0-6 pass; P0-8 pass; P0-7 after the first nightly backup.**
+**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): running on the shared server; P0-1…P0-6 pass; P0-8 pass; P0-7 deferred (Manj).**
 **Started:** 2026-11-21
 
 ## Known so far
@@ -78,5 +78,5 @@ Design: `.10x/specs/2026-11-21-phase-0-foundations-design.md`, ADR-006…009 (Pr
 - [x] T0.4 Job queue + scheduler heartbeat
 - [x] T0.5 Hardening: Tailscale (+ Tailscale SSH), SSH key-only + fail2ban, Hostinger firewall 22/80/443 — done 21 Nov. **P0-8 PASS** 21 Nov (external scan: only 22/80/443 open; SSH publickey only). Re-runs weekly.
 - [x] T0.6 Deployed via Hostinger Docker manager (image from GHCR); P0-1…P0-5 SMOKE PASS on the live server, 21 Nov
-- [ ] T0.7 Local daily backups + restore drill (P0-7) + rebuild/move runbook
+- [~] T0.7 Local daily backups running. **P0-7 restore drill deferred by Manj (21 Nov):** Hostinger's weekly backup is enough until the build gets big; do the drill then, or before moving JARVIS to its own server. Rebuild/move runbook still to write.
 - [ ] T0.8 QA + security review; merge
