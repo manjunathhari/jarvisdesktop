@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** 0 — Brainstorming (in progress)
+**Phase:** 0 — Brainstorming: spec written, awaiting user review
 **Started:** 2026-11-21
 
 ## Known so far
@@ -18,5 +18,8 @@
 - Voice: defaulted to A — local open-source natural voice (user did not pick; confirm in spec review).
 - Repo: github.com/manjunathhari/jarvisdesktop (was empty; state moved here 2026-11-21).
 
+- Design section 3 APPROVED (testing + security).
+
 ## Open questions
-- Design section 3: testing + security, then write spec
+- User review of spec `.10x/specs/2026-11-21-jarvis-news-wall-design.md` (incl. voice choice)
+- Permission to push to GitHub
