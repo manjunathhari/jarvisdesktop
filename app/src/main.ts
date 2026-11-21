@@ -116,6 +116,10 @@ document.addEventListener("pointerdown", (e) => {
   if ((e.target as HTMLElement).closest("#devtype")) return;
   invoke("tap");
 });
+// Esc always closes JARVIS, whatever is on screen.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") invoke("quit");
+});
 $("orb").addEventListener("keydown", (e) => {
   if (e.key === "Enter" || e.key === " ") invoke("tap");
 });

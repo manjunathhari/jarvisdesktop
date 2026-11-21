@@ -26,6 +26,15 @@ impl Ui for TauriUi {
             UiEvent::Heard(s) => app.emit("jarvis://heard", s),
             UiEvent::Status(m) => app.emit("jarvis://status", m),
             UiEvent::Mic(on) => app.emit("jarvis://mic", on),
+            UiEvent::Quit => {
+                // Let "Goodbye" play before the window closes.
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1600)).await;
+                    app.exit(0);
+                });
+                Ok(())
+            }
         };
         if let Err(e) = r {
             tracing::warn!(error = %e, "emit failed");
@@ -47,6 +56,12 @@ fn say(text: String, jarvis: State<'_, Handle>) {
     // Typed stand-in for the microphone until Milestone B; length-capped.
     let text: String = text.chars().take(500).collect();
     jarvis.send(Event::Utterance(text));
+}
+
+/// Emergency exit (Esc key): closes immediately.
+#[tauri::command]
+fn quit(app: AppHandle) {
+    app.exit(0);
 }
 
 #[tauri::command]
@@ -105,7 +120,12 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![tap, say, typed_input_enabled])
+        .invoke_handler(tauri::generate_handler![
+            tap,
+            say,
+            quit,
+            typed_input_enabled
+        ])
         .run(tauri::generate_context!())
         .expect("error while running JARVIS");
 }

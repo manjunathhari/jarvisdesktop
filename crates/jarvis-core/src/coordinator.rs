@@ -79,6 +79,8 @@ pub enum Effect {
     Status(Mode),
     /// What JARVIS heard, for the caption line.
     Heard(String),
+    /// Close JARVIS.
+    Quit,
 }
 
 /// Commands handled on the PC without the brain: instant and offline.
@@ -87,6 +89,7 @@ pub enum LocalCommand {
     StopTalking,
     ClearScreen,
     StopListening,
+    Quit,
 }
 
 fn normalise(text: &str) -> String {
@@ -110,6 +113,9 @@ fn normalise(text: &str) -> String {
     if words.last() == Some(&"please") {
         words.pop();
     }
+    if words.last() == Some(&"jarvis") {
+        words.pop();
+    }
     words.join(" ")
 }
 
@@ -122,6 +128,9 @@ pub fn local_command(text: &str) -> Option<LocalCommand> {
         }
         "stop listening" | "go to sleep" | "mute" | "mute yourself" | "mic off"
         | "microphone off" => Some(LocalCommand::StopListening),
+        "shut down" | "shutdown" | "exit" | "quit" | "goodbye" | "close yourself" | "turn off" => {
+            Some(LocalCommand::Quit)
+        }
         _ => None,
     }
 }
@@ -274,6 +283,11 @@ impl Coordinator {
                 self.set_mode(Mode::FollowUp, fx);
                 self.start_timer(Timer::FollowUp, FOLLOW_UP_WINDOW, fx);
             }
+            Some(LocalCommand::Quit) => {
+                fx.push(Effect::StopSpeaking);
+                fx.push(Effect::Speak(format!("Goodbye, {}.", self.user_name)));
+                fx.push(Effect::Quit);
+            }
             Some(LocalCommand::StopListening) => {
                 fx.push(Effect::StopSpeaking);
                 fx.push(Effect::Speak(
@@ -389,6 +403,18 @@ mod tests {
         );
         assert_eq!(greeting(20, "Manj"), "Good evening, Manj. How can I help?");
         assert_eq!(greeting(2, "Manj"), "Good evening, Manj. How can I help?");
+    }
+
+    #[test]
+    fn shut_down_says_goodbye_then_quits() {
+        assert_eq!(local_command("Jarvis, shut down"), Some(LocalCommand::Quit));
+        assert_eq!(local_command("goodbye jarvis"), Some(LocalCommand::Quit));
+        assert_eq!(local_command("exit"), Some(LocalCommand::Quit));
+        let mut c = Coordinator::new("Manj");
+        let fx = c.step(Event::Utterance("shut down".into()));
+        assert_eq!(spoken(&fx), vec!["Goodbye, Manj."]);
+        assert_eq!(fx.last(), Some(&Effect::Quit));
+        assert!(think_of(&fx).is_none());
     }
 
     #[test]

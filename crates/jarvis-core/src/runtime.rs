@@ -25,6 +25,8 @@ pub enum UiEvent {
     Heard(String),
     Status(Mode),
     Mic(bool),
+    /// Close the app (after the goodbye has had a moment to play).
+    Quit,
 }
 
 pub trait Ui: Send + Sync + 'static {
@@ -74,6 +76,7 @@ async fn run(
                 Effect::Status(m) => ui.emit(UiEvent::Status(m)),
                 Effect::Mic(on) => ui.emit(UiEvent::Mic(on)),
                 Effect::Screen(v) => ui.emit(UiEvent::Screen(v)),
+                Effect::Quit => ui.emit(UiEvent::Quit),
                 Effect::SetTimer { timer, id, after } => {
                     let tx = tx.clone();
                     tokio::spawn(async move {
@@ -352,6 +355,14 @@ mod tests {
         h.send(Event::Utterance("clear the screen".into()));
         settle().await;
         assert_eq!(ui.last_screen(), Some(ScreenView::default()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shut_down_reaches_the_ui() {
+        let (h, ui) = start(None);
+        h.send(Event::Utterance("Jarvis, shut down".into()));
+        settle().await;
+        assert!(ui.0.lock().unwrap().contains(&UiEvent::Quit));
     }
 
     #[tokio::test(start_paused = true)]
