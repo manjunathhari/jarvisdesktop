@@ -14,9 +14,9 @@
   /* modular scale 1.25 from 18px — readable from across a room */
   --s-1: 0.9rem;
   --s0: 1.125rem;
-  --s1: 1.406rem;
+  --s1: clamp(1rem, 0.55rem + 0.75vw, 1.406rem);
   --s2: 1.758rem;
-  --s3: 2.197rem;
+  --s3: clamp(1.5rem, 0.8rem + 1.15vw, 2.197rem);
 
   --gap: clamp(1rem, 2.2vw, 2.5rem);
 }
@@ -43,7 +43,7 @@ html, body {
   inset: var(--gap) var(--gap) 11rem var(--gap);
   display: grid;
   grid-template-columns: 2fr 1fr;
-  grid-template-rows: minmax(0, 1.25fr) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) minmax(0, 1.1fr);
   grid-template-areas:
     "primary side"
     "secondary side";
@@ -68,7 +68,7 @@ html, body {
 }
 
 /* stories: the number is what you say, so it leads */
-.stories { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.9em; }
+.stories { list-style: none; margin: 0; padding: 0; display: grid; gap: clamp(0.5em, 1.2vh, 0.9em); }
 .panel[data-slot="secondary"] .stories { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--gap); }
 
 .story { display: grid; grid-template-columns: 3.4rem 1fr; column-gap: 0.7em; align-items: baseline; }
@@ -81,7 +81,7 @@ html, body {
 .story .t {
   font: 500 var(--s1) / 1.22 var(--display);
   display: -webkit-box;
-  -webkit-line-clamp: 3;
+  -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
   max-width: 34ch;

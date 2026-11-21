@@ -165,9 +165,13 @@ document.addEventListener("pointerdown", (e) => {
   if ((e.target as HTMLElement).closest("#devtype, #setup")) return;
   invoke("tap");
 });
-// Esc always closes JARVIS, whatever is on screen.
+// Esc always closes JARVIS; F11 switches between window and full screen.
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") invoke("quit");
+  if (e.key === "F11") {
+    e.preventDefault();
+    invoke("toggle_fullscreen");
+  }
 });
 $("orb").addEventListener("keydown", (e) => {
   if (e.key === "Enter" || e.key === " ") invoke("tap");

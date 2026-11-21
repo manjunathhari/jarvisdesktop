@@ -90,6 +90,13 @@ fn video_failed(jarvis: State<'_, Handle>) {
     jarvis.send(Event::VideoFailed);
 }
 
+/// F11: switch between JARVIS's window and full screen.
+#[tauri::command]
+fn toggle_fullscreen(window: tauri::WebviewWindow) -> Result<(), String> {
+    let full = window.is_fullscreen().map_err(|e| e.to_string())?;
+    window.set_fullscreen(!full).map_err(|e| e.to_string())
+}
+
 /// Emergency exit (Esc key): closes immediately.
 #[tauri::command]
 fn quit(app: AppHandle) {
@@ -243,6 +250,7 @@ pub fn run() {
             say,
             quit,
             video_failed,
+            toggle_fullscreen,
             typed_input_enabled,
             needs_key,
             save_key
