@@ -44,3 +44,28 @@ jobs:
           JARVIS_REF: ${{ github.sha }}
       - name: Image builds
         run: docker build --tag jarvis-server:ci .
+
+  publish:
+    # After tests pass on the Phase 0 branch or main, publish the image the server pulls,
+    # tagged with the commit (the server deploys by JARVIS_REF = commit SHA).
+    needs: test
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/phase-0-foundations')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: server
+          push: true
+          tags: ghcr.io/manjunathhari/jarvis-server:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/manjunathhari/jarvisdesktop
+            org.opencontainers.image.description=JARVIS server (Architecture v2)

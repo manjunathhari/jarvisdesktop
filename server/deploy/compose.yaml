@@ -1,7 +1,7 @@
 # JARVIS on the (shared, temporary) server — ADR-009, spec §10.
 #
 # Deployed as Docker project "jarvis" (Hostinger Docker manager or plain `docker compose`).
-# The server builds the image itself from the repository at commit JARVIS_REF (no registry).
+# The image is built and published by CI (server.yml) as ghcr.io/manjunathhari/jarvis-server:<commit>.
 # JARVIS_REF is the only environment value; it is not secret. Secrets are files in
 # /etc/jarvis/secrets (root:10001, 0440), created by deploy/harden/harden.sh.
 #
@@ -18,10 +18,7 @@ x-logging: &logging
   options: { max-size: "10m", max-file: "3" }
 
 x-app: &app
-  image: jarvis-server:${JARVIS_REF:?set JARVIS_REF to a commit of manjunathhari/jarvisdesktop}
-  build:
-    context: https://github.com/manjunathhari/jarvisdesktop.git#${JARVIS_REF}:server
-  pull_policy: build
+  image: ghcr.io/manjunathhari/jarvis-server:${JARVIS_REF:?set JARVIS_REF to a commit of manjunathhari/jarvisdesktop}
   restart: unless-stopped
   depends_on:
     postgres: { condition: service_healthy }
