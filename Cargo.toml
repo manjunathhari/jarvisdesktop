@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/jarvis-core", "crates/jarvis-modules", "crates/jarvis-brain"]
+members = ["crates/jarvis-core", "crates/jarvis-modules", "crates/jarvis-brain", "app/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

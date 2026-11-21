@@ -25,7 +25,7 @@ jobs:
         with:
           node-version: 22
       - name: Build UI
-        working-directory: app/ui
+        working-directory: app
         run: |
           npm ci
           npm run build

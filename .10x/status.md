@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** 3 — Planning Complete. Next: T1 (implementation not started)
+**Phase:** 4 — Implementation: Milestone A complete (branch `milestone-a`); next Milestone B
 **Started:** 2026-11-21
 
 ## Known so far
@@ -22,10 +22,14 @@
 
 - Spec APPROVED by user 2026-11-21 (voice default A accepted). Push to GitHub approved.
 
+## Needs the user
+- Run Milestone A on the Windows PC (README) and `jarvis-eval` with the API key.
+- Approve web lookups so feed URLs / channel IDs can be verified.
+
 ## Open questions
 - Does the target PC have an NVIDIA GPU? (sets Whisper model size)
 
 ## Task list (news-wall) — see decisions/engineering-manager/news-wall.md
-- [ ] Milestone A: T1 scaffold+CI · T2 core types · T3 coordinator · T4 news · T5 live_tv · T6 ClaudeBrain · T7 brain evals · T8 Tauri UI
+- [x] Milestone A: T1 scaffold+CI · T2 core types · T3 coordinator · T4 news · T5 live_tv · T6 ClaudeBrain · T7 brain evals · T8 Tauri UI (81 tests green)
 - [ ] Milestone B: T9 ears/STT · T10 wake word · T11 TTS spike+voice · T12 model downloads
 - [ ] Milestone C: T13 Windows platform · T14 end-to-end + latency · T15 QA/security + installer

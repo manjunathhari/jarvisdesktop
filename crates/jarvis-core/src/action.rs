@@ -62,6 +62,21 @@ pub trait Module: Send + Sync {
     ) -> Result<ModuleOutput, ActionError>;
 }
 
+/// Lets one module be shared, e.g. registered *and* refreshed in the background.
+#[async_trait]
+impl<M: Module + ?Sized> Module for std::sync::Arc<M> {
+    fn actions(&self) -> Vec<ActionSpec> {
+        (**self).actions()
+    }
+    async fn handle(
+        &self,
+        action: &Action,
+        screen: &ScreenState,
+    ) -> Result<ModuleOutput, ActionError> {
+        (**self).handle(action, screen).await
+    }
+}
+
 /// Holds every module and refuses anything not registered.
 #[derive(Default)]
 pub struct Registry {
