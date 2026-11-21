@@ -1,14 +1,15 @@
 # JARVIS on the (shared, temporary) server — ADR-009, spec §10.
 #
-# Lives at /opt/jarvis/compose.yaml on the server. JARVIS_IMAGE comes from /opt/jarvis/.env
-# (an image pinned by digest). Secrets are files in /etc/jarvis/secrets (root-only, 0600).
+# Deployed as Docker project "jarvis" (Hostinger Docker manager or plain `docker compose`).
+# The server builds the image itself from the repository at commit JARVIS_REF (no registry).
+# JARVIS_REF is the only environment value; it is not secret. Secrets are files in
+# /etc/jarvis/secrets (root:10001, 0440), created by deploy/harden/harden.sh.
 #
 # No service publishes a port. Everything sits on an internal network with no internet route.
 #
-#   docker compose run --rm admin bootstrap   # once per server
-#   docker compose run --rm admin migrate     # before each new version
-#   docker compose up -d                      # postgres, core, scheduler, backup
-#   docker compose run --rm core smoke        # P0-1 … P0-5 on the live database
+# On every `up`, the one-shot `init` service bootstraps roles, applies migrations and (with
+# JARVIS_SMOKE_ON_INIT=1) prints "SMOKE PASS/FAIL" lines for P0-1 … P0-5; core and scheduler
+# start only if it succeeds.
 
 name: jarvis
 
@@ -17,10 +18,14 @@ x-logging: &logging
   options: { max-size: "10m", max-file: "3" }
 
 x-app: &app
-  image: ${JARVIS_IMAGE:?set JARVIS_IMAGE in /opt/jarvis/.env}
+  image: jarvis-server:${JARVIS_REF:?set JARVIS_REF to a commit of manjunathhari/jarvisdesktop}
+  build:
+    context: https://github.com/manjunathhari/jarvisdesktop.git#${JARVIS_REF}:server
+  pull_policy: build
   restart: unless-stopped
   depends_on:
     postgres: { condition: service_healthy }
+    init: { condition: service_completed_successfully }
   networks: [jarvis_internal]
   read_only: true
   tmpfs: [/tmp]
@@ -51,6 +56,21 @@ services:
       timeout: 5s
       retries: 10
 
+  init:
+    <<: *app
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+    command: ["init"]
+    environment:
+      JARVIS_DB_HOST: postgres
+      JARVIS_DB_NAME: jarvis
+      JARVIS_PROCESS: init
+      JARVIS_SMOKE_ON_INIT: ${JARVIS_SMOKE_ON_INIT:-1}
+      TZ: Asia/Kolkata
+    secrets: [pg_superuser_password, pg_owner_password, pg_app_password]
+    mem_limit: 256m
+
   core:
     <<: *app
     command: ["serve"]
@@ -72,20 +92,6 @@ services:
       JARVIS_PROCESS: scheduler
       TZ: Asia/Kolkata
     secrets: [pg_app_password]
-    mem_limit: 256m
-
-  # One-off admin commands (bootstrap, migrate). Never left running.
-  admin:
-    <<: *app
-    restart: "no"
-    profiles: [admin]
-    command: ["migrate"]
-    environment:
-      JARVIS_DB_HOST: postgres
-      JARVIS_DB_NAME: jarvis
-      JARVIS_PROCESS: admin
-      TZ: Asia/Kolkata
-    secrets: [pg_superuser_password, pg_owner_password, pg_app_password]
     mem_limit: 256m
 
   # K5: local daily dumps only (same container as the existing Postgres 16 on this server).

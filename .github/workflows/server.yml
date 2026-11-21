@@ -41,6 +41,6 @@ jobs:
       - name: Compose file is valid
         run: docker compose -f deploy/compose.yaml config --quiet
         env:
-          JARVIS_IMAGE: ghcr.io/example/jarvis-server@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          JARVIS_REF: ${{ github.sha }}
       - name: Image builds
         run: docker build --tag jarvis-server:ci .

@@ -1,5 +1,6 @@
 """`jarvis-core`: the core process and its admin commands.
 
+jarvis-core init        bootstrap + migrate (+ smoke if JARVIS_SMOKE_ON_INIT=1), one-shot
 jarvis-core bootstrap   create roles and database (superuser; once per server)
 jarvis-core migrate     apply migrations (owner role)
 jarvis-core serve       run the core loop: heartbeat + job queue (app role)
@@ -10,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import socket
 import sys
@@ -71,16 +73,17 @@ def serve(poll_seconds: float = 2.0) -> None:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     parser = argparse.ArgumentParser(prog="jarvis-core")
-    parser.add_argument("command", choices=["bootstrap", "migrate", "serve", "smoke"])
+    parser.add_argument("command", choices=["init", "bootstrap", "migrate", "serve", "smoke"])
     args = parser.parse_args(argv)
 
-    if args.command == "bootstrap":
-        bootstrap(
-            config.superuser_dsn(),
-            "jarvis",
-            config.secret("pg_owner_password"),
-            config.secret("pg_app_password"),
-        )
+    if args.command == "init":
+        _bootstrap()
+        migrate.upgrade(config.owner_dsn())
+        log.info("bootstrap done; migrations at head")
+        if os.environ.get("JARVIS_SMOKE_ON_INIT") == "1":
+            return _smoke()
+    elif args.command == "bootstrap":
+        _bootstrap()
         log.info("bootstrap done")
     elif args.command == "migrate":
         migrate.upgrade(config.owner_dsn())
@@ -88,12 +91,25 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "serve":
         serve()
     else:
-        with psycopg.connect(config.app_dsn(), autocommit=True) as conn:
-            results = smoke.run(conn)
-        for name, ok, detail in results:
-            print(f"{'PASS' if ok else 'FAIL'}  {name}  ({detail})")
-        return 0 if all(ok for _, ok, _ in results) else 1
+        return _smoke()
     return 0
+
+
+def _bootstrap() -> None:
+    bootstrap(
+        config.superuser_dsn(),
+        "jarvis",
+        config.secret("pg_owner_password"),
+        config.secret("pg_app_password"),
+    )
+
+
+def _smoke() -> int:
+    with psycopg.connect(config.app_dsn(), autocommit=True) as conn:
+        results = smoke.run(conn)
+    for name, ok, detail in results:
+        print(f"SMOKE {'PASS' if ok else 'FAIL'}  {name}  ({detail})", flush=True)
+    return 0 if all(ok for _, ok, _ in results) else 1
 
 
 if __name__ == "__main__":
