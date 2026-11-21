@@ -22,12 +22,18 @@
 
 - Spec APPROVED by user 2026-11-21 (voice default A accepted). Push to GitHub approved.
 
+## Target PC (reported 2026-11-21)
+- Windows 11 Home 25H2 (build 26200), i7-13620H 10C/16T, 23.7 GB RAM, 122 GB free
+- GPU: Intel UHD only (no NVIDIA driver found) → Whisper runs on CPU; start with small English model, measure latency in T9
+- Mic: Realtek microphone array; WebView2 157 present
+- Dev tools not yet installed (Git, Node, Rust, VS C++ Build Tools) — winget steps given
+
 ## Needs the user
 - Run Milestone A on the Windows PC (README) and `jarvis-eval` with the API key.
 - Approve web lookups so feed URLs / channel IDs can be verified.
 
 ## Open questions
-- Does the target PC have an NVIDIA GPU? (sets Whisper model size)
+
 
 ## Task list (news-wall) — see decisions/engineering-manager/news-wall.md
 - [x] Milestone A: T1 scaffold+CI · T2 core types · T3 coordinator · T4 news · T5 live_tv · T6 ClaudeBrain · T7 brain evals · T8 Tauri UI (81 tests green)
