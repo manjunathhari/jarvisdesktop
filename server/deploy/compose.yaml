@@ -1,0 +1,138 @@
+# JARVIS on the (shared, temporary) server — ADR-009, spec §10.
+#
+# Lives at /opt/jarvis/compose.yaml on the server. JARVIS_IMAGE comes from /opt/jarvis/.env
+# (an image pinned by digest). Secrets are files in /etc/jarvis/secrets (root-only, 0600).
+#
+# No service publishes a port. Everything sits on an internal network with no internet route.
+#
+#   docker compose run --rm admin bootstrap   # once per server
+#   docker compose run --rm admin migrate     # before each new version
+#   docker compose up -d                      # postgres, core, scheduler, backup
+#   docker compose run --rm core smoke        # P0-1 … P0-5 on the live database
+
+name: jarvis
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+x-app: &app
+  image: ${JARVIS_IMAGE:?set JARVIS_IMAGE in /opt/jarvis/.env}
+  restart: unless-stopped
+  depends_on:
+    postgres: { condition: service_healthy }
+  networks: [jarvis_internal]
+  read_only: true
+  tmpfs: [/tmp]
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  logging: *logging
+  environment:
+    JARVIS_DB_HOST: postgres
+    JARVIS_DB_NAME: jarvis
+    TZ: Asia/Kolkata
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_superuser_password
+      TZ: Asia/Kolkata
+    secrets: [pg_superuser_password]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    networks: [jarvis_internal]
+    mem_limit: 1g
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  core:
+    <<: *app
+    command: ["serve"]
+    environment:
+      JARVIS_DB_HOST: postgres
+      JARVIS_DB_NAME: jarvis
+      JARVIS_PROCESS: core
+      TZ: Asia/Kolkata
+    secrets: [pg_app_password]
+    mem_limit: 512m
+
+  scheduler:
+    <<: *app
+    entrypoint: ["jarvis-scheduler"]
+    command: []
+    environment:
+      JARVIS_DB_HOST: postgres
+      JARVIS_DB_NAME: jarvis
+      JARVIS_PROCESS: scheduler
+      TZ: Asia/Kolkata
+    secrets: [pg_app_password]
+    mem_limit: 256m
+
+  # One-off admin commands (bootstrap, migrate). Never left running.
+  admin:
+    <<: *app
+    restart: "no"
+    profiles: [admin]
+    command: ["migrate"]
+    environment:
+      JARVIS_DB_HOST: postgres
+      JARVIS_DB_NAME: jarvis
+      JARVIS_PROCESS: admin
+      TZ: Asia/Kolkata
+    secrets: [pg_superuser_password, pg_owner_password, pg_app_password]
+    mem_limit: 256m
+
+  # K5: local daily dumps only (same container as the existing Postgres 16 on this server).
+  backup:
+    image: prodrigestivill/postgres-backup-local:17
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: jarvis
+      POSTGRES_USER: jarvis_owner
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_owner_password
+      SCHEDULE: "@daily"
+      BACKUP_KEEP_DAYS: 7
+      BACKUP_KEEP_WEEKS: 4
+      BACKUP_KEEP_MONTHS: 3
+      TZ: Asia/Kolkata
+    secrets: [pg_owner_password]
+    volumes: [backups:/backups]
+    networks: [jarvis_internal]
+    mem_limit: 256m
+    logging: *logging
+
+  # Phase 2 placeholders: defined so the shape is fixed, never started in Phase 0.
+  gateway:
+    <<: *app
+    profiles: [phase2]
+    entrypoint: ["python", "-c", "raise SystemExit('gateway arrives in Phase 2')"]
+    command: []
+    secrets: [pg_app_password]
+  workers:
+    <<: *app
+    profiles: [phase2]
+    entrypoint: ["python", "-c", "raise SystemExit('workers arrive in Phase 2')"]
+    command: []
+    secrets: [pg_app_password]
+
+networks:
+  jarvis_internal:
+    internal: true
+
+volumes:
+  pgdata:
+  backups:
+
+secrets:
+  pg_superuser_password: { file: /etc/jarvis/secrets/pg_superuser_password }
+  pg_owner_password: { file: /etc/jarvis/secrets/pg_owner_password }
+  pg_app_password: { file: /etc/jarvis/secrets/pg_app_password }
