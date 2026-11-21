@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** 1 — Strategy Complete
+**Phase:** 2 — Design Complete (ADR-001..004)
 **Started:** 2026-11-21
 
 ## Known so far

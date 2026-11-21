@@ -1,2 +1,2 @@
-# Handoff → Architect
-Strategy done (decisions/cto/news-wall.md, decisions/product-manager/news-wall.md). Write ADRs: shell, brain interface + action menu, module contract, local audio pipeline. Then architect + staff-engineer records.
+# Handoff → Engineering Manager
+Design done: ADR-001 Tauri shell, ADR-002 swappable brain/tool use, ADR-003 module contract, ADR-004 local audio. Layout + state machine in decisions/architect/news-wall.md; standards in decisions/staff-engineer/. Break into ≤half-day tasks.
