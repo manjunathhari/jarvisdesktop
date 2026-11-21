@@ -34,7 +34,7 @@ jobs:
         run: |
           methods=$(ssh -v -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
                     -o ConnectTimeout=10 "nobody@$SERVER_IP" true 2>&1 \
-                    | grep -m1 'Authentications that can continue' | sed 's/.*continue: //')
+                    | grep -m1 'Authentications that can continue' | sed 's/.*continue: //' | tr -d '\r[:space:]')
           echo "SSH offers: $methods"
           [ "$methods" = "publickey" ] || { echo "FAIL: SSH offers more than publickey"; exit 1; }
           echo "PASS: SSH accepts keys only"
