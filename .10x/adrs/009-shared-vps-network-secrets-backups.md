@@ -21,7 +21,7 @@ v2 asks for: Tailscale-only access, secrets never in the repo (and "in a vault")
 ### Network
 1. **Tailscale** on the server and Manj's PC (one tailnet, Manj's account). The server gets tag `tag:server`; MagicDNS name used everywhere instead of IPs.
 2. **Hostinger firewall** (outside the VM, so Docker cannot bypass it) attached to the server: allow inbound TCP 22 (pubmedgemini's deploy), TCP 80 and 443 (pubmedgemini via Traefik) and UDP 41641 (Tailscale direct connections); drop everything else.
-3. **SSH:** stays reachable from the internet but **key-only** (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PermitRootLogin prohibit-password`) with fail2ban, so pubmedgemini's existing root deploy key keeps working unchanged. Manj connects over Tailscale with his own key.
+3. **SSH:** stays reachable from the internet but **key-only** (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PermitRootLogin prohibit-password`) with fail2ban, so pubmedgemini's existing root deploy key keeps working unchanged. Manj connects over the tailnet with **Tailscale SSH** (identity from his Tailscale login, no keys to manage); OpenSSH on port 22 is unaffected for pubmedgemini.
 4. **pubmedgemini is left alone** (Manj, 21 Nov): its repository, containers, deploy key and deploy flow are not changed. That is why port 22 stays public on this shared server.
 5. **JARVIS publishes no host ports.** Its containers sit on an internal Docker network. In Phase 2 the gateway binds to the server's Tailscale address only.
 6. **Ubuntu side:** unattended security upgrades on; fail2ban on the SSH port.
