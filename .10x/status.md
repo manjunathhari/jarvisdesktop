@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** 0 — Brainstorming: spec written, awaiting user review
+**Phase:** 1 — Strategy Complete
 **Started:** 2026-11-21
 
 ## Known so far
@@ -20,6 +20,7 @@
 
 - Design section 3 APPROVED (testing + security).
 
+- Spec APPROVED by user 2026-11-21 (voice default A accepted). Push to GitHub approved.
+
 ## Open questions
-- User review of spec `.10x/specs/2026-11-21-jarvis-news-wall-design.md` (incl. voice choice)
-- Permission to push to GitHub
+- Does the target PC have an NVIDIA GPU? (sets Whisper model size)
