@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): design approved; T0.1–T0.4 built, CI green; next T0.5 hardening (needs Manj).**
+**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): running on the shared server; P0-1…P0-6 pass; P0-8 waits for a repo secret; P0-7 after the first nightly backup.**
 **Started:** 2026-11-21
 
 ## Known so far
@@ -76,7 +76,7 @@ Design: `.10x/specs/2026-11-21-phase-0-foundations-design.md`, ADR-006…009 (Pr
 - [x] T0.2 Contracts (JSON Schema + pydantic + examples + tests)
 - [x] T0.3 Migrations: roles, ledger, audit, ops, allowed_transition, transition(); P0-1…P0-6 green in CI
 - [x] T0.4 Job queue + scheduler heartbeat
-- [ ] T0.5 Hardening: Tailscale, SSH key-only + fail2ban, Hostinger firewall 22/80/443; P0-8 (pubmedgemini untouched)
-- [ ] T0.6 Compose deploy on server; P0-1…P0-5 on server
+- [x] T0.5 Hardening: Tailscale (+ Tailscale SSH), SSH key-only + fail2ban, Hostinger firewall 22/80/443 — done 21 Nov. P0-8 external scan workflow ready; waiting for SERVER_IP repo secret (Manj).
+- [x] T0.6 Deployed via Hostinger Docker manager (image from GHCR); P0-1…P0-5 SMOKE PASS on the live server, 21 Nov
 - [ ] T0.7 Local daily backups + restore drill (P0-7) + rebuild/move runbook
 - [ ] T0.8 QA + security review; merge

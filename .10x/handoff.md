@@ -1,9 +1,11 @@
 # Handoff
-**Now:** Architecture v2 Phase 0. Design approved (spec + ADR-006…009, K5 local backups only). T0.1–T0.4 built on branch `phase-0-foundations` (draft PR #2); CI green on Postgres 17 (70 tests, image builds).
+**Now:** Architecture v2 Phase 0. JARVIS server is **running** on the shared Hostinger server (Docker project `jarvis`, deployed at commit b525bd3). P0-1…P0-5 passed live (init SMOKE lines), P0-6 in CI.
 
-**Next: T0.5 hardening** — see `decisions/sde/phase-0-foundations.md` for constraints:
-- Build workspace cannot SSH to the server; Hostinger API cannot run host commands → write `server/deploy/harden/harden.sh` (idempotent) for Manj to paste into the Hostinger web console. It installs Tailscale (Manj approves the login URL), creates `/etc/jarvis/secrets` (root:10001 0440), sets SSH key-only, enables unattended upgrades.
-- pubmedgemini is left alone (Manj): SSH stays public, key-only + fail2ban.
-- Then Hostinger firewall via the connector: allow TCP 22/80/443 + UDP 41641; verify P0-8.
+**Remaining Phase 0**
+- **P0-8:** `.github/workflows/network-check.yml` scans from a GitHub runner. Needs repo secret `SERVER_IP` (Manj adds it in GitHub → Settings → Secrets and variables → Actions); then re-run the workflow.
+- **P0-7 (T0.7):** first daily dump lands after midnight IST in volume `jarvis_backups`. Drill plan: deploy a one-shot Docker project via the connector that mounts that volume (external), restores the newest dump into a scratch Postgres 17 and compares the P0-1 smoke ticket and its 7 audit rows; read the result from its logs. Write the rebuild/move runbook (`server/deploy/README.md`).
+- **T0.8:** QA + security review → `.10x/reviews/`; mark PR #2 ready; Manj approves merge.
 
-**Then T0.6:** publish image to GHCR by digest; add one-shot `init` service; deploy compose via Hostinger Docker API; `smoke` = P0-1…P0-5 on server.
+**How to deploy a new version:** push to `phase-0-foundations`/`main` → CI publishes `ghcr.io/manjunathhari/jarvis-server:<commit>` → connector `vps_docker_create` with content = raw GitHub URL of `server/deploy/compose.yaml` at that commit and environment `JARVIS_REF=<commit>` → read `vps_docker_logs` for SMOKE lines.
+
+**Constraints:** build workspace cannot reach the server over SSH; connector has no shell. Do not touch pubmedgemini, Traefik, Ollama or the Postgres 16 project.

@@ -14,3 +14,10 @@
 - No SSH from the build workspace and the Hostinger API can't run host commands → T0.5 hardening is a script Manj pastes into the Hostinger web console.
 - For deploys through the Hostinger Docker API, replace `docker compose run admin …` with a one-shot `init` service (bootstrap + migrate) that core waits on.
 - Image publishing to GHCR (pinned digest) still to add for T0.6.
+
+## 21 Nov evening — deployed
+- Hardening script run by Manj in the web console; Tailscale SSH chosen for Manj's access (no keys to manage).
+- Hostinger firewall `jarvis-shared-server`: TCP 22/80/443, UDP 41641; synced.
+- Hostinger Docker manager does not build images → CI `publish` job pushes to GHCR; compose pulls by commit tag.
+- `init` service (bootstrap + migrate + smoke) replaces the admin profile; deploys are fully API-driven.
+- Setting the SERVER_IP repo secret needs Manj (blocked for the agent).

@@ -193,12 +193,14 @@ Plus unit tests for every allowed and every forbidden transition (generated from
 
 ## 10. Deployment on the shared server
 
-- Location on the server: `/opt/jarvis/` (compose file, `.env` without secrets), secrets in `/etc/jarvis/secrets/` (ADR-009).
-- Compose project `jarvis`, separate from the others. Services running in Phase 0: `postgres`, `core`, `scheduler`. `gateway` and `workers` are defined under the `phase2` profile and do not start.
-- Networks: `jarvis_internal` (internal: no internet route) joins postgres, core and scheduler. **No JARVIS port is published on the host.** Admin access to the database is `docker exec` over SSH (itself Tailscale-only).
-- Memory limits: postgres 1 GB, core 512 MB, scheduler 256 MB, so Ollama and pubmedgemini keep their headroom.
-- Images: built on Manj's PC or in CI and pulled from GitHub Container Registry, pinned by digest (same pattern pubmedgemini already uses).
-- Migrations run as a one-off `core migrate` command with the owner role before a new version starts; the running app uses `jarvis_app`.
+*(Updated 21 Nov after the first deploy.)*
+- **How it is deployed:** as Docker project `jarvis` through the Hostinger Docker manager (the connector), from `server/deploy/compose.yaml` at a pinned commit. The only environment value is `JARVIS_REF` (the commit); it is not secret. Plain `docker compose` works the same way when JARVIS moves to its own server.
+- **Image:** CI builds and publishes `ghcr.io/manjunathhari/jarvis-server:<commit>` after the tests pass (`server.yml`, job `publish`). The Hostinger Docker manager pulls but does not build.
+- **Secrets:** files in `/etc/jarvis/secrets/` (root:10001, 0440), created by `deploy/harden/harden.sh`; never in Hostinger's environment field.
+- **Start-up order:** `postgres` → one-shot `init` (bootstrap roles, migrate, then print `SMOKE PASS/FAIL` for P0-1…P0-5) → `core`, `scheduler` start only if `init` succeeded. `backup` runs daily dumps (K5). `gateway` and `workers` sit under the `phase2` profile.
+- **Network:** `jarvis_internal` (internal: no internet route). **No JARVIS port is published on the host.**
+- **Memory limits:** postgres 1 GB, core 512 MB, scheduler/init/backup 256 MB.
+- **Admin access:** Tailscale SSH from Manj's PC (`tailscale ssh root@jarvis-server`) or the Hostinger web console.
 
 ## 11. Order of work
 
