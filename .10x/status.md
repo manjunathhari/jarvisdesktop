@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): design proposed, awaiting review.**
+**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): design approved; T0.1–T0.4 built, CI green; next T0.5 hardening (needs Manj).**
 **Started:** 2026-11-21
 
 ## Known so far
@@ -72,10 +72,10 @@ Design: `.10x/specs/2026-11-21-phase-0-foundations-design.md`, ADR-006…009 (Pr
 - Later, at hardening: Tailscale sign-in on server and PC; Hostinger 2FA.
 
 ### Phase 0 task list (after approval)
-- [ ] T0.1 CI path filters + `server/` skeleton + server.yml
-- [ ] T0.2 Contracts (JSON Schema + pydantic + examples + tests)
-- [ ] T0.3 Migrations: roles, ledger, audit, ops, allowed_transition, transition(); P0-1…P0-6 green in CI
-- [ ] T0.4 Job queue + scheduler heartbeat
+- [x] T0.1 CI path filters + `server/` skeleton + server.yml
+- [x] T0.2 Contracts (JSON Schema + pydantic + examples + tests)
+- [x] T0.3 Migrations: roles, ledger, audit, ops, allowed_transition, transition(); P0-1…P0-6 green in CI
+- [x] T0.4 Job queue + scheduler heartbeat
 - [ ] T0.5 Hardening: Tailscale, pubmedgemini deploy via tailnet, SSH key-only, Hostinger firewall; P0-8
 - [ ] T0.6 Compose deploy on server; P0-1…P0-5 on server
 - [ ] T0.7 Local daily backups + restore drill (P0-7) + rebuild/move runbook
