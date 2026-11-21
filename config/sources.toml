@@ -40,7 +40,12 @@ url = "https://www.theguardian.com/world/rss"
 region = "world"
 
 # Live TV: official YouTube channels. The first is the default.
+# Al Jazeera first: confirmed playing on the user's PC (2026-11-21); NDTV refused to embed.
 # Channel IDs to be verified on first run (the player shows "offline" if wrong).
+
+[[channels]]
+name = "Al Jazeera English"
+youtube_channel_id = "UCNye-wNBqNL5ZzHSJj3l8Bg"
 
 [[channels]]
 name = "NDTV 24x7"
@@ -53,10 +58,6 @@ youtube_channel_id = "UCYPvAwZP8pZhSMW8qs7cVCw"
 [[channels]]
 name = "WION"
 youtube_channel_id = "UC_gUM8rL-Lrg6O3adPW9K1g"
-
-[[channels]]
-name = "Al Jazeera English"
-youtube_channel_id = "UCNye-wNBqNL5ZzHSJj3l8Bg"
 
 [[channels]]
 name = "DW News"
