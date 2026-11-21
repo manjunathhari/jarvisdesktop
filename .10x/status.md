@@ -38,5 +38,5 @@
 
 ## Task list (news-wall) — see decisions/engineering-manager/news-wall.md
 - [x] Milestone A: T1 scaffold+CI · T2 core types · T3 coordinator · T4 news · T5 live_tv · T6 ClaudeBrain · T7 brain evals · T8 Tauri UI (81 tests green)
-- [ ] Milestone B: T9 ears/STT · T10 wake word · [x] T11 voice (George, Kokoro) · [x] T12 model download (voice) — verified on the user's PC 2026-11-21 (sounds good, speed fine, latency acceptable)
+- [ ] Milestone B: [x] T9 ears/STT (tap-to-talk; awaiting on-device check) · [ ] T10 wake word · [x] T11 voice (George, Kokoro) · [x] T12 model download (voice) — verified on the user's PC 2026-11-21 (sounds good, speed fine, latency acceptable)
 - [ ] Milestone C: T13 Windows platform · T14 end-to-end + latency · T15 QA/security + installer

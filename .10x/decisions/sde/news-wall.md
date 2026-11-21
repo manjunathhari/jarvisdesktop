@@ -41,3 +41,11 @@ User feedback: no way to exit; having to use the terminal every time is annoying
 - Stand-in web voice speaks until George is ready; UI shows "Getting my voice ready, N%".
 - Engine compiled on Windows only (its build downloads prebuilt libs, blocked in the cloud workspace). Verified by the Windows CI build; not yet heard on the device.
 - Installer build 5: 7.9 MB.
+
+## Listening (T9) — 2026-11-21, ADR-005
+- `jarvis-ears`: cpal capture → 16 kHz mono (tested resampler) → gate (ignore mic while George speaks + 300 ms tail) → Silero VAD → Whisper small.en int8 → `Event::Utterance`.
+- Mic stream paused unless coordinator is Listening/FollowUp (Windows mic indicator only then).
+- Models fetched individually: Whisper small.en int8 from csukuangfj/sherpa-onnx-whisper-small.en (~375 MB), silero_vad.onnx from sherpa-onnx releases. Generic `ensure_files` with resumable per-file completion.
+- LISTEN_TIMEOUT raised 8 → 10 s (greeting takes ~2 s).
+- Also this session: multi-headline briefing; auto-skip channels that refuse to embed (YouTube onError → next_channel, max 4); Al Jazeera default; JARVIS in its own resizable window with F11 full screen.
+- Not yet: "Hey Jarvis" wake word (needs KWS keyword file), voice barge-in (needs echo cancellation), hotkey.
