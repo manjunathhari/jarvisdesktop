@@ -76,7 +76,7 @@ Design: `.10x/specs/2026-11-21-phase-0-foundations-design.md`, ADR-006…009 (Pr
 - [x] T0.2 Contracts (JSON Schema + pydantic + examples + tests)
 - [x] T0.3 Migrations: roles, ledger, audit, ops, allowed_transition, transition(); P0-1…P0-6 green in CI
 - [x] T0.4 Job queue + scheduler heartbeat
-- [ ] T0.5 Hardening: Tailscale, pubmedgemini deploy via tailnet, SSH key-only, Hostinger firewall; P0-8
+- [ ] T0.5 Hardening: Tailscale, SSH key-only + fail2ban, Hostinger firewall 22/80/443; P0-8 (pubmedgemini untouched)
 - [ ] T0.6 Compose deploy on server; P0-1…P0-5 on server
 - [ ] T0.7 Local daily backups + restore drill (P0-7) + rebuild/move runbook
 - [ ] T0.8 QA + security review; merge

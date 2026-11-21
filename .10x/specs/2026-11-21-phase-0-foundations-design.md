@@ -26,7 +26,7 @@ Not in Phase 0: the gateway, any AI call, the memory engine (Phase 1), connector
 
 **The shared server is temporary:** once JARVIS is functioning it moves to its own server. Losing ledger data is acceptable; losing JARVIS itself is not — so everything needed to rebuild it lives in the repo, and rebuilding is the same scripted procedure as moving out.
 
-Consequences of sharing the server are handled in ADR-009: ports 80/443 stay public for pubmedgemini, JARVIS and SSH become Tailscale-only, pubmedgemini's deploy moves onto Tailscale.
+Consequences of sharing the server are handled in ADR-009: pubmedgemini is left untouched, so ports 22 (key-only SSH, used by its deploy), 80 and 443 stay public; everything JARVIS is Tailscale-only.
 
 ## 3. Repository layout
 
@@ -187,7 +187,7 @@ Tamper-evident hash chaining is deliberately left out (YAGNI); trigger to add it
 | P0-5 | Context expiry | Expired row absent from `current_context`; live row present | CI + server |
 | P0-6 | Migrations | Empty database → `alembic upgrade head` → `downgrade base` → `upgrade head` succeeds; schema matches | CI |
 | P0-7 | Backup restore | Latest local daily backup restored into a scratch Postgres container (rehearses moving the data to a new server); P0-1's ticket and its 7 audit rows present and identical | Server (manual drill, scripted) |
-| P0-8 | Network | From outside the tailnet: only TCP ports 80 and 443 answer (plus Tailscale's UDP port); SSH (22) and anything JARVIS refused. From Manj's PC over Tailscale: SSH works | Server, run from the PC and from an outside host |
+| P0-8 | Network | From outside the tailnet: only TCP 22, 80 and 443 answer (plus Tailscale's UDP port); SSH refuses passwords; nothing JARVIS answers. From Manj's PC over Tailscale: SSH works | Server, run from the PC and from an outside host |
 
 Plus unit tests for every allowed and every forbidden transition (generated from the tables in §6), the job claim race, and contract examples.
 
@@ -205,7 +205,7 @@ Plus unit tests for every allowed and every forbidden transition (generated from
 1. This spec + ADR-006…009 → Manj reviews.
 2. Branch `phase-0-foundations`: CI path filters; `server/` skeleton; `contracts/` with tests (contracts first).
 3. Migrations: roles, ledger, audit, ops; lifecycle function; tests P0-1…P0-6 green in CI.
-4. Server hardening (ADR-009): Tailscale on the server and the PC; pubmedgemini deploy moved onto Tailscale and tested; SSH keys only; Hostinger firewall allowing only 80/443; P0-8.
+4. Server hardening (ADR-009): Tailscale on the server and the PC; SSH keys only + fail2ban; Hostinger firewall allowing only 22/80/443; P0-8. pubmedgemini untouched.
 5. Deploy compose stack; run P0-1…P0-5 on the server.
 6. Local daily backups (same container as the existing Postgres 16); restore drill P0-7; rebuild runbook written.
 7. QA and security review; merge to main.
@@ -214,8 +214,8 @@ Plus unit tests for every allowed and every forbidden transition (generated from
 
 | Risk | Mitigation |
 |---|---|
-| Closing SSH to the internet locks Manj out | Tailscale verified working from the PC *before* the firewall change; Hostinger web console is the break-glass route |
-| pubmedgemini deploys break | Its GitHub workflow joins the tailnet with a tagged, ephemeral key; tested before port 22 is closed |
+| Turning off password login locks Manj out | Manj's key and Tailscale verified first; Hostinger web console is the break-glass route |
+| SSH stays internet-facing (for pubmedgemini) | Key-only, fail2ban, root by key only; closes fully when JARVIS moves to its own server |
 | Docker-published ports bypass the Ubuntu firewall | JARVIS publishes none; the Hostinger firewall sits outside the VM and Docker cannot override it |
 | Another project on the box exhausts memory | Memory limits on JARVIS containers; heartbeat check flags a starved scheduler |
 | Public repo exposes infrastructure details | No IPs, hostnames, server IDs or secrets committed; scripts take them as arguments |

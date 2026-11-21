@@ -20,11 +20,11 @@ v2 asks for: Tailscale-only access, secrets never in the repo (and "in a vault")
 
 ### Network
 1. **Tailscale** on the server and Manj's PC (one tailnet, Manj's account). The server gets tag `tag:server`; MagicDNS name used everywhere instead of IPs.
-2. **Hostinger firewall** (outside the VM, so Docker cannot bypass it) attached to the server: allow inbound TCP 80 and 443 (pubmedgemini via Traefik) and UDP 41641 (Tailscale direct connections); drop everything else, **including TCP 22**.
-3. **SSH:** key-only (`PasswordAuthentication no`, `PermitRootLogin prohibit-password`), so pubmedgemini's existing root deploy key keeps working, but only over Tailscale. Manj's PC gets its own key.
-4. **pubmedgemini deploy** moves onto the tailnet: its GitHub workflow uses `tailscale/github-action` with an OAuth client limited to `tag:ci` (ephemeral nodes), and an ACL allowing `tag:ci → tag:server:22` only. Verified with a real deploy **before** port 22 is closed.
+2. **Hostinger firewall** (outside the VM, so Docker cannot bypass it) attached to the server: allow inbound TCP 22 (pubmedgemini's deploy), TCP 80 and 443 (pubmedgemini via Traefik) and UDP 41641 (Tailscale direct connections); drop everything else.
+3. **SSH:** stays reachable from the internet but **key-only** (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PermitRootLogin prohibit-password`) with fail2ban, so pubmedgemini's existing root deploy key keeps working unchanged. Manj connects over Tailscale with his own key.
+4. **pubmedgemini is left alone** (Manj, 21 Nov): its repository, containers, deploy key and deploy flow are not changed. That is why port 22 stays public on this shared server.
 5. **JARVIS publishes no host ports.** Its containers sit on an internal Docker network. In Phase 2 the gateway binds to the server's Tailscale address only.
-6. **Ubuntu side:** unattended security upgrades on; fail2ban not needed once SSH is off the internet.
+6. **Ubuntu side:** unattended security upgrades on; fail2ban on the SSH port.
 7. **Break-glass:** Hostinger web console (works with SSH closed) behind the Hostinger account's password + 2FA.
 
 ### Secrets
@@ -54,7 +54,7 @@ So recovery means *rebuild*, and rebuild is the same procedure as *moving out*:
 |---|---|---|---|
 | Dedicated second VPS for JARVIS | Clean isolation; firewall fully closed | Extra monthly cost | Manj chose to share (K1) |
 | UFW only (no Hostinger firewall) | Configured from the box | Docker-published ports bypass UFW; a misconfigured compose file could expose a port | Provider firewall can't be bypassed from inside |
-| Keep SSH public with fail2ban | No change to pubmedgemini deploy | Internet-facing SSH on a box holding family data | v2 requires Tailscale-only access |
+| Close SSH to the internet and move pubmedgemini's deploy onto the tailnet | Matches v2 "Tailscale-only" fully | Requires changing pubmedgemini | Manj chose to leave pubmedgemini alone; SSH stays public, key-only, with fail2ban, until JARVIS moves to its own server |
 | Tailscale SSH instead of OpenSSH | No keys to manage | Ties login to Tailscale ACLs; pubmedgemini's deploy key flow changes more | Plain OpenSSH over the tailnet is simpler to reason about |
 | Secrets as `.env` file | Common | Values visible in `docker inspect` and process env | Compose file secrets avoid that |
 | SOPS-encrypted secrets in the repo | Versioned | Public repo; key management overhead now | Deferred until Phase 3 |
@@ -63,15 +63,15 @@ So recovery means *rebuild*, and rebuild is the same procedure as *moving out*:
 
 ## Consequences
 ### Positive
-- Nothing belonging to JARVIS, and no SSH, is reachable from the internet; pubmedgemini keeps working.
+- Nothing belonging to JARVIS is reachable from the internet; pubmedgemini keeps working untouched.
 - JARVIS can be rebuilt on any server from the repo; moving out is a rehearsed, scripted procedure.
 - Local backups reuse a container already proven on this server.
 ### Negative
 - Shared box: a compromise of pubmedgemini or Traefik (both internet-facing) puts the JARVIS host at risk. Accepted with K1; containers isolated, JARVIS ports unpublished.
-- Root login (key-only, tailnet-only) remains for pubmedgemini's deploy.
+- SSH stays internet-facing (key-only, fail2ban, root by key only) for pubmedgemini's deploy — a deliberate deviation from v2's Tailscale-only rule on this temporary server.
 - Losing the server or the Hostinger account loses the ledger data (accepted by Manj). Otherwise up to 24 h can be lost between daily backups.
 ### Risks
-- Lock-out during the firewall change → order: Tailscale verified from PC → pubmedgemini deploy verified via tailnet → then close 22. Web console as fallback.
+- Lock-out when password login is turned off → Manj's own key and Tailscale verified first; Hostinger web console as fallback.
 - Rebuild steps rot if never run → the move to the new server is done with the same scripts; CI checks the compose file and migrations on every change.
 - Docker group = root-equivalent → only root uses Docker on this box.
 
