@@ -10,9 +10,9 @@ v2 makes the ledger the system of record: "models interpret and propose; only va
 
 ## Decision
 1. **One database `jarvis`, three schemas:** `ledger` (entities), `audit` (ADR-008), `ops` (job queue, heartbeats).
-2. **Roles:**
+2. **Roles** (created once by a superuser bootstrap step, `jarvis_server.bootstrap`, together with the database; everything else is migrations run as the owner):
    - `jarvis_owner` — owns all objects; used only by migrations.
-   - `jarvis_app` — used by core, scheduler and (later) workers. `SELECT` and `INSERT` on ledger tables (a new row's state is forced to the initial state, point 7); `UPDATE` on every column **except** `state` (column-level grants); no `DELETE` on stateful tables (end a task with CANCELLED or SUPERSEDED instead); `INSERT/SELECT` on `audit.event`; full use of `ops` tables; `EXECUTE` on `ledger.transition`.
+   - `jarvis_app` — used by core, scheduler and (later) workers. `SELECT` and `INSERT` on ledger tables (a new row's state is forced to the initial state, point 7); `UPDATE` on every column **except** `state` (column-level grants); no `DELETE` on stateful tables (end a task with CANCELLED or SUPERSEDED instead); `SELECT` on `audit.event` (rows are written only by the database functions); full use of `ops` tables; `EXECUTE` on `ledger.transition`.
 3. **Common columns** on every ledger table: `id uuid default gen_random_uuid()`, `created_at`, `updated_at` (trigger), `visibility` enum (default PRIVATE), `source_ref text not null`.
 4. **States as Postgres enums** (`task_state`, `commitment_state`), spelled exactly as in `contracts/`.
 5. **Legal moves as data:** table `ledger.allowed_transition(entity_type, from_state, to_state)`, filled by migration from the tables in the spec §6. Changing the lifecycle = a new migration, reviewed like code.

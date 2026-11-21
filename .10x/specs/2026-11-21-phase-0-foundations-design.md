@@ -163,7 +163,7 @@ Table `audit.event`, append-only (ADR-008).
 | details jsonb | Anything else |
 
 Protection, three layers:
-1. **Privileges:** the app role `jarvis_app` has only `INSERT` and `SELECT` on `audit.event`; `UPDATE`, `DELETE`, `TRUNCATE` revoked (P0-3).
+1. **Privileges:** the app role `jarvis_app` can only `SELECT` from `audit.event`. Rows are written solely by `SECURITY DEFINER` database functions, so the app can neither change nor forge them (P0-3).
 2. **Trigger:** a `BEFORE UPDATE OR DELETE` trigger raises an error for every role, including the owner, so mistakes in migrations or manual sessions are blocked too.
 3. **Backups:** daily copies (ADR-009) keep older versions of the history, so a quiet rewrite on the live database would disagree with them.
 
