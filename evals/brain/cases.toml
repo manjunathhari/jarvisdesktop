@@ -1,0 +1,276 @@
+# Brain evaluation cases. Judged against eval::EVAL_SCREEN (stories 1–9, NDTV playing).
+# `expect` = action the brain's FIRST tool call must be; "none" = no tool call.
+# `args` = values that must be present (strings compared case-insensitively).
+# Target from the plan: ~30 per action; this first set has ~10 per action. Extend with
+# real phrasings the user actually says once JARVIS is in daily use.
+
+# ── show_news ────────────────────────────────────────────────
+[[case]]
+say = "Bring me the latest news"
+expect = "show_news"
+[[case]]
+say = "What's happening today?"
+expect = "show_news"
+[[case]]
+say = "Show me the headlines"
+expect = "show_news"
+[[case]]
+say = "Any news?"
+expect = "show_news"
+[[case]]
+say = "Give me today's top stories"
+expect = "show_news"
+[[case]]
+say = "What's going on in the world"
+expect = "show_news"
+args = { region = "world" }
+[[case]]
+say = "Just the Indian news please"
+expect = "show_news"
+args = { region = "india" }
+[[case]]
+say = "Show me international news only"
+expect = "show_news"
+args = { region = "world" }
+[[case]]
+say = "Anything about cricket?"
+expect = "show_news"
+args = { topic = "cricket" }
+[[case]]
+say = "What's the news on Bengaluru"
+expect = "show_news"
+args = { topic = "bengaluru" }
+[[case]]
+say = "Refresh the news"
+expect = "show_news"
+[[case]]
+say = "Update me on current affairs"
+expect = "show_news"
+
+# ── open_story ───────────────────────────────────────────────
+[[case]]
+say = "Open number four"
+expect = "open_story"
+args = { number = 4 }
+[[case]]
+say = "Open story 2"
+expect = "open_story"
+args = { number = 2 }
+[[case]]
+say = "Show me the second one"
+expect = "open_story"
+args = { number = 2 }
+[[case]]
+say = "Let me see number seven"
+expect = "open_story"
+args = { number = 7 }
+[[case]]
+say = "Expand number 9"
+expect = "open_story"
+args = { number = 9 }
+[[case]]
+say = "Open the one about the metro"
+expect = "open_story"
+args = { number = 3 }
+[[case]]
+say = "Show me the RBI story"
+expect = "open_story"
+args = { number = 5 }
+[[case]]
+say = "Open the climate summit story"
+expect = "open_story"
+args = { number = 7 }
+[[case]]
+say = "Pull up number one"
+expect = "open_story"
+args = { number = 1 }
+[[case]]
+say = "Open six"
+expect = "open_story"
+args = { number = 6 }
+
+# ── summarise_story ──────────────────────────────────────────
+[[case]]
+say = "Tell me more about number two"
+expect = "summarise_story"
+args = { number = 2 }
+[[case]]
+say = "Read me number four"
+expect = "summarise_story"
+args = { number = 4 }
+[[case]]
+say = "What's story five about?"
+expect = "summarise_story"
+args = { number = 5 }
+[[case]]
+say = "Summarise the first one"
+expect = "summarise_story"
+args = { number = 1 }
+[[case]]
+say = "Give me the gist of number eight"
+expect = "summarise_story"
+args = { number = 8 }
+[[case]]
+say = "What does the heatwave story say?"
+expect = "summarise_story"
+args = { number = 6 }
+[[case]]
+say = "Read out the markets story"
+expect = "summarise_story"
+args = { number = 9 }
+[[case]]
+say = "Brief me on number three"
+expect = "summarise_story"
+args = { number = 3 }
+[[case]]
+say = "What's the monsoon story about"
+expect = "summarise_story"
+args = { number = 1 }
+[[case]]
+say = "Summarise seven for me"
+expect = "summarise_story"
+args = { number = 7 }
+
+# ── play_live_tv ─────────────────────────────────────────────
+[[case]]
+say = "Put on India Today"
+expect = "play_live_tv"
+args = { channel = "india today" }
+[[case]]
+say = "Switch to WION"
+expect = "play_live_tv"
+args = { channel = "wion" }
+[[case]]
+say = "Play Al Jazeera live"
+expect = "play_live_tv"
+args = { channel = "al jazeera english" }
+[[case]]
+say = "Can I watch DW News"
+expect = "play_live_tv"
+args = { channel = "dw news" }
+[[case]]
+say = "Play live news"
+expect = "play_live_tv"
+[[case]]
+say = "Show me a live channel"
+expect = "play_live_tv"
+[[case]]
+say = "Turn on NDTV"
+expect = "play_live_tv"
+args = { channel = "ndtv 24x7" }
+[[case]]
+say = "I want to watch the news live"
+expect = "play_live_tv"
+[[case]]
+say = "Put the TV back on"
+expect = "play_live_tv"
+[[case]]
+say = "Play India Today instead"
+expect = "play_live_tv"
+args = { channel = "india today" }
+
+# ── next_channel ─────────────────────────────────────────────
+[[case]]
+say = "Next channel"
+expect = "next_channel"
+[[case]]
+say = "Change the channel"
+expect = "next_channel"
+[[case]]
+say = "Try another channel"
+expect = "next_channel"
+[[case]]
+say = "Switch channel"
+expect = "next_channel"
+[[case]]
+say = "This one isn't working, try the next"
+expect = "next_channel"
+[[case]]
+say = "Something else on TV"
+expect = "next_channel"
+[[case]]
+say = "Flip to the next one"
+expect = "next_channel"
+[[case]]
+say = "Go to another news channel"
+expect = "next_channel"
+
+# ── close_panel ──────────────────────────────────────────────
+[[case]]
+say = "Close the video"
+expect = "close_panel"
+args = { which = "video" }
+[[case]]
+say = "Turn off the TV"
+expect = "close_panel"
+args = { which = "video" }
+[[case]]
+say = "Stop the video"
+expect = "close_panel"
+args = { which = "video" }
+[[case]]
+say = "Hide the international news"
+expect = "close_panel"
+args = { which = "world" }
+[[case]]
+say = "Close the Indian headlines"
+expect = "close_panel"
+args = { which = "india" }
+[[case]]
+say = "Remove the world news column"
+expect = "close_panel"
+args = { which = "world" }
+[[case]]
+say = "Get rid of the video"
+expect = "close_panel"
+args = { which = "video" }
+[[case]]
+say = "Close the India news"
+expect = "close_panel"
+args = { which = "india" }
+
+# ── clear_screen ─────────────────────────────────────────────
+[[case]]
+say = "Clear everything off the screen"
+expect = "clear_screen"
+[[case]]
+say = "Wipe the screen"
+expect = "clear_screen"
+[[case]]
+say = "Take it all down"
+expect = "clear_screen"
+[[case]]
+say = "Blank screen please"
+expect = "clear_screen"
+[[case]]
+say = "Remove all of it"
+expect = "clear_screen"
+[[case]]
+say = "Close everything"
+expect = "clear_screen"
+[[case]]
+say = "Reset the display"
+expect = "clear_screen"
+[[case]]
+say = "I'm done, clear it"
+expect = "clear_screen"
+
+# ── none (outside what JARVIS can do yet, or just chat) ─────
+[[case]]
+say = "Thank you Jarvis"
+expect = "none"
+[[case]]
+say = "Send an email to my secretary"
+expect = "none"
+[[case]]
+say = "What's on my calendar today?"
+expect = "none"
+[[case]]
+say = "Delete all the files on my computer"
+expect = "none"
+[[case]]
+say = "How are you?"
+expect = "none"
+[[case]]
+say = "Post this on Facebook"
+expect = "none"

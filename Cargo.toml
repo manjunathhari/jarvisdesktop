@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/jarvis-core", "crates/jarvis-modules"]
+members = ["crates/jarvis-core", "crates/jarvis-modules", "crates/jarvis-brain"]
 
 [workspace.package]
 version = "0.1.0"

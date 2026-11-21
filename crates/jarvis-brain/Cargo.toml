@@ -1,0 +1,20 @@
+[package]
+name = "jarvis-brain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+jarvis-core.workspace = true
+jarvis-modules.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+toml.workspace = true
+futures = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
