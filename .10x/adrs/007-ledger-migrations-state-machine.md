@@ -1,6 +1,6 @@
 # ADR-007: Ledger in Postgres, versioned migrations, state machine enforced in the database
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-11-21
 **Feature:** phase-0-foundations
 **Author:** 10x-Team (Architect + Staff Engineer + DBA)

@@ -5,4 +5,4 @@
 - Audit written inside the database in the same transaction; refused transitions recorded and committed.
 - Compose project `jarvis`: postgres, core, scheduler running; gateway, workers under profile phase2. Internal network, no published ports, memory limits.
 - Contracts as JSON Schema in `contracts/` (shared with desktop in Phase 2) + pydantic mirrors.
-- Failure modes: lock-out during hardening, pubmedgemini deploy break, shared-box compromise, lost backup password — see spec §12.
+- Failure modes: lock-out during hardening, pubmedgemini deploy break, shared-box compromise, server loss (rebuild from repo; data loss accepted) — see spec §12.

@@ -1,6 +1,6 @@
-# ADR-009: Shared VPS — Tailscale-only access, file-based secrets, encrypted off-site backups
+# ADR-009: Shared VPS (temporary) — Tailscale-only access, file-based secrets, rebuild-from-repo recovery
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-11-21
 **Feature:** phase-0-foundations
 **Author:** 10x-Team (Architect + Security Engineer + DevOps + SRE)
@@ -29,18 +29,22 @@ v2 asks for: Tailscale-only access, secrets never in the repo (and "in a vault")
 
 ### Secrets
 - Files under `/etc/jarvis/secrets/` (root:root, mode 0600), mounted into containers as Docker Compose `secrets` (they appear as files in `/run/secrets/`, never in environment variables or `docker inspect`).
-- Contents in Phase 0: `pg_superuser_password`, `pg_owner_password`, `pg_app_password`, `restic_password`, `backup_s3_access_key`, `backup_s3_secret_key`.
+- Contents in Phase 0: `pg_superuser_password`, `pg_owner_password`, `pg_app_password`.
 - Generated on the server by `deploy/harden/` scripts; never typed into chat, never committed.
-- **Copies of `restic_password` and the backup storage keys** go into Manj's password manager — without them the off-site backups cannot be restored.
+- Nothing secret has to survive losing the server: a rebuild generates new secrets.
+- JARVIS secrets are **never** put in Hostinger's Docker manager environment field (its API returns those values in plain text).
 - A real vault (e.g. SOPS + age, or Vaultwarden/Infisical) is **deferred**; trigger: OAuth refresh tokens for Gmail/Calendar arrive (Phase 3) or a second admin is added.
 
-### Backups
-- **Tool:** restic (client-side encryption, deduplication, verified restores).
-- **What:** nightly `pg_dump --format=custom` of the `jarvis` database, streamed into restic; later the memory git repo (Phase 1) joins the same job.
-- **Where:** a bucket at a **second provider** — proposed **Cloudflare R2** (Manj's Cloudflare account is already connected to Claude), alternative Backblaze B2. Bucket credentials scoped to that one bucket.
-- **Schedule and retention:** systemd timer at 03:30 IST; keep 7 daily, 4 weekly, 12 monthly; weekly `restic check`.
-- **Restore drill (P0-7):** script restores the latest snapshot into a throwaway Postgres container and compares P0-1's ticket and audit rows. Run once in Phase 0, then monthly (v2 Phase 5 makes it routine).
-- Hostinger's weekly VM backup stays on as an extra, not as the backup of record (same provider, not encrypted by us).
+### Recovery and backups
+Manj's requirement (21 Nov): **losing ledger data is acceptable; losing JARVIS itself is not.** And this shared server is **temporary** — JARVIS moves to its own server once it is functioning.
+
+So recovery means *rebuild*, and rebuild is the same procedure as *moving out*:
+- **Everything needed to recreate JARVIS lives in the repo:** code, migrations, compose file, hardening and deploy scripts, runbook. Images are in GitHub Container Registry. Nothing about the system exists only on the server.
+- **Rebuild / move procedure** (`server/deploy/README.md`): new Ubuntu server → `harden/` scripts (generate fresh secrets) → Tailscale → `compose up` → `core migrate` → restore the latest dump if one is available. A fresh, empty JARVIS is a valid outcome.
+- **Local data backups:** the same `postgres-backup-local` container already used on this server for `ascent`/`tracker`, pointed at the `jarvis` database: daily, keep 7 daily / 4 weekly / 3 monthly, on a Docker volume on the server.
+- **Hostinger's weekly VM backup** stays on as a second, coarse copy.
+- **Restore test (P0-7):** the latest local dump is restored into a scratch Postgres container and P0-1's ticket and audit rows are compared. This is also the rehearsal for moving the data to the new server.
+- **No off-site copy in Phase 0** (deliberate deviation from v2 §13.3). Trigger to add encrypted off-site backups (restic to a second provider): the move to JARVIS's own server, or the first time losing the data would actually hurt.
 
 ### Admin access
 - **Manj only** (handover question 6). No second admin in Phase 0; revisit with the vault trigger.
@@ -54,23 +58,25 @@ v2 asks for: Tailscale-only access, secrets never in the repo (and "in a vault")
 | Tailscale SSH instead of OpenSSH | No keys to manage | Ties login to Tailscale ACLs; pubmedgemini's deploy key flow changes more | Plain OpenSSH over the tailnet is simpler to reason about |
 | Secrets as `.env` file | Common | Values visible in `docker inspect` and process env | Compose file secrets avoid that |
 | SOPS-encrypted secrets in the repo | Versioned | Public repo; key management overhead now | Deferred until Phase 3 |
-| Backups to the same Hostinger account | Easy | Provider or account loss takes backups too | v2 requires off-site |
-| WAL archiving / point-in-time recovery (pgBackRest) | Minute-level recovery | More setup | Nightly dumps fit family scale; revisit when Jarvis runs daily life |
+| Encrypted off-site backups now (restic → R2/B2) | Data survives loss of server or account | Extra account, keys and a password to keep safe | Data loss is acceptable for now (Manj); added at the move to JARVIS's own server |
+| WAL archiving / point-in-time recovery (pgBackRest) | Minute-level recovery | More setup | Daily dumps fit family scale; revisit when Jarvis runs daily life |
 
 ## Consequences
 ### Positive
 - Nothing belonging to JARVIS, and no SSH, is reachable from the internet; pubmedgemini keeps working.
-- Backups survive loss of the server or the Hostinger account, and are proven by a real restore.
+- JARVIS can be rebuilt on any server from the repo; moving out is a rehearsed, scripted procedure.
+- Local backups reuse a container already proven on this server.
 ### Negative
 - Shared box: a compromise of pubmedgemini or Traefik (both internet-facing) puts the JARVIS host at risk. Accepted with K1; containers isolated, JARVIS ports unpublished.
 - Root login (key-only, tailnet-only) remains for pubmedgemini's deploy.
-- Up to 24 h of ledger data can be lost between nightly backups.
+- Losing the server or the Hostinger account loses the ledger data (accepted by Manj). Otherwise up to 24 h can be lost between daily backups.
 ### Risks
 - Lock-out during the firewall change → order: Tailscale verified from PC → pubmedgemini deploy verified via tailnet → then close 22. Web console as fallback.
-- Lost restic password → stored in password manager; drill proves the stored copy works.
+- Rebuild steps rot if never run → the move to the new server is done with the same scripts; CI checks the compose file and migrations on every change.
 - Docker group = root-equivalent → only root uses Docker on this box.
 
 ## Dependencies
 - Depends on K1 (shared server), ADR-006 (Postgres), ADR-008 (backups as audit layer 3).
 - Constrains Phase 2 (gateway binds to the Tailscale address; desktop reaches it over the tailnet) and Phase 3 (vault trigger).
-- Needs from Manj: Tailscale account sign-in on server and PC; R2 (or B2) bucket; password manager entries; Hostinger account 2FA.
+- Needs from Manj: Tailscale account sign-in on server and PC; Hostinger account 2FA.
+- Trigger to revisit: JARVIS starts functioning → move to its own server, close the firewall fully, add off-site backups.

@@ -1,6 +1,6 @@
 # ADR-006: Server stack — Python 3.12, uv, psycopg 3 with plain SQL, Alembic, pytest
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-11-21
 **Feature:** phase-0-foundations
 **Author:** 10x-Team (Architect + Staff Engineer)

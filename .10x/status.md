@@ -59,6 +59,7 @@ Kick-off decisions (Manj):
 - K1 Server: existing Hostinger KVM 2, Mumbai, **shared** (pubmedgemini, Ollama, Traefik, standalone Postgres 16 stay). gemma-lab projects deleted from it.
 - K2 Repo: this repo, server under `server/`.
 - K3 Database: dedicated Postgres 17 container for JARVIS; existing Postgres 16 untouched.
+- K5 Recovery: losing data OK, losing JARVIS not — rebuild from repo; shared server temporary, move out once functioning; local backups only for now.
 - K4 Stack: Python 3.12, uv, psycopg 3 + plain SQL, Alembic, pytest, ruff, mypy; FastAPI from Phase 2.
 - `milestone-a` merged into `main` (PR #1).
 
@@ -66,9 +67,9 @@ Design: `.10x/specs/2026-11-21-phase-0-foundations-design.md`, ADR-006…009 (Pr
 
 ### Needs Manj
 - Review spec + ADR-006…009.
-- Confirm backup storage (proposed Cloudflare R2; alt. Backblaze B2).
+- ~~Backup storage~~ — decided: data loss acceptable; local daily backups + Hostinger weekly; JARVIS rebuildable from repo. Shared server is temporary; JARVIS moves out once functioning (K5).
 - Repo is public: confirm OK for server code (no secrets/addresses will be committed), or make it private.
-- Later, at hardening: Tailscale sign-in on server and PC; Hostinger 2FA; password-manager entries for backup keys.
+- Later, at hardening: Tailscale sign-in on server and PC; Hostinger 2FA.
 
 ### Phase 0 task list (after approval)
 - [ ] T0.1 CI path filters + `server/` skeleton + server.yml
@@ -77,5 +78,5 @@ Design: `.10x/specs/2026-11-21-phase-0-foundations-design.md`, ADR-006…009 (Pr
 - [ ] T0.4 Job queue + scheduler heartbeat
 - [ ] T0.5 Hardening: Tailscale, pubmedgemini deploy via tailnet, SSH key-only, Hostinger firewall; P0-8
 - [ ] T0.6 Compose deploy on server; P0-1…P0-5 on server
-- [ ] T0.7 Backups + restore drill; P0-7
+- [ ] T0.7 Local daily backups + restore drill (P0-7) + rebuild/move runbook
 - [ ] T0.8 QA + security review; merge

@@ -1,6 +1,6 @@
 # ADR-008: Append-only audit trail enforced by privileges and a trigger
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-11-21
 **Feature:** phase-0-foundations
 **Author:** 10x-Team (Architect + Security Engineer + DBA)
@@ -13,7 +13,7 @@ v2 requires an append-only audit of every state change ("who/what, from-state, t
 - **Written only inside the database** — by `ledger.transition()` and the creation triggers (ADR-007) — in the same transaction as the change it records. Python never inserts audit rows for state changes itself.
 - **Layer 1, privileges:** `jarvis_app` gets `INSERT, SELECT` only; `UPDATE, DELETE, TRUNCATE` revoked; no ownership.
 - **Layer 2, trigger:** `BEFORE UPDATE OR DELETE` and `BEFORE TRUNCATE` triggers raise an exception for every role, including `jarvis_owner`. A future retention job that must remove old rows will be a reviewed migration that archives to cold storage first (v2 §13.2), not an ad-hoc delete.
-- **Layer 3, backups:** encrypted off-site copies (ADR-009) preserve history even if the server is compromised.
+- **Layer 3, backups:** daily copies (ADR-009) keep older versions of the history; off-site copies are added when JARVIS moves to its own server.
 
 ## Alternatives Considered
 | Alternative | Pros | Cons | Why Not |
@@ -32,7 +32,7 @@ v2 requires an append-only audit of every state change ("who/what, from-state, t
 - Correcting a wrong audit row is impossible by design; corrections are new rows referencing the old one.
 - The table only grows; tiering to warm/cold storage is needed later (v2 §13.2, Phase 5).
 ### Risks
-- Superuser (`postgres`) can still disable triggers → superuser credentials stay in the secrets folder, never used by any service; off-site backups expose silent edits.
+- Superuser (`postgres`) can still disable triggers → superuser credentials stay in the secrets folder, never used by any service; older backups expose silent edits.
 - Audit volume → trivial at family scale; `seq` index keeps reads fast.
 
 ## Dependencies

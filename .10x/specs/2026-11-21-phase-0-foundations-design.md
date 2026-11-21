@@ -1,6 +1,6 @@
 # JARVIS server — Phase 0 (Foundations) design
 
-**Status:** Proposed — awaiting Manj's review
+**Status:** Approved by Manj 2026-11-21 (with K5: local backups only)
 **Date:** 2026-11-21
 **Feature slug:** `phase-0-foundations`
 **Inputs:** Architecture v2 (project doc `Jarvis_Architecture_v2.md`), decisions D1–D8 (`jarvis-architecture.md`), `phase-0-handover.md`
@@ -22,6 +22,9 @@ Not in Phase 0: the gateway, any AI call, the memory engine (Phase 1), connector
 | K2 | Repository | **Same repo** as the desktop node (`jarvisdesktop`), server code under `server/`. |
 | K3 | Database | A **dedicated Postgres 17 container** for JARVIS; the existing Postgres 16 is not touched. |
 | K4 | Python tools | Python 3.12 + uv; psycopg 3 with plain SQL; Alembic; pytest against real Postgres; ruff + mypy; FastAPI from Phase 2. |
+| K5 | Recovery | Full foundations, except backups: losing ledger data is acceptable, losing JARVIS is not. Rebuild from the repo; local daily backups + Hostinger weekly; no off-site copy yet. The shared server is temporary: JARVIS moves to its own server once it is functioning. |
+
+**The shared server is temporary:** once JARVIS is functioning it moves to its own server. Losing ledger data is acceptable; losing JARVIS itself is not — so everything needed to rebuild it lives in the repo, and rebuilding is the same scripted procedure as moving out.
 
 Consequences of sharing the server are handled in ADR-009: ports 80/443 stay public for pubmedgemini, JARVIS and SSH become Tailscale-only, pubmedgemini's deploy moves onto Tailscale.
 
@@ -55,8 +58,8 @@ jarvisdesktop/
     └── deploy/
         ├── compose.yaml
         ├── harden/               # idempotent shell scripts, run once per server
-        ├── backup/               # backup + restore scripts, systemd units
-        └── README.md             # runbook
+        ├── backup/               # local backup config + restore script
+        └── README.md             # runbook: rebuild / move to a new server
 ```
 
 CI: a new `server.yml` workflow runs only when `server/**` or `contracts/**` change. The existing Rust CI and Windows installer workflows get `paths-ignore: [server/**, contracts/**, .10x/**]` so a server commit never builds or publishes a desktop release.
@@ -162,7 +165,7 @@ Table `audit.event`, append-only (ADR-008).
 Protection, three layers:
 1. **Privileges:** the app role `jarvis_app` has only `INSERT` and `SELECT` on `audit.event`; `UPDATE`, `DELETE`, `TRUNCATE` revoked (P0-3).
 2. **Trigger:** a `BEFORE UPDATE OR DELETE` trigger raises an error for every role, including the owner, so mistakes in migrations or manual sessions are blocked too.
-3. **Backups:** off-site encrypted copies (ADR-009) mean even the server's root cannot quietly rewrite history without the older copies disagreeing.
+3. **Backups:** daily copies (ADR-009) keep older versions of the history, so a quiet rewrite on the live database would disagree with them.
 
 Tamper-evident hash chaining is deliberately left out (YAGNI); trigger to add it: more than one admin, or audit used as evidence for someone other than Manj.
 
@@ -183,7 +186,7 @@ Tamper-evident hash chaining is deliberately left out (YAGNI); trigger to add it
 | P0-4 | Commitment lifecycle | EXPECTED → AT_RISK → SECURED → FULFILLED with 4 audit rows | CI + server |
 | P0-5 | Context expiry | Expired row absent from `current_context`; live row present | CI + server |
 | P0-6 | Migrations | Empty database → `alembic upgrade head` → `downgrade base` → `upgrade head` succeeds; schema matches | CI |
-| P0-7 | Backup restore | Latest off-site backup restored into a scratch Postgres container; P0-1's ticket and its 7 audit rows present and identical | Server (manual drill, scripted) |
+| P0-7 | Backup restore | Latest local daily backup restored into a scratch Postgres container (rehearses moving the data to a new server); P0-1's ticket and its 7 audit rows present and identical | Server (manual drill, scripted) |
 | P0-8 | Network | From outside the tailnet: only TCP ports 80 and 443 answer (plus Tailscale's UDP port); SSH (22) and anything JARVIS refused. From Manj's PC over Tailscale: SSH works | Server, run from the PC and from an outside host |
 
 Plus unit tests for every allowed and every forbidden transition (generated from the tables in §6), the job claim race, and contract examples.
@@ -204,7 +207,7 @@ Plus unit tests for every allowed and every forbidden transition (generated from
 3. Migrations: roles, ledger, audit, ops; lifecycle function; tests P0-1…P0-6 green in CI.
 4. Server hardening (ADR-009): Tailscale on the server and the PC; pubmedgemini deploy moved onto Tailscale and tested; SSH keys only; Hostinger firewall allowing only 80/443; P0-8.
 5. Deploy compose stack; run P0-1…P0-5 on the server.
-6. Backups to off-site storage; restore drill P0-7.
+6. Local daily backups (same container as the existing Postgres 16); restore drill P0-7; rebuild runbook written.
 7. QA and security review; merge to main.
 
 ## 12. Risks
@@ -216,4 +219,5 @@ Plus unit tests for every allowed and every forbidden transition (generated from
 | Docker-published ports bypass the Ubuntu firewall | JARVIS publishes none; the Hostinger firewall sits outside the VM and Docker cannot override it |
 | Another project on the box exhausts memory | Memory limits on JARVIS containers; heartbeat check flags a starved scheduler |
 | Public repo exposes infrastructure details | No IPs, hostnames, server IDs or secrets committed; scripts take them as arguments |
-| Backup password lost → backups useless | Restic password and storage keys also stored in Manj's password manager; restore drill proves it |
+| Server or Hostinger account lost | Ledger data lost (accepted); JARVIS rebuilt from the repo with the runbook |
+| Moving out turns into a project of its own | Everything scripted from day one; P0-7 rehearses the data move |
