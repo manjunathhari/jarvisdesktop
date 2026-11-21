@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** 2 — Design Complete (ADR-001..004)
+**Phase:** 3 — Planning Complete. Next: T1 (implementation not started)
 **Started:** 2026-11-21
 
 ## Known so far
@@ -24,3 +24,8 @@
 
 ## Open questions
 - Does the target PC have an NVIDIA GPU? (sets Whisper model size)
+
+## Task list (news-wall) — see decisions/engineering-manager/news-wall.md
+- [ ] Milestone A: T1 scaffold+CI · T2 core types · T3 coordinator · T4 news · T5 live_tv · T6 ClaudeBrain · T7 brain evals · T8 Tauri UI
+- [ ] Milestone B: T9 ears/STT · T10 wake word · T11 TTS spike+voice · T12 model downloads
+- [ ] Milestone C: T13 Windows platform · T14 end-to-end + latency · T15 QA/security + installer
