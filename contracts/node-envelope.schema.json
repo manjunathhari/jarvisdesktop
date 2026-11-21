@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/node-envelope.schema.json",
+  "title": "Node message envelope",
+  "description": "Wrapper for every message between a node (desktop, phone) and the gateway. STUB: shape may grow before it is used.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "message_id",
+    "node_id",
+    "sent_at",
+    "kind",
+    "payload"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "message_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "node_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "session_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "sent_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "kind": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "payload": {
+      "type": "object"
+    }
+  }
+}
