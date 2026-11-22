@@ -8,9 +8,9 @@
 
 **Tech Stack:** Python 3.12, uv, psycopg 3 (sync in core, async in the gateway), Alembic, FastAPI and uvicorn, `rfc8785`, `cryptography` (Ed25519), `httpx` (Claude), pytest, ruff, mypy; Postgres 17; Docker Compose; `tailscale/tailscale` sidecar.
 
-**Plan revision:** 9 (22 Nov 2026). Revision 9 applies Manj's rulings on the Task 3 review (spec R9-1 to R9-6): stream-cursor isolation by session (Tasks 3, 7, 10 and 11), strict event details, `supersede` / `expire` outcomes, `id_conflict`, `unknown_item`, the `stream_cursor` grant, the stricter Task 2 mixed-load test, and two Task 7 notes. Revision 8 (corrected after Manj's review: the exact set of functions that do and don't call `current_node` is now explicit). Revision 8 applies Manj's rulings on the Task 2 review (spec R8-1, R8-2): strict fencing with one lock order and race tests in both orders (Tasks 2, 3 and 7), CONNECT / DISCONNECT audit, and five smaller points in Task 2. Revision 7 (corrected after Manj's review: Task 2 Step 3 now returns structured refusals instead of raising). Revision 7 applies Manj's rulings on Task 2 (spec R7-1 to R7-6): audited refusals return a structured result and the caller commits before raising, audited enrolment creation, the five-function `gw` surface, `last_ping_at`, the `JF001` fencing error and the 0008 rollback rule. They change Tasks 2 and 3. Revision 6 (corrected after Manj's review: Task 6's enrolment test ends with `welcome` and makes no second `hello`, and Task 12's key-source statements now separate enrolment from ordinary welcomes and rotation). Revision 6 adds Manj's handshake corrections (spec R6-6 to R6-8): the enrolment key-pinning `welcome` block, separate `hello` and `enrol` validation paths, per-sender `seq`, and stale-node refusal after the challenge. They change Task 1, Task 6 and Task 12's tests. Revision 5 applied Manj's Task 1 rulings (spec Revision 6): the `challenge` kind and nonce handshake, key-announcement expiry, gateway/core key separation cases and the timestamp rule. They change Task 1 (contracts and shared cases) and Task 6 (handshake tests). Revision 4 fixed the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
+**Plan revision:** 10 (22 Nov 2026). Revision 10 makes `ledger.consume_approval` an audited structured refusal and states the trigger is a backstop (spec R10-1, R10-2). That changes Task 4 and the Task 11 caller rule. Revision 9 applies Manj's rulings on the Task 3 review (spec R9-1 to R9-6): stream-cursor isolation by session (Tasks 3, 7, 10 and 11), strict event details, `supersede` / `expire` outcomes, `id_conflict`, `unknown_item`, the `stream_cursor` grant, the stricter Task 2 mixed-load test, and two Task 7 notes. Revision 8 (corrected after Manj's review: the exact set of functions that do and don't call `current_node` is now explicit). Revision 8 applies Manj's rulings on the Task 2 review (spec R8-1, R8-2): strict fencing with one lock order and race tests in both orders (Tasks 2, 3 and 7), CONNECT / DISCONNECT audit, and five smaller points in Task 2. Revision 7 (corrected after Manj's review: Task 2 Step 3 now returns structured refusals instead of raising). Revision 7 applies Manj's rulings on Task 2 (spec R7-1 to R7-6): audited refusals return a structured result and the caller commits before raising, audited enrolment creation, the five-function `gw` surface, `last_ping_at`, the `JF001` fencing error and the 0008 rollback rule. They change Tasks 2 and 3. Revision 6 (corrected after Manj's review: Task 6's enrolment test ends with `welcome` and makes no second `hello`, and Task 12's key-source statements now separate enrolment from ordinary welcomes and rotation). Revision 6 adds Manj's handshake corrections (spec R6-6 to R6-8): the enrolment key-pinning `welcome` block, separate `hello` and `enrol` validation paths, per-sender `seq`, and stale-node refusal after the challenge. They change Task 1, Task 6 and Task 12's tests. Revision 5 applied Manj's Task 1 rulings (spec Revision 6): the `challenge` kind and nonce handshake, key-announcement expiry, gateway/core key separation cases and the timestamp rule. They change Task 1 (contracts and shared cases) and Task 6 (handshake tests). Revision 4 fixed the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
 
-**Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, **Revision 9** (R9-1 to R9-6, on top of the approved Revisions 4 to 8). Implementers work from Revision 9 only. Section references (§) below point there. Read it alongside this plan.
+**Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, **Revision 10** (R10-1, R10-2, on top of the approved Revisions 4 to 9). Implementers work from Revision 10 only. Section references (§) below point there. Read it alongside this plan.
 
 **Out of this plan (separate plans):**
 - **Plan B:** the Rust desktop node (spec §13).
@@ -512,8 +512,12 @@ git commit -am "Phase 2: conversations, append-only events, outbox and multi-nod
 
 **Interfaces:**
 - Produces (SQL):
-  - `ledger.approval` (columns in §5.5), with a trigger enforcing the decision guards;
-  - `ledger.consume_approval(p_approval_id uuid) RETURNS uuid`, which returns the execution key, or NULL if it can't be consumed (app);
+  - `ledger.approval` (columns in §5.5), with a **backstop** trigger enforcing the decision guards. It raises `check_violation` on an illegal write and writes no audit row (spec R10-2);
+  - `ledger.consume_approval(p_approval_id uuid) RETURNS TABLE (execution_key uuid, refusal text)` (app EXECUTE only; SECURITY DEFINER):
+    - **success:** `(key, NULL)` with a `CONSUME` audit row;
+    - **refusal:** `(NULL, 'unknown_approval' | 'not_approved' | 'expired' | 'already_consumed')`, each with a REJECTED audit row in the same transaction. It never raises for a refusal (spec R10-1, R7-1);
+  - `audit.event` gains `entity_type = 'approval'`, if it doesn't exist yet, and the action `CONSUME`. The contract enums and `contracts/audit-event.schema.json` are updated to match;
+  - **rollback:** `downgrade()` refuses, leaving the schema intact, if any `ledger.approval`, `ops.brain_budget`, `ops.brain_reservation` or `ops.brain_usage` row, or any approval audit row, exists. Otherwise it removes everything 0010 added. There is a down/up test, and the P0-6 fingerprint covers the new tables;
   - `ops.brain_budget`, `ops.brain_reservation` (including `turn_id uuid NULL`, with the partial unique index `UNIQUE (turn_id) WHERE state IN ('ACTIVE','SETTLED','LAPSED')`) and `ops.brain_usage`, as in §5.6.
 
   All of these are app only, with no gateway grant.
@@ -522,9 +526,19 @@ git commit -am "Phase 2: conversations, append-only events, outbox and multi-nod
 
 ```python
 def test_decision_only_from_pending_before_expiry(app):    # APPROVED after expires_at → raises (P2-E11)
-def test_consume_once(app):                                # first → uuid; second → None
-def test_consume_refused_unless_approved_and_in_date(app):  # PENDING → None; DENIED → None; expired → None
-def test_concurrent_consume_one_wins(dsns):                # two connections in threads → exactly one non-null key
+def test_consume_once(app):                                # first → (uuid, None) + CONSUME audit; second → (None, 'already_consumed')
+                                                           #   + REJECTED audit row
+def test_consume_refused_unless_approved_and_in_date(app):  # PENDING / DENIED / EXPIRED → (None, 'not_approved'); APPROVED but
+                                                           #   past expires_at → (None, 'expired'); unknown id → (None,
+                                                           #   'unknown_approval'); each audited
+def test_consume_refusal_audit_survives_python_boundary(dsns):  # through dbcall.audited_call: wrapper raises after commit; a separate
+                                                           #   connection sees the REJECTED row
+def test_concurrent_consume_one_wins(dsns):                # two connections in threads (propagating thread errors) → exactly one
+                                                           #   (key, None) and one (None, 'already_consumed'); the second call's
+                                                           #   wait on the row lock is proven via pg_stat_activity
+def test_trigger_is_backstop(owner_or_app):                # direct UPDATE setting execution_key, or changing decision from
+                                                           #   APPROVED to DENIED → check_violation; no audit row
+def test_0010_down_and_up_and_refusal(...):                # empty → down/up clean; any approval or budget row → downgrade refuses
 def test_reservation_unique_per_turn_except_released(app): # ACTIVE then second ACTIVE same turn → UniqueViolation;
                                                            #   RELEASED then ACTIVE same turn → allowed
 def test_gateway_has_no_access(gateway):                   # SELECT ledger.approval / ops.brain_budget → denied (P2-S1)
@@ -1018,7 +1032,7 @@ git commit -am "Phase 2: conversation turn with sessions, memory retrieval, hold
   - `actions.issue_live(conn, *, reply_id: UUID, session_id: UUID, target_node_id: UUID, person_id: UUID, action_kind: str, args: dict, now: datetime) -> int`: writes a signed ACTION chunk with that `session_id` (spec R9-1) with `valid_until = now + 2 min`, NOTIFYs, and returns its `seq`.
   - `approvals.propose_delete(conn, *, session_id, person_id, node_id, name: str, now) -> UUID | None`: issues `pc.list_test_folder` and waits for its receipt (10 s); then creates the task (through Atlas) and the approval (expiry 10 min, `card_authz` signed); then the URGENT outbox card. It returns `None` if the file isn't listed.
   - Job handlers:
-    - `approval.decision`: the §9.3 step 6 checks, then the decision, `consume_approval`, and the signed `node.action` outbox item, all in one transaction;
+    - `approval.decision`: the §9.3 step 6 checks, then the decision, `consume_approval`, and the signed `node.action` outbox item, all in one transaction. A refusal from `consume_approval` (or from the §9.3 checks) is **committed with its audit row**, and the handler returns. It never raises inside that transaction (spec R10-1);
     - `action.receipt`: one receipt per key; the file ID and hash check; a fresh listing; then the outcome and close (§9.4);
     - `approval.expire` and `approval.expiring` (scheduled).
   - **`memory.write` from conversation (REVERSIBLE, §12):** `actions.memory_write(conn, engine, *, person_id, content: str, category: str, topics: Sequence[str]) -> str` writes a STATED entry with `by = memory_slug(person_id)` and `source = <inbound id>`, and creates a SILENT outbox item for history. Claude's arguments can never set `by`, `viewer` or the subject.

@@ -1,6 +1,6 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** **Revision 9, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, revision 9. Revision 9 adds R9-1 to R9-6 (§20), all from the Task 3 review: per-person isolation of the stream cursor, strict event details, explicit `supersede` / `expire` outcomes, the `id_conflict` refusal, the `unknown_item` refusal, and the gateway's `stream_cursor` read grant.
+**Status:** **Revision 10, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, revision 10. Revision 10 adds R10-1 and R10-2 (§20), found when preparing Task 4: `ledger.consume_approval` returns a structured, audited refusal (R7-1), and the approval decision trigger is a backstop invariant, not the refusal path.
 
 **Approval history:**
 - **Revision 4:** approved by Manj on 2026-11-22.
@@ -8,6 +8,7 @@
 - **Revision 6** (R6-1 to R6-8): approved by Manj with plan revision 6 (corrected) on 2026-11-22.
 - **Revision 7** (R7-1 to R7-6): approved by Manj with plan revision 7b on 2026-11-22.
 - **Revision 8** (R8-1, R8-2): approved by Manj with plan revision 8b on 2026-11-22.
+- **Revision 9** (R9-1 to R9-6): approved by Manj with plan revision 9 on 2026-11-22.
 
 Authorises the implementation plan, not code. ADR-011 to 014 remain Proposed.
 **Date:** 2026-11-22
@@ -285,6 +286,16 @@ Columns: `id`, `task_id`, `requested_from_person_id`, `requesting_node_id`, `tie
 Guards in the database, so no code path can skip them:
 - `decision` changes only from PENDING. APPROVED or DENIED are accepted only while `now() < expires_at` (P2-E11).
 - `consumed_at` and `execution_key` are set exactly once, only when `decision = APPROVED` and `now() < expires_at`, through `ledger.consume_approval(approval_id)` (§9.4).
+
+**Two layers (R10-1, R10-2):**
+- **The refusal path:** `ledger.consume_approval` is an audited function under R7-1. It returns `(execution_key, NULL)` on success, with a `CONSUME` audit row. On a refusal it returns `(NULL, reason)`, never a bare NULL, where `reason` is:
+  - `unknown_approval`;
+  - `not_approved`, when the decision is PENDING, DENIED or EXPIRED;
+  - `expired`, when the decision is APPROVED but `now() ≥ expires_at`;
+  - `already_consumed`.
+
+  Each refusal writes a REJECTED audit row in the same transaction. The decision path in Task 11 likewise checks under its row lock and records an audited refusal, rather than relying on an error.
+- **The backstop:** the trigger on `ledger.approval` is an invariant guard, not a refusal path. It raises (`check_violation`) on any write that breaks the guards above, such as a decision changing from anything but PENDING, APPROVED or DENIED after expiry, or `execution_key` being set or changed outside `consume_approval`. Correct code never reaches it, so it writes no audit row of its own: a raise rolls the transaction back anyway.
 
 ### 5.6 Cost meter and budget reservations (`ops`)
 
@@ -600,8 +611,9 @@ UPDATE ledger.approval
  WHERE id = $1 AND decision = 'APPROVED' AND consumed_at IS NULL AND expires_at > now()
 RETURNING execution_key;
 ```
-- **Zero rows → nothing is issued.** It was denied, expired or already consumed. Two concurrent decision jobs for one approval can't both issue an action, because the row lock serialises them and the second sees `consumed_at` set.
-- A retried job, after a crash, finds the approval already consumed and the action already in the outbox, and does nothing more (ADR-013 idempotency).
+- The function wraps this `UPDATE`. **Zero rows → nothing is issued**, and the function returns the specific refusal with its audit row (§5.5, R10-1). It was unknown, not approved, expired or already consumed. Two concurrent decision jobs for one approval can't both issue an action, because the row lock serialises them and the second sees `consumed_at` set.
+- A retried job, after a crash, finds the approval already consumed (`already_consumed`) and the action already in the outbox, and does nothing more (ADR-013 idempotency).
+- **The caller must not roll back a refusal.** The decision handler (Task 11) runs the decision attempt, `consume_approval` and the outbox write in one transaction. On a refusal it **commits** the transaction, which holds only the refusal's audit row and the decision outcome, and returns. It does not raise inside the transaction (R7-1).
 - Receipts are accepted only for an issued `execution_key`, once.
 
 **Path safety (desktop):**
@@ -941,3 +953,10 @@ Architecture direction approved; implementation approval pending these changes. 
 | R9-4 | **`id_conflict`:** a `message_id` already recorded by another node is an audited refusal; a same-node repeat stays idempotent | §4.1 |
 | R9-5 | **`unknown_item`:** an unknown outbox item, or another person's, is an audited refusal | §4.1 |
 | R9-6 | **Gateway grant:** SELECT on `conv.stream_cursor` | §4.1 |
+
+**Revision 10 (22 Nov 2026). Matching plan: revision 10.** Found when preparing Task 4:
+
+| # | Change | Where |
+|---|---|---|
+| R10-1 | **`ledger.consume_approval` follows R7-1:** it returns `(execution_key, refusal)`. Refusals are `unknown_approval`, `not_approved`, `expired` and `already_consumed`, each audited in the same transaction. Success writes a `CONSUME` audit row. A caller commits a refusal and never rolls it back. | §5.5, §9.4 |
+| R10-2 | **The approval trigger is a backstop invariant:** it raises `check_violation` on an illegal write, with no audit row of its own. It is not the refusal path. | §5.5 |
