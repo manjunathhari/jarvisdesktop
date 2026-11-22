@@ -1,5 +1,6 @@
 # Engineering Manager — index
 ## Active features
+- phase-1-memory-engine — v2 memory engine (ADR-010, approved 2026-11-22)
 - news-wall — 15 tasks, 3 milestones
 ## Working agreement
 - Tasks ≤ half a day; one task = one PR-sized commit series with tests.

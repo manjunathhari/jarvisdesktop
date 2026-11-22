@@ -8,8 +8,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from uuid import UUID
 
 import psycopg
+
+# The household seeded by migration 0006 (D6 "me only": one household).
+HOUSEHOLD_ID = UUID("00000000-0000-4000-8000-000000000001")
 
 SECRETS_DIR = Path(os.environ.get("JARVIS_SECRETS_DIR", "/run/secrets"))
 

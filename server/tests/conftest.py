@@ -6,6 +6,7 @@ Tests connect as jarvis_app, exactly like the running services.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
 from collections.abc import Iterator
@@ -32,13 +33,19 @@ def _with(dsn: str, **kw: str) -> str:
     return psycopg.conninfo.make_conninfo(dsn, **kw)
 
 
-@pytest.fixture(scope="session")
-def dsns() -> Iterator[Dsns]:
+_PASSWORDS = (secrets.token_urlsafe(16), secrets.token_urlsafe(16))
+
+
+@contextlib.contextmanager
+def fresh_database() -> Iterator[Dsns]:
+    """A new database built from migrations alone; dropped afterwards."""
     superuser = os.environ.get("JARVIS_TEST_SUPERUSER_DSN")
     if not superuser:
         pytest.skip("JARVIS_TEST_SUPERUSER_DSN not set; database tests skipped")
     database = f"jarvis_test_{secrets.token_hex(4)}"
-    owner_pw, app_pw = secrets.token_urlsafe(16), secrets.token_urlsafe(16)
+    # Roles are cluster-wide and bootstrap sets their passwords, so every test database in
+    # one run must use the same passwords or earlier connections stop authenticating.
+    owner_pw, app_pw = _PASSWORDS
     bootstrap(superuser, database, owner_pw, app_pw)
     d = Dsns(
         superuser=_with(superuser, dbname=database),
@@ -47,9 +54,17 @@ def dsns() -> Iterator[Dsns]:
         database=database,
     )
     migrate.upgrade(d.owner)
-    yield d
-    with psycopg.connect(superuser, autocommit=True) as conn:
-        conn.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
+    try:
+        yield d
+    finally:
+        with psycopg.connect(superuser, autocommit=True) as conn:
+            conn.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
+
+
+@pytest.fixture(scope="session")
+def dsns() -> Iterator[Dsns]:
+    with fresh_database() as d:
+        yield d
 
 
 @pytest.fixture

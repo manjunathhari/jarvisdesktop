@@ -1,0 +1,20 @@
+{
+  "memory_id": "42",
+  "subject": "household",
+  "category": "preference",
+  "domain": "travel",
+  "tag": "MAYBE",
+  "content": "Prefers morning domestic flights",
+  "source": "msg-7f3a",
+  "recorded_on": "2026-11-21",
+  "by": "manj",
+  "confirmed_by": "manj",
+  "confirmed_on": "2026-11-22",
+  "visibility": "FAMILY_SHARED",
+  "shared_with": [],
+  "topics": [
+    "travel",
+    "flights"
+  ],
+  "happened_on": null
+}

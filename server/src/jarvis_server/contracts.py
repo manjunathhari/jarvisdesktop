@@ -5,7 +5,7 @@ The schemas are the source of truth; tests/test_contracts.py keeps these models 
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import UUID
@@ -54,11 +54,15 @@ class ActorKind(StrEnum):
 class EntityType(StrEnum):
     TASK = "task"
     COMMITMENT = "commitment"
+    MEMORY = "memory"
 
 
 class AuditAction(StrEnum):
     CREATE = "CREATE"
     TRANSITION = "TRANSITION"
+    UPDATE = "UPDATE"
+    CONFIRM = "CONFIRM"
+    ARCHIVE = "ARCHIVE"
 
 
 class AuditOutcome(StrEnum):
@@ -76,6 +80,22 @@ class ApprovalDecision(StrEnum):
     PENDING = "PENDING"
     APPROVED = "APPROVED"
     DENIED = "DENIED"
+    EXPIRED = "EXPIRED"
+
+
+class MemoryCategory(StrEnum):
+    IDENTITY = "identity"
+    PREFERENCE = "preference"
+    EPISODIC = "episodic"
+    OPERATIONAL = "operational"
+    LEARNED = "learned"
+
+
+class MemoryTag(StrEnum):
+    STATED = "STATED"
+    CONFIRMED = "CONFIRMED"
+    INFERRED = "INFERRED"
+    HISTORICAL = "HISTORICAL"
     EXPIRED = "EXPIRED"
 
 
@@ -135,6 +155,37 @@ class AuditEvent(_Contract):
     details: dict[str, Any]
 
 
+SLUG = r"^[a-z][a-z0-9-]{1,30}$"
+Slug = Annotated[str, Field(pattern=SLUG)]
+
+
+class MemoryEntry(_Contract):
+    """One memory entry (Architecture v2 §11, Phase 1 spec §4.3)."""
+
+    memory_id: Annotated[str, Field(pattern=r"^m-[0-9]{4,}$")]
+    subject: Slug
+    category: MemoryCategory
+    domain: Annotated[str, Field(pattern=r"^[a-z_]{1,40}$")] | None = None
+    tag: MemoryTag
+    content: Annotated[str, Field(min_length=1, max_length=500, pattern=r"^[^\n\r]+$")]
+    source: Annotated[str, Field(pattern=r"^[A-Za-z0-9_.:-]{1,100}$")]
+    recorded_on: date
+    by: Annotated[str, Field(pattern=r"^([a-z][a-z0-9-]{1,30}|agent:[a-z][a-z0-9-]{0,39}|system)$")]
+    confirmed_by: Slug | None = None
+    confirmed_on: date | None = None
+    visibility: Visibility
+    shared_with: tuple[Slug, ...] = ()
+    topics: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^[a-z0-9-]{1,30}$")], ...], Field(max_length=8)
+    ] = ()
+    happened_on: date | None = None
+
+    @property
+    def drives_action(self) -> bool:
+        """Only STATED and CONFIRMED entries may drive an action (v2 §11.3)."""
+        return self.tag in (MemoryTag.STATED, MemoryTag.CONFIRMED)
+
+
 class Receipt(_Contract):
     """Stub (Phase 2/3)."""
 
@@ -175,6 +226,7 @@ MODELS: dict[str, type[_Contract]] = {
     "task": Task,
     "commitment": Commitment,
     "audit-event": AuditEvent,
+    "memory-entry": MemoryEntry,
     "receipt": Receipt,
     "approval": Approval,
     "node-envelope": NodeEnvelope,

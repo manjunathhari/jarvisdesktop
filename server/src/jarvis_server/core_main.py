@@ -5,7 +5,7 @@ jarvis-core bootstrap   create roles and database (superuser; once per server)
 jarvis-core migrate     apply migrations (owner role)
 jarvis-core downgrade   undo the newest migration (owner role; take a dump first)
 jarvis-core serve       run the core loop: heartbeat + job queue (app role)
-jarvis-core smoke       check P0-1 … P0-5 against the live database (app role)
+jarvis-core smoke       check P0-1 … P0-5 (live database, app role) and M1-M4 (temporary repo)
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ import psycopg
 
 from jarvis_server import config, jobs, migrate, smoke
 from jarvis_server.bootstrap import bootstrap
+from jarvis_server.memory import checks as memory_checks
+from jarvis_server.memory import service as memory_service
 
 log = logging.getLogger("jarvis.core")
 
@@ -50,10 +52,15 @@ def serve(poll_seconds: float = 2.0) -> None:
     last_beat = 0.0
     with psycopg.connect(config.app_dsn(), autocommit=True) as conn:
         log.info("core started as %s", worker)
+        memory = memory_service.open_engine(conn)  # refuses to start if memory does not load
         while not stopping:
             if time.monotonic() - last_beat >= jobs.HEARTBEAT_INTERVAL.total_seconds():
                 jobs.beat(conn, "core")
                 jobs.sweep_abandoned(conn)
+                try:
+                    memory_service.write_daily_bundle(memory)
+                except Exception as e:  # a failed backup must not stop core
+                    log.warning("memory backup bundle failed: %s", e)
                 last_beat = time.monotonic()
             job = jobs.claim(conn, worker)
             if job is None:
@@ -113,6 +120,13 @@ def _bootstrap() -> None:
 def _smoke() -> int:
     with psycopg.connect(config.app_dsn(), autocommit=True) as conn:
         results = smoke.run(conn)
+        row = conn.execute(
+            "SELECT has_function_privilege('audit.record_memory(text, text, text, text, text,"
+            " text, text, text, text)', 'EXECUTE')"
+        ).fetchone()
+        results.append(("memory audit function", bool(row and row[0]), "app may record"))
+    # M1-M4 in a throwaway repo with fictional people: no live memory, no live audit rows.
+    results += memory_checks.run()
     for name, ok, detail in results:
         print(f"SMOKE {'PASS' if ok else 'FAIL'}  {name}  ({detail})", flush=True)
     return 0 if all(ok for _, ok, _ in results) else 1

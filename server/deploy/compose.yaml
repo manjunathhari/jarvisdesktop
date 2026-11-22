@@ -8,8 +8,12 @@
 # No service publishes a port. Everything sits on an internal network with no internet route.
 #
 # On every `up`, the one-shot `init` service bootstraps roles, applies migrations and (with
-# JARVIS_SMOKE_ON_INIT=1) prints "SMOKE PASS/FAIL" lines for P0-1 … P0-5; core and scheduler
-# start only if it succeeds.
+# JARVIS_SMOKE_ON_INIT=1) prints "SMOKE PASS/FAIL" lines for P0-1 … P0-5 and M1-M4 (memory
+# checks run in a temporary repo with fictional people); core and scheduler start only if it
+# succeeds.
+#
+# Memory (ADR-010): the private git repo lives in volume `memory`, mounted only into core.
+# core also writes a daily git bundle into its own volume `memory_backups`.
 
 name: jarvis
 
@@ -75,8 +79,13 @@ services:
       JARVIS_DB_HOST: postgres
       JARVIS_DB_NAME: jarvis
       JARVIS_PROCESS: core
+      JARVIS_MEMORY_DIR: /var/lib/jarvis/memory
+      JARVIS_MEMORY_BUNDLE_DIR: /backups/memory
       TZ: Asia/Kolkata
     secrets: [pg_app_password]
+    volumes:
+      - memory:/var/lib/jarvis/memory
+      - memory_backups:/backups/memory
     mem_limit: 512m
 
   scheduler:
@@ -135,6 +144,8 @@ networks:
 volumes:
   pgdata:
   backups:
+  memory:
+  memory_backups:
 
 secrets:
   pg_superuser_password: { file: /etc/jarvis/secrets/pg_superuser_password }

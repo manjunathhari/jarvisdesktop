@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): running on the shared server; P0-1…P0-6 pass; P0-8 pass; P0-7 deferred (Manj); reviews done — PR #2 ready to merge.**
+**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): complete, PR #2 merged 2026-11-21; running on the shared server. Phase 1 (memory engine): built and reviewed 2026-11-22 on branch `phase-1-memory-engine` — 236 tests green, M1–M4 pass, no blocking review issues; PR #3 open; CI green (Postgres 17); **live check passed 2026-11-22** (commit 6e49572: migration 0007 applied, `SMOKE PASS` ×10, `memory ready: 0 entries`, first bundle written). Awaiting Manj's merge.**
 **Started:** 2026-11-21
 
 ## Known so far
@@ -79,4 +79,26 @@ Design: `.10x/specs/2026-11-21-phase-0-foundations-design.md`, ADR-006…009 (Pr
 - [x] T0.5 Hardening: Tailscale (+ Tailscale SSH), SSH key-only + fail2ban, Hostinger firewall 22/80/443 — done 21 Nov. **P0-8 PASS** 21 Nov (external scan: only 22/80/443 open; SSH publickey only). Re-runs weekly.
 - [x] T0.6 Deployed via Hostinger Docker manager (image from GHCR); P0-1…P0-5 SMOKE PASS on the live server, 21 Nov
 - [x] T0.7 Local daily backups running; rebuild/move runbook `server/deploy/README.md`. P0-7 restore drill deferred by Manj (Hostinger weekly backup suffices until the build grows).
-- [x] T0.8 QA + security review (`.10x/reviews/2026-11-21-*`), no blocking issues — awaiting Manj's merge of PR #2
+- [x] T0.8 QA + security review (`.10x/reviews/2026-11-21-*`), no blocking issues — PR #2 merged 2026-11-21
+
+## 2026-11-22 — Architecture v2 Phase 1 (memory engine)
+Spec `.10x/specs/2026-11-21-phase-1-memory-engine-design.md` approved by Manj; ADR-010 accepted.
+Decisions: P1 engine only (no real memories until Phase 2) · P2 markdown is the truth · P3 private git repo, no remote · P4 deterministic retrieval · P5 audit in Postgres, no content · P6 viewer-based access · no automatic parental access to PRIVATE · dedicated server before real memories (encryption at rest later).
+Boundary: no embeddings, AI inference, consolidation, external memory services or real personal data in Phase 1.
+
+### Phase 1 task list
+- [x] T1.1 ADR-010; interface, types, memory-entry contract
+- [x] T1.2 Strict markdown parser and writer
+- [x] T1.3 Private git store and history
+- [x] T1.4 Lifecycle and tag rules
+- [x] T1.5 Visibility, retrieval, M1–M4
+- [x] T1.6 Migration 0007 (memory audit + S5) and recovery
+- [x] T1.7 Deploy: git in image, memory volume, smoke, bundle, runbook
+- [x] T1.8 Independent QA and security review — `reviews/2026-11-22-phase-1-*`; 3 medium + 4 low findings fixed
+
+Build: 236 tests green locally (Postgres 16, password auth) and in CI (Postgres 17); ruff, format, mypy clean. CI caught two issues fixed before merge: test role passwords reset by a second test database; retrieval speed on a shared runner (now ~4 ms for 5,000 entries). Deviations from the spec: `decisions/sde/phase-1-memory-engine.md`.
+
+### Next (Phase 1 close-out)
+1. ~~Push and open PR~~ — PR #3. 2. ~~CI green~~. 3. ~~Live check~~ — passed 2026-11-22.
+4. Manj merges PR #3; then remove `phase-1-memory-engine` from the publish condition in `server.yml` and redeploy `main`.
+5. Next phase: Phase 2 (Jarvis core + nodes) — brainstorm + design doc first.
