@@ -8,9 +8,9 @@
 
 **Tech Stack:** Python 3.12, uv, psycopg 3 (sync in core, async in the gateway), Alembic, FastAPI and uvicorn, `rfc8785`, `cryptography` (Ed25519), `httpx` (Claude), pytest, ruff, mypy; Postgres 17; Docker Compose; `tailscale/tailscale` sidecar.
 
-**Plan revision:** 5 (22 Nov 2026). Revision 5 applies Manj's Task 1 rulings (spec Revision 6): the `challenge` kind and nonce handshake, key-announcement expiry, gateway/core key separation cases and the timestamp rule. They change Task 1 (contracts and shared cases) and Task 6 (handshake tests). Revision 4 fixed the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
+**Plan revision:** 6 (22 Nov 2026). Revision 6 adds Manj's handshake corrections (spec R6-6 to R6-8): the enrolment key-pinning `welcome` block, separate `hello` and `enrol` validation paths, per-sender `seq`, and stale-node refusal after the challenge. They change Task 1, Task 6 and Task 12's tests. Revision 5 applied Manj's Task 1 rulings (spec Revision 6): the `challenge` kind and nonce handshake, key-announcement expiry, gateway/core key separation cases and the timestamp rule. They change Task 1 (contracts and shared cases) and Task 6 (handshake tests). Revision 4 fixed the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
 
-**Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, **Revision 6**. Revision 5 is the approved Revision 4 plus the offline-node and resume rules (R5-1, R5-2). Revision 6 adds R6-1 to R6-5. Implementers work from Revision 6 only. Section references (§) below point there. Read it alongside this plan.
+**Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, **Revision 6** (R6-1 to R6-8). Revision 5 is the approved Revision 4 plus the offline-node and resume rules (R5-1, R5-2). Implementers work from Revision 6 only. Section references (§) below point there. Read it alongside this plan.
 
 **Out of this plan (separate plans):**
 - **Plan B:** the Rust desktop node (spec §13).
@@ -87,7 +87,7 @@ Only then change the contract. The plan and the spec are updated in the same com
 **Files:**
 - Modify: `contracts/node-envelope.schema.json` (add required `seq` (integer ≥ 1) and `sig` (string); remove the STUB note; `kind` becomes an enum of the 17 kinds below; `node_id` is a UUID, and the nil UUID is allowed only for `challenge` and a node-less `enrol` (spec §6.1))
 - Modify: `contracts/approval.schema.json` (add the §5.5 columns; remove the STUB note)
-- Create: `contracts/messages/<kind>.schema.json`, one per kind: `challenge`, `enrol`, `hello`, `welcome`, `utterance`, `reply.chunk`, `outbox.item`, `outbox.cleared`, `received`, `ack`, `approval.decision`, `node.action`, `action.receipt`, `keyset`, `ping`, `pong`, `error` (payload shapes from the §7.1 table; `error` = `{code, detail}`; `received` = `{outbox_id}` **or** `{reply_id, seq}`, which acknowledges every chunk up to `seq`; `hello` = `{nonce, resume: [{reply_id, last_seq}], clock_skew_ms?}`, where `resume` is the node's own record of what it has shown and `last_seq` is any integer (spec R6-5); `challenge` = `{nonce (43-char base64url), issued_at, expires_at, key_id, public_key}`; `enrol` = `{token, public_key, nonce}`; all timestamps are RFC 3339 with an offset (spec R6-4))
+- Create: `contracts/messages/<kind>.schema.json`, one per kind: `challenge`, `enrol`, `hello`, `welcome`, `utterance`, `reply.chunk`, `outbox.item`, `outbox.cleared`, `received`, `ack`, `approval.decision`, `node.action`, `action.receipt`, `keyset`, `ping`, `pong`, `error` (payload shapes from the §7.1 table; `error` = `{code, detail}`; `received` = `{outbox_id}` **or** `{reply_id, seq}`, which acknowledges every chunk up to `seq`; `hello` = `{nonce, resume: [{reply_id, last_seq}], clock_skew_ms?}`, where `resume` is the node's own record of what it has shown and `last_seq` is any integer (spec R6-5); `challenge` = `{nonce (43-char base64url), issued_at, expires_at, key_id, public_key}`; `enrol` = `{token, public_key, nonce}`; `welcome` gains an optional `enrolment` = `{node_id, core_key_id, core_public_key}` (spec R6-6); the envelope's `seq` is per sender per connection, starting at 1 and going up by exactly 1 (spec R6-8); all timestamps are RFC 3339 with an offset (spec R6-4))
 - Create: `contracts/messages/authz.schema.json` (`{object, key_id, sig}`; `object` fields exactly as listed in §7.1)
 - Create: `contracts/examples/messages/<kind>.valid.json` and `.invalid.json`
 - Create: `contracts/signing-vectors/generate.mjs` (the independent generator; no server code)
@@ -141,6 +141,8 @@ The expected values come from a separate implementation, so a defect in `signing
   - `reject-tampered-args`;
   - `reject-gateway-key-under-core-key-id`: signed with the **gateway's** private key, purpose `core-authz`, `key_id` = the trusted core key's ID → reject `bad_signature` (spec R6-3);
   - keyset cases (spec R6-2), checked by `check_keyset`: `accept-keyset` (inside validity), `reject-keyset-expired` (`now` = `valid_until` + 31 s), `accept-keyset-within-tolerance` (`now` = `valid_until` + 29 s), `reject-keyset-payload-mismatch`, `reject-naive-valid-until` (and its keyset twin);
+  - enrolment-pinning cases, checked by a new reference `check_enrolment_welcome(welcome_payload: Mapping[str, Any], *, core_fingerprint: str) -> tuple[UUID, str, bytes]` in `node_rules.py`: `accept-enrolment-welcome`, `reject-enrolment-core-fingerprint-mismatch`, `reject-enrolment-block-missing`;
+  - sequence cases, checked by a new reference `SeqChecker` in `node_rules.py` (`expect(peer_seq: int) -> None`, raising `Rejected('bad_seq')`): `accept-consecutive`, `reject-gap`, `reject-repeat`, `reject-decrease`, `reject-first-not-1`;
   - challenge cases, checked by a new reference `check_challenge(env, *, pinned_gateway: Mapping[str, bytes] | None, enrol_fingerprint: str | None) -> dict` in `node_rules.py`: `accept-challenge`, `accept-challenge-enrol-by-fingerprint`, `reject-challenge-unpinned-key`, `reject-challenge-fingerprint-mismatch`, `reject-challenge-bad-signature`, `reject-challenge-signed-by-core-key`, `reject-challenge-naive-time`.
 
   These are produced by the same generator.
@@ -521,6 +523,23 @@ git commit -am "Phase 2: core dispatch, deterministic notification rules, reconn
 def test_challenge_is_first_message_and_signed(...):       # on connect, first message is challenge; gw-transport sig verifies
                                                              #   with the pinned gateway key; nonce 43 chars; expires_at = issued_at + 30 s
 def test_nonce_unique_per_connection(...):                   # 50 connections → 50 distinct nonces
+def test_hello_path_checks_unchanged_by_enrolment(...):      # hello for a registered node signed with a different key → 4401
+                                                             #   bad_signature; revoked → revoked; whois ≠ row → identity_mismatch
+def test_enrol_path_signed_by_other_key_refused(...):        # enrol whose envelope is signed by a key ≠ payload public_key → 4401
+def test_enrol_with_registered_key_refused(...):             # payload public_key already belongs to a node → 4401 key_in_use
+def test_enrol_identity_from_connection_not_message(...):    # extra 'tailscale_identity' in payload → schema error; node row
+                                                             #   gets the whois identity
+def test_hello_with_nil_node_id_refused(...):                # hello on path A with nil UUID → 4401
+def test_enrol_welcome_carries_core_key_and_node_pins_it(...):  # FakeNode enrol → welcome.enrolment; check_enrolment_welcome ok;
+                                                             #   later node.action signed by core accepted
+def test_enrol_with_substituted_core_key(...):               # gateway configured with a core key ≠ the code's fingerprint →
+                                                             #   FakeNode discards keys, stores no node_id, closes; no action run
+def test_node_ignores_core_content_before_pinning(...):      # an approval card arriving before the enrolment block is processed
+                                                             #   → refused
+def test_seq_checked_per_direction(...):                     # gateway sends seq 1..5 while node sends 1..3 on one connection →
+                                                             #   all accepted; a node message with seq continuing the gateway's
+                                                             #   count (6) → 4401 bad_seq; FakeNode rejects a gateway message
+                                                             #   with a gap
 def test_hello_with_other_connections_nonce_refused(...):    # conn A's nonce sent in hello on conn B → closed 4401, audit bad_nonce
 def test_hello_after_challenge_expiry_refused(...):          # injected clock +31 s → closed 4401, audit challenge_expired
 def test_second_hello_on_same_connection_refused(...):       # nonce consumed: a replayed hello on the same socket → closed
@@ -946,7 +965,7 @@ git commit -am "Phase 2: policy engine, approvals with signed cards, Atlas inter
   - `retire(conn, key_id: str) -> None`.
 - **Offline-node recovery rule: a node that missed the overlap must re-enrol.**
   - **The 24-hour activation policy stays.** A node that is offline when the key activates can't be brought up to date over the gateway, because nothing the gateway sends is trustworthy to it: the gateway may be signing with a key the node never received, and welcome messages carry no keys by design. Recovery therefore never asks the node to accept a key from the gateway.
-  - **The gateway refuses STALE nodes.** In `hello`, if `gw.node.key_state = 'STALE'`, the gateway closes the WebSocket with close code **4409** (`reenrol_required`) before sending any signed message. A close code authorises nothing, so it is safe unsigned.
+  - **The gateway refuses STALE nodes (spec R6-6).** Every connection first gets the pre-authentication `challenge`, which authorises nothing and carries no Jarvis content. After a STALE node's `hello` passes path A, the gateway closes with **4409** (`reenrol_required`) **instead of** `welcome`. It sends no welcome, summary, outbox item, chunk or action. The close code authorises nothing, so it is safe unsigned. If the gateway key itself rotated, the stale node can't verify the challenge and closes before `hello`.
     - The node treats 4409 as "stop and ask for re-enrolment". It runs nothing, shows "Jarvis's keys have changed. Please re-enrol this device", and keeps its local journal.
     - A forged 4409 can only deny service, which an attacker on the path could do anyway.
   - **A node with fresh keys but an unknown key_id** fails closed too. If a node that isn't STALE receives a `gw-transport` or `core-authz` signature with a `key_id` it has never pinned, it rejects the message, closes the connection and shows the same re-enrol prompt. This covers any gap between the database flag and the node's state.
@@ -987,11 +1006,14 @@ def test_one_active_key_per_role(app):              # second ACTIVE CORE row →
 def test_gateway_cannot_write_trusted_keys(gateway):# INSERT/UPDATE gw.trusted_key → denied
 def test_gateway_refuses_start_without_active_secret(...): ...
 def test_core_rotation_node_offline_beyond_24h(...):   # node A online acks, node B offline; 24 h pass (injected clock) →
-                                                       #   key ACTIVE, B marked STALE; B reconnects → closed 4409 before any
-                                                       #   signed message; B runs nothing; B.prompt == 'reenrol'
+                                                       #   key ACTIVE, B marked STALE; B reconnects → receives exactly one
+                                                       #   message (challenge), then close 4409 after its hello; no welcome,
+                                                       #   outbox item, chunk or action; B runs nothing; B.prompt == 'reenrol'
 def test_gateway_rotation_node_offline_beyond_24h(...):# same for a GATEWAY key; also: if B were not flagged, a
                                                        #   gw-transport signature with an unknown key_id makes B close and
-                                                       #   prompt re-enrol (B never accepts the new gateway key from transport)
+                                                       #   prompt re-enrol (B never accepts the new gateway key from transport);
+                                                       #   with a rotated gateway key, B closes on the challenge itself and
+                                                       #   never sends hello
 def test_reconnect_within_overlap_gets_keyset_first(...):  # B offline 2 h, others acked → not activated yet (waits for all
                                                        #   or 24 h); B reconnects → first message after welcome handshake
                                                        #   is the keyset; then activation proceeds

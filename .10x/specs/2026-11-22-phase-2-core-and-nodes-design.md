@@ -1,10 +1,12 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** Revision 6, for Manj's review. Revision 6 adds R6-1 to R6-5 (§20: the `challenge` handshake, key-announcement expiry, gateway/core key separation, the timestamp distinction, and the `resume` schema), matching plan **revision 5**. Revision 5 was approved with plan revision 4 on 2026-11-22. Revision 4 was approved by Manj on 2026-11-22. Revision 5 adds two protocol rules, recorded in §20 as R5-1 and R5-2, and its matching plan is `.10x/plans/2026-11-22-phase-2-server.md`, **revision 4**. The two rules are:
-- **R5-1:** the §7.1 offline-node re-enrolment rule (STALE nodes, close code 4409, `node reenrol`);
-- **R5-2:** the §6.2 validated-resume rule (out-of-range `resume` ignored; resume from the durable acknowledged cursor).
+**Status:** **Revision 6, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, revision 6. Revision 6 adds R6-1 to R6-8 (§20): the `challenge` handshake, key-announcement expiry, gateway/core key separation, timestamps, the `resume` schema, the enrolment key-pinning response, per-sender `seq`, and stale-node refusal after the challenge.
 
-Revision 5 awaits Manj's confirmation together with plan revision 4. Authorises the implementation plan, not code. ADR-011 to 014 remain Proposed.
+**Approval history:**
+- **Revision 4:** approved by Manj on 2026-11-22.
+- **Revision 5** (R5-1 offline-node re-enrolment, R5-2 validated resume): approved by Manj with plan revision 4 on 2026-11-22.
+
+Authorises the implementation plan, not code. ADR-011 to 014 remain Proposed.
 **Date:** 2026-11-22
 **Feature slug:** `phase-2-core-and-nodes`
 **Inputs:** Architecture v2 §5–§9, §13–§15 (project doc `Jarvis_Architecture_v2.md`), decisions D1–D8, `phase-1-handover.md`, Phase 0 and Phase 1 designs, the Phase 2 kick-off conversation (22 Nov 2026).
@@ -252,16 +254,33 @@ Core only.
    Anything else (a missing, malformed or unverifiable challenge, or any other message first) → the node closes the connection and sends nothing.
 4. **Clock skew is advisory only.** The node computes `skew = issued_at − its own clock`. If `|skew|` > 30 s, the node puts `clock_skew_ms` in `hello`, shows "This device's clock is off", and the gateway records event `node.clock_skew` (codes only). The server's time never replaces the node's own clock for validity checks, and never substitutes for nonce or signature checks.
 5. **The node replies** with `hello` (`nonce`, `resume`, optional `clock_skew_ms`), signed `node-msg` with its key. A new device sends `enrol` instead (token, public key, `nonce`), signed with its new key (§7.2).
-6. **The gateway checks the reply.** All of these must hold, and any failure closes the connection with code 4401, writing an audit row with the failing check as a code (`bad_signature`, `bad_nonce`, `challenge_expired`, `not_first`, `identity_mismatch`, `revoked`):
-   - it is the **first** node message on this connection;
+6. **The gateway checks the reply** (R6-7 splits this into two paths). Any failure closes the connection with code 4401 and writes an audit row with the failing check as a code (`bad_signature`, `bad_nonce`, `challenge_expired`, `not_first`, `bad_seq`, `identity_mismatch`, `revoked`, `bad_token`, `key_in_use`).
+
+   **Checks common to both paths:**
+   - it is the **first** node message on this connection, with `seq` = 1 (R6-8);
    - its `nonce` equals **this connection's** nonce, compared in constant time;
-   - it arrived before `expires_at` on the gateway's clock;
-   - the signature verifies with the node's registered public key (for `enrol`, the key in the message);
+   - it arrived before `expires_at` on the gateway's clock.
+
+   **Path A, an existing node (`hello`)**, all of these as well, **unchanged by enrolment**:
+   - the envelope `node_id` names a registered node (not the nil UUID);
+   - the `node-msg` signature verifies with **that node's registered** `public_key`;
    - the node isn't revoked;
-   - the Tailscale identity matches the node row.
+   - the connection's Tailscale identity (from `whois`) equals the node row's `tailscale_identity`;
+   - the node's `key_state` decides what happens next: CURRENT → step 7; STALE → R6-6.
+
+   **Path B, a new enrolment (`enrol`, envelope `node_id` = nil UUID)**, all of these as well:
+   - the `node-msg` signature verifies with the **public key carried in the `enrol` message**, which proves the device holds that key;
+   - that public key isn't already registered to any node;
+   - `gw.enrol_node(token, public_key, tailscale_identity)` succeeds, with `tailscale_identity` taken from **this connection's** `whois`, never from the message. The function enforces the token being valid, unused and unexpired, single use under concurrency, insert-only, and the unique active Tailscale identity (§7.2).
+
+   An `enrol` can never authenticate as an existing node, and a `hello` can never create one.
 
    **The nonce is consumed on the first reply, whatever the outcome.** A connection gets one attempt. A nonce from one connection can't authenticate another: each connection only ever compares against its own nonce, and an old nonce is gone once its connection closes.
-7. **Welcome:** the gateway opens a `gw.node_connection` row and sends `welcome`, with the open session, if any, and the reconnect summary (§8.3).
+7. **Welcome:** the gateway opens a `gw.node_connection` row and sends `welcome`, with the open session, if any, and the reconnect summary (§8.3). After a successful **enrolment** (path B), `welcome` also carries an `enrolment` block, which the node must verify before it accepts anything core-authorised (§7.2 step 5, R6-6).
+   - **The block:** `node_id`, `core_key_id`, `core_public_key`.
+   - **The node's check:** `fingerprint(core_public_key)` equals the core fingerprint in the enrolment code. Then it pins `core_key_id → core_public_key` as a CORE key, stores `node_id`, and from then on uses `node_id` as its envelope `node_id`.
+
+   Until that check passes, the node treats the connection as unauthorised. It shows nothing from the summary, and refuses every `node.action`, approval card and `keyset`.
 
 **Envelope `node_id` before the node is known:** `challenge`, and an `enrol` from a device without a node ID, carry the nil UUID `00000000-0000-0000-0000-000000000000`. Every other message carries the real node ID: the sender for node messages, the recipient for gateway messages. The gateway refuses the nil UUID on any other kind.
 
@@ -297,7 +316,9 @@ No node request is involved (P2-E01).
 
 ### 7.1 Envelope, signatures and trust
 
-Every message uses `contracts/node-envelope.schema.json`, made final in Phase 2. It adds two fields: `seq` (a per-connection counter, strictly increasing) and `sig`.
+Every message uses `contracts/node-envelope.schema.json`, made final in Phase 2. It adds two fields, `seq` and `sig`.
+
+**`seq` counts per sender, per connection (R6-8).** Each side keeps its own counter for the messages **it sends** on a connection. The counter starts at 1 on the first message (`challenge` for the gateway; `hello` or `enrol` for the node) and goes up by exactly 1 per message. Each side checks the **other side's** counter independently: the next message from the peer must carry the previous peer `seq` + 1. A gap, a repeat or a decrease is a protocol error, so the receiving side closes the connection: the gateway with 4401 and audit `bad_seq`; the node without replying. The two directions never share or compare counters. A new connection starts both counters again at 1.
 
 **Canonical form and signature input (exact):**
 - **Serialisation:** RFC 8785, the JSON Canonicalization Scheme (JCS). Python uses the `rfc8785` package and Rust uses `serde_jcs`. Numbers in signed objects are integers only (amounts in paise, times as RFC 3339 strings), so JCS's number rules never come into play.
@@ -337,7 +358,8 @@ A valid gateway signature alone is never enough.
 - **Gateway and core keys are never interchangeable (R6-3).** A signature made with the gateway's key is never accepted as a core signature, even under the core key's `key_id`. The node verifies a `core-authz` signature only with the public key pinned for that `key_id` as a CORE key. The shared rule cases (`contracts/signing-vectors/authz-cases.json`) include this case, and both the Python reference checker and the Rust node must reject it.
 - **A node that missed the overlap re-enrols** (Revision 5, R5-1):
   - Activation waits for every active node to acknowledge, or 24 h.
-  - Nodes that hadn't acknowledged are marked STALE, and the gateway closes their `hello` with code 4409 (`reenrol_required`) before sending any signed message.
+  - Nodes that hadn't acknowledged are marked STALE.
+  - **Refusing a stale node (R6-6):** every connection, a stale node's included, first receives the pre-authentication `challenge` (§6.1 step 2). The challenge authorises nothing and carries no Jarvis content: a nonce, times and the gateway's key. After a STALE node's `hello` passes path A's checks, the gateway closes with code **4409** (`reenrol_required`) **instead of** `welcome`. It sends no welcome, summary, outbox item, reply chunk or action. If the gateway key itself was rotated, the stale node can't verify the challenge (an unpinned key) and closes before sending `hello` (§6.1 step 3).
   - A node that sees 4409, or any signature with an unknown `key_id`, runs nothing and asks to be re-enrolled.
   - `jarvis-core node reenrol <node_id>` revokes the old node and issues a new enrolment code carrying the current fingerprints.
   - A node never accepts a key from the gateway alone.
@@ -349,7 +371,7 @@ A valid gateway signature alone is never enough.
 |---|---|---|
 | `challenge` | ← | `nonce`, `issued_at`, `expires_at`, `key_id`, `public_key` (gateway's); first message on every connection (§6.1, R6-1) |
 | `enrol` | node → | token, public key, `nonce` (§7.2) |
-| `hello` / `welcome` | node → / ← server | handshake (§6.1); `hello` carries `nonce`, `resume` (each `last_seq` any integer; validated by the gateway per §6.2 step 6 and R5-2, so a negative value means 0), optional `clock_skew_ms`; `welcome` carries the open session and the reconnect summary |
+| `hello` / `welcome` | node → / ← server | handshake (§6.1); `hello` carries `nonce`, `resume` (each `last_seq` any integer; validated by the gateway per §6.2 step 6 and R5-2, so a negative value means 0), optional `clock_skew_ms`; `welcome` carries the open session, the reconnect summary and, after an enrolment only, the `enrolment` block (`node_id`, `core_key_id`, `core_public_key`; §6.1 step 7) |
 | `utterance` | → | `text`, `screen_summary` |
 | `reply.chunk` | ← | `reply_id`, `seq`, `type` (SPEECH or ACTION), `text` or `authz` (ACTION), `final` |
 | `outbox.item` | ← | `outbox_id`, `priority`, `kind`, `body`, `expires_at`, `authz` (approval cards) |
@@ -366,12 +388,18 @@ Payload schemas go in `contracts/` with examples and contract tests, before feat
 ### 7.2 Registering a node (my call; hardened per review)
 
 1. **Manj creates an enrolment.** He runs `jarvis-core node enrol --person manj --kind desktop --name "study PC"` on the server over Tailscale SSH (`docker compose exec core …`). It writes a row in **`gw.enrolment`** (`id`, `token_hash` (SHA-256 of a 128-bit random token), `person_id`, `kind`, `name`, `expires_at` = now + 15 min, `used_at`, `node_id`). It prints an **enrolment code**: the token plus the core and gateway key fingerprints. Nothing in the repo or the build workspace sees it.
-2. **The desktop connects.** It generates its key pair and stores the private key with Windows DPAPI. It connects and sends `enrol` (token + public key), signed `node-msg` with the new key, which proves it holds that key.
-3. **The gateway registers it.** The gateway reads the peer's Tailscale identity from `whois` **for this connection**, never from the message, and calls `gw.enrol_node(token, public_key, tailscale_identity)`. In one transaction the function:
+2. **The desktop connects and checks the gateway.** It generates its key pair and stores the private key with Windows DPAPI. It connects; the first message is the gateway's `challenge` (§6.1 step 2). The device verifies it with the challenge's `public_key` **only if** `fingerprint(public_key)` equals the gateway fingerprint in the enrolment code, and if so pins that gateway key. Otherwise it closes and sends nothing.
+3. **The desktop sends `enrol`:** `{token, public_key, nonce}`, envelope `node_id` = the nil UUID, `seq` = 1, signed `node-msg` with the new key, which proves it holds that key.
+4. **The gateway registers it** (§6.1 step 6, path B). The gateway reads the peer's Tailscale identity from `whois` **for this connection**, never from the message, and calls `gw.enrol_node(token, public_key, tailscale_identity)`. In one transaction the function:
    - runs `UPDATE gw.enrolment SET used_at = now() WHERE token_hash = sha256(token) AND used_at IS NULL AND expires_at > now() RETURNING …`. Zero rows → audit REJECTED and raise, so two concurrent uses of one token can't both succeed;
    - **inserts** a new `gw.node` (new UUID, `person_id` and `kind` from the enrolment row, not from the caller), with unique constraints on `public_key` and on active `tailscale_identity`. It never updates an existing node, so it can't change another node's key or identity;
    - records `node_id` on the enrolment and writes an audit row.
-4. **Pinning and handshake.** The gateway returns the core and gateway public keys. The node pins them only if they match the fingerprints in the code (§7.1). The connection then continues as a normal `hello`.
+5. **The core key is pinned from the code, not from the gateway.** The gateway sends `welcome` with the `enrolment` block (`node_id`, `core_key_id`, `core_public_key`), as in §6.1 step 7.
+   - **Match:** if `fingerprint(core_public_key)` equals the core fingerprint in the enrolment code, the device pins the key as a CORE key and stores `node_id`. The connection is then the authenticated connection of that new node. No second handshake is needed: the token, the proof of key possession and the Tailscale binding were all checked in step 4.
+   - **Mismatch:** the device discards its new key pair, stores nothing, closes the connection, and shows "Enrolment failed: the server's key does not match the code." The node row created in step 4 is orphaned; its token is used up. Manj revokes it (`jarvis-core node revoke`) and issues a new code.
+
+   A gateway can't substitute a different core key, because only a key matching the out-of-band fingerprint is ever pinned.
+6. **Later connections** use the normal path: `challenge` → `hello` (path A) → `welcome`.
 
 No job is involved, so enrolment works with core down.
 
@@ -805,3 +833,6 @@ Architecture direction approved; implementation approval pending these changes. 
 | R6-3 | **Gateway key never accepted as a core signature,** even under the core `key_id`; a shared case | §7.1 |
 | R6-4 | **Timestamps:** protocol and signed timestamps are RFC 3339 with an offset; database records stay `timestamptz` and are written in RFC 3339 when they go on the wire | §7.1 |
 | R6-5 | **`hello.resume.last_seq` is any integer in the schema,** so the gateway's validation rule (negative → 0; above the maximum → ignored) is what applies, not a schema rejection. This makes the approved Task 7 behaviour reachable. | §7.1 table |
+| R6-6 | **Enrolment key pinning and stale-node refusal after the challenge:** after a successful enrolment, `welcome` carries `node_id`, `core_key_id` and `core_public_key`. The node pins the core key only if it matches the code's fingerprint, refuses all core-authorised content until then, and on a mismatch discards its keys and stores nothing. A STALE node gets the pre-authentication challenge, then 4409 instead of `welcome`, and no post-handshake content. | §6.1 step 7, §7.1, §7.2 |
+| R6-7 | **Separate `hello` and `enrol` validation paths:** path A (existing node: registered key, not revoked, Tailscale identity matches the row) is unchanged; path B (enrolment: signature by the message's own key, key not already registered, token rules and identity from the connection, through `gw.enrol_node`). Neither path can do the other's job. | §6.1 step 6 |
+| R6-8 | **`seq` per sender, per connection:** each side numbers its own messages from 1, increasing by exactly 1, and checks the peer's counter independently; a gap, repeat or decrease closes the connection | §7.1 |
