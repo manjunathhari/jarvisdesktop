@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): complete, PR #2 merged 2026-11-21; running on the shared server. Phase 1 (memory engine): spec approved 2026-11-22, implementation in progress on branch `phase-1-memory-engine`.**
+**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): complete, PR #2 merged 2026-11-21; running on the shared server. Phase 1 (memory engine): built and reviewed 2026-11-22 on branch `phase-1-memory-engine` — 236 tests green, M1–M4 pass, no blocking review issues; awaiting PR, CI and the pre-merge live check.**
 **Started:** 2026-11-21
 
 ## Known so far
@@ -94,6 +94,12 @@ Boundary: no embeddings, AI inference, consolidation, external memory services o
 - [x] T1.5 Visibility, retrieval, M1–M4
 - [x] T1.6 Migration 0007 (memory audit + S5) and recovery
 - [x] T1.7 Deploy: git in image, memory volume, smoke, bundle, runbook
-- [ ] T1.8 Independent QA and security review (in progress)
+- [x] T1.8 Independent QA and security review — `reviews/2026-11-22-phase-1-*`; 3 medium + 4 low findings fixed
 
-Build: 217 tests green locally (Postgres 16); ruff, format, mypy clean. Deviations from the spec: `decisions/sde/phase-1-memory-engine.md`.
+Build: 236 tests green locally (Postgres 16); ruff, format, mypy clean. Image not built in the build session (Docker Hub blocked) — CI builds it. Deviations from the spec: `decisions/sde/phase-1-memory-engine.md`.
+
+### Next (Phase 1 close-out)
+1. Push the branch and open a PR (build session had no push access — Manj to grant, or push the bundle).
+2. CI green on Postgres 17; image published from the branch.
+3. Deploy that commit to project `jarvis`; check `SMOKE PASS` ×10 in `init` logs and `memory ready` in `core` logs.
+4. Merge; remove `phase-1-memory-engine` from the publish condition in `server.yml`.

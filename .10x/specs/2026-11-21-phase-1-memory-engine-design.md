@@ -267,3 +267,21 @@ Speed target: `retrieve_context` under 50 ms with 5,000 entries (tested).
 | Privacy 2 | **Dedicated server before real memories.** Encryption at rest stays a later hardening requirement; dedicated hosting does not replace it. |
 
 Boundary for Phase 1: no embeddings, AI-based inference, automatic consolidation, external memory services or real personal data.
+
+## 15. Changes made during the build (2026-11-22)
+
+Recorded so the spec matches the code. Details: `decisions/sde/phase-1-memory-engine.md`, review: `reviews/2026-11-22-phase-1-security-review.md`.
+
+| § | Change | Why |
+|---|---|---|
+| §7, §9 | **Archive takes a reason code**, one of `no-longer-true`, `superseded`, `recorded-in-error`, `requested-by-person`. Every audit reason is a short code (`^[a-z][a-z0-9-]{0,63}$`), enforced by the database. Refusals never repeat what the caller passed | The audit trail can never be erased, so no free text may enter it (review S1) |
+| §7 | Update and archive follow confirm's rule: the subject or the recorder; for `household` entries any household member. Agents may update only INFERRED/HISTORICAL entries and cannot archive | The spec named the rule only for confirm |
+| §8 | `history(memory_id, *, viewer)`; `get(memory_id, *, viewer)` and `people()` added; no per-entry `version`; `recorded_on` is the date of the current wording's source (git keeps the earlier ones) | Hidden entries must stay hidden; per-entry commit would need blame on every load |
+| §9 | Audit entity ID is **UUID v3** of the memory reference (same in Python and SQL, tested) | Computable in plain SQL without an extension |
+| §9 | `audit.record_memory` also checks the actor's shape and that the tag change is legal for the action | Review S3 |
+| §9 | S5 lives in bootstrap (superuser) and also covers `template1` | Migrations run as owner, which cannot revoke on other databases |
+| §9, §11 | Bundles go to their own volume `memory_backups` (core only) | Core never sees the database dumps |
+| §4.4 | First start commits `index.md` only; folders appear with their first entry. The engine refuses repos with extra local git config or `.git/info/attributes`; `core.fsmonitor` is forced off | Git settings can run code (review S2) |
+| §6 | Word matching works in any script (NFKC, case-folded, Latin accents dropped); `limit` is clamped to 1–50 | Review Q3, D6 |
+| §4.3 | Episodic years must have four digits | Review Q1 |
+| §2 | Not built: a call to change visibility or sharing after a write | Not needed for M1–M4; Phase 2 adds it with the gateway |

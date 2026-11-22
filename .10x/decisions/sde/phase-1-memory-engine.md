@@ -27,7 +27,7 @@ Also: `contracts/memory-entry.schema.json` (+ examples), audit-event schema gain
 | — | Entry metadata carries `domain:` | Every entry carries everything needed to place it |
 
 ## Tests
-217 total (Phase 0: 72). New: format 50, engine 66, acceptance (Postgres) 18, service 4; contracts 35 → 42.
+236 total (Phase 0: 72). New: format 50, engine 74, acceptance (Postgres) 29, service 4; contracts 35 → 42. Review fixes listed in spec §15.
 
 ## Tech debt
 - `search`/`retrieve_context` scan linearly (fine to ~50k entries; ADR-010 option B later).
