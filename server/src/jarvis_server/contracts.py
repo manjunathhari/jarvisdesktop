@@ -56,6 +56,8 @@ class EntityType(StrEnum):
     COMMITMENT = "commitment"
     MEMORY = "memory"
     NODE = "node"
+    INBOUND = "inbound"
+    OUTBOX = "outbox"
 
 
 class AuditAction(StrEnum):
@@ -70,6 +72,12 @@ class AuditAction(StrEnum):
     CONNECT_REFUSED = "CONNECT_REFUSED"
     CONNECT = "CONNECT"
     DISCONNECT = "DISCONNECT"
+    INBOUND = "INBOUND"
+    SEND = "SEND"
+    RECEIVE = "RECEIVE"
+    ACK = "ACK"
+    SUPERSEDE = "SUPERSEDE"
+    EXPIRE = "EXPIRE"
 
 
 class AuditOutcome(StrEnum):

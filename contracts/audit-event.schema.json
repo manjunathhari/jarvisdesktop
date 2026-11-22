@@ -48,7 +48,9 @@
         "task",
         "commitment",
         "memory",
-        "node"
+        "node",
+        "inbound",
+        "outbox"
       ]
     },
     "entity_id": {
@@ -67,7 +69,13 @@
         "REVOKE",
         "CONNECT_REFUSED",
         "CONNECT",
-        "DISCONNECT"
+        "DISCONNECT",
+        "INBOUND",
+        "SEND",
+        "RECEIVE",
+        "ACK",
+        "SUPERSEDE",
+        "EXPIRE"
       ]
     },
     "from_state": {

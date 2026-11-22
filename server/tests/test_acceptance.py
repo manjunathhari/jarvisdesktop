@@ -232,12 +232,13 @@ def test_p0_6_migrations_go_down_and_up_cleanly(dsns: Dsns) -> None:
         with psycopg.connect(dsns.owner) as conn:
             return conn.execute(
                 "SELECT table_schema, table_name, column_name, data_type FROM"
-                " information_schema.columns WHERE table_schema IN ('ledger','audit','ops','gw')"
+                " information_schema.columns"
+                " WHERE table_schema IN ('ledger','audit','ops','gw','conv','comm')"
                 " ORDER BY 1, 2, 3"
             ).fetchall()
 
     before = schema_fingerprint()
-    assert {r[0] for r in before} == {"ledger", "audit", "ops", "gw"}
+    assert {r[0] for r in before} == {"ledger", "audit", "ops", "gw", "conv", "comm"}
     migrate.downgrade(dsns.owner, "base")
     assert schema_fingerprint() == []
     migrate.upgrade(dsns.owner, "head")

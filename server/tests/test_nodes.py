@@ -37,6 +37,7 @@ from jarvis_server.memory import format as memory_format
 from jarvis_server.signing import fingerprint, public_bytes
 
 from .conftest import Dsns, fresh_database
+from .helpers.threads import InThread, run_all
 
 Conn = psycopg.Connection[Any]
 
@@ -52,6 +53,12 @@ GATEWAY_FUNCTIONS = {
     "gw.close_connection(bigint,text)",
     "gw.touch_connection(bigint)",
     "gw.current_node(bigint)",
+    # Migration 0009 (Task 3): the conv and comm connection functions (§4.1).
+    "conv.record_inbound(bigint,uuid,text,jsonb)",
+    "comm.record_sent(bigint,uuid)",
+    "comm.record_received(bigint,uuid)",
+    "comm.acknowledge(bigint,uuid)",
+    "conv.record_chunk_received(bigint,uuid,integer)",
 }
 
 
@@ -331,11 +338,7 @@ def test_concurrent_use_of_one_token_one_wins(app: Conn, ndb: Dsns) -> None:
             with lock:
                 results.append(outcome)
 
-    threads = [threading.Thread(target=attempt, args=(k,)) for k in keys]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    run_all([lambda k=k: attempt(k) for k in keys], timeout=30)
     assert sorted(type(r).__name__ for r in results) == ["UUID", "str"]
     assert "bad_token" in results
     count = app.execute(
@@ -507,45 +510,6 @@ def test_at_most_one_open_connection_per_node(app: Conn, gateway: Conn, owner: C
 NIL = uuid.UUID(int=0)
 
 
-class _InThread:
-    """Run `fn(conn)` on a new autocommit connection in a thread; keep its pid and outcome."""
-
-    def __init__(self, dsn: str, fn: Any) -> None:
-        self.pid: int | None = None
-        self.result: Any = None
-        self.error: BaseException | None = None
-        self._ready = threading.Event()
-        self._thread = threading.Thread(target=self._run, args=(dsn, fn))
-        self._thread.start()
-        assert self._ready.wait(10)
-
-    def _run(self, dsn: str, fn: Any) -> None:
-        with psycopg.connect(dsn, autocommit=True) as conn:
-            self.pid = conn.info.backend_pid
-            self._ready.set()
-            try:
-                self.result = fn(conn)
-            except BaseException as e:
-                self.error = e
-
-    def join(self) -> None:
-        self._thread.join(15)
-        assert not self._thread.is_alive()
-
-
-def _wait_until_lock_blocked(ndb: Dsns, pid: int | None) -> None:
-    """Proves a real lock wait (pg_stat_activity), not a sleep."""
-    with psycopg.connect(ndb.superuser, autocommit=True) as su:
-        for _ in range(400):
-            row = su.execute(
-                "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s", (pid,)
-            ).fetchone()
-            if row is not None and row[0] == "Lock":
-                return
-            time.sleep(0.025)
-    pytest.fail(f"backend {pid} never waited on a lock")
-
-
 def _conn_row(app: Conn, conn_id: int) -> tuple[Any, ...]:
     row = app.execute(
         "SELECT closed_at IS NOT NULL, close_reason, last_ping_at FROM gw.node_connection"
@@ -561,13 +525,14 @@ def test_revoke_wins_heartbeat_refused(app: Conn, gateway: Conn, ndb: Dsns) -> N
     conn_id = _open(gateway, node_id)
     with psycopg.connect(ndb.app) as holder:  # revoke_node, transaction held open
         holder.execute("SELECT * FROM gw.revoke_node(%s)", (node_id,))
-        touch = _InThread(
+        touch = InThread(
             ndb.gateway, lambda c: c.execute("SELECT gw.touch_connection(%s)", (conn_id,))
         )
-        _wait_until_lock_blocked(ndb, touch.pid)
+        touch.wait_until_blocked(ndb.superuser)
         holder.commit()
-    touch.join()
-    assert isinstance(touch.error, psycopg.Error) and touch.error.sqlstate == FENCED_SQLSTATE
+    with pytest.raises(psycopg.Error) as e:
+        touch.join()
+    assert e.value.sqlstate == FENCED_SQLSTATE
     assert _node_row(app, node_id)["last_seen_at"] is None
     assert _conn_row(app, conn_id) == (True, "revoked", None)
 
@@ -577,11 +542,10 @@ def test_heartbeat_wins_revoke_waits(app: Conn, gateway: Conn, ndb: Dsns) -> Non
     conn_id = _open(gateway, node_id)
     with psycopg.connect(ndb.gateway) as holder:  # touch_connection, transaction held open
         holder.execute("SELECT gw.touch_connection(%s)", (conn_id,))
-        revoke = _InThread(ndb.app, lambda c: nodes.revoke(c, node_id))
-        _wait_until_lock_blocked(ndb, revoke.pid)
+        revoke = InThread(ndb.app, lambda c: nodes.revoke(c, node_id))
+        revoke.wait_until_blocked(ndb.superuser)
         holder.commit()
     revoke.join()
-    assert revoke.error is None
     node = _node_row(app, node_id)
     assert node["revoked_at"] is not None and node["last_seen_at"] is not None
     closed, reason, ping = _conn_row(app, conn_id)
@@ -594,13 +558,14 @@ def test_supersede_wins_write_refused(app: Conn, gateway: Conn, ndb: Dsns) -> No
     with psycopg.connect(ndb.gateway) as holder:  # open_connection(new), held open
         row = holder.execute("SELECT conn_id FROM gw.open_connection(%s)", (node_id,)).fetchone()
         assert row is not None
-        write = _InThread(
+        write = InThread(
             ndb.gateway, lambda c: c.execute("SELECT gw.current_node(%s)", (old,)).fetchone()
         )
-        _wait_until_lock_blocked(ndb, write.pid)
+        write.wait_until_blocked(ndb.superuser)
         holder.commit()
-    write.join()
-    assert isinstance(write.error, psycopg.Error) and write.error.sqlstate == FENCED_SQLSTATE
+    with pytest.raises(psycopg.Error) as e:
+        write.join()
+    assert e.value.sqlstate == FENCED_SQLSTATE
     with pytest.raises(psycopg.Error) as e:
         gateway.execute("SELECT gw.current_node(%s)", (old,))
     assert e.value.sqlstate == FENCED_SQLSTATE
@@ -612,17 +577,16 @@ def test_write_wins_supersede_waits(app: Conn, gateway: Conn, ndb: Dsns) -> None
     with psycopg.connect(ndb.gateway) as holder:  # a write's fence: current_node(old), held
         row = holder.execute("SELECT gw.current_node(%s)", (old,)).fetchone()
         assert row == (node_id,)
-        opener = _InThread(
+        opener = InThread(
             ndb.gateway,
             lambda c: c.execute(
                 "SELECT conn_id, refusal FROM gw.open_connection(%s)", (node_id,)
             ).fetchone(),
         )
-        _wait_until_lock_blocked(ndb, opener.pid)
+        opener.wait_until_blocked(ndb.superuser)
         assert _conn_row(app, old)[0] is False  # the old connection is still open meanwhile
         holder.commit()
-    opener.join()
-    assert opener.error is None and opener.result[1] is None
+    assert opener.join()[1] is None
     assert _conn_row(app, old)[:2] == (True, "superseded")
 
 
@@ -631,7 +595,6 @@ def test_no_deadlock_under_mixed_load(app: Conn, gateway: Conn, ndb: Dsns) -> No
     node_ids = [_node(app, gateway) for _ in range(2)]
     current: dict[uuid.UUID, int] = {n: _open(gateway, n) for n in node_ids}
     all_nodes = list(node_ids)
-    failures: list[BaseException] = []
 
     def worker(seed: int) -> None:
         rnd = random.Random(seed)  # noqa: S311  # a reproducible test load, not crypto
@@ -676,18 +639,12 @@ def test_no_deadlock_under_mixed_load(app: Conn, gateway: Conn, ndb: Dsns) -> No
                             gw_conn.execute("SELECT gw.current_node(%s)", (conn_id,))
                             time.sleep(0.001)  # hold the fence briefly, like a real write
                 except psycopg.Error as e:
-                    if e.sqlstate != FENCED_SQLSTATE:  # fenced, or an unknown connection
-                        failures.append(e)
-                except BaseException as e:
-                    failures.append(e)
+                    # Only the fence, and only where another worker may have closed,
+                    # superseded or revoked this connection (or none is open yet: id 0).
+                    if e.sqlstate != FENCED_SQLSTATE or op not in ("touch", "close", "current"):
+                        raise
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(120)
-    assert not any(t.is_alive() for t in threads)
-    assert failures == []
+    run_all([lambda i=i: worker(i) for i in range(8)], timeout=120)
     # Final state: one open connection at most per node, none on a revoked node, and the
     # permanent audit agrees with the connection rows.
     bad = app.execute(
@@ -943,7 +900,7 @@ def test_gateway_has_no_write_privilege_anywhere(owner: Conn) -> None:
     assert granted == []
 
 
-def test_gateway_execute_surface_is_exactly_five(owner: Conn) -> None:
+def test_gateway_execute_surface_is_exactly_the_spec_list(owner: Conn) -> None:
     """Every non-system, non-trigger function. Trigger functions are excluded: they can only
     run as triggers, never be called."""
     rows = owner.execute(
