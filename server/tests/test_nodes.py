@@ -676,7 +676,7 @@ def test_no_deadlock_under_mixed_load(app: Conn, gateway: Conn, ndb: Dsns) -> No
                             gw_conn.execute("SELECT gw.current_node(%s)", (conn_id,))
                             time.sleep(0.001)  # hold the fence briefly, like a real write
                 except psycopg.Error as e:
-                    if e.sqlstate not in (FENCED_SQLSTATE, "22023"):  # fenced or unknown conn
+                    if e.sqlstate != FENCED_SQLSTATE:  # fenced, or an unknown connection
                         failures.append(e)
                 except BaseException as e:
                     failures.append(e)
@@ -707,6 +707,22 @@ def test_no_deadlock_under_mixed_load(app: Conn, gateway: Conn, ndb: Dsns) -> No
         {"n": all_nodes},
     ).fetchone()
     assert counts is not None and counts[0] == counts[2] and counts[1] == counts[3]
+
+
+def test_unknown_connection_is_fenced_everywhere(app: Conn, gateway: Conn) -> None:
+    unknown = 10**12
+    since = _seq(app)
+    for stmt in (
+        "SELECT gw.close_connection(%s, 'node_closed')",
+        "SELECT gw.touch_connection(%s)",
+        "SELECT gw.current_node(%s)",
+    ):
+        with pytest.raises(psycopg.Error) as e:
+            gateway.execute(stmt, (unknown,))
+        assert e.value.sqlstate == FENCED_SQLSTATE, stmt
+    assert _node_audit_actions(app, since) == []
+    row = app.execute("SELECT count(*) FROM gw.node_connection WHERE id = %s", (unknown,))
+    assert row.fetchone() == (0,)
 
 
 def test_gw_connection_functions_do_not_call_current_node(owner: Conn) -> None:

@@ -264,6 +264,7 @@ $$;
 
 -- Gateway: close a connection with a reason code. True when it closed it; false, with no
 -- second DISCONNECT, when it was already closed (also after a revocation, which closes it).
+-- An unknown connection ID is fenced (JF001), as in current_node and touch_connection.
 CREATE FUNCTION gw.close_connection(p_conn_id bigint, p_reason text) RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
@@ -274,8 +275,8 @@ BEGIN
         RAISE EXCEPTION 'malformed close_connection call' USING ERRCODE = 'invalid_parameter_value';
     END IF;
     SELECT c.node_id INTO v_node FROM gw.node_connection c WHERE c.id = p_conn_id;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'unknown connection' USING ERRCODE = 'invalid_parameter_value';
+    IF NOT FOUND THEN  -- an unknown connection is unusable like a closed one (R7-5)
+        RAISE EXCEPTION 'connection_fenced' USING ERRCODE = 'JF001';
     END IF;
     PERFORM 1 FROM gw.node n WHERE n.id = v_node FOR SHARE;
     SELECT c.closed_at INTO v_closed FROM gw.node_connection c WHERE c.id = p_conn_id FOR UPDATE;
