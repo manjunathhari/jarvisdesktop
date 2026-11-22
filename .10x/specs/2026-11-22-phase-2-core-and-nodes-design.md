@@ -307,6 +307,12 @@ A valid gateway signature alone is never enough.
 **Trust distribution and rotation:**
 - **Pinning at enrolment:** the enrolment code Manj types into the desktop (§7.2) contains the fingerprints of the current core and gateway public keys. During enrolment the node receives the keys and pins them only if they match the fingerprints, so the gateway can't substitute its own key for core's.
 - **Rotation:** core announces a new key in a `keyset` message whose `authz` object (kind `keyset`) is signed by the **current** core key. Nodes add the new `key_id`, accept both keys for a 24 h overlap, then drop the old one. The gateway key rotates the same way, but its announcement is signed by core.
+- **A node that missed the overlap re-enrols** (added with plan rev 3, 22 Nov):
+  - Activation waits for every active node to acknowledge, or 24 h.
+  - Nodes that hadn't acknowledged are marked STALE, and the gateway closes their `hello` with code 4409 (`reenrol_required`) before sending any signed message.
+  - A node that sees 4409, or any signature with an unknown `key_id`, runs nothing and asks to be re-enrolled.
+  - `jarvis-core node reenrol <node_id>` revokes the old node and issues a new enrolment code carrying the current fingerprints.
+  - A node never accepts a key from the gateway alone.
 - **Compromise:** if the core key leaks, every node is re-enrolled (there's a runbook step). The keys are kept in the secret files, so a leak needs server access.
 
 **Message kinds:**
