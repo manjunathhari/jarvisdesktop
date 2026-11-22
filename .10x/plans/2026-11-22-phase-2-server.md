@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12, uv, psycopg 3 (sync in core, async in the gateway), Alembic, FastAPI and uvicorn, `rfc8785`, `cryptography` (Ed25519), `httpx` (Claude), pytest, ruff, mypy; Postgres 17; Docker Compose; `tailscale/tailscale` sidecar.
 
-**Plan revision:** 2 (22 Nov 2026), after Manj's review: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
+**Plan revision:** 3 (22 Nov 2026). Revision 3 adds the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
 
 **Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md` (Revision 4, approved 2026-11-22). Section references (§) below point there. Read it alongside this plan.
 
@@ -204,7 +204,7 @@ Expected: FAIL (`ModuleNotFoundError: jarvis_server.signing`)
 
 - [ ] **Step 5: Run the tests to check they pass**
 
-Run: `cd server && uv run pytest tests/test_signing.py tests/test_message_contracts.py tests/test_contracts.py -v`
+Run: `cd server && uv run pytest tests/test_signing.py tests/test_message_contracts.py tests/test_node_rules.py tests/test_contracts.py -v`
 Expected: all PASS
 
 - [ ] **Step 6: Add the CI check that the vectors are reproducible**
@@ -239,7 +239,7 @@ git commit -m "Phase 2: final node envelope, message contracts, JCS signing and 
   - `gw.open_connection(p_node_id uuid) RETURNS bigint`: in one transaction it closes any open connection of that node (`closed_at = now()`, reason `superseded`) and opens the new one. At most one open connection per node, enforced by a partial unique index `UNIQUE (node_id) WHERE closed_at IS NULL`;
   - `gw.close_connection(p_conn_id bigint, p_reason text) RETURNS void`;
   - `gw.current_node(p_conn_id bigint) RETURNS uuid`: an internal helper used by every gateway-facing function in Tasks 3 and 7. It returns the node only if the connection is open and the node is not revoked, and raises `connection_fenced` otherwise;
-  - `gw.touch_node(p_node_id uuid) RETURNS void`;
+  - `gw.touch_connection(p_conn_id bigint) RETURNS void`: the heartbeat. It updates `gw.node.last_seen_at` for `gw.current_node(p_conn_id)` and `gw.node_connection.last_ping_at`. A superseded, closed or revoked connection raises `connection_fenced`, so it can't update anything;
   - `gw.revoke_node(p_node_id uuid) RETURNS void` (EXECUTE for `jarvis_app` only);
   - `audit.event` accepts `entity_type = 'node'` and actions `ENROL`, `REVOKE`, `CONNECT_REFUSED`.
 - Produces (Python), in `jarvis_server.nodes`:
@@ -267,7 +267,9 @@ def test_gateway_cannot_revoke(gateway):                 # SELECT gw.revoke_node
 def test_gateway_cannot_change_node_key(gateway):        # P2-S6: UPDATE gw.node SET public_key=… → InsufficientPrivilege
 def test_gateway_cannot_change_node_identity(gateway):   # P2-S6: UPDATE gw.node SET tailscale_identity=… → InsufficientPrivilege
 def test_gateway_cannot_unrevoke_or_repoint(gateway):    # P2-S6: UPDATE gw.node SET revoked_at=NULL / person_id=… / kind=… → denied
-def test_touch_node_changes_only_last_seen(gateway, app):# P2-S6: every other column identical before and after gw.touch_node
+def test_touch_connection_changes_only_last_seen(gateway, app):  # P2-S6: every other gw.node column identical before and after
+def test_heartbeat_from_superseded_connection_rejected(gateway, app):  # conn1 superseded by conn2 → touch_connection(conn1)
+                                                         #   raises connection_fenced; last_seen_at unchanged
 def test_security_definer_functions_have_fixed_search_path(owner):
     rows = owner.execute("""SELECT p.oid::regprocedure, p.proconfig FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -563,7 +565,8 @@ git commit -am "Phase 2: gateway handshake, enrolment, inbound recording; fake n
   - **Stream relay, with a durable cursor:**
     - The gateway LISTENs on `jarvis_stream` (payload: `reply_id`). For each connected node in the session it sends chunks with `seq > conv.stream_cursor.acked_seq` for that `(reply_id, node)`, read from the database, not from process memory.
     - The node acknowledges with `received {reply_id, seq}` → `conv.record_chunk_received`.
-    - **On (re)connect**, the gateway re-sends unacknowledged chunks of the node's session replies from the last 10 minutes, starting at `max(acked_seq, the node's resume.last_seq) + 1`.
+    - **On (re)connect**, the gateway re-sends unacknowledged chunks of the node's session replies from the last 10 minutes. It starts at `max(acked_seq, clamp(resume.last_seq)) + 1`, where `clamp(x) = min(max(x, 0), max_seq_in_db(reply_id))`.
+    - A `resume` entry for an unknown `reply_id`, a reply outside the node's sessions, or a `last_seq` above the stored maximum is ignored for that reply and recorded as event `node.resume_out_of_range` (codes only). A node's own state can never make the gateway skip a chunk that exists.
     - The node drops any `(reply_id, seq)` it has already shown, so a chunk sent twice is shown once.
     - ACTION chunks go only to `target_node_id`, and only while `now() <= valid_until`.
     - An in-memory "last sent" value may exist to avoid busy re-sends, but it is only an optimisation. Correctness depends on the cursor alone.
@@ -579,6 +582,9 @@ def test_stream_resumes_after_gateway_restart(...):     # chunks 1..3 sent and a
                                                         #   node gets 4,5 only; shown_chunks == [1,2,3,4,5] (P2-E03)
 def test_unacked_chunks_resent_after_restart(...):      # chunks 1..3 sent, node acked only 2; restart → node gets 3 again
                                                         #   but shows it once
+def test_resume_beyond_stored_max_does_not_skip(...):   # 3 chunks stored, acked 1; node claims resume last_seq 99 →
+                                                        #   gateway sends 2..3; event node.resume_out_of_range written
+def test_resume_for_foreign_reply_ignored(...):         # resume names another person's reply → nothing sent for it; event written
 def test_core_restart_mid_stream(...):                  # core writes chunks 1..2 then dies (lease expiry); sweep runs →
                                                         #   node keeps 1..2, gets no final chunk, gets one
                                                         #   'turn.indeterminate' outbox item; brain called once (P2-E03, P2-B4)
@@ -838,7 +844,7 @@ git commit -am "Phase 2: conversation turn with sessions, memory retrieval, hold
     - `approval.expire` and `approval.expiring` (scheduled).
   - **`memory.write` from conversation (REVERSIBLE, §12):** `actions.memory_write(conn, engine, *, person_id, content: str, category: str, topics: Sequence[str]) -> str` writes a STATED entry with `by = memory_slug(person_id)` and `source = <inbound id>`, and creates a SILENT outbox item for history. Claude's arguments can never set `by`, `viewer` or the subject.
   - **Tickets linked to sessions:** `propose_delete` inserts `conv.session_ticket(session_id, task_id)` in the same transaction as the task (v2 §8.4).
-  - Key trust and rotation are in Task 12. This task reads keys through `keys.active_core_key()` from that task. Until then, a temporary single-key loader with the same signature is used.
+  - **Creates `core/keys.py`** with only the temporary `active_core_key() -> tuple[Ed25519PrivateKey, str]`. It reads the single secret `core_signing_key`, with `key_id = fingerprint(public)`. Task 12 modifies this file and replaces the body, keeping the signature.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -896,7 +902,7 @@ git commit -am "Phase 2: policy engine, approvals with signed cards, Atlas inter
 
 **Files:**
 - Create: `server/migrations/versions/0011_trusted_keys.py`
-- Create: `server/src/jarvis_server/core/keys.py`
+- Modify: `server/src/jarvis_server/core/keys.py` (created in Task 11 with the temporary loader)
 - Modify: `gateway/keys.py`, `gateway/app.py` (load the trusted key set from the database; sign with the ACTIVE gateway key)
 - Modify: `server/src/jarvis_server/core_main.py` (`keys` subcommands)
 - Test: `server/tests/test_key_rotation.py`
@@ -909,8 +915,20 @@ git commit -am "Phase 2: policy engine, approvals with signed cards, Atlas inter
 - Produces (Python), in `core.keys`:
   - `active_core_key() -> tuple[Ed25519PrivateKey, str]`: the private key comes from the secret file named for the ACTIVE CORE `key_id`; `key_id` = `fingerprint(public)`;
   - `announce(conn, *, role: Literal['CORE','GATEWAY'], public_key: bytes) -> str`: inserts a NEXT key and writes one `keyset` outbox item per active node. The item's `authz` (kind `keyset`, with `role`, `key_id`, `public_key`, `not_before`) is **always signed by the ACTIVE core key**, for both roles;
-  - `activate_ready(conn, now: datetime) -> list[str]`: a NEXT key becomes ACTIVE, and the previous ACTIVE of that role becomes RETIRED-pending. That happens when every `keyset` item for it is ACKNOWLEDGED, or after 24 h, whichever is first. Runs from the scheduler every minute;
+  - `activate_ready(conn, now: datetime) -> list[str]`: a NEXT key becomes ACTIVE, and the previous ACTIVE of that role becomes RETIRED-pending. That happens when every `keyset` item for it is ACKNOWLEDGED, or after 24 h, whichever is first. In the **same transaction**, every active node whose `keyset` item was **not** acknowledged is marked `gw.node.key_state = 'STALE'` (a new column, default `'CURRENT'`; app-writable, gateway SELECT only). Runs from the scheduler every minute;
   - `retire(conn, key_id: str) -> None`.
+- **Offline-node recovery rule: a node that missed the overlap must re-enrol.**
+  - **The 24-hour activation policy stays.** A node that is offline when the key activates can't be brought up to date over the gateway, because nothing the gateway sends is trustworthy to it: the gateway may be signing with a key the node never received, and welcome messages carry no keys by design. Recovery therefore never asks the node to accept a key from the gateway.
+  - **The gateway refuses STALE nodes.** In `hello`, if `gw.node.key_state = 'STALE'`, the gateway closes the WebSocket with close code **4409** (`reenrol_required`) before sending any signed message. A close code authorises nothing, so it is safe unsigned.
+    - The node treats 4409 as "stop and ask for re-enrolment". It runs nothing, shows "Jarvis's keys have changed. Please re-enrol this device", and keeps its local journal.
+    - A forged 4409 can only deny service, which an attacker on the path could do anyway.
+  - **A node with fresh keys but an unknown key_id** fails closed too. If a node that isn't STALE receives a `gw-transport` or `core-authz` signature with a `key_id` it has never pinned, it rejects the message, closes the connection and shows the same re-enrol prompt. This covers any gap between the database flag and the node's state.
+  - **During the overlap**, a node that reconnects before activation gets its pending `keyset` items **first**, before the welcome summary, other outbox items or any action. So it learns the new key while the old one is still active.
+  - **Operator procedure (runbook):**
+    1. `jarvis-core node reenrol <node_id>`: in one transaction, revokes the old node and creates a fresh enrolment for the same person, kind and name. It prints a new enrolment code with the **current** core and gateway fingerprints.
+    2. On the device, choose "Re-enrol" and enter the code. The device generates a new key pair and enrols as a new node. The pinned keys come from the code's fingerprints (out of band, from Manj), never from the gateway alone.
+    3. The old node's unacknowledged outbox items are re-addressed to the person, so they appear on the new node through the normal "all nodes of the person" rule.
+  - **`jarvis-core keys list`** shows the STALE nodes after each activation, so Manj knows which devices need step 1.
 - CLI:
   - `jarvis-core keys announce --role CORE|GATEWAY --public-key-file <path>`: the new private key is placed by `harden.sh` as secret `core_signing_key_<key_id>` or `gateway_signing_key_<key_id>`;
   - `jarvis-core keys retire <key_id>`;
@@ -923,7 +941,8 @@ git commit -am "Phase 2: policy engine, approvals with signed cards, Atlas inter
 - **Node behaviour (FakeNode, and Plan B):**
   - accepts a `keyset` only if its `authz` verifies with a pinned CORE key;
   - trusts both the old and the new key until a later `keyset` or 24 h after `not_before`;
-  - accepts `gw-transport` from either GATEWAY key during that overlap.
+  - accepts `gw-transport` from either GATEWAY key during that overlap;
+  - on close code 4409, or on any signature with an unknown `key_id`: runs nothing, keeps its journal and prompts for re-enrolment (offline-node recovery rule, below).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -940,6 +959,20 @@ def test_activation_waits_for_all_acks_or_24h(app): ...
 def test_one_active_key_per_role(app):              # second ACTIVE CORE row → UniqueViolation
 def test_gateway_cannot_write_trusted_keys(gateway):# INSERT/UPDATE gw.trusted_key → denied
 def test_gateway_refuses_start_without_active_secret(...): ...
+def test_core_rotation_node_offline_beyond_24h(...):   # node A online acks, node B offline; 24 h pass (injected clock) →
+                                                       #   key ACTIVE, B marked STALE; B reconnects → closed 4409 before any
+                                                       #   signed message; B runs nothing; B.prompt == 'reenrol'
+def test_gateway_rotation_node_offline_beyond_24h(...):# same for a GATEWAY key; also: if B were not flagged, a
+                                                       #   gw-transport signature with an unknown key_id makes B close and
+                                                       #   prompt re-enrol (B never accepts the new gateway key from transport)
+def test_reconnect_within_overlap_gets_keyset_first(...):  # B offline 2 h, others acked → not activated yet (waits for all
+                                                       #   or 24 h); B reconnects → first message after welcome handshake
+                                                       #   is the keyset; then activation proceeds
+def test_reenrol_recovers_stale_node(...):             # node reenrol → old node revoked, new code with current
+                                                       #   fingerprints; FakeNode re-enrols with a new key; receives the
+                                                       #   old node's pending items; accepts actions signed by the new key
+def test_reenrol_code_pins_from_fingerprints_not_gateway(...):  # gateway presents a key not matching the code's fingerprint
+                                                       #   during re-enrolment → node refuses
 ```
 
 - [ ] **Step 2: Run the tests to check they fail**
@@ -947,7 +980,7 @@ def test_gateway_refuses_start_without_active_secret(...): ...
 Run: `cd server && uv run pytest tests/test_key_rotation.py -v`
 Expected: FAIL
 
-- [ ] **Step 3: Implement migration 0011, `core/keys.py`, the gateway key loading, the CLI and the FakeNode keyset handling**
+- [ ] **Step 3: Implement migration 0011 (including `gw.node.key_state`); the rotation functions in `core/keys.py` (modify); the gateway key loading; the CLI; and the FakeNode keyset handling**
 
 Replace Task 11's temporary loader with `active_core_key()`. Add `keys.activate` to the scheduler's job list (Task 13).
 
@@ -1045,10 +1078,10 @@ git commit -am "Phase 2: set_visibility, scheduled expiries and sweeps, retentio
   | `P2-S1` | As the gateway role: `ledger.transition`, `audit.event` insert, `audit.record_memory` all denied |
   | `P2-S6-db` | Direct update of `gw.node` key or identity denied; SECURITY DEFINER `search_path` check |
   | `P2-B-idx` | Second ACTIVE reservation for one turn refused |
-  | `P2-fence` | A superseded smoke connection is fenced |
+  | `P2-fence` | A superseded smoke connection is fenced, including `gw.touch_connection` |
 
   Rows that need the gateway, a node or a brain are **not** in init smoke: E02, E03, E05, E07, E09, E10, E12, E13, A*, B1 to B5, S2, S3, S4 and S6-enrolment. They run in CI with the fake node (Tasks 6 to 12). S5, S7 and P0-8 are live checks (Step 6).
-- Modify: `server/deploy/README.md` (Tailscale auth key and ACL for `tag:jarvis-gateway:8443`; node enrol and revoke; core key rotation and re-enrolment; the gateway checks; the live checks below)
+- Modify: `server/deploy/README.md` (Tailscale auth key and ACL for `tag:jarvis-gateway:8443`; node enrol and revoke; core and gateway key rotation, `keys list` after activation, and the re-enrolment procedure for STALE nodes (Task 12); the gateway checks; the live checks below)
 - Modify: `.github/workflows/server.yml` (a step that fails if `docker compose -f deploy/compose.yaml config` contains `ports:`)
 - Test: `server/tests/test_compose.py`
 
