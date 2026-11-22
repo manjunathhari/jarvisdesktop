@@ -1,6 +1,6 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** Approved by Manj 2026-11-22 (Revision 4). Authorises the implementation plan, not code. ADR-011 to 014 remain Proposed.
+**Status:** Revision 5. Revision 4 was approved by Manj on 2026-11-22. Revision 5 adds only the §7.1 offline-node re-enrolment rule (STALE nodes, close code 4409, `node reenrol`), made with plan revision 3; it awaits Manj's confirmation together with the plan. Authorises the implementation plan, not code. ADR-011 to 014 remain Proposed.
 **Date:** 2026-11-22
 **Feature slug:** `phase-2-core-and-nodes`
 **Inputs:** Architecture v2 §5–§9, §13–§15 (project doc `Jarvis_Architecture_v2.md`), decisions D1–D8, `phase-1-handover.md`, Phase 0 and Phase 1 designs, the Phase 2 kick-off conversation (22 Nov 2026).
@@ -250,7 +250,7 @@ Core only.
    - `memory.retrieve_context(person, utterance, viewer=person)`;
    - the tool menu: the desktop modules (news, live TV, screen actions) plus `pc.delete_test_file`. `pc.list_test_folder` is called by core itself (§9.3), not offered to Claude.
 5. Core calls the router (§10). As speech arrives, core writes `conv.stream_chunk` rows (`seq` 1, 2, …) and NOTIFYs `jarvis_stream` with only the `reply_id`.
-6. The gateway, woken by NOTIFY, reads the new chunks from its last `seq` and sends them to every connected node in the session. **NOTIFY is only a wake-up; the chunks are the durable stream.** If either process restarts mid-reply, the gateway resumes from the last `seq` it sent (P2-E03).
+6. The gateway, woken by NOTIFY, reads the new chunks from its last `seq` and sends them to every connected node in the session. **NOTIFY is only a wake-up; the chunks are the durable stream.** If either process restarts mid-reply, the gateway resumes from the node's durable acknowledged cursor (`conv.stream_cursor`). A `resume` position the node reports is used only when it is within the stored range; otherwise the cursor is used (P2-E03; R5-2).
 7. When the reply is complete, core writes the final chunk (`final = true`) and the JARVIS `conv.message`.
 8. **Tool calls go to policy (§9), never straight to a node.** A READ_ONLY module call, such as "show the news", is part of the live reply: core writes it as a `conv.stream_chunk` of type ACTION with a core-signed `authz` (§7.1) and `valid_until` = now + 2 minutes, and the gateway sends it as `node.action` to the node that spoke. The gateway, the node and core each enforce `valid_until` (§9.4); a node that reconnects later never replays it. It does **not** go in the outbox. An IRREVERSIBLE call becomes an approval, which does go in the outbox (§9.3), and the action it leads to is sent only after approval.
 9. The node acknowledges what it rendered. The audit trail records the turn as codes only.
@@ -307,7 +307,7 @@ A valid gateway signature alone is never enough.
 **Trust distribution and rotation:**
 - **Pinning at enrolment:** the enrolment code Manj types into the desktop (§7.2) contains the fingerprints of the current core and gateway public keys. During enrolment the node receives the keys and pins them only if they match the fingerprints, so the gateway can't substitute its own key for core's.
 - **Rotation:** core announces a new key in a `keyset` message whose `authz` object (kind `keyset`) is signed by the **current** core key. Nodes add the new `key_id`, accept both keys for a 24 h overlap, then drop the old one. The gateway key rotates the same way, but its announcement is signed by core.
-- **A node that missed the overlap re-enrols** (added with plan rev 3, 22 Nov):
+- **A node that missed the overlap re-enrols** (Revision 5, with plan rev 3, 22 Nov):
   - Activation waits for every active node to acknowledge, or 24 h.
   - Nodes that hadn't acknowledged are marked STALE, and the gateway closes their `hello` with code 4409 (`reenrol_required`) before sending any signed message.
   - A node that sees 4409, or any signature with an unknown `key_id`, runs nothing and asks to be re-enrolled.
@@ -759,3 +759,10 @@ Architecture direction approved; implementation approval pending these changes. 
 | R3 | Verify the card signature when processing a decision | §5.5 `card_authz`, §9.3 step 6; P2-A9 |
 | R1a | Concurrent jobs for the same turn | §10.1 step 6: per-turn row lock (turn, then budget), partial unique index, a table of what each job does, the sweep owns crash cleanup; P2-B5 |
 | R1b | What qualifies for RELEASED | §10.1 step 4: connect phase vs send phase; RELEASED only for connect-phase failures; any send-phase outcome short of success is indeterminate; unclassifiable counts as send; §10.2; P2-B4 |
+
+**Revision 5 (22 Nov 2026, with plan revision 3):**
+
+| # | Change | Where |
+|---|---|---|
+| R5-1 | **A node that missed the key-rotation overlap must re-enrol.** Activation (all acknowledged, or 24 h) marks the non-acknowledging nodes STALE; the gateway closes a STALE node's `hello` with 4409 before any signed message; a node that sees 4409, or an unknown `key_id`, runs nothing and asks to be re-enrolled; `jarvis-core node reenrol` revokes the old node and issues a code with the current fingerprints. A node never accepts a key from the gateway alone. | §7.1 |
+| R5-2 | **Reconnect `resume` is validated before use** (from plan revision 4): a `last_seq` above the stored maximum, or for an unknown or foreign reply, is ignored and the gateway resumes from the acknowledged cursor, logging `node.resume_out_of_range`. | §6.2 step 6 note |

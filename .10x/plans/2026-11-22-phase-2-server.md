@@ -8,9 +8,9 @@
 
 **Tech Stack:** Python 3.12, uv, psycopg 3 (sync in core, async in the gateway), Alembic, FastAPI and uvicorn, `rfc8785`, `cryptography` (Ed25519), `httpx` (Claude), pytest, ruff, mypy; Postgres 17; Docker Compose; `tailscale/tailscale` sidecar.
 
-**Plan revision:** 3 (22 Nov 2026). Revision 3 adds the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
+**Plan revision:** 4 (22 Nov 2026). Revision 4 fixes the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
 
-**Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md` (Revision 4, approved 2026-11-22). Section references (§) below point there. Read it alongside this plan.
+**Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, **Revision 5**: the approved Revision 4 plus the §7.1 offline-node re-enrolment rule that this plan's Task 12 implements. The spec's status line and §20 record the change. Implementers work from Revision 5 only. Section references (§) below point there. Read it alongside this plan.
 
 **Out of this plan (separate plans):**
 - **Plan B:** the Rust desktop node (spec §13).
@@ -565,8 +565,17 @@ git commit -am "Phase 2: gateway handshake, enrolment, inbound recording; fake n
   - **Stream relay, with a durable cursor:**
     - The gateway LISTENs on `jarvis_stream` (payload: `reply_id`). For each connected node in the session it sends chunks with `seq > conv.stream_cursor.acked_seq` for that `(reply_id, node)`, read from the database, not from process memory.
     - The node acknowledges with `received {reply_id, seq}` → `conv.record_chunk_received`.
-    - **On (re)connect**, the gateway re-sends unacknowledged chunks of the node's session replies from the last 10 minutes. It starts at `max(acked_seq, clamp(resume.last_seq)) + 1`, where `clamp(x) = min(max(x, 0), max_seq_in_db(reply_id))`.
-    - A `resume` entry for an unknown `reply_id`, a reply outside the node's sessions, or a `last_seq` above the stored maximum is ignored for that reply and recorded as event `node.resume_out_of_range` (codes only). A node's own state can never make the gateway skip a chunk that exists.
+    - **On (re)connect**, the gateway re-sends unacknowledged chunks of the node's session replies from the last 10 minutes. For each reply it **validates the node's `resume` entry first**, then picks the start:
+
+      | `resume` entry for this reply | Start at |
+      |---|---|
+      | absent | `acked_seq + 1` |
+      | `last_seq` < 0 | treated as 0 → `acked_seq + 1` |
+      | 0 ≤ `last_seq` ≤ `max_seq_in_db(reply_id)` | `max(acked_seq, last_seq) + 1` |
+      | `last_seq` > `max_seq_in_db(reply_id)` | **entry ignored** → `acked_seq + 1`; event `node.resume_out_of_range` |
+      | unknown `reply_id`, or a reply outside the node's sessions | **entry ignored**; nothing sent for it; event `node.resume_out_of_range` |
+
+      Events hold codes and IDs only. There is no clamping to the maximum, so a node's own state can never make the gateway skip a chunk that exists.
     - The node drops any `(reply_id, seq)` it has already shown, so a chunk sent twice is shown once.
     - ACTION chunks go only to `target_node_id`, and only while `now() <= valid_until`.
     - An in-memory "last sent" value may exist to avoid busy re-sends, but it is only an optimisation. Correctness depends on the cursor alone.
@@ -582,8 +591,11 @@ def test_stream_resumes_after_gateway_restart(...):     # chunks 1..3 sent and a
                                                         #   node gets 4,5 only; shown_chunks == [1,2,3,4,5] (P2-E03)
 def test_unacked_chunks_resent_after_restart(...):      # chunks 1..3 sent, node acked only 2; restart → node gets 3 again
                                                         #   but shows it once
-def test_resume_beyond_stored_max_does_not_skip(...):   # 3 chunks stored, acked 1; node claims resume last_seq 99 →
-                                                        #   gateway sends 2..3; event node.resume_out_of_range written
+def test_resume_beyond_stored_max_does_not_skip(...):   # 3 chunks stored, acked_seq 1; node resume last_seq 99 →
+                                                        #   delivered seqs == [2, 3]; exactly one comm.event
+                                                        #   node.resume_out_of_range for this reply_id and node
+def test_resume_within_range_used(...):                 # 3 stored, acked 1, resume last_seq 2 → delivered == [3]; no event
+def test_resume_negative_treated_as_zero(...):          # 3 stored, acked 1, resume last_seq -5 → delivered == [2, 3]; no event
 def test_resume_for_foreign_reply_ignored(...):         # resume names another person's reply → nothing sent for it; event written
 def test_core_restart_mid_stream(...):                  # core writes chunks 1..2 then dies (lease expiry); sweep runs →
                                                         #   node keeps 1..2, gets no final chunk, gets one
