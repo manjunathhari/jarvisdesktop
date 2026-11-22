@@ -1,5 +1,5 @@
 # Handoff
-**Now:** Phase 0 and Phase 1 complete. Phase 1 (memory engine) merged 2026-11-22 (PR #3, main `f373775`): 236 tests green, M1–M4 pass, reviews in `reviews/2026-11-22-phase-1-*` with no blocking issues. Close-out PR removes the Phase 1 branch from the image-publish condition; then redeploy `main`. Next: Phase 2 (Jarvis core + nodes) — brainstorm, design doc and ADRs (next free: 011) before any code.
+**Now:** Phase 0 and Phase 1 complete. Phase 1 (memory engine) merged 2026-11-22 (PR #3, main `f373775`): 236 tests green, M1–M4 pass, reviews in `reviews/2026-11-22-phase-1-*` with no blocking issues. Close-out PR #4 limits image publishing to `main`; then redeploy `main`. Next: Phase 2 (Jarvis core + nodes) — brainstorm, design doc and ADRs (next free: 011) before any code.
 
 **Read first:** spec (§15 lists build changes) `.10x/specs/2026-11-21-phase-1-memory-engine-design.md`, ADR-010, `decisions/*/phase-1-memory-engine.md`.
 

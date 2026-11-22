@@ -100,5 +100,5 @@ Build: 236 tests green locally (Postgres 16, password auth) and in CI (Postgres 
 
 ### Next (Phase 1 close-out)
 1. ~~Push and open PR~~ — PR #3. 2. ~~CI green~~. 3. ~~Live check~~ — passed 2026-11-22.
-4. ~~Manj merges PR #3~~ — merged 2026-11-22. ~~Remove `phase-1-memory-engine` from the publish condition~~ — close-out PR. Redeploy `main` after this PR merges.
+4. ~~Manj merges PR #3~~ — merged 2026-11-22. ~~Remove the phase branches from the publish condition (main only)~~ — close-out PR #4. Redeploy `main` after this PR merges.
 5. Next phase: Phase 2 (Jarvis core + nodes) — brainstorm + design doc first.
