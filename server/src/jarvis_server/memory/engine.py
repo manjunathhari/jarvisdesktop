@@ -49,6 +49,9 @@ log = logging.getLogger("jarvis.memory")
 SYSTEM = "system"
 _AGENT_RE = re.compile(r"^agent:[a-z][a-z0-9-]{0,39}$")
 UNASSIGNED = "m-unassigned"
+_MEMORY_ID_RE = re.compile(r"^m-[0-9]{4,}$")
+# Fixed reasons for archive (spec §7). Free text never reaches the append-only audit trail.
+ARCHIVE_REASONS = ("no-longer-true", "superseded", "recorded-in-error", "requested-by-person")
 MAX_CONTEXT = 50
 _TAG_RANK = {
     MemoryTag.CONFIRMED: 0,
@@ -99,9 +102,13 @@ class MemoryVersion:
 
 
 class _Refusal(Exception):
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-        self.reason = reason
+    """A rule refused the change. `code` is a fixed reason code (the only text audited);
+    `detail` names fields, never values, and goes only to the caller."""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(code)
+        self.code = code
+        self.detail = detail
 
 
 # --- the engine ----------------------------------------------------------------------------
@@ -139,6 +146,7 @@ class MemoryEngine:
                     _message("create repository", "INIT", None, None, None, SYSTEM),
                 )
             self.store.check_no_remote()
+            self.store.check_safe()
             with self.store.locked():
                 if self.store.discard_uncommitted():
                     log.warning("memory: discarded uncommitted changes left by a crash")
@@ -197,7 +205,7 @@ class MemoryEngine:
                     trailers.get("From") or None,
                     trailers.get("To") or None,
                     AuditOutcome.APPLIED,
-                    f"reconciled: commit had no audit row (actor {trailers.get('Actor', '?')})",
+                    "reconciled",
                     c.sha,
                 )
             )
@@ -280,7 +288,7 @@ class MemoryEngine:
                     or text.matches(wanted, e.content, e.topics)
                 )
             ]
-            return _ranked(found)[:limit]
+            return _ranked(found)[: max(1, min(limit, MAX_CONTEXT))]
 
     def history(self, memory_id: str, *, viewer: str) -> list[MemoryVersion]:
         """Every committed version of one entry, oldest first (M2)."""
@@ -302,6 +310,8 @@ class MemoryEngine:
 
     def assert_actionable(self, memory_ids: Iterable[str]) -> None:
         """Raise NotActionable unless every entry is STATED or CONFIRMED (M3)."""
+        if isinstance(memory_ids, str):
+            raise TypeError("pass a list of memory IDs, not a single string")
         with self._lock:
             self._fresh()
             blocked = [
@@ -369,15 +379,15 @@ class MemoryEngine:
         def change() -> tuple[str, MemoryEntry, str | None]:
             self._check_by(by)
             if tag not in (MemoryTag.STATED, MemoryTag.INFERRED, MemoryTag.HISTORICAL):
-                raise _Refusal(f"cannot write {tag.value} directly")
+                raise _Refusal("tag-not-writable")
             if (by == SYSTEM or by.startswith("agent:")) and tag is MemoryTag.STATED:
-                raise _Refusal("agents and system may only write INFERRED or HISTORICAL")
+                raise _Refusal("agent-tag-not-allowed")
             if subject != HOUSEHOLD and subject not in self._people:
-                raise _Refusal(f"unknown subject {subject!r}")
+                raise _Refusal("unknown-subject")
             names = tuple(shared_with)
             for name in names:
                 if name not in self._people:
-                    raise _Refusal(f"unknown person {name!r} in shared with")
+                    raise _Refusal("unknown-shared-with")
             memory_id = f"m-{self._next_number():04d}"
             entry = self._build(
                 memory_id=memory_id,
@@ -405,11 +415,11 @@ class MemoryEngine:
             old = self._changeable(memory_id, by)
             if by == SYSTEM or by.startswith("agent:"):
                 if old.tag not in (MemoryTag.INFERRED, MemoryTag.HISTORICAL):
-                    raise _Refusal("agents and system may only update INFERRED or HISTORICAL")
+                    raise _Refusal("agent-update-not-allowed")
             elif not self._may_edit(old, by):
-                raise _Refusal("only the subject or the recorder can update")
+                raise _Refusal("not-subject-or-recorder")
             if content == old.content:
-                raise _Refusal("content unchanged")
+                raise _Refusal("content-unchanged")
             tag = MemoryTag.STATED if old.tag is MemoryTag.CONFIRMED else old.tag
             entry = self._build(
                 **{
@@ -430,13 +440,13 @@ class MemoryEngine:
         """A person confirms an entry. Jarvis can never confirm its own inference."""
 
         def change() -> tuple[str, MemoryEntry, str | None]:
-            old = self._changeable(memory_id, by)
             if by not in self._people:
-                raise _Refusal("only a person can confirm")
+                raise _Refusal("person-required")
+            old = self._changeable(memory_id, by)
             if not self._may_edit(old, by):
-                raise _Refusal("only the subject or the recorder can confirm")
+                raise _Refusal("not-subject-or-recorder")
             if old.tag not in (MemoryTag.STATED, MemoryTag.INFERRED):
-                raise _Refusal(f"cannot confirm a {old.tag.value} entry")
+                raise _Refusal("tag-not-confirmable")
             entry = old.model_copy(
                 update={
                     "tag": MemoryTag.CONFIRMED,
@@ -449,22 +459,23 @@ class MemoryEngine:
         self._apply(AuditAction.CONFIRM, memory_id, by, change)
 
     def archive(self, memory_id: str, *, by: str, reason: str) -> None:
-        """Mark an entry EXPIRED: no longer true, kept for history."""
+        """Mark an entry EXPIRED: no longer true, kept for history. `reason` is one of
+        ARCHIVE_REASONS."""
 
         def change() -> tuple[str, MemoryEntry, str | None]:
-            old = self._changeable(memory_id, by)
             if by.startswith("agent:"):
-                raise _Refusal("agents cannot archive")
+                raise _Refusal("agent-archive-not-allowed")
+            if reason not in ARCHIVE_REASONS:
+                raise _Refusal("bad-archive-reason", "use one of " + ", ".join(ARCHIVE_REASONS))
+            old = self._changeable(memory_id, by)
             if by != SYSTEM and not self._may_edit(old, by):
-                raise _Refusal("only the subject or the recorder can archive")
-            if not reason.strip():
-                raise _Refusal("a reason is required")
+                raise _Refusal("not-subject-or-recorder")
             entry = old.model_copy(
                 update={"tag": MemoryTag.EXPIRED, "confirmed_by": None, "confirmed_on": None}
             )
             return memory_id, entry, old.tag.value
 
-        self._apply(AuditAction.ARCHIVE, memory_id, by, change, reason=reason.strip()[:500])
+        self._apply(AuditAction.ARCHIVE, memory_id, by, change, reason=reason)
 
     def add_person(self, slug: str, person_id: UUID, display_name: str, *, by: str) -> None:
         """Make a ledger person a memory subject (spec §4.2)."""
@@ -474,22 +485,23 @@ class MemoryEngine:
             try:
                 self._check_by(by)
                 if by.startswith("agent:"):
-                    raise _Refusal("agents cannot add people")
+                    raise _Refusal("agent-add-person-not-allowed")
                 if not fmt.SLUG_RE.match(slug) or slug in (HOUSEHOLD, SYSTEM):
-                    raise _Refusal("bad subject name")
+                    raise _Refusal("bad-subject-name")
                 if slug in self._people:
-                    raise _Refusal(f"{slug!r} already exists")
+                    raise _Refusal("subject-exists")
                 if any(p.person_id == person_id for p in self._people.values()):
-                    raise _Refusal("that person already has a memory subject")
+                    raise _Refusal("person-has-subject")
                 name = display_name.strip()
                 if not name or len(name) > 100 or any(ord(ch) < 32 for ch in name):
-                    raise _Refusal("bad display name")
+                    raise _Refusal("bad-display-name")
                 try:
                     self.directory.organization_of(person_id)
                 except LookupError:
-                    raise _Refusal("person not in the ledger") from None
+                    raise _Refusal("person-not-in-ledger") from None
             except _Refusal as r:
-                self._refused(by, ref, AuditAction.CREATE, None, r.reason)
+                valid = bool(fmt.SLUG_RE.match(slug))
+                self._refused(by, ref if valid else UNASSIGNED, AuditAction.CREATE, r)
             person = Person(slug, person_id, name)
             path = f"people/{slug}.md"
             files = {path: fmt.render_file(path, [], person)}
@@ -520,7 +532,8 @@ class MemoryEngine:
             try:
                 ref, entry, from_tag = change()
             except _Refusal as r:
-                self._refused(by, memory_id or UNASSIGNED, action, None, r.reason)
+                bad = not (memory_id and _MEMORY_ID_RE.match(memory_id))
+                self._refused(by, UNASSIGNED if bad else str(memory_id), action, r)
             entries = {**self._entries, ref: entry}
             path = fmt.path_for(entry)
             files = {
@@ -567,24 +580,14 @@ class MemoryEngine:
             raise
         self._head = sha
 
-    def _refused(
-        self, by: str, ref: str, action: AuditAction, from_tag: str | None, reason: str
-    ) -> NoReturn:
+    def _refused(self, by: str, ref: str, action: AuditAction, r: _Refusal) -> NoReturn:
         kind, actor_id = self._actor(by)
         self.audit.record(
             AuditRecord(
-                kind,
-                actor_id,
-                ref,
-                action,
-                from_tag,
-                None,
-                AuditOutcome.REJECTED,
-                reason,
-                None,
+                kind, actor_id, ref, action, None, None, AuditOutcome.REJECTED, r.code, None
             )
         )
-        raise MemoryRefused(reason)
+        raise MemoryRefused(r.code, r.detail)
 
     def _actor(self, by: str) -> tuple[ActorKind, str]:
         if by == SYSTEM:
@@ -592,27 +595,27 @@ class MemoryEngine:
         if by.startswith("agent:"):
             return ActorKind.AGENT, by.removeprefix("agent:")[:200] or "unknown"
         person = self._people.get(by)
-        return ActorKind.PERSON, str(person.person_id) if person else f"unknown:{by[:100]}"
+        return ActorKind.PERSON, str(person.person_id) if person else "unknown"
 
     def _check_by(self, by: str) -> None:
         if by == SYSTEM:
             return
         if by.startswith("agent:"):
             if not _AGENT_RE.match(by):
-                raise _Refusal("bad agent name")
+                raise _Refusal("bad-agent-name")
             return
         if by not in self._people:
-            raise _Refusal(f"unknown recorder {by!r}")
+            raise _Refusal("unknown-recorder")
 
     def _changeable(self, memory_id: str, by: str) -> MemoryEntry:
         self._check_by(by)
         old = self._entries.get(memory_id)
         if old is None:
-            raise _Refusal("no such entry")
+            raise _Refusal("no-such-entry")
         if by in self._people and not self.can_see(old, by):
-            raise _Refusal("no such entry")  # do not reveal entries the person cannot see
+            raise _Refusal("no-such-entry")  # do not reveal entries the person cannot see
         if old.tag is MemoryTag.EXPIRED:
-            raise _Refusal("EXPIRED entries are kept for history only")
+            raise _Refusal("entry-expired")
         return old
 
     def _build(self, **fields: object) -> MemoryEntry:
@@ -621,9 +624,9 @@ class MemoryEngine:
             fmt.check_entry(entry)
         except ValidationError as e:
             problems = "; ".join(f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors())
-            raise _Refusal(f"invalid entry: {problems}") from None
+            raise _Refusal("invalid-entry", problems) from None
         except MemoryFormatError as e:
-            raise _Refusal(f"invalid entry: {e.problem}") from None
+            raise _Refusal("invalid-entry", e.problem) from None
         return entry
 
     def _next_number(self) -> int:

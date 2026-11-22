@@ -23,8 +23,17 @@ class RemoteConfigured(MemoryEngineError):
     """The memory repo has a git remote. Memory must never be pushable (ADR-010)."""
 
 
+class UnsafeRepo(MemoryEngineError):
+    """The repo's own git config or attributes could run code or send data elsewhere."""
+
+
 class MemoryRefused(MemoryEngineError):
-    """A change was refused by the rules. The refusal has been audited."""
+    """A change was refused by the rules. The refusal has been audited with `code` only."""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code = code
+        self.detail = detail
 
 
 class UnknownViewer(MemoryEngineError):

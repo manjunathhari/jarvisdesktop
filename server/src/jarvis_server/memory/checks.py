@@ -13,12 +13,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from jarvis_server.config import HOUSEHOLD_ID
 from jarvis_server.contracts import MemoryCategory, MemoryTag, Visibility
 from jarvis_server.memory.engine import SYSTEM, AuditRecord, MemoryEngine
 from jarvis_server.memory.errors import MemoryRefused, NotActionable
 
 # Fictional people. MANJ and HOUSEHOLD match the Phase 0 seed so Postgres tests can reuse them.
-HOUSEHOLD_ID = uuid.UUID("00000000-0000-4000-8000-000000000001")
 MANJ_ID = uuid.UUID("00000000-0000-4000-8000-000000000002")
 DAUGHTER_ID = uuid.UUID("00000000-0000-4000-8000-00000000d001")
 NEIGHBOUR_ID = uuid.UUID("00000000-0000-4000-8000-00000000d002")
@@ -137,7 +137,7 @@ def seed_m4(engine: MemoryEngine) -> dict[str, str]:
             topics=["school"],
         ),
     }
-    engine.archive(ids["old_school"], by="manj", reason="changed school")
+    engine.archive(ids["old_school"], by="manj", reason="no-longer-true")
     return ids
 
 

@@ -132,7 +132,7 @@ def test_every_change_has_one_audit_row_and_no_content(
         domain="lifestyle",
     )
     eng.update(mid, "Unique-marker-7781 tea", "test", by="manj")
-    eng.archive(mid, by="manj", reason="test")
+    eng.archive(mid, by="manj", reason="no-longer-true")
     rows = memory_rows(app, mid, since)
     assert [(r[0], r[1], r[2]) for r in rows] == [
         ("CREATE", None, "STATED"),
@@ -233,5 +233,105 @@ def test_0007_goes_down_and_up_on_a_database_without_memory_rows() -> None:
 
 def test_s5_app_cannot_connect_to_the_default_database(mdb: Dsns) -> None:
     dsn = psycopg.conninfo.make_conninfo(mdb.app, dbname="postgres")
+    with pytest.raises(psycopg.OperationalError, match="permission denied"):
+        psycopg.connect(dsn).close()
+
+
+# --- findings from the independent review (2026-11-22) -------------------------------------
+
+
+def test_q4_malformed_ids_are_refused_and_audited(eng: MemoryEngine, app: Conn, since: int) -> None:
+    with pytest.raises(MemoryRefused, match="no-such-entry"):
+        eng.confirm("bogus", by="manj")
+    with pytest.raises(MemoryRefused, match="bad-subject-name"):
+        eng.add_person("Bad Slug", uuid.uuid4(), "x", by="system")
+    rows = memory_rows(app, "m-unassigned", since)
+    assert [(r[0], r[3]) for r in rows] == [("CONFIRM", "REJECTED"), ("CREATE", "REJECTED")]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        # free text as reason, actor or illegal tag change: all refused by the database
+        (
+            "SYSTEM",
+            "system",
+            "m-0001",
+            "ARCHIVE",
+            "STATED",
+            "EXPIRED",
+            "APPLIED",
+            "Her diary was about Rahul",
+            "a" * 40,
+        ),
+        (
+            "PERSON",
+            "Rahul from school",
+            "m-0001",
+            "CREATE",
+            None,
+            "STATED",
+            "APPLIED",
+            "create",
+            "a" * 40,
+        ),
+        (
+            "SYSTEM",
+            "system",
+            "m-0001",
+            "CONFIRM",
+            "HISTORICAL",
+            "CONFIRMED",
+            "APPLIED",
+            "confirm",
+            "a" * 40,
+        ),
+        ("SYSTEM", "system", "m-0001", "CREATE", None, "CONFIRMED", "APPLIED", "create", "a" * 40),
+        (
+            "SYSTEM",
+            "system",
+            "m-0001",
+            "UPDATE",
+            "STATED",
+            "CONFIRMED",
+            "APPLIED",
+            "update",
+            "a" * 40,
+        ),
+        (
+            "SYSTEM",
+            "system",
+            "m-0001",
+            "UPDATE",
+            "EXPIRED",
+            "EXPIRED",
+            "APPLIED",
+            "update",
+            "a" * 40,
+        ),
+        (
+            "SYSTEM",
+            "system",
+            "m-0001",
+            "ARCHIVE",
+            "EXPIRED",
+            "EXPIRED",
+            "APPLIED",
+            "archive",
+            "a" * 40,
+        ),
+        ("SYSTEM", "system", "m-0001", "CONFIRM", "STATED", None, "REJECTED", "x", None),
+        ("AGENT", "Atlas Bot", "m-0001", "CREATE", None, "INFERRED", "APPLIED", "create", "a" * 40),
+    ],
+)
+def test_s3_record_memory_refuses_free_text_and_illegal_changes(
+    app: Conn, args: tuple[Any, ...]
+) -> None:
+    with pytest.raises(psycopg.errors.InvalidParameterValue):
+        app.execute("SELECT audit.record_memory(%s, %s, %s, %s, %s, %s, %s, %s, %s)", args)
+
+
+def test_s4_app_cannot_connect_to_template1(mdb: Dsns) -> None:
+    dsn = psycopg.conninfo.make_conninfo(mdb.app, dbname="template1")
     with pytest.raises(psycopg.OperationalError, match="permission denied"):
         psycopg.connect(dsn).close()

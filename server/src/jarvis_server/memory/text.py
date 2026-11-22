@@ -1,15 +1,15 @@
 """Word matching for retrieval and search (Phase 1 spec §6, step 5). Deterministic, no AI.
 
-Words are lower-cased runs of letters and digits; stop-words are dropped; simple plurals are
-folded ("trips" -> "trip", "activities" -> "activity"). A small fixed alias table maps common
-words to a canonical topic word, so "school trip" also matches entries tagged "travel".
+Words are runs of letters, marks and digits in any script (Kannada, Devanagari, Latin ...),
+normalised with NFKC and case-folded; accents on Latin letters are dropped ("café" ->
+"cafe"). Stop-words are dropped and simple English plurals folded ("trips" -> "trip").
+A small fixed alias table maps common words to a canonical topic word, so "school trip"
+also matches entries tagged "travel".
 """
 
 from __future__ import annotations
 
-import re
-
-_WORD = re.compile(r"[a-z0-9]+")
+import unicodedata
 
 STOP_WORDS = frozenset(
     [
@@ -88,8 +88,36 @@ ALIASES: dict[str, str] = {
 }
 
 
+def _normalise(text_: str) -> str:
+    """NFKC + casefold; drop combining accents that sit on Latin letters only."""
+    decomposed = unicodedata.normalize("NFKD", text_.casefold())
+    out: list[str] = []
+    for ch in decomposed:
+        if unicodedata.combining(ch) and out and out[-1].isascii():
+            continue
+        out.append(ch)
+    return unicodedata.normalize("NFKC", "".join(out))
+
+
+def _split(text_: str) -> list[str]:
+    """Runs of letters (L*), marks (M*) and digits (N*)."""
+    found: list[str] = []
+    current: list[str] = []
+    for ch in text_:
+        if unicodedata.category(ch)[0] in "LMN":
+            current.append(ch)
+        elif current:
+            found.append("".join(current))
+            current = []
+    if current:
+        found.append("".join(current))
+    return found
+
+
 def fold(word: str) -> str:
-    """Fold a simple English plural to its singular."""
+    """Fold a simple English plural to its singular (ASCII words only)."""
+    if not word.isascii():
+        return word
     if len(word) > 4 and word.endswith("ies"):
         return word[:-3] + "y"
     if len(word) > 3 and word.endswith("s") and not word.endswith(("ss", "us", "is")):
@@ -99,7 +127,7 @@ def fold(word: str) -> str:
 
 def words(text: str) -> set[str]:
     """The folded, stop-word-free words of a text."""
-    return {fold(w) for w in _WORD.findall(text.lower()) if w not in STOP_WORDS}
+    return {fold(w) for w in _split(_normalise(text)) if w not in STOP_WORDS}
 
 
 def terms(text: str) -> set[str]:

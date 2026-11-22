@@ -14,7 +14,7 @@ from typing import Any
 
 import psycopg
 
-from jarvis_server.memory.checks import HOUSEHOLD_ID
+from jarvis_server.config import HOUSEHOLD_ID
 from jarvis_server.memory.engine import MemoryEngine
 from jarvis_server.memory.pg import PgAudit, PgDirectory
 

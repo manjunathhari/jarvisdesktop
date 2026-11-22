@@ -251,6 +251,8 @@ def check_entry(entry: MemoryEntry, path: str = "<entry>", line: int = 0) -> Non
         raise bad(f"{entry.category.value} takes no domain")
     if (entry.category is MemoryCategory.EPISODIC) != (entry.happened_on is not None):
         raise bad("happened on is required for episodic entries and only for them")
+    if entry.happened_on is not None and entry.happened_on.year < 1000:
+        raise bad("happened on must be a four-digit year")
     if entry.category is MemoryCategory.IDENTITY and entry.subject == HOUSEHOLD:
         raise bad("identity entries are about a person, not the household")
     if entry.visibility not in (

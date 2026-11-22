@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from jarvis_server.memory.errors import MemoryEngineError, RemoteConfigured
+from jarvis_server.memory.errors import MemoryEngineError, RemoteConfigured, UnsafeRepo
 
 AUTHOR = ("Jarvis", "jarvis@localhost")
 _SAFE_ENV = {
@@ -30,12 +30,23 @@ _SAFE_ENV = {
     "LC_ALL": "C",
 }
 _CONFIG = (
-    "-c",
-    "core.hooksPath=/dev/null",
-    "-c",
-    "commit.gpgsign=false",
-    "-c",
-    "core.quotepath=off",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "core.fsmonitor=false",
+    "-c", "commit.gpgsign=false",
+    "-c", "core.quotepath=off",
+)  # fmt: skip
+# The only keys allowed in the repo's own .git/config: anything else (fsmonitor, filters,
+# include.path, url rewrites, remotes ...) could run code or send memory somewhere.
+_ALLOWED_LOCAL_CONFIG = frozenset(
+    {
+        "core.repositoryformatversion",
+        "core.filemode",
+        "core.bare",
+        "core.logallrefupdates",
+        "core.ignorecase",
+        "core.precomposeunicode",
+        "core.symlinks",
+    }
 )
 
 
@@ -88,6 +99,20 @@ class GitStore:
                 f"memory repo at {self.root} has git remote(s) {remotes}; memory must never "
                 "be pushable. Remove the remote by hand before starting."
             )
+
+    def check_safe(self) -> None:
+        """Refuse a repo whose local config or attributes go beyond the plain defaults."""
+        keys = {
+            k.lower()
+            for k in self._git("config", "--local", "--name-only", "--list").split()
+            if k.strip()
+        }
+        extra = sorted(keys - _ALLOWED_LOCAL_CONFIG)
+        if extra:
+            raise UnsafeRepo(f"memory repo has unexpected git config keys: {', '.join(extra)}")
+        attributes = self.root / ".git" / "info" / "attributes"
+        if attributes.exists() and attributes.read_text().strip():
+            raise UnsafeRepo("memory repo has .git/info/attributes; remove it")
 
     def discard_uncommitted(self) -> bool:
         """Drop changes that were never committed (a write that crashed). True if any."""
@@ -156,14 +181,24 @@ class GitStore:
 
     def commit(self, files: dict[str, str], message: str) -> str:
         """Write `files` (path -> full text) and commit them. Returns the new commit."""
-        for rel, text in files.items():
-            target = self.root / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            tmp = target.with_suffix(target.suffix + ".tmp")
-            tmp.write_text(text, encoding="utf-8")
-            os.replace(tmp, target)
-        self._git("add", "--", *files)
-        self._git("commit", "-q", "--no-verify", "-m", message)
+        before = self._git("rev-parse", "--verify", "-q", "HEAD", check=False).strip() or None
+        try:
+            for rel, text in files.items():
+                target = self.root / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.with_suffix(target.suffix + ".tmp")
+                tmp.write_text(text, encoding="utf-8")
+                os.replace(tmp, target)
+            self._git("add", "--", *files)
+            self._git("commit", "-q", "--no-verify", "-m", message)
+        except BaseException:
+            # Leave nothing staged or half-written for the next change to pick up (QA Q2).
+            if before is not None:
+                self._git("reset", "-q", "--hard", before, check=False)
+            else:
+                self._git("read-tree", "--empty", check=False)
+            self._git("clean", "-q", "-fdx", "-e", ".git", check=False)
+            raise
         return self.head()
 
     def bundle(self, target: Path) -> None:

@@ -3,8 +3,10 @@
 - entity_type 'memory'; actions UPDATE, CONFIRM, ARCHIVE.
 - audit.record_memory(): the only way the app records a memory change. entity_id is the
   UUID v3 of the memory reference (m-NNNN, person:<slug>, m-unassigned) in MEMORY_NAMESPACE;
-  details holds {"memory_id", "commit"}. Arguments are checked so no free text other than the
-  reason can reach the row, and the reason is capped.
+  details holds {"memory_id", "commit"}. Every argument is checked against a fixed shape, so
+  no free text can reach the append-only row: the reason is a short code, the actor is a
+  person UUID, an agent name, 'system' or 'unknown', and the tag change must be legal for the
+  action (spec §7).
 
 Downgrade refuses once memory audit rows exist: the audit trail is append-only (ADR-008).
 
@@ -57,6 +59,32 @@ def upgrade() -> None:
            OR coalesce(p_to, 'STATED') NOT IN ('STATED','CONFIRMED','INFERRED','HISTORICAL','EXPIRED') THEN
             RAISE EXCEPTION 'bad memory tag' USING ERRCODE = 'invalid_parameter_value';
         END IF;
+        IF p_reason !~ '^[a-z][a-z0-9-]{{0,63}}$' THEN
+            RAISE EXCEPTION 'memory audit reason must be a short code'
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+        IF NOT (
+            (p_actor_kind = 'PERSON' AND (p_actor_id = 'unknown' OR p_actor_id ~
+                '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'))
+            OR (p_actor_kind = 'AGENT' AND p_actor_id ~ '^[a-z][a-z0-9-]{{0,39}}$')
+            OR (p_actor_kind = 'SYSTEM' AND p_actor_id = 'system')
+        ) THEN
+            RAISE EXCEPTION 'bad memory actor' USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+        IF p_outcome = 'APPLIED' AND NOT (
+            (p_action = 'CREATE' AND p_from IS NULL
+                AND (p_to IN ('STATED', 'INFERRED', 'HISTORICAL')
+                     OR (p_to IS NULL AND p_ref LIKE 'person:%')))
+            OR (p_action = 'UPDATE' AND (p_from = p_to OR (p_from = 'CONFIRMED' AND p_to = 'STATED'))
+                AND p_from <> 'EXPIRED')
+            OR (p_action = 'CONFIRM' AND p_from IN ('STATED', 'INFERRED') AND p_to = 'CONFIRMED')
+            OR (p_action = 'ARCHIVE' AND p_from <> 'EXPIRED' AND p_to = 'EXPIRED')
+        ) THEN
+            RAISE EXCEPTION 'illegal memory tag change' USING ERRCODE = 'invalid_parameter_value';
+        END IF;
+        IF p_outcome = 'REJECTED' AND (p_from IS NOT NULL OR p_to IS NOT NULL) THEN
+            RAISE EXCEPTION 'refusals carry no tags' USING ERRCODE = 'invalid_parameter_value';
+        END IF;
         IF p_commit IS NOT NULL AND p_commit !~ '^[0-9a-f]{{40}}$' THEN
             RAISE EXCEPTION 'bad commit' USING ERRCODE = 'invalid_parameter_value';
         END IF;
@@ -66,7 +94,7 @@ def upgrade() -> None:
         END IF;
         PERFORM audit.append(
             p_actor_kind, p_actor_id, 'memory', audit.memory_entity_id(p_ref), p_action,
-            p_from, p_to, p_outcome, left(p_reason, 500), NULL,
+            p_from, p_to, p_outcome, p_reason, NULL,
             jsonb_strip_nulls(jsonb_build_object('memory_id', p_ref, 'commit', p_commit)));
     END;
     $$;

@@ -5,6 +5,7 @@ The Postgres audit function and M1-M4 against the real database are in test_memo
 
 from __future__ import annotations
 
+import re
 import subprocess
 import threading
 import time
@@ -23,6 +24,7 @@ from jarvis_server.contracts import (
     MemoryTag,
     Visibility,
 )
+from jarvis_server.memory import checks as checks_ids
 from jarvis_server.memory import format as fmt
 from jarvis_server.memory.checks import (
     HOUSEHOLD_ID,
@@ -117,7 +119,7 @@ def _entry_with_tag(eng: MemoryEngine, tag: MemoryTag) -> str:
         eng.confirm(mid, by="manj")
     elif tag is MemoryTag.EXPIRED:
         mid = pref(eng)
-        eng.archive(mid, by="manj", reason="test")
+        eng.archive(mid, by="manj", reason="no-longer-true")
     else:
         mid = pref(eng, tag=tag, by="manj" if tag is S else "agent:atlas")
     return mid
@@ -136,7 +138,7 @@ def test_tag_rules(
         elif call == "update":
             eng.update(mid, "Likes green tea", "test", by=by)
         else:
-            eng.archive(mid, by=by, reason="no longer true")
+            eng.archive(mid, by=by, reason="no-longer-true")
 
     if result is None:
         with pytest.raises(MemoryRefused):
@@ -151,18 +153,21 @@ def test_tag_rules(
 @pytest.mark.parametrize(
     ("kw", "fragment"),
     [
-        ({"tag": MemoryTag.CONFIRMED}, "directly"),
-        ({"tag": MemoryTag.EXPIRED}, "directly"),
-        ({"by": "agent:atlas"}, "INFERRED or HISTORICAL"),
-        ({"by": SYSTEM}, "INFERRED or HISTORICAL"),
-        ({"subject": "stranger"}, "unknown subject"),
-        ({"by": "stranger"}, "unknown recorder"),
-        ({"by": "agent:BAD NAME", "tag": INF}, "agent name"),
+        ({"tag": MemoryTag.CONFIRMED}, "tag-not-writable"),
+        ({"tag": MemoryTag.EXPIRED}, "tag-not-writable"),
+        ({"by": "agent:atlas"}, "agent-tag-not-allowed"),
+        ({"by": SYSTEM}, "agent-tag-not-allowed"),
+        ({"subject": "stranger"}, "unknown-subject"),
+        ({"by": "stranger"}, "unknown-recorder"),
+        ({"by": "agent:BAD NAME", "tag": INF}, "bad-agent-name"),
         ({"visibility": Visibility.SELECTED_GROUP}, "Phase 1"),
         ({"visibility": Visibility.ORGANIZATION_SHARED}, "Phase 1"),
         ({"shared_with": ["daughter"]}, "shared with"),
         ({"visibility": Visibility.SELECTED_PERSON}, "shared with"),
-        ({"visibility": Visibility.SELECTED_PERSON, "shared_with": ["ghost"]}, "unknown person"),
+        (
+            {"visibility": Visibility.SELECTED_PERSON, "shared_with": ["ghost"]},
+            "unknown-shared-with",
+        ),
         ({"content": "two\nlines"}, "content"),
         ({"content": ""}, "content"),
         ({"content": "x" * 501}, "content"),
@@ -223,9 +228,9 @@ def test_no_automatic_parental_access(eng: MemoryEngine) -> None:
     for change in (
         lambda: eng.confirm(mid, by="manj"),
         lambda: eng.update(mid, "x", "test", by="manj"),
-        lambda: eng.archive(mid, by="manj", reason="x"),
+        lambda: eng.archive(mid, by="manj", reason="no-longer-true"),
     ):
-        with pytest.raises(MemoryRefused, match="no such entry"):
+        with pytest.raises(MemoryRefused, match="no-such-entry"):
             change()
     with pytest.raises(MemoryNotFound):
         eng.history(mid, viewer="manj")
@@ -242,7 +247,7 @@ def test_unknown_viewer_is_refused(eng: MemoryEngine) -> None:
 
 def test_ids_are_never_reused(eng: MemoryEngine) -> None:
     a = pref(eng)
-    eng.archive(a, by="manj", reason="test")
+    eng.archive(a, by="manj", reason="no-longer-true")
     b = pref(eng, content="Likes coffee")
     assert (a, b) == ("m-0001", "m-0002")
     reopened = make(eng.store.root)
@@ -256,7 +261,7 @@ def test_one_commit_per_change_and_no_content_in_commits_or_audit(
     mid = pref(eng, content="Secret sauce recipe")
     eng.update(mid, "Secret sauce recipe v2", "test", by="manj")
     eng.confirm(mid, by="manj")
-    eng.archive(mid, by="manj", reason="test")
+    eng.archive(mid, by="manj", reason="no-longer-true")
     assert len(eng.store.log()) == commits + 4
     messages = git(eng, "log", "--format=%B")
     assert "Secret" not in messages
@@ -412,3 +417,128 @@ def test_retrieve_context_speed_with_5000_entries(tmp_path: Path) -> None:
     elapsed = time.perf_counter() - start
     assert len(got) == 50
     assert elapsed < 0.05, f"retrieve_context took {elapsed * 1000:.1f} ms"
+
+
+# --- findings from the independent review (2026-11-22) -------------------------------------
+
+CODE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+
+
+def test_q1_episodic_year_must_have_four_digits(eng: MemoryEngine) -> None:
+    with pytest.raises(MemoryRefused, match="invalid-entry"):
+        pref(
+            eng,
+            category=MemoryCategory.EPISODIC,
+            domain=None,
+            tag=H,
+            by="agent:atlas",
+            happened_on=date(999, 1, 1),
+        )
+    make(eng.store.root)  # still loads
+
+
+def test_q2_failed_commit_leaves_nothing_behind(
+    eng: MemoryEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = eng.store._git
+    calls = {"failed": False}
+
+    def flaky(*args: str, check: bool = True) -> str:
+        if args and args[0] == "commit" and not calls["failed"]:
+            calls["failed"] = True
+            raise RuntimeError("disk full")
+        return real(*args, check=check)
+
+    monkeypatch.setattr(eng.store, "_git", flaky)
+    with pytest.raises(RuntimeError):
+        pref(
+            eng,
+            category=MemoryCategory.EPISODIC,
+            domain=None,
+            tag=H,
+            by="agent:atlas",
+            happened_on=date(2026, 5, 1),
+        )
+    mid = pref(eng)
+    files = git(eng, "show", "--name-only", "--format=", "HEAD").split()
+    assert "episodic/2026.md" not in files
+    assert git(eng, "status", "--porcelain") == ""
+    assert make(eng.store.root).get(mid, viewer="manj").content == "Likes tea"
+
+
+def test_q3_matching_works_in_any_script(eng: MemoryEngine) -> None:
+    kannada = pref(eng, content="ದೋಸೆ ಇಷ್ಟ", domain="restaurants")
+    cafe = pref(eng, content="Loves the Café near school", domain="restaurants")
+    assert [e.memory_id for e in eng.search("ದೋಸೆ", viewer="manj")] == [kannada]
+    assert [e.memory_id for e in eng.search("cafe", viewer="manj")] == [cafe]
+    assert eng.search("ಇಷ್ಟ", viewer="manj")[0].memory_id == kannada
+
+
+def test_q5_retrieve_context_most_recent_first(tmp_path: Path) -> None:
+    day = {"d": date(2026, 1, 1)}
+    e = MemoryEngine(
+        tmp_path / "m", StaticDirectory(), ListAudit(), HOUSEHOLD_ID, today=lambda: day["d"]
+    ).open()
+    add_test_family(e)
+    older = pref(e, topics=["travel"])
+    day["d"] = date(2026, 6, 1)
+    newer = pref(e, topics=["travel"])
+    day["d"] = date(2026, 3, 1)
+    middle = pref(e, topics=["travel"])
+    got = [x.memory_id for x in e.retrieve_context("manj", "trip", viewer="manj")]
+    assert got == [newer, middle, older]
+
+
+def test_s1_no_free_text_reaches_the_audit(eng: MemoryEngine, audit: ListAudit) -> None:
+    mid = pref(eng)
+    with pytest.raises(MemoryRefused, match="bad-archive-reason"):
+        eng.archive(mid, by="manj", reason="Her diary was about Rahul")
+    for bad in (
+        lambda: pref(eng, subject="her-diary-secret"),
+        lambda: pref(eng, by="rahul-told-me"),
+        lambda: eng.confirm("diary about rahul", by="manj"),
+        lambda: eng.add_person("Rahul Diary", checks_ids.NEIGHBOUR_ID, "x", by=SYSTEM),
+    ):
+        with pytest.raises(MemoryRefused):
+            bad()
+    eng.archive(mid, by="manj", reason="superseded")
+    for r in audit.records:
+        assert CODE.match(r.reason), r.reason
+        assert r.ref in ("m-unassigned",) or r.ref.startswith(("m-0", "person:")), r.ref
+        assert "diary" not in repr(r).lower() and "rahul" not in repr(r).lower()
+
+
+def test_s2_repo_config_that_could_run_code_is_refused(eng: MemoryEngine) -> None:
+    from jarvis_server.memory.errors import UnsafeRepo
+
+    for key, value in (("core.fsmonitor", "touch pwned"), ("include.path", "../evil.cfg")):
+        git(eng, "config", key, value)
+        with pytest.raises(UnsafeRepo, match=key.lower()):
+            make(eng.store.root)
+        git(eng, "config", "--unset", key)
+    attrs = eng.store.root / ".git" / "info" / "attributes"
+    attrs.parent.mkdir(exist_ok=True)
+    attrs.write_text("*.md filter=evil\n")
+    with pytest.raises(UnsafeRepo):
+        make(eng.store.root)
+    attrs.unlink()
+    make(eng.store.root)
+
+
+def test_s5_agents_learn_nothing_about_existence_from_confirm(eng: MemoryEngine) -> None:
+    mid = pref(eng)
+    codes = []
+    for target in (mid, "m-9999"):
+        with pytest.raises(MemoryRefused) as err:
+            eng.confirm(target, by="agent:atlas")
+        codes.append(err.value.code)
+    assert codes == ["person-required", "person-required"]
+
+
+def test_d6_limit_and_argument_checks(eng: MemoryEngine) -> None:
+    for i in range(3):
+        pref(eng, content=f"Travel note {i}", topics=["travel"])
+    assert len(eng.retrieve_context("manj", "trip", viewer="manj", limit=-1)) == 1
+    assert len(eng.retrieve_context("manj", "trip", viewer="manj", limit=500)) == 3
+    with pytest.raises(TypeError):
+        eng.assert_actionable("m-0001")

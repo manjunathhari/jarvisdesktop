@@ -23,6 +23,7 @@ from jarvis_server.memory.errors import (
     NotActionable,
     RemoteConfigured,
     UnknownViewer,
+    UnsafeRepo,
 )
 from jarvis_server.memory.format import HOUSEHOLD, Person
 
@@ -45,5 +46,6 @@ __all__ = [
     "Person",
     "RemoteConfigured",
     "UnknownViewer",
+    "UnsafeRepo",
     "Visibility",
 ]
