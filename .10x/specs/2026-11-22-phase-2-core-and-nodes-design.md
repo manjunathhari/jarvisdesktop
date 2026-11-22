@@ -1,6 +1,6 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** Revision 4 for Manj's final approval. Architecture and ADR-011 to 014 decisions approved 22 Nov; review blockers and final points resolved (§20).
+**Status:** Approved by Manj 2026-11-22 (Revision 4). Authorises the implementation plan, not code. ADR-011 to 014 remain Proposed.
 **Date:** 2026-11-22
 **Feature slug:** `phase-2-core-and-nodes`
 **Inputs:** Architecture v2 §5–§9, §13–§15 (project doc `Jarvis_Architecture_v2.md`), decisions D1–D8, `phase-1-handover.md`, Phase 0 and Phase 1 designs, the Phase 2 kick-off conversation (22 Nov 2026).
