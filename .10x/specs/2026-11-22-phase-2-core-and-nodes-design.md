@@ -1,6 +1,6 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** Revision 2 for Manj's final review. Architecture direction approved 22 Nov; review blockers resolved (§20).
+**Status:** Revision 3 for Manj's final approval. Architecture and ADR-011 to 014 decisions approved 22 Nov; review blockers and final points resolved (§20).
 **Date:** 2026-11-22
 **Feature slug:** `phase-2-core-and-nodes`
 **Inputs:** Architecture v2 §5–§9, §13–§15 (project doc `Jarvis_Architecture_v2.md`), decisions D1–D8, `phase-1-handover.md`, Phase 0 and Phase 1 designs, the Phase 2 kick-off conversation (22 Nov 2026).
@@ -198,7 +198,7 @@ Jobs use the existing `claim` with `FOR UPDATE SKIP LOCKED`. Every job handler m
 
 ### 5.5 Approvals (`ledger.approval`)
 
-Columns: `id`, `task_id`, `requested_from_person_id`, `requesting_node_id`, `tier`, `action_kind`, `action_args` (for the delete test: file name, size, SHA-256 and Windows file ID, all from the listing; §9.3), `summary`, `expires_at`, `decision` (PENDING, APPROVED, DENIED, EXPIRED), `decided_at`, `decided_by_node_id`, `consumed_at`, `execution_key` (unique, null until consumed).
+Columns: `id`, `task_id`, `requested_from_person_id`, `requesting_node_id`, `tier`, `action_kind`, `action_args` (for the delete test: file name, size, SHA-256 and Windows file ID, all from the listing; §9.3), `summary`, `card_authz` (the core-signed `approval.card` authorisation exactly as sent; §7.1), `expires_at`, `decision` (PENDING, APPROVED, DENIED, EXPIRED), `decided_at`, `decided_by_node_id`, `consumed_at`, `execution_key` (unique, null until consumed).
 
 Guards in the database, so no code path can skip them:
 - `decision` changes only from PENDING. APPROVED or DENIED are accepted only while `now() < expires_at` (P2-E11).
@@ -209,7 +209,7 @@ Guards in the database, so no code path can skip them:
 | Table | Key columns |
 |---|---|
 | `ops.brain_budget` | One row per month: `month`, `cap_inr`, `settled_inr`, `reserved_inr`. All changes happen under a row lock (§10.1). |
-| `ops.brain_reservation` | `id`, `job_id`, `month`, `day`, `reserved_inr`, `state` (ACTIVE, SETTLED, RELEASED, LAPSED), `actual_inr`, `created_at`, `lease_until` |
+| `ops.brain_reservation` | `id`, `job_id`, `turn_id` (the `conv.inbound` id; null for probes), `month`, `day`, `reserved_inr`, `state` (ACTIVE, SETTLED, RELEASED, LAPSED), `actual_inr`, `created_at`, `lease_until` |
 | `ops.brain_usage` | `id`, `reservation_id`, `model`, `input_tokens`, `output_tokens`, `cost_inr`, `at` |
 
 Core only.
@@ -439,6 +439,13 @@ A failure is refused, audited and explained in the reply.
 4. Core writes the approval card as an URGENT outbox item, with a signed `authz` (kind `approval.card`), and Jarvis says "That needs your approval."
 5. The desktop shows the card. Manj approves by tap or by voice ("approve"). The node sends `approval.decision` (signed `node-msg`), including the card's `authz.sig`, so the decision is tied to exactly that card.
 6. Core handles the `approval.decision` job. In **one transaction** it:
+   - **verifies the decision before anything else** (all must hold, checked under `SELECT … FOR UPDATE` on the approval row):
+     - the supplied `card_sig` is byte-for-byte equal to `ledger.approval.card_authz.sig`, and that stored signature verifies over the stored card object with a trusted core key. The decision therefore refers to exactly the card core signed and the person saw;
+     - the approval's `requested_from_person_id` equals the person of the authenticated node that sent the decision, taken from `conv.inbound.person_id` (filled from `gw.node`, §4.1), never from the payload;
+     - the sending node is not revoked, and the card's `person_id` matches as well;
+     - `decision = PENDING` and `now() < expires_at`.
+
+     If any check fails, nothing is decided or consumed. An audit row (REJECTED, with the failing check as a code) is written, and the node is told the decision was refused and shown the approval's real server state;
    - sets the decision through the guarded trigger;
    - calls `ledger.consume_approval()`;
    - writes the signed `node.action` (kind `node.action`, the four file values, the `execution_key`, `target_node_id`, and `valid_until` = the earlier of now + 2 min and the approval expiry) as an outbox item addressed to the requesting node only.
@@ -471,13 +478,22 @@ RETURNING execution_key;
 
    Any mismatch → refuse, with receipt `result = MISMATCH`.
 3. Still through the same handle, rename it into the staging subfolder `<test folder>\.jarvis-pending\<execution_key>` (`SetFileInformationByHandle(FileRenameInfoEx)`, same volume, atomic). Then close the handle. The exclusive handle means no other process could change or replace the file between steps 1 and 3.
-4. Re-open the staged file, confirm its file ID still matches, and send it to the **Recycle Bin** with `IFileOperation` (`FOFX_RECYCLEONDELETE`). It's never a permanent delete.
+4. **Recycle from protected staging (fail closed).** `IFileOperation` works on paths, so the staged path is protected and re-verified immediately before use:
+   - **The staging folder is the desktop's own.** At startup the desktop creates `.jarvis-pending` itself if it is missing, opens it with `FILE_FLAG_OPEN_REPARSE_POINT`, and refuses to use it if it is a reparse point. It sets a protected DACL (inheritance off) granting access only to the signed-in user and SYSTEM, and reads the DACL back to confirm. Each execution uses a fresh subfolder, `<execution_key>`, created with `CreateDirectoryW`, which fails if the name already exists, and given the same checks.
+   - **Threat model:** another process running as the same signed-in user with intent to race the desktop is out of scope. It could already change anything that user owns. In scope are accidental changes, other users and services, and link-based tricks. The checks above close those off.
+   - **Verify, then recycle, keeping hold of the file:**
+     - immediately before recycling, re-check that the staging subfolder is not a reparse point and its DACL is unchanged;
+     - re-open the staged file with `FILE_FLAG_OPEN_REPARSE_POINT` and share mode `FILE_SHARE_DELETE` only, so nothing else can open it for read or write while the handle is held;
+     - confirm through that handle that the file ID equals the approved ID and the final path is `<staging>\<execution_key>\<name>`;
+     - with the handle still open, call `IFileOperation` (`FOFX_RECYCLEONDELETE`) on that path. It's never a permanent delete;
+     - **after the call**, confirm through the still-open handle that the object now lives in the Recycle Bin (its final path is under `$Recycle.Bin`). Then close the handle.
+   - **Fail closed:** if any precondition can't be established, `IFileOperation` is **not** called. That covers the folder being created or checked, the DACL being set or confirmed, the file ID matching, and the final path matching. The file stays in staging (still recoverable), and the receipt is `REFUSED` with the failing check. If the post-check shows the handle's object did **not** move to the Recycle Bin, the receipt is `ERROR` with what was found, and the task is never marked done. Anything that was moved is in the Recycle Bin, so nothing is permanently lost.
 
 **Durable idempotency on the desktop (survives restarts):**
 - An append-only journal file in the app's data folder (fsync after every write) records `execution_key → STARTED`, before step 1, and then `→ DONE + receipt`.
 - **On restart:**
   - a DONE key → re-send its stored receipt, never execute again;
-  - a STARTED key → work out where it got to: file still in the folder (not moved), in `.jarvis-pending\<key>` (moved, not recycled → finish step 4), or gone (done). Then send the matching receipt.
+  - a STARTED key → work out where it got to: file still in the folder (not moved), in `.jarvis-pending\<key>` (moved, not recycled → redo step 4 in full, with every check), or gone (done). Then send the matching receipt.
 - A `node.action` whose key is already in the journal is never executed again, and its stored receipt is re-sent.
 - The journal also holds the outbox seen-list (§8.2).
 
@@ -500,6 +516,8 @@ RETURNING execution_key;
 | P2-A6 | File swapped (same name, different content or file ID) after approval | MISMATCH; nothing recycled |
 | P2-A7 | Symlink or junction as the file or the folder, or a traversal name | Refused |
 | P2-A8 | Desktop killed between STARTED and DONE | On restart it finishes or reports correctly, never executes twice |
+| P2-A9 | Decision with a wrong or altered `card_sig`, from another person's node, after expiry, or for an already-decided approval | Refused and audited; nothing decided or consumed |
+| P2-A10 | Staging folder or staged file changed before recycling (reparse point, permissions changed, file ID differs) | Recycle not called; file left in staging; receipt REFUSED |
 
 ## 10. Brain router (Claude only, D4, D8)
 
@@ -525,6 +543,15 @@ Every Claude call reserves its worst-case cost **before** it starts, under a row
 3. **Settle** after the call, in one transaction: compute the actual cost from the API's reported usage; move the reservation to SETTLED with `actual_inr`; move the amount from `reserved_inr` to `settled_inr`; write `ops.brain_usage`.
 4. **Release** if the call failed before any tokens were billed (connection refused, or 4xx/5xx before the stream started): the reservation becomes RELEASED and `reserved_inr` goes down.
 5. **Lapse after a crash:** a scheduler sweep finds ACTIVE reservations past `lease_until`. Each becomes LAPSED and its **full reserved amount counts as settled**, because tokens may have been billed and we can't tell. This is conservative: a crash can only make the meter over-count, never under-count.
+6. **A lapsed call is indeterminate and is never retried as a new call.** Each reservation records the turn it serves (`turn_id` = the `conv.inbound` id). A LAPSED reservation means Claude may already have processed that turn.
+   - **Before reserving**, the `conv.turn` handler checks for any earlier reservation for the same `turn_id`:
+     - none, or only RELEASED ones (which failed before anything was billed) → it may call Claude;
+     - an ACTIVE one past its lease, or a LAPSED one → it must **not** call Claude again.
+   - **When it must not call**, it lapses the reservation if not already done, marks the turn `INDETERMINATE` (a new column, `conv.inbound.outcome`), and writes an event. A TODAY notification goes to the session: "I may not have finished answering that. Please ask again if you still need it." It then completes the job. Any chunks already streamed stay in history, with no final chunk.
+   - **The person asking again** is a new turn with a new reservation, which is the only way that turn's work runs again.
+   - **A provider-side check could change this rule only by a later decision.** The Anthropic API offers no mechanism that reliably proves a request did not run, so Phase 2 assumes it might have.
+
+   This keeps the exactly-once promise for held turns: a turn reaches Claude at most once without the person asking again. Test P2-B4.
 
 The checks before a reservation are the same thresholds as before:
 
@@ -540,7 +567,7 @@ P2-B2 covers the thresholds. P2-B3: 20 concurrent turns against a budget with ro
 ### 10.2 Failure handling
 
 - A Claude timeout or 5xx marks the brain DOWN after 2 consecutive failures.
-- Held `conv.turn` jobs are re-queued with a delay, not failed, and Jarvis tells the person (CLAUDE_DOWN, §8.1).
+- Held `conv.turn` jobs are re-queued with a delay, not failed, and Jarvis tells the person (CLAUDE_DOWN, §8.1). **Only turns whose reservation was RELEASED are re-queued for another Claude call.** A failure that may have reached Claude, such as a timeout after the request was sent or a stream cut mid-reply, settles the reservation as LAPSED and follows the indeterminate rule (§10.1, step 6). That turn isn't sent again.
 - `brain.probe` runs every 2 minutes, with a minimal request whose cost is reserved like any other. On success, CLAUDE_BACK is emitted and held turns run once, in order.
 - Reminders, expiries, delivery and verification never call Claude, so they continue (P2-B1).
 - **No direct desktop fallback (my call):** after cutover the desktop holds no Claude key. If the server is unreachable, the desktop says so locally ("I can't reach the server right now"). This keeps F1 true.
@@ -598,10 +625,11 @@ Flow tests:
 | Test | Proves |
 |---|---|
 | P2-A1 | Voice request → approval card on the desktop → approve → test file deleted → receipt verified → spoken result; full audit trail |
-| P2-A2 … A8 | The negative cases in §9.4: no approval; expired; revoked node; duplicate or concurrent execution; swapped file; symlink, junction or traversal; desktop crash mid-action |
+| P2-A2 … A10 | The negative cases in §9.4: no approval; expired; revoked node; duplicate or concurrent execution; swapped file; symlink, junction or traversal; desktop crash mid-action; decision not matching the signed card or person; staging tampered |
 | P2-B1 | Claude down: turn held, person told, reminders, expiries and delivery continue; Claude back: held turn runs exactly once |
 | P2-B2 | Cost cap: 80% warns; 100% refuses new calls; the daily ceiling holds; a cap-held turn expires after 1 hour with a notification and never runs later |
 | P2-B3 | Budget under concurrency: 20 concurrent turns, room for 3 → exactly 3 reserved; a crashed call's reservation lapses at full value |
+| P2-B4 | Core killed after Claude was called but before the reply was stored: the retried job makes **no** second Claude call; the turn is INDETERMINATE and the person is notified; a timeout after sending does the same, while a refused connection is re-queued and answered once |
 | P2-S1 | Gateway role can't read memory, call `ledger.transition()` or write `audit.event` |
 | P2-S2 | Person and viewer come from the node row even when the message claims another person |
 | P2-S3 | A bad signature, a replayed `seq` or an unknown Tailscale peer is refused |
@@ -686,3 +714,11 @@ Architecture direction approved; implementation approval pending these changes. 
 | C3 | Live action expiry | §7.1 and §9.4: signed `valid_until`, enforced by the gateway, the node and core |
 | C4 | Retention | §5.7 |
 | C5 | Dedicated server | §19 |
+
+**Final review points (Manj, rev 2 → rev 3):**
+
+| # | Point | Resolved in |
+|---|---|---|
+| R1 | An uncertain Claude call must not be retried as a new call | §10.1 step 6, §10.2; P2-B4 |
+| R2 | Protect staging → Recycle Bin against a swap | §9.4 step 4 (own protected folder, fresh subfolder, verify by handle immediately before, check after, fail closed); P2-A10 |
+| R3 | Verify the card signature when processing a decision | §5.5 `card_authz`, §9.3 step 6; P2-A9 |
