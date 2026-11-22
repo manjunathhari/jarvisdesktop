@@ -166,6 +166,12 @@ class GitStore:
         self._git("commit", "-q", "--no-verify", "-m", message)
         return self.head()
 
+    def bundle(self, target: Path) -> None:
+        """Write a git bundle of every branch to `target` (daily backup; restore with clone)."""
+        tmp = target.with_suffix(".tmp")
+        self._git("bundle", "create", "-q", str(tmp), "--all")
+        os.replace(tmp, target)
+
     def reset_to(self, sha: str) -> None:
         """Undo the engine's own last commit (audit failed). Only under the lock."""
         self._git("reset", "-q", "--hard", sha)
