@@ -8,9 +8,9 @@
 
 **Tech Stack:** Python 3.12, uv, psycopg 3 (sync in core, async in the gateway), Alembic, FastAPI and uvicorn, `rfc8785`, `cryptography` (Ed25519), `httpx` (Claude), pytest, ruff, mypy; Postgres 17; Docker Compose; `tailscale/tailscale` sidecar.
 
-**Plan revision:** 4 (22 Nov 2026). Revision 4 fixes the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
+**Plan revision:** 5 (22 Nov 2026). Revision 5 applies Manj's Task 1 rulings (spec Revision 6): the `challenge` kind and nonce handshake, key-announcement expiry, gateway/core key separation cases and the timestamp rule. They change Task 1 (contracts and shared cases) and Task 6 (handshake tests). Revision 4 fixed the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
 
-**Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, **Revision 5**: the approved Revision 4 plus the §7.1 offline-node re-enrolment rule that this plan's Task 12 implements. The spec's status line and §20 record the change. Implementers work from Revision 5 only. Section references (§) below point there. Read it alongside this plan.
+**Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, **Revision 6**. Revision 5 is the approved Revision 4 plus the offline-node and resume rules (R5-1, R5-2). Revision 6 adds R6-1 to R6-5. Implementers work from Revision 6 only. Section references (§) below point there. Read it alongside this plan.
 
 **Out of this plan (separate plans):**
 - **Plan B:** the Rust desktop node (spec §13).
@@ -85,9 +85,9 @@ Only then change the contract. The plan and the spec are updated in the same com
 ### Task 1: Contracts and signing
 
 **Files:**
-- Modify: `contracts/node-envelope.schema.json` (add required `seq` (integer ≥ 1) and `sig` (string); remove the STUB note; `kind` becomes an enum of the 16 kinds below)
+- Modify: `contracts/node-envelope.schema.json` (add required `seq` (integer ≥ 1) and `sig` (string); remove the STUB note; `kind` becomes an enum of the 17 kinds below; `node_id` is a UUID, and the nil UUID is allowed only for `challenge` and a node-less `enrol` (spec §6.1))
 - Modify: `contracts/approval.schema.json` (add the §5.5 columns; remove the STUB note)
-- Create: `contracts/messages/<kind>.schema.json`, one per kind: `enrol`, `hello`, `welcome`, `utterance`, `reply.chunk`, `outbox.item`, `outbox.cleared`, `received`, `ack`, `approval.decision`, `node.action`, `action.receipt`, `keyset`, `ping`, `pong`, `error` (payload shapes from the §7.1 table; `error` = `{code, detail}`; `received` = `{outbox_id}` **or** `{reply_id, seq}`, which acknowledges every chunk up to `seq`; `hello` adds `resume: [{reply_id, last_seq}]`, the node's own record of what it has shown)
+- Create: `contracts/messages/<kind>.schema.json`, one per kind: `challenge`, `enrol`, `hello`, `welcome`, `utterance`, `reply.chunk`, `outbox.item`, `outbox.cleared`, `received`, `ack`, `approval.decision`, `node.action`, `action.receipt`, `keyset`, `ping`, `pong`, `error` (payload shapes from the §7.1 table; `error` = `{code, detail}`; `received` = `{outbox_id}` **or** `{reply_id, seq}`, which acknowledges every chunk up to `seq`; `hello` = `{nonce, resume: [{reply_id, last_seq}], clock_skew_ms?}`, where `resume` is the node's own record of what it has shown and `last_seq` is any integer (spec R6-5); `challenge` = `{nonce (43-char base64url), issued_at, expires_at, key_id, public_key}`; `enrol` = `{token, public_key, nonce}`; all timestamps are RFC 3339 with an offset (spec R6-4))
 - Create: `contracts/messages/authz.schema.json` (`{object, key_id, sig}`; `object` fields exactly as listed in §7.1)
 - Create: `contracts/examples/messages/<kind>.valid.json` and `.invalid.json`
 - Create: `contracts/signing-vectors/generate.mjs` (the independent generator; no server code)
@@ -111,7 +111,8 @@ Only then change the contract. The plan and the spec are updated in the same com
   - `sign_envelope(purpose: Purpose, key: Ed25519PrivateKey, key_id: str, env: dict[str, Any]) -> dict[str, Any]` (returns `env` with `sig` set over every other field)
   - `verify_envelope(purpose: Purpose, public_key: bytes, key_id: str, env: Mapping[str, Any]) -> bool`
   - `make_authz(key: Ed25519PrivateKey, key_id: str, obj: Mapping[str, Any]) -> dict[str, Any]`
-  - `check_authz(authz: Mapping[str, Any], trusted: Mapping[str, bytes]) -> dict[str, Any]` (returns the object; raises `AuthzInvalid` if `key_id` isn't trusted or the signature fails)
+  - `check_authz(authz: Mapping[str, Any], trusted: Mapping[str, bytes]) -> dict[str, Any]` (returns the object; raises `AuthzInvalid` if `key_id` isn't trusted or the signature fails). `trusted` must hold **only CORE keys**: callers never pass gateway keys, which is what makes R6-3 hold
+  - `new_nonce() -> str` (32 bytes from `secrets.token_bytes`, base64url without padding: 43 characters)
   - `fingerprint(public_key: bytes) -> str` (the first 10 bytes of SHA-256, as lower-case base32 without padding: 16 characters)
   - `load_private_key(pem_path: Path) -> Ed25519PrivateKey`, `public_bytes(key: Ed25519PrivateKey) -> bytes` (raw 32 bytes)
 - Produces, in `contracts.py`: `MESSAGE_MODELS: dict[str, type[BaseModel]]` and `Authz`
@@ -137,7 +138,10 @@ The expected values come from a separate implementation, so a defect in `signing
   - `reject-expired`: `valid_until` + 31 s ≤ now;
   - `accept-within-tolerance`: `valid_until` + 29 s = now;
   - `reject-untrusted-key-id`;
-  - `reject-tampered-args`.
+  - `reject-tampered-args`;
+  - `reject-gateway-key-under-core-key-id`: signed with the **gateway's** private key, purpose `core-authz`, `key_id` = the trusted core key's ID → reject `bad_signature` (spec R6-3);
+  - keyset cases (spec R6-2), checked by `check_keyset`: `accept-keyset` (inside validity), `reject-keyset-expired` (`now` = `valid_until` + 31 s), `accept-keyset-within-tolerance` (`now` = `valid_until` + 29 s), `reject-keyset-payload-mismatch`, `reject-naive-valid-until` (and its keyset twin);
+  - challenge cases, checked by a new reference `check_challenge(env, *, pinned_gateway: Mapping[str, bytes] | None, enrol_fingerprint: str | None) -> dict` in `node_rules.py`: `accept-challenge`, `accept-challenge-enrol-by-fingerprint`, `reject-challenge-unpinned-key`, `reject-challenge-fingerprint-mismatch`, `reject-challenge-bad-signature`, `reject-challenge-signed-by-core-key`, `reject-challenge-naive-time`.
 
   These are produced by the same generator.
 - **Review:** the task's reviewer checks by hand:
@@ -514,7 +518,18 @@ git commit -am "Phase 2: core dispatch, deterministic notification rules, reconn
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-def test_enrol_then_hello(gw_client, enrolment_code):       # FakeNode.enrol pins keys matching the fingerprints; hello → welcome
+def test_challenge_is_first_message_and_signed(...):       # on connect, first message is challenge; gw-transport sig verifies
+                                                             #   with the pinned gateway key; nonce 43 chars; expires_at = issued_at + 30 s
+def test_nonce_unique_per_connection(...):                   # 50 connections → 50 distinct nonces
+def test_hello_with_other_connections_nonce_refused(...):    # conn A's nonce sent in hello on conn B → closed 4401, audit bad_nonce
+def test_hello_after_challenge_expiry_refused(...):          # injected clock +31 s → closed 4401, audit challenge_expired
+def test_second_hello_on_same_connection_refused(...):       # nonce consumed: a replayed hello on the same socket → closed
+def test_failed_first_reply_consumes_nonce(...):             # bad-signature hello, then a correct one on the same socket → closed
+def test_message_before_hello_refused(...):                  # utterance as first message → closed 4401, audit not_first
+def test_nil_node_id_only_for_challenge_and_enrol(...):      # nil UUID on utterance → error/closed
+def test_clock_skew_recorded_not_trusted(...):               # hello with clock_skew_ms 120000 → event node.clock_skew; handshake proceeds
+def test_node_refuses_challenge_from_unpinned_key(...):      # FakeNode with pinned key K1; gateway signs with K2 → node closes, sends nothing
+def test_enrol_then_hello(gw_client, enrolment_code):       # FakeNode.enrol verifies challenge by the code's fingerprint, pins keys; hello → welcome
 def test_enrol_refuses_keys_not_matching_fingerprints(...):  # gateway configured with a different core key → node refuses
 def test_unknown_tailscale_peer_closed(...):                 # FakeWhoIs returns None → close code 4401 (P2-S3)
 def test_tailscale_identity_mismatch_closed(...):            # registered "ts:pc", whois "ts:other" → closed, audit CONNECT_REFUSED

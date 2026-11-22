@@ -1,6 +1,6 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** Revision 5. Revision 4 was approved by Manj on 2026-11-22. Revision 5 adds two protocol rules, recorded in §20 as R5-1 and R5-2, and its matching plan is `.10x/plans/2026-11-22-phase-2-server.md`, **revision 4**. The two rules are:
+**Status:** Revision 6, for Manj's review. Revision 6 adds R6-1 to R6-5 (§20: the `challenge` handshake, key-announcement expiry, gateway/core key separation, the timestamp distinction, and the `resume` schema), matching plan **revision 5**. Revision 5 was approved with plan revision 4 on 2026-11-22. Revision 4 was approved by Manj on 2026-11-22. Revision 5 adds two protocol rules, recorded in §20 as R5-1 and R5-2, and its matching plan is `.10x/plans/2026-11-22-phase-2-server.md`, **revision 4**. The two rules are:
 - **R5-1:** the §7.1 offline-node re-enrolment rule (STALE nodes, close code 4409, `node reenrol`);
 - **R5-2:** the §6.2 validated-resume rule (out-of-range `resume` ignored; resume from the durable acknowledged cursor).
 
@@ -240,9 +240,30 @@ Core only.
 
 ### 6.1 A node connects
 
-1. The WebSocket opens on `jarvis-gw`'s tailnet address. The gateway reads the peer's Tailscale identity from the sidecar's local API (`whois`). An unknown peer is closed.
-2. The node sends `hello`: `node_id`, plus a signature over a server-sent nonce. The gateway checks the signature against `gw.node.public_key`, that the node is not revoked, and that the Tailscale identity matches the node row. Any failure closes the connection and writes an audit row.
-3. The gateway opens a `gw.node_connection` row and sends `welcome`: the open session, if any, plus the reconnect summary (§8.3).
+1. **Open:** the WebSocket opens on `jarvis-gw`'s tailnet address. The gateway reads the peer's Tailscale identity from the sidecar's local API (`whois`). An unknown peer is closed.
+2. **Challenge (R6-1):** immediately after accepting the WebSocket, and before reading anything from the node, the gateway sends `challenge`, signed `gw-transport`.
+   - **The nonce:** 32 bytes from the operating system's cryptographic random source, base64url (43 characters). It is new for every connection and held only in that connection's memory, so it dies with the connection or a gateway restart. A nonce is never derived from, or reused across, anything else.
+   - **The payload:** `nonce`, `issued_at` (gateway clock, RFC 3339 with offset), `expires_at` (= `issued_at` + 30 s), and the gateway's current `key_id` and `public_key`.
+3. **The node checks the challenge before replying:**
+   - it must be the first message on the connection;
+   - its `key_id` and `public_key` must match a pinned gateway key. During enrolment, which has no pinned key yet, `fingerprint(public_key)` must equal the gateway fingerprint in the enrolment code;
+   - the `gw-transport` signature must verify with that key.
+
+   Anything else (a missing, malformed or unverifiable challenge, or any other message first) → the node closes the connection and sends nothing.
+4. **Clock skew is advisory only.** The node computes `skew = issued_at − its own clock`. If `|skew|` > 30 s, the node puts `clock_skew_ms` in `hello`, shows "This device's clock is off", and the gateway records event `node.clock_skew` (codes only). The server's time never replaces the node's own clock for validity checks, and never substitutes for nonce or signature checks.
+5. **The node replies** with `hello` (`nonce`, `resume`, optional `clock_skew_ms`), signed `node-msg` with its key. A new device sends `enrol` instead (token, public key, `nonce`), signed with its new key (§7.2).
+6. **The gateway checks the reply.** All of these must hold, and any failure closes the connection with code 4401, writing an audit row with the failing check as a code (`bad_signature`, `bad_nonce`, `challenge_expired`, `not_first`, `identity_mismatch`, `revoked`):
+   - it is the **first** node message on this connection;
+   - its `nonce` equals **this connection's** nonce, compared in constant time;
+   - it arrived before `expires_at` on the gateway's clock;
+   - the signature verifies with the node's registered public key (for `enrol`, the key in the message);
+   - the node isn't revoked;
+   - the Tailscale identity matches the node row.
+
+   **The nonce is consumed on the first reply, whatever the outcome.** A connection gets one attempt. A nonce from one connection can't authenticate another: each connection only ever compares against its own nonce, and an old nonce is gone once its connection closes.
+7. **Welcome:** the gateway opens a `gw.node_connection` row and sends `welcome`, with the open session, if any, and the reconnect summary (§8.3).
+
+**Envelope `node_id` before the node is known:** `challenge`, and an `enrol` from a device without a node ID, carry the nil UUID `00000000-0000-0000-0000-000000000000`. Every other message carries the real node ID: the sender for node messages, the recipient for gateway messages. The gateway refuses the nil UUID on any other kind.
 
 ### 6.2 A conversation turn (reactive)
 
@@ -280,6 +301,7 @@ Every message uses `contracts/node-envelope.schema.json`, made final in Phase 2.
 
 **Canonical form and signature input (exact):**
 - **Serialisation:** RFC 8785, the JSON Canonicalization Scheme (JCS). Python uses the `rfc8785` package and Rust uses `serde_jcs`. Numbers in signed objects are integers only (amounts in paise, times as RFC 3339 strings), so JCS's number rules never come into play.
+- **Timestamps (R6-4).** Every timestamp in a protocol message or signed object is an RFC 3339 string **with an explicit offset**, such as `2026-11-22T10:02:00+05:30` or `…Z`. A timestamp without an offset is malformed and rejected. Database records, such as `ledger.approval`'s own columns, use Postgres `timestamptz` and are not wire formats. When a database value goes into a message or signed object (an approval card's `valid_until`, for example), it is written in this RFC 3339 form.
 - **Signed bytes:** `"jarvis-sig-v1\n" + purpose + "\n" + key_id + "\n" + JCS(object)`.
 - **Signature:** Ed25519 over those bytes, base64url without padding.
 - **Shared test vectors:** `contracts/signing-vectors/` holds objects, keys, purposes and expected signatures. The vectors are checked by both the Python and the Rust test suites in CI, so the two can't drift.
@@ -311,6 +333,8 @@ A valid gateway signature alone is never enough.
 **Trust distribution and rotation:**
 - **Pinning at enrolment:** the enrolment code Manj types into the desktop (§7.2) contains the fingerprints of the current core and gateway public keys. During enrolment the node receives the keys and pins them only if they match the fingerprints, so the gateway can't substitute its own key for core's.
 - **Rotation:** core announces a new key in a `keyset` message whose `authz` object (kind `keyset`) is signed by the **current** core key. Nodes add the new `key_id`, accept both keys for a 24 h overlap, then drop the old one. The gateway key rotates the same way, but its announcement is signed by core.
+- **Key announcements expire (R6-2).** The announcement's validity is the `issued_at` and `valid_until` fields **inside the signed `authz.object`**. Core sets `valid_until` = `issued_at` + 24 h, the length of the overlap. A node rejects a `keyset` when `now > valid_until + 30 s`, the same tolerance as actions, so an old but correctly signed announcement can't be replayed later. A node that missed the window re-enrols (R5-1). The node also rejects a `keyset` whose payload differs from `authz.object.args`.
+- **Gateway and core keys are never interchangeable (R6-3).** A signature made with the gateway's key is never accepted as a core signature, even under the core key's `key_id`. The node verifies a `core-authz` signature only with the public key pinned for that `key_id` as a CORE key. The shared rule cases (`contracts/signing-vectors/authz-cases.json`) include this case, and both the Python reference checker and the Rust node must reject it.
 - **A node that missed the overlap re-enrols** (Revision 5, R5-1):
   - Activation waits for every active node to acknowledge, or 24 h.
   - Nodes that hadn't acknowledged are marked STALE, and the gateway closes their `hello` with code 4409 (`reenrol_required`) before sending any signed message.
@@ -323,8 +347,9 @@ A valid gateway signature alone is never enough.
 
 | Kind | Direction | Payload |
 |---|---|---|
-| `enrol` | node → | token, public key (§7.2) |
-| `hello` / `welcome` | node → / ← server | handshake (§6.1); `welcome` carries the open session and the reconnect summary |
+| `challenge` | ← | `nonce`, `issued_at`, `expires_at`, `key_id`, `public_key` (gateway's); first message on every connection (§6.1, R6-1) |
+| `enrol` | node → | token, public key, `nonce` (§7.2) |
+| `hello` / `welcome` | node → / ← server | handshake (§6.1); `hello` carries `nonce`, `resume` (each `last_seq` any integer; validated by the gateway per §6.2 step 6 and R5-2, so a negative value means 0), optional `clock_skew_ms`; `welcome` carries the open session and the reconnect summary |
 | `utterance` | → | `text`, `screen_summary` |
 | `reply.chunk` | ← | `reply_id`, `seq`, `type` (SPEECH or ACTION), `text` or `authz` (ACTION), `final` |
 | `outbox.item` | ← | `outbox_id`, `priority`, `kind`, `body`, `expires_at`, `authz` (approval cards) |
@@ -333,7 +358,7 @@ A valid gateway signature alone is never enough.
 | `approval.decision` | → | `approval_id`, `decision`, `card_sig` |
 | `node.action` | ← | `authz` (§7.1) |
 | `action.receipt` | → | `execution_key` (or `reply_id` + `seq` for live actions), `result`, `evidence` |
-| `keyset` | ← | new public key, `authz` signed by the current core key |
+| `keyset` | ← | new role, `key_id`, public key, and `authz` (kind `keyset`) signed by the current core key; the payload must equal `authz.object.args` |
 | `ping` / `pong` | both | heartbeat, every 30 s; 3 missed = offline (v2 §13.3) |
 
 Payload schemas go in `contracts/` with examples and contract tests, before feature code (v2 §15).
@@ -770,3 +795,13 @@ Architecture direction approved; implementation approval pending these changes. 
 |---|---|---|
 | R5-1 | **Offline-node recovery after key rotation** (first drafted with plan revision 3). **A node that missed the key-rotation overlap must re-enrol.** Activation (all acknowledged, or 24 h) marks the non-acknowledging nodes STALE; the gateway closes a STALE node's `hello` with 4409 before any signed message; a node that sees 4409, or an unknown `key_id`, runs nothing and asks to be re-enrolled; `jarvis-core node reenrol` revokes the old node and issues a code with the current fingerprints. A node never accepts a key from the gateway alone. | §7.1 |
 | R5-2 | **Validated resume** (with plan revision 4). **Reconnect `resume` is validated before use**: a `last_seq` above the stored maximum, or for an unknown or foreign reply, is ignored and the gateway resumes from the acknowledged cursor, logging `node.resume_out_of_range`. | §6.2 step 6 note |
+
+**Revision 6 (22 Nov 2026). Matching plan: revision 5.** Owner rulings on Task 1's open questions:
+
+| # | Change | Where |
+|---|---|---|
+| R6-1 | **`challenge` handshake:** a 17th message kind. The gateway sends it first on every connection, signed `gw-transport`, with a fresh single-use 32-byte nonce, `issued_at` / `expires_at` (+30 s), and its key ID and public key. The node verifies it against its pinned gateway key (or, during enrolment, the code's fingerprint), then signs the nonce in `hello` or `enrol`. The gateway checks first message, connection-bound nonce, expiry, signature, revocation and identity; the nonce is consumed on the first reply; any failure closes with 4401. Server time is advisory, for skew detection only. The nil UUID is used as the envelope `node_id` before the node is known. | §6.1, §7.1 table |
+| R6-2 | **Key announcements expire:** the validity fields are inside the signed `authz.object` (`valid_until` = `issued_at` + 24 h); the node rejects an expired announcement with 30 s tolerance; shared cases for valid, expired and boundary | §7.1 |
+| R6-3 | **Gateway key never accepted as a core signature,** even under the core `key_id`; a shared case | §7.1 |
+| R6-4 | **Timestamps:** protocol and signed timestamps are RFC 3339 with an offset; database records stay `timestamptz` and are written in RFC 3339 when they go on the wire | §7.1 |
+| R6-5 | **`hello.resume.last_seq` is any integer in the schema,** so the gateway's validation rule (negative → 0; above the maximum → ignored) is what applies, not a schema rejection. This makes the approved Task 7 behaviour reachable. | §7.1 table |
