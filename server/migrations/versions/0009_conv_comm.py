@@ -22,6 +22,9 @@
 - audit.event: entity types 'inbound', 'outbox' and 'stream'; actions INBOUND, SEND, RECEIVE,
   ACK, SUPERSEDE, EXPIRE and CHUNK_RECEIVE. Rows carry codes and IDs only.
 
+The trigger functions comm.refuse_change and comm.outbox_guard have PUBLIC EXECUTE revoked
+like every other function here.
+
 Foreign keys from conv.inbound, comm.delivery and conv.stream_cursor to gw.node take a KEY SHARE
 lock on the same node row that gw.current_node already holds FOR SHARE in that transaction, so
 they can never wait and add nothing to the lock order.
@@ -150,6 +153,7 @@ CREATE TRIGGER append_only_rows BEFORE UPDATE OR DELETE ON comm.event
     FOR EACH ROW EXECUTE FUNCTION comm.refuse_change();
 CREATE TRIGGER append_only_truncate BEFORE TRUNCATE ON comm.event
     FOR EACH STATEMENT EXECUTE FUNCTION comm.refuse_change();
+REVOKE ALL ON FUNCTION comm.refuse_change() FROM PUBLIC;  -- a trigger function, never called
 
 CREATE TABLE comm.outbox (
     id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -205,6 +209,7 @@ END;
 $$;
 CREATE TRIGGER outbox_guard BEFORE INSERT OR UPDATE ON comm.outbox
     FOR EACH ROW EXECUTE FUNCTION comm.outbox_guard();
+REVOKE ALL ON FUNCTION comm.outbox_guard() FROM PUBLIC;  -- a trigger function, never called
 
 -- One row per item per node, updated on each retry.
 CREATE TABLE comm.delivery (

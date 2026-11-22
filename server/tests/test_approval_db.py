@@ -231,6 +231,44 @@ def test_decision_only_from_pending_before_expiry(
         assert _row(app, approval)[0] == first
 
 
+def test_decided_approval_needs_decider_and_time(
+    app: Conn, owner: Conn, ids: tuple[uuid.UUID, uuid.UUID]
+) -> None:
+    """APPROVED or DENIED needs both decided_at and decided_by_node_id; EXPIRED needs neither."""
+    task_id, node_id = ids
+    for decision in ("APPROVED", "DENIED"):
+        for decided_at, decider in (("now()", "NULL"), ("NULL", "%s"), ("NULL", "NULL")):
+            approval = _approval(app, ids)
+            params: tuple[Any, ...] = (node_id, approval) if decider == "%s" else (approval,)
+            with pytest.raises(psycopg.errors.CheckViolation) as e:
+                app.execute(
+                    f"UPDATE ledger.approval SET decision = '{decision}',"
+                    f" decided_at = {decided_at}, decided_by_node_id = {decider}"
+                    " WHERE id = %s".encode(),
+                    params,
+                )
+            assert e.value.diag.constraint_name == "approval_decided_by_node_and_time"
+            assert _row(app, approval) == ("PENDING", None, None)
+            # An insert in that shape is refused too (the guard trigger refuses it first).
+            for conn in (app, owner):
+                with pytest.raises(psycopg.errors.CheckViolation):
+                    conn.execute(
+                        "INSERT INTO ledger.approval (task_id, requested_from_person_id,"
+                        " requesting_node_id, tier, action_kind, action_args, summary,"
+                        " card_authz, expires_at, decision, decided_at, decided_by_node_id)"
+                        " VALUES (%s, %s, %s, 'IRREVERSIBLE', 'file.delete', '{}', 'x', %s,"
+                        f" now() + interval '10 minutes', '{decision}', {decided_at},"
+                        f" {decider})".encode(),
+                        (task_id, MANJ, node_id, Jsonb(CARD_AUTHZ))
+                        + ((node_id,) if decider == "%s" else ()),
+                    )
+    expired = _approval(app, ids, "-1 second")
+    app.execute(  # expiry is not a node decision
+        "UPDATE ledger.approval SET decision = 'EXPIRED' WHERE id = %s", (expired,)
+    )
+    assert _row(app, expired)[0] == "EXPIRED"
+
+
 def test_new_approval_starts_pending_and_unconsumed(
     app: Conn, owner: Conn, ids: tuple[uuid.UUID, uuid.UUID]
 ) -> None:
@@ -565,7 +603,7 @@ def _fingerprint(conn: Conn) -> list[tuple[Any, ...]]:
 
 
 def _objects(conn: Conn) -> list[tuple[Any, ...]]:
-    """Indexes, constraints, triggers and functions 0010 adds, by name."""
+    """Indexes, constraints, triggers and functions (with their ACLs) 0010 adds, by name."""
     return conn.execute(
         "SELECT 'index', indexrelid::regclass::text FROM pg_index"
         "  WHERE indrelid::regclass::text = ANY(%(t)s)"
@@ -573,7 +611,8 @@ def _objects(conn: Conn) -> list[tuple[Any, ...]]:
         "  FROM pg_constraint WHERE conrelid::regclass::text = ANY(%(t)s)"
         " UNION ALL SELECT 'trigger', tgname FROM pg_trigger"
         "  WHERE NOT tgisinternal AND tgrelid::regclass::text = ANY(%(t)s)"
-        " UNION ALL SELECT 'function', p.oid::regprocedure::text FROM pg_proc p"
+        " UNION ALL SELECT 'function', p.oid::regprocedure::text || ' ' || p.proacl::text"
+        "  FROM pg_proc p"
         "  JOIN pg_namespace n ON n.oid = p.pronamespace"
         "  WHERE n.nspname = 'ledger' AND p.proname IN ('consume_approval', 'approval_guard')"
         " ORDER BY 1, 2",

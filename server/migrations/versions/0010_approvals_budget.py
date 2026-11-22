@@ -27,7 +27,10 @@
   paise. At most one live (ACTIVE, SETTLED or LAPSED) reservation per turn. The reserve, settle
   and lapse logic (§10.1) comes in a later task.
 - audit.event: entity type 'approval'; action CONSUME. Rows carry codes and IDs only.
-- All of it is for the core (jarvis_app); the gateway has no grant on any 0010 object.
+- All of it is for the core (jarvis_app); the gateway has no grant on any 0010 object, and
+  PUBLIC has no EXECUTE on either function, the trigger function included.
+- An APPROVED or DENIED approval records both decided_at and decided_by_node_id (CHECK
+  approval_decided_by_node_and_time); EXPIRED is not a node decision and needs neither.
 
 Downgrade refuses once any approval, budget, reservation or usage row, or any approval audit
 row, exists.
@@ -65,6 +68,10 @@ CREATE TABLE ledger.approval (
     execution_key             uuid CONSTRAINT approval_execution_key_unique UNIQUE,
     CHECK (decision <> 'PENDING' OR (decided_at IS NULL AND decided_by_node_id IS NULL)),
     CHECK (decided_by_node_id IS NULL OR decision IN ('APPROVED', 'DENIED')),
+    -- A node's decision records which node decided and when; EXPIRED is not a node decision.
+    CONSTRAINT approval_decided_by_node_and_time
+        CHECK (decision NOT IN ('APPROVED', 'DENIED')
+               OR (decided_at IS NOT NULL AND decided_by_node_id IS NOT NULL)),
     CHECK ((consumed_at IS NULL) = (execution_key IS NULL)),
     CHECK (execution_key IS NULL OR decision = 'APPROVED')
 );
@@ -121,6 +128,7 @@ END;
 $$;
 CREATE TRIGGER approval_guard BEFORE INSERT OR UPDATE ON ledger.approval
     FOR EACH ROW EXECUTE FUNCTION ledger.approval_guard();
+REVOKE ALL ON FUNCTION ledger.approval_guard() FROM PUBLIC;  -- a trigger function, never called
 
 REVOKE ALL ON ledger.approval FROM PUBLIC;
 GRANT SELECT, INSERT ON ledger.approval TO jarvis_app;

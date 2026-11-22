@@ -983,6 +983,35 @@ def test_no_function_executable_by_public(owner: Conn) -> None:
     assert rows == []
 
 
+# Phase 0 trigger functions that still carry PostgreSQL's default PUBLIC EXECUTE. Left as they
+# are, pending an owner decision (Task 4 follow-up report); nothing may be added to this list.
+PHASE_0_PUBLIC_TRIGGER_FUNCTIONS = [
+    "audit.refuse_change()",
+    "ledger.require_initial_state()",
+    "ledger.stamp_times()",
+]
+
+
+def test_no_function_in_jarvis_schemas_executable_by_public(owner: Conn) -> None:
+    """Every function in the Jarvis schemas, trigger functions included, has PUBLIC EXECUTE
+    revoked (PostgreSQL grants it by default), apart from the listed Phase 0 ones."""
+    rows = owner.execute(
+        "SELECT p.oid::regprocedure::text FROM pg_proc p"
+        " JOIN pg_namespace n ON n.oid = p.pronamespace"
+        " WHERE n.nspname IN ('gw', 'conv', 'comm', 'ledger', 'ops', 'audit')"
+        " AND (p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a"
+        "      WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE'))"
+        " ORDER BY 1"
+    ).fetchall()
+    triggers = owner.execute(
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace"
+        " WHERE n.nspname IN ('gw', 'conv', 'comm', 'ledger', 'ops', 'audit')"
+        " AND p.prorettype = 'trigger'::regtype"
+    ).fetchone()
+    assert triggers is not None and triggers[0] > 0
+    assert [r[0] for r in rows] == PHASE_0_PUBLIC_TRIGGER_FUNCTIONS
+
+
 # --- the CLI (jarvis-core node enrol / node revoke) -------------------------------------------
 
 
