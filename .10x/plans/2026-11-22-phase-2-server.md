@@ -8,9 +8,9 @@
 
 **Tech Stack:** Python 3.12, uv, psycopg 3 (sync in core, async in the gateway), Alembic, FastAPI and uvicorn, `rfc8785`, `cryptography` (Ed25519), `httpx` (Claude), pytest, ruff, mypy; Postgres 17; Docker Compose; `tailscale/tailscale` sidecar.
 
-**Plan revision:** 7 (22 Nov 2026; corrected after Manj's review: Task 2 Step 3 now returns structured refusals instead of raising). Revision 7 applies Manj's rulings on Task 2 (spec R7-1 to R7-6): audited refusals return a structured result and the caller commits before raising, audited enrolment creation, the five-function `gw` surface, `last_ping_at`, the `JF001` fencing error and the 0008 rollback rule. They change Tasks 2 and 3. Revision 6 (corrected after Manj's review: Task 6's enrolment test ends with `welcome` and makes no second `hello`, and Task 12's key-source statements now separate enrolment from ordinary welcomes and rotation). Revision 6 adds Manj's handshake corrections (spec R6-6 to R6-8): the enrolment key-pinning `welcome` block, separate `hello` and `enrol` validation paths, per-sender `seq`, and stale-node refusal after the challenge. They change Task 1, Task 6 and Task 12's tests. Revision 5 applied Manj's Task 1 rulings (spec Revision 6): the `challenge` kind and nonce handshake, key-announcement expiry, gateway/core key separation cases and the timestamp rule. They change Task 1 (contracts and shared cases) and Task 6 (handshake tests). Revision 4 fixed the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
+**Plan revision:** 8 (22 Nov 2026). Revision 8 applies Manj's rulings on the Task 2 review (spec R8-1, R8-2): strict fencing with one lock order and race tests in both orders (Tasks 2, 3 and 7), CONNECT / DISCONNECT audit, and five smaller points in Task 2. Revision 7 (corrected after Manj's review: Task 2 Step 3 now returns structured refusals instead of raising). Revision 7 applies Manj's rulings on Task 2 (spec R7-1 to R7-6): audited refusals return a structured result and the caller commits before raising, audited enrolment creation, the five-function `gw` surface, `last_ping_at`, the `JF001` fencing error and the 0008 rollback rule. They change Tasks 2 and 3. Revision 6 (corrected after Manj's review: Task 6's enrolment test ends with `welcome` and makes no second `hello`, and Task 12's key-source statements now separate enrolment from ordinary welcomes and rotation). Revision 6 adds Manj's handshake corrections (spec R6-6 to R6-8): the enrolment key-pinning `welcome` block, separate `hello` and `enrol` validation paths, per-sender `seq`, and stale-node refusal after the challenge. They change Task 1, Task 6 and Task 12's tests. Revision 5 applied Manj's Task 1 rulings (spec Revision 6): the `challenge` kind and nonce handshake, key-announcement expiry, gateway/core key separation cases and the timestamp rule. They change Task 1 (contracts and shared cases) and Task 6 (handshake tests). Revision 4 fixed the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
 
-**Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, **Revision 7** (R7-1 to R7-6, on top of the approved Revisions 4, 5 and 6). Implementers work from Revision 7 only. Section references (§) below point there. Read it alongside this plan.
+**Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, **Revision 8** (R8-1, R8-2, on top of the approved Revisions 4 to 7). Implementers work from Revision 8 only. Section references (§) below point there. Read it alongside this plan.
 
 **Out of this plan (separate plans):**
 - **Plan B:** the Rust desktop node (spec §13).
@@ -234,6 +234,7 @@ git commit -m "Phase 2: final node envelope, message contracts, JCS signing and 
 - Modify: `server/src/jarvis_server/core_main.py` `_bootstrap()` and `config.py` (`gateway_dsn()`, which reads secret `pg_gateway_password`)
 - Create: `server/migrations/versions/0008_gateway_nodes.py`
 - Create: `server/src/jarvis_server/dbcall.py` (the audited-call helper; spec R7-1)
+- Modify: `server/src/jarvis_server/contracts.py` and `contracts/audit-event.schema.json` (audit enums gain `entity_type` `node` and the six new actions, which existing contract tests require to match the database)
 - Create: `server/src/jarvis_server/nodes.py` (core-side node admin)
 - Modify: `server/src/jarvis_server/core_main.py` (subcommands `node enrol --person <slug> --kind DESKTOP|PHONE --name <text>` and `node revoke <node_id>`)
 - Test: `server/tests/test_nodes.py`
@@ -249,13 +250,30 @@ git commit -m "Phase 2: final node envelope, message contracts, JCS signing and 
   - `gw.current_node(p_conn_id bigint) RETURNS uuid`: an internal helper used by every gateway-facing function in Tasks 3 and 7. It returns the node only if the connection is open and the node is not revoked. Otherwise it raises `RAISE EXCEPTION 'connection_fenced' USING ERRCODE = 'JF001'` (spec R7-5), with no audit row of its own. The gateway also calls it directly for its 60 s revocation re-check;
   - `gw.touch_connection(p_conn_id bigint) RETURNS void`: the heartbeat. It updates `gw.node.last_seen_at` for `gw.current_node(p_conn_id)` and `gw.node_connection.last_ping_at`. A superseded, closed or revoked connection raises `connection_fenced`, so it can't update anything;
   - `gw.revoke_node(p_node_id uuid) RETURNS TABLE (applied boolean, refusal text)` (EXECUTE for `jarvis_app` only): `(true, NULL)`, or `(false, 'unknown_node' | 'already_revoked')`, audited either way;
-  - `audit.event` accepts `entity_type = 'node'` and actions `ENROL_CREATE`, `ENROL`, `REVOKE`, `CONNECT_REFUSED`;
+  - `audit.event` accepts `entity_type = 'node'` and actions `ENROL_CREATE`, `ENROL`, `REVOKE`, `CONNECT_REFUSED`, `CONNECT`, `DISCONNECT` (spec R8-2):
+    - **`CONNECT`** comes from `open_connection`, with details `node_id`, `conn_id` and `superseded_conn_id`;
+    - **`DISCONNECT`** comes from `close_connection`, from `open_connection` for the connection it supersedes (reason `superseded`), and from `revoke_node` for each connection it closes (reason `revoked`), with details `node_id`, `conn_id` and `reason`.
+
+    Each is written in the same transaction as the change, holds IDs and codes only, and heartbeats aren't audited;
+  - **refused-enrolment audit rows** use the enrolment's ID as `entity_id` whenever the token matched an enrolment (used or expired), and the nil UUID only when no enrolment matches;
+  - **argument checks:** `gw.enrol_node` refuses a `p_token` that isn't exactly the token length (26 base32 characters) with `invalid_parameter_value`, like the other argument checks;
+  - **strict fencing (spec R8-1):** the locks and lock order in spec §4.1:
+
+    | Function | Node row | Connection row(s) |
+    |---|---|---|
+    | `current_node` | `FOR SHARE` | `FOR SHARE` |
+    | `touch_connection` | `FOR NO KEY UPDATE` | `FOR NO KEY UPDATE` |
+    | `close_connection` | `FOR SHARE` | `FOR UPDATE` |
+    | `open_connection` | `FOR UPDATE` | `FOR UPDATE` (the node's open connection, if any) |
+    | `revoke_node` | `FOR UPDATE` | `FOR UPDATE` (all open connections) |
+
+    Always node row first, then connection rows. `touch_connection` also repeats `closed_at IS NULL` and `revoked_at IS NULL` in both of its `UPDATE … WHERE` clauses, and raises `JF001` if either matches no row;
   - **gateway EXECUTE:** exactly these five: `gw.enrol_node`, `gw.open_connection`, `gw.close_connection`, `gw.touch_connection`, `gw.current_node` (spec R7-3);
   - **rollback:** `downgrade()` refuses, with a clear error and the schema left intact, if any `audit.event` row has `entity_type = 'node'`, or any `gw.node` or `gw.enrolment` row exists. Otherwise it removes everything 0008 added, including grants; the cluster-wide role stays (spec R7-6).
 - Produces (Python), in `jarvis_server.dbcall` (spec R7-1):
   - `class Refused(Exception)` with `reason: str`, plus subclasses `EnrolmentRefused`, `RevokeRefused` and `ConnectRefused`
   - `class TransactionNotIdle(Exception)`
-  - `audited_call(conn: psycopg.Connection, sql: str, params: Sequence[Any]) -> tuple[Any, ...]`: raises `TransactionNotIdle` unless `conn.info.transaction_status` is IDLE; otherwise runs the call in `with conn.transaction():`, which commits on exit, and returns the row. Callers raise their `Refused` subclass **after** it returns.
+  - `audited_call(conn: psycopg.Connection, sql: LiteralString, params: Sequence[Any]) -> tuple[Any, ...]` (`LiteralString`, not `str`, so only literal SQL can be passed; the async twin takes the same type): raises `TransactionNotIdle` unless `conn.info.transaction_status` is IDLE; otherwise runs the call in `with conn.transaction():`, which commits on exit, and returns the row. Callers raise their `Refused` subclass **after** it returns.
   - `async audited_call_async(conn: psycopg.AsyncConnection, …)`: the same rule, for the gateway (Task 6)
   - `FENCED_SQLSTATE = "JF001"`
 - Produces (Python), in `jarvis_server.nodes`:
@@ -297,6 +315,25 @@ def test_gateway_cannot_change_node_key(gateway):        # P2-S6: UPDATE gw.node
 def test_gateway_cannot_change_node_identity(gateway):   # P2-S6: UPDATE gw.node SET tailscale_identity=… → InsufficientPrivilege
 def test_gateway_cannot_unrevoke_or_repoint(gateway):    # P2-S6: UPDATE gw.node SET revoked_at=NULL / person_id=… / kind=… → denied
 def test_touch_connection_changes_only_last_seen(gateway, app):  # P2-S6: every other gw.node column identical before and after
+def test_revoke_wins_heartbeat_refused(dsns):          # R8-1 order 1: revoke_node holds its transaction open; touch_connection in
+                                                         #   a thread blocks; revoke commits → touch raises JF001; last_seen_at and
+                                                         #   last_ping_at unchanged (the reviewer's probe, as a test)
+def test_heartbeat_wins_revoke_waits(dsns):              # R8-1 order 2: touch_connection holds its transaction open; revoke_node in
+                                                         #   a thread blocks (verified via pg_locks/pg_stat_activity wait); touch
+                                                         #   commits → revoke completes; node revoked, connection closed 'revoked'
+def test_supersede_wins_write_refused(dsns):             # open_connection(new) first, then a fenced write via current_node(old) → JF001
+def test_write_wins_supersede_waits(dsns):               # current_node(old) held in an open transaction; open_connection(new) blocks
+                                                         #   until it commits, then completes
+def test_no_deadlock_under_mixed_load(dsns):             # 8 threads × 200 random calls of touch / close / open / revoke / current_node
+                                                         #   on 2 nodes → no deadlock error (40P01), final state consistent
+def test_connect_disconnect_audited(app, gateway):       # open → CONNECT {node_id, conn_id, superseded_conn_id: null}; second open
+                                                         #   → DISCONNECT {old, 'superseded'} + CONNECT {new, superseded_conn_id: old};
+                                                         #   close → DISCONNECT {reason}; revoke → REVOKE + DISCONNECT 'revoked'; no
+                                                         #   audit row from touch_connection; details hold only IDs and codes
+def test_connection_audit_outlives_connection_rows(owner):  # delete gw.node_connection rows (as owner, simulating retention) →
+                                                         #   CONNECT/DISCONNECT rows remain
+def test_refused_enrolment_audit_uses_enrolment_id(...): # used or expired token → entity_id = enrolment id; unknown token → nil UUID
+def test_token_length_checked(gateway):                  # 25 or 27 chars → invalid_parameter_value; no audit row
 def test_heartbeat_from_superseded_connection_rejected(gateway, app):  # conn1 superseded by conn2 → touch_connection(conn1)
                                                          #   raises connection_fenced; last_seen_at unchanged
 def test_security_definer_functions_have_fixed_search_path(owner):
@@ -323,6 +360,10 @@ def test_p0_6_migrations_go_down_and_up_cleanly(...):    # existing P0-6 test: i
 ```
 
 - [ ] **Step 3: Implement the bootstrap role, migration 0008, `dbcall.py`, `nodes.py` and the CLI**
+
+**Interim key source:** `node enrol` takes the core fingerprint from secret `core_signing_key` and the gateway fingerprint from `gateway_signing_key.pub` (the gateway's raw public key) in the secrets directory. Both are read in one function, `core_main._key_fingerprints()`. Task 14 supplies `gateway_signing_key.pub`, and Task 12 replaces this source with `gw.trusted_key`.
+
+**Not deployable on its own:** after this commit, `init` needs the `pg_gateway_password` secret, which only arrives with the compose and deployment task (Task 14). No deploy happens before Task 14.
 
 `gw.enrol_node` follows §7.2 step 4 exactly, returning a structured refusal rather than raising (spec R7-1):
 - **Consume the token and register the node together:** in one `BEGIN … EXCEPTION WHEN unique_violation … END` block, a single `UPDATE gw.enrolment SET used_at = now() WHERE token_hash = sha256(p_token) AND used_at IS NULL AND expires_at > now() RETURNING …`, then the node insert, using `person_id` and `kind` from the enrolment row.
@@ -366,6 +407,8 @@ git commit -am "Phase 2: gateway role, node registry, one-time enrolment (migrat
   **All gateway-facing functions take `p_conn_id`, never a node ID,** and get the node through `gw.current_node`, so a fenced connection can't record anything.
 
   **Refusals follow spec R7-1:** an audited refusal is returned, never raised; fencing raises `JF001`. Python callers use `dbcall.audited_call` from Task 2.
+
+  **Strict fencing (spec R8-1):** every function above that takes `p_conn_id` calls `gw.current_node(p_conn_id)` **first**, before any other read or write, in the same transaction. It holds its share locks to commit, and takes no other lock on `gw.node` or `gw.node_connection` (which keeps the single lock order). No function checks the connection and then writes in a separate transaction.
   - `comm.supersede(p_outbox_id uuid) RETURNS void` and `comm.expire(p_outbox_id uuid) RETURNS void` (app; NOTIFY `jarvis_outbox`).
 
   Each function locks the row with `FOR UPDATE`, moves the state forward only, and writes an audit row.
@@ -392,6 +435,14 @@ def test_delivery_race_is_consistent(gateway, app):          # P2-E13 (database 
                                                              #   sent/received/ack/supersede across threads; final state ∈ legal
                                                              #   set; no forward-rank violation in audit order. The display-once
                                                              #   half is in Task 7.
+def test_revoke_wins_inbound_refused(dsns):                  # R8-1 order 1 for conv.record_inbound: revoke commits while
+                                                             #   record_inbound waits → JF001; no conv.inbound row, no job
+def test_inbound_wins_revoke_waits(dsns):                    # R8-1 order 2: record_inbound's transaction open → revoke_node waits,
+                                                             #   then completes; the inbound row exists and was recorded before REVOKE
+def test_supersede_wins_ack_refused(dsns):                   # same pair of orders for comm.acknowledge (one representative delivery
+def test_ack_wins_supersede_waits(dsns):                     #   function); the others share the current_node call, checked by test below
+def test_every_conn_function_calls_current_node_first(owner):# each p_conn_id function's source (pg_proc.prosrc) calls gw.current_node
+                                                             #   before any other statement
 def test_fenced_connection_refused_everywhere(gateway, app): # open conn1, open conn2 for the same node → conn1 is closed
                                                              #   'superseded'; record_inbound / record_sent / record_received /
                                                              #   acknowledge / record_chunk_received with conn1 → SQLSTATE JF001
@@ -660,7 +711,7 @@ git commit -am "Phase 2: gateway handshake, enrolment, inbound recording; fake n
     - An in-memory "last sent" value may exist to avoid busy re-sends, but it is only an optimisation. Correctness depends on the cursor alone.
   - **Outbox relay:** the gateway LISTENs on `jarvis_outbox`, runs the 60 s re-send sweep, and sends `outbox.cleared` on terminal states.
   - **Welcome:** carries `{session_id, summary: reconnect_summary(...)}`.
-  - **Duplicate connection rule:** `gw.open_connection` fences the old connection in the database (Task 2). The gateway then closes the old socket with reason `superseded`. Any message still arriving on the old socket, or any delivery the gateway tries through it, fails with `connection_fenced`. The gateway drops it and stops that socket's tasks.
+  - **Duplicate connection rule:** `gw.open_connection` fences the old connection in the database (Task 2), with strict ordering (spec R8-1). Every delivery (`record_sent`) and every inbound record for a socket runs in its own transaction, which calls the fenced function **before** the frame is written to the socket. A frame is written only if that call succeeded. The gateway then closes the old socket with reason `superseded`. Any message still arriving on the old socket, or any delivery the gateway tries through it, fails with `connection_fenced`. The gateway drops it and stops that socket's tasks.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -687,6 +738,10 @@ def test_resend_after_two_minutes_same_id(...):         # clock advanced; sweep 
 def test_outbox_survives_restart(...):                  # item PENDING; restart gateway; node connects → receives it (P2-E03)
 def test_second_connection_supersedes_first(...):       # same node connects twice → first closed 'superseded';
                                                         #   pending item delivered once in total to that node  [Review Focus 3]
+def test_revoke_during_delivery(...):                   # R8-1 end to end: revoke_node committed before record_sent → the item is
+                                                        #   not written to the socket; record_sent committed first → revoke waits,
+                                                        #   then the socket is closed within one revocation re-check
+def test_frame_written_only_after_fenced_record(...):   # injected failure (JF001) in record_sent → no frame reaches the FakeNode
 def test_old_socket_is_fenced(...):                     # after supersede, the old FakeNode sends an utterance, an ack and a
                                                         #   received → none recorded (no conv.inbound row, state unchanged);
                                                         #   no outbox.item is written to the old socket

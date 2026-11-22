@@ -1,11 +1,12 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** **Revision 7, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, revision 7. Revision 7 adds R7-1 to R7-6 (§20): how audited refusals work (the function audits and returns a structured refusal, and the caller commits before raising); audited enrolment creation; the gateway's function surface; `last_ping_at`; the fenced-connection error code; and the 0008 rollback rule (in the plan).
+**Status:** **Revision 8, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, revision 8. Revision 8 adds R8-1 and R8-2 (§20): strict connection fencing with one lock order, and permanent CONNECT / DISCONNECT audit.
 
 **Approval history:**
 - **Revision 4:** approved by Manj on 2026-11-22.
 - **Revision 5** (R5-1 offline-node re-enrolment, R5-2 validated resume): approved by Manj with plan revision 4 on 2026-11-22.
 - **Revision 6** (R6-1 to R6-8): approved by Manj with plan revision 6 (corrected) on 2026-11-22.
+- **Revision 7** (R7-1 to R7-6): approved by Manj with plan revision 7b on 2026-11-22.
 
 Authorises the implementation plan, not code. ADR-011 to 014 remain Proposed.
 **Date:** 2026-11-22
@@ -131,11 +132,48 @@ The five functions in the `gw` schema are the gateway's whole node and connectio
   | Failure | The function | Audit |
   |---|---|---|
   | **A refused request:** a decision the database makes against a well-formed call (a bad or used token, a key already in use, an unknown inbound kind, revoking an unknown or already revoked node) | writes the REJECTED audit row and **returns a structured refusal**: a defined reason code, never a bare NULL. It does not raise. | Yes, in the same transaction as the decision |
-  | **A fenced connection** (§7.1, R7-5): the connection is closed, superseded or its node revoked | raises the dedicated error `connection_fenced` (SQLSTATE `JF001`), distinct from ordinary permission denial | No row of its own: the operation that caused the fencing (opening a newer connection, closing it, or revoking the node) is already audited |
+  | **A fenced connection** (§7.1, R7-5): the connection is closed, superseded or its node revoked | raises the dedicated error `connection_fenced` (SQLSTATE `JF001`), distinct from ordinary permission denial | No row of its own: the operation that caused the fencing is in the permanent audit trail. That's `CONNECT` with the superseded connection, `DISCONNECT`, or `REVOKE` plus `DISCONNECT` (R8-2) |
   | **A malformed call** (a missing or invalid argument: a programming error) | raises `invalid_parameter_value` | No |
 
 - **The caller commits before it raises (R7-1).** The Python wrapper for an audited function runs the call in **its own transaction**, which it commits, and only then raises the matching application exception (for example `EnrolmentRefused(reason)`). It must never call an audited function inside a transaction it might roll back, because the refusal's audit row would disappear with it. The shared helper refuses to run unless the connection is idle, with no transaction open. Tests go through this Python boundary: after the exception, a **separate** connection must still see the audit row.
 - No second call writes an audit row afterwards: the function records the refusal atomically with its decision.
+
+**Strict connection fencing (R8-1).** A write made on a connection is ordered against the revocation of its node, and against the closing or superseding of the connection:
+- **Revocation or supersede first:** if it commits first, the write is refused with `JF001`.
+- **Write first:** if the write takes its locks first, the revocation or supersede waits until the write's transaction ends, then completes.
+- **Never a momentary check:** a write never proceeds just because the connection was valid a moment earlier.
+
+**How the database enforces it:**
+- Every gateway write that runs on an established connection calls `gw.current_node(conn_id)` first, in the same transaction. That covers every connection function in §4.1 except opening and closing.
+- `current_node` takes row locks and keeps them until that transaction ends.
+- Under READ COMMITTED, a lock request that waited re-reads the row's latest committed version, so the fence conditions (`closed_at IS NULL` on the connection, `revoked_at IS NULL` on the node) are checked against what has actually committed.
+- The heartbeat also repeats both conditions in its own `UPDATE … WHERE`, and raises `JF001` if no row matches.
+
+**One lock order everywhere:** the **node row first, then the connection row or rows**. A connection's `node_id` never changes, so reading it before taking any lock is safe.
+
+| Function | Node row | Connection row(s) |
+|---|---|---|
+| `gw.current_node` (all fenced writes in Tasks 3 and 7) | `FOR SHARE` | `FOR SHARE` (this connection) |
+| `gw.touch_connection` (heartbeat) | `FOR NO KEY UPDATE` | `FOR NO KEY UPDATE` (this connection) |
+| `gw.close_connection` | `FOR SHARE` | `FOR UPDATE` (this connection) |
+| `gw.open_connection` (supersedes) | `FOR UPDATE` | `FOR UPDATE` (the node's open connection, if any) |
+| `gw.revoke_node` | `FOR UPDATE` | `FOR UPDATE` (all the node's open connections) |
+
+**Why these locks:**
+- **Revocation and supersede wait:** both take `FOR UPDATE` on the node, which conflicts with every write's `FOR SHARE`, so they wait for in-flight writes, and writes wait for them.
+- **Closing a connection** conflicts with writes only on that connection's row.
+- **The heartbeat** takes the stronger lock from the start, instead of upgrading a share lock later. That way two heartbeats for the same node queue up and don't deadlock.
+
+**The one limit, accepted:** after a write commits, the gateway may already be writing the corresponding frame to the socket. A revocation that commits in that instant can't recall the frame. The gateway's 60 s revocation re-check closes the socket. The database record itself is strictly ordered.
+
+**Connection audit (R8-2).** Opening and closing connections are recorded in the permanent audit trail, independent of the 90-day retention of `gw.node_connection` rows. They hold IDs and codes only, and heartbeats aren't audited.
+
+| Action | Written by | `details` |
+|---|---|---|
+| `CONNECT` | `gw.open_connection` | `node_id`, `conn_id`, `superseded_conn_id` (or null) |
+| `DISCONNECT` | `gw.close_connection`; `gw.open_connection` for the connection it supersedes (reason `superseded`); `gw.revoke_node` for each connection it closes (reason `revoked`) | `node_id`, `conn_id`, `reason` |
+
+Each is written in the same transaction as the change it records. A connection row left open by a gateway restart is closed, with its `DISCONNECT` (reason `superseded`), when the node next connects.
 
 Its password is a new secret file, `pg_gateway_password`. Privilege tests: P2-S1 and P2-S6 (§14).
 
@@ -174,7 +212,7 @@ Three new schemas keep the boundaries visible: `gw` (nodes), `conv` (conversatio
 | `gw.node_connection` | `id`, `node_id`, `opened_at`, `last_ping_at`, `closed_at`, `close_reason` |
 | `gw.enrolment` | `id`, `token_hash`, `person_id`, `kind`, `name`, `expires_at`, `used_at`, `node_id` (§7.2). Rows are created only through the audited core function `gw.create_enrolment(…)` (R7-2); no role inserts them directly, and the gateway has no grant on this table. |
 
-A revoked node (`revoked_at` set) is refused at the handshake, and its open connection is closed within one sweep (P2-E10).
+A revoked node (`revoked_at` set) is refused at the handshake, and its open connection is closed within one sweep (P2-E10). `gw.node_connection` rows are kept for 90 days (§5.7). The permanent record of every open, supersede and close is the `CONNECT` / `DISCONNECT` audit (R8-2).
 
 ### 5.2 Conversations (`conv`)
 
@@ -862,3 +900,10 @@ Architecture direction approved; implementation approval pending these changes. 
 | R7-4 | **`gw.node_connection.last_ping_at`** added | §5.1 |
 | R7-5 | **Fenced connections raise SQLSTATE `JF001`** (`connection_fenced`), distinct from permission denial. No audit row of its own; the cause is already audited | §4.1 |
 | R7-6 | **Rollback of migration 0008** refuses if any node audit row, node or enrolment exists, and leaves the schema intact. A down-and-up test covers the empty case (plan Task 2) | plan Task 2 |
+
+**Revision 8 (22 Nov 2026). Matching plan: revision 8.** Owner rulings on Task 2's review:
+
+| # | Change | Where |
+|---|---|---|
+| R8-1 | **Strict connection fencing.** A revocation or supersede that commits first refuses the old connection's write; a write that takes its locks first makes the revocation or supersede wait. `current_node` takes share locks held to commit; the heartbeat re-checks both conditions in its update. One lock order, node row then connection rows, with fixed modes per function. Applies to Tasks 2, 3 and 7. Races are tested in both orders. | §4.1 |
+| R8-2 | **Permanent connection audit:** `CONNECT` (node, connection, superseded connection) and `DISCONNECT` (node, connection, reason), with IDs and codes only, and no heartbeat audit. This makes R7-5's premise true. | §4.1, §5.1 |
