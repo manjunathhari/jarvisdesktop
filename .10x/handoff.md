@@ -1,5 +1,5 @@
 # Handoff
-**Now:** Phase 0 complete and live. Phase 1 (memory engine) built and reviewed 2026-11-22 on branch `phase-1-memory-engine`: 236 tests green, M1–M4 pass, QA + security reviews in `reviews/2026-11-22-phase-1-*` with no blocking issues. PR #3 open, CI green, live check passed (live server runs branch commit 6e49572). Next: Manj merges; then Phase 2.
+**Now:** Phase 0 and Phase 1 complete. Phase 1 (memory engine) merged 2026-11-22 (PR #3, main `f373775`): 236 tests green, M1–M4 pass, reviews in `reviews/2026-11-22-phase-1-*` with no blocking issues. Close-out PR #4 limits image publishing to `main`; then redeploy `main`. Next: Phase 2 (Jarvis core + nodes) — brainstorm, design doc and ADRs (next free: 011) before any code.
 
 **Read first:** spec (§15 lists build changes) `.10x/specs/2026-11-21-phase-1-memory-engine-design.md`, ADR-010, `decisions/*/phase-1-memory-engine.md`.
 
@@ -7,7 +7,6 @@
 
 **Follow-ups carried forward**
 - S3: the Phase 2 gateway must derive the acting person/node (memory `viewer`/`by`) from authentication, never from client input.
-- After merge: remove `phase-1-memory-engine` from the image-publish condition in `.github/workflows/server.yml`.
 - Phase 2: add a call to change visibility/sharing after a write; consider an index on memory audit `details->>'commit'` if reconciliation slows.
 - S4: pin image digests before moving to JARVIS's own server. S5: closed in migration 0007 (Phase 1).
 - Q3: turn off deploy smoke (`JARVIS_SMOKE_ON_INIT=0`) or clean `smoke-check` rows once real data arrives.

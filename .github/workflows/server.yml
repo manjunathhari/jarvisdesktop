@@ -46,10 +46,10 @@ jobs:
         run: docker build --tag jarvis-server:ci .
 
   publish:
-    # After tests pass on the Phase 0 branch or main, publish the image the server pulls,
+    # After tests pass on main, publish the image the server pulls,
     # tagged with the commit (the server deploys by JARVIS_REF = commit SHA).
     needs: test
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/phase-0-foundations' || github.ref == 'refs/heads/phase-1-memory-engine')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
