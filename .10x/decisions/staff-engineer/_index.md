@@ -1,5 +1,6 @@
 # Staff Engineer — index
 ## Active features
+- phase-1-memory-engine — v2 memory engine (ADR-010, approved 2026-11-22)
 - news-wall
 - phase-0-foundations (Python server standards in its file)
 ## Standards (all features)

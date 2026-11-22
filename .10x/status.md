@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): running on the shared server; P0-1…P0-6 pass; P0-8 pass; P0-7 deferred (Manj); reviews done — PR #2 ready to merge.**
+**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): complete, PR #2 merged 2026-11-21; running on the shared server. Phase 1 (memory engine): spec approved 2026-11-22, implementation in progress on branch `phase-1-memory-engine`.**
 **Started:** 2026-11-21
 
 ## Known so far
@@ -79,4 +79,19 @@ Design: `.10x/specs/2026-11-21-phase-0-foundations-design.md`, ADR-006…009 (Pr
 - [x] T0.5 Hardening: Tailscale (+ Tailscale SSH), SSH key-only + fail2ban, Hostinger firewall 22/80/443 — done 21 Nov. **P0-8 PASS** 21 Nov (external scan: only 22/80/443 open; SSH publickey only). Re-runs weekly.
 - [x] T0.6 Deployed via Hostinger Docker manager (image from GHCR); P0-1…P0-5 SMOKE PASS on the live server, 21 Nov
 - [x] T0.7 Local daily backups running; rebuild/move runbook `server/deploy/README.md`. P0-7 restore drill deferred by Manj (Hostinger weekly backup suffices until the build grows).
-- [x] T0.8 QA + security review (`.10x/reviews/2026-11-21-*`), no blocking issues — awaiting Manj's merge of PR #2
+- [x] T0.8 QA + security review (`.10x/reviews/2026-11-21-*`), no blocking issues — PR #2 merged 2026-11-21
+
+## 2026-11-22 — Architecture v2 Phase 1 (memory engine)
+Spec `.10x/specs/2026-11-21-phase-1-memory-engine-design.md` approved by Manj; ADR-010 accepted.
+Decisions: P1 engine only (no real memories until Phase 2) · P2 markdown is the truth · P3 private git repo, no remote · P4 deterministic retrieval · P5 audit in Postgres, no content · P6 viewer-based access · no automatic parental access to PRIVATE · dedicated server before real memories (encryption at rest later).
+Boundary: no embeddings, AI inference, consolidation, external memory services or real personal data in Phase 1.
+
+### Phase 1 task list
+- [ ] T1.1 ADR-010; interface, types, memory-entry contract
+- [ ] T1.2 Strict markdown parser and writer
+- [ ] T1.3 Private git store and history
+- [ ] T1.4 Lifecycle and tag rules
+- [ ] T1.5 Visibility, retrieval, M1–M4
+- [ ] T1.6 Migration 0007 (memory audit + S5) and recovery
+- [ ] T1.7 Deploy: git in image, memory volume, smoke, bundle, runbook
+- [ ] T1.8 Independent QA and security review
