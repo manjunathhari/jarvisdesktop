@@ -33,6 +33,9 @@ def _with(dsn: str, **kw: str) -> str:
     return psycopg.conninfo.make_conninfo(dsn, **kw)
 
 
+_PASSWORDS = (secrets.token_urlsafe(16), secrets.token_urlsafe(16))
+
+
 @contextlib.contextmanager
 def fresh_database() -> Iterator[Dsns]:
     """A new database built from migrations alone; dropped afterwards."""
@@ -40,7 +43,9 @@ def fresh_database() -> Iterator[Dsns]:
     if not superuser:
         pytest.skip("JARVIS_TEST_SUPERUSER_DSN not set; database tests skipped")
     database = f"jarvis_test_{secrets.token_hex(4)}"
-    owner_pw, app_pw = secrets.token_urlsafe(16), secrets.token_urlsafe(16)
+    # Roles are cluster-wide and bootstrap sets their passwords, so every test database in
+    # one run must use the same passwords or earlier connections stop authenticating.
+    owner_pw, app_pw = _PASSWORDS
     bootstrap(superuser, database, owner_pw, app_pw)
     d = Dsns(
         superuser=_with(superuser, dbname=database),
