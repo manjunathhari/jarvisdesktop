@@ -1,6 +1,10 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** Revision 5. Revision 4 was approved by Manj on 2026-11-22. Revision 5 adds only the §7.1 offline-node re-enrolment rule (STALE nodes, close code 4409, `node reenrol`), made with plan revision 3; it awaits Manj's confirmation together with the plan. Authorises the implementation plan, not code. ADR-011 to 014 remain Proposed.
+**Status:** Revision 5. Revision 4 was approved by Manj on 2026-11-22. Revision 5 adds two protocol rules, recorded in §20 as R5-1 and R5-2, and its matching plan is `.10x/plans/2026-11-22-phase-2-server.md`, **revision 4**. The two rules are:
+- **R5-1:** the §7.1 offline-node re-enrolment rule (STALE nodes, close code 4409, `node reenrol`);
+- **R5-2:** the §6.2 validated-resume rule (out-of-range `resume` ignored; resume from the durable acknowledged cursor).
+
+Revision 5 awaits Manj's confirmation together with plan revision 4. Authorises the implementation plan, not code. ADR-011 to 014 remain Proposed.
 **Date:** 2026-11-22
 **Feature slug:** `phase-2-core-and-nodes`
 **Inputs:** Architecture v2 §5–§9, §13–§15 (project doc `Jarvis_Architecture_v2.md`), decisions D1–D8, `phase-1-handover.md`, Phase 0 and Phase 1 designs, the Phase 2 kick-off conversation (22 Nov 2026).
@@ -307,7 +311,7 @@ A valid gateway signature alone is never enough.
 **Trust distribution and rotation:**
 - **Pinning at enrolment:** the enrolment code Manj types into the desktop (§7.2) contains the fingerprints of the current core and gateway public keys. During enrolment the node receives the keys and pins them only if they match the fingerprints, so the gateway can't substitute its own key for core's.
 - **Rotation:** core announces a new key in a `keyset` message whose `authz` object (kind `keyset`) is signed by the **current** core key. Nodes add the new `key_id`, accept both keys for a 24 h overlap, then drop the old one. The gateway key rotates the same way, but its announcement is signed by core.
-- **A node that missed the overlap re-enrols** (Revision 5, with plan rev 3, 22 Nov):
+- **A node that missed the overlap re-enrols** (Revision 5, R5-1):
   - Activation waits for every active node to acknowledge, or 24 h.
   - Nodes that hadn't acknowledged are marked STALE, and the gateway closes their `hello` with code 4409 (`reenrol_required`) before sending any signed message.
   - A node that sees 4409, or any signature with an unknown `key_id`, runs nothing and asks to be re-enrolled.
@@ -760,9 +764,9 @@ Architecture direction approved; implementation approval pending these changes. 
 | R1a | Concurrent jobs for the same turn | §10.1 step 6: per-turn row lock (turn, then budget), partial unique index, a table of what each job does, the sweep owns crash cleanup; P2-B5 |
 | R1b | What qualifies for RELEASED | §10.1 step 4: connect phase vs send phase; RELEASED only for connect-phase failures; any send-phase outcome short of success is indeterminate; unclassifiable counts as send; §10.2; P2-B4 |
 
-**Revision 5 (22 Nov 2026, with plan revision 3):**
+**Revision 5 (22 Nov 2026). Matching plan: revision 4.** Two additions:
 
 | # | Change | Where |
 |---|---|---|
-| R5-1 | **A node that missed the key-rotation overlap must re-enrol.** Activation (all acknowledged, or 24 h) marks the non-acknowledging nodes STALE; the gateway closes a STALE node's `hello` with 4409 before any signed message; a node that sees 4409, or an unknown `key_id`, runs nothing and asks to be re-enrolled; `jarvis-core node reenrol` revokes the old node and issues a code with the current fingerprints. A node never accepts a key from the gateway alone. | §7.1 |
-| R5-2 | **Reconnect `resume` is validated before use** (from plan revision 4): a `last_seq` above the stored maximum, or for an unknown or foreign reply, is ignored and the gateway resumes from the acknowledged cursor, logging `node.resume_out_of_range`. | §6.2 step 6 note |
+| R5-1 | **Offline-node recovery after key rotation** (first drafted with plan revision 3). **A node that missed the key-rotation overlap must re-enrol.** Activation (all acknowledged, or 24 h) marks the non-acknowledging nodes STALE; the gateway closes a STALE node's `hello` with 4409 before any signed message; a node that sees 4409, or an unknown `key_id`, runs nothing and asks to be re-enrolled; `jarvis-core node reenrol` revokes the old node and issues a code with the current fingerprints. A node never accepts a key from the gateway alone. | §7.1 |
+| R5-2 | **Validated resume** (with plan revision 4). **Reconnect `resume` is validated before use**: a `last_seq` above the stored maximum, or for an unknown or foreign reply, is ignored and the gateway resumes from the acknowledged cursor, logging `node.resume_out_of_range`. | §6.2 step 6 note |
