@@ -1,6 +1,6 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** **Revision 10, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, revision 10. Revision 10 adds R10-1 and R10-2 (§20), found when preparing Task 4: `ledger.consume_approval` returns a structured, audited refusal (R7-1), and the approval decision trigger is a backstop invariant, not the refusal path.
+**Status:** **Revision 11, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, revision 11. Revision 11 adds R11-1 to R11-3 (§20), from the Task 5 review: audited refusals inside a job transaction, the rule that an audit row always survives, and typed optional notification inputs.
 
 **Approval history:**
 - **Revision 4:** approved by Manj on 2026-11-22.
@@ -9,6 +9,7 @@
 - **Revision 7** (R7-1 to R7-6): approved by Manj with plan revision 7b on 2026-11-22.
 - **Revision 8** (R8-1, R8-2): approved by Manj with plan revision 8b on 2026-11-22.
 - **Revision 9** (R9-1 to R9-6): approved by Manj with plan revision 9 on 2026-11-22.
+- **Revision 10** (R10-1, R10-2): approved by Manj with plan revision 10 on 2026-11-22.
 
 Authorises the implementation plan, not code. ADR-011 to 014 remain Proposed.
 **Date:** 2026-11-22
@@ -151,6 +152,13 @@ All of these take the connection ID, except `gw.enrol_node` and `gw.open_connect
 
 - **The caller commits before it raises (R7-1).** The Python wrapper for an audited function runs the call in **its own transaction**, which it commits, and only then raises the matching application exception (for example `EnrolmentRefused(reason)`). It must never call an audited function inside a transaction it might roll back, because the refusal's audit row would disappear with it. The shared helper refuses to run unless the connection is idle, with no transaction open. Tests go through this Python boundary: after the exception, a **separate** connection must still see the audit row.
 - No second call writes an audit row afterwards: the function records the refusal atomically with its decision.
+- **Inside a job (R11-1).** A job handler runs in dispatch's one job transaction (ADR-013), so the commit-before-raise rule takes this form:
+  1. **The job transaction is the audited call's transaction.** Inside a handler, audited functions are called through `dbcall.audited_call_in_job`, never through `audited_call`.
+  2. **No transaction of its own.** `audited_call_in_job` works only inside dispatch's job transaction. It refuses to run anywhere else, and it never opens, commits or rolls back a transaction itself.
+  3. **A kept refusal ends the handler normally.** When a handler gets an audited refusal it must keep, it returns normally, and dispatch commits the job transaction, including the refusal's audit row.
+  4. **Then it stops.** After that refusal the handler does no further work and raises nothing that could roll the transaction back.
+  5. **This applies to every approval refusal** in the decision handler (§9.3, §9.4, R10-1).
+- **An audit row always survives (R11-2).** There is no exception for refusals that "seem informational". If a call writes an audit row, that row must survive. If an outcome genuinely needs no audit record, it is defined as a **non-audited no-op**, which writes no audit row at all. For example, `comm.create_outbox` asked to supersede an item that is already terminal skips the supersede as a non-audited no-op, and doesn't call the audited `comm.supersede`. A direct call to `comm.supersede` on a terminal item still returns `'terminal'` with its audit row (R9-3), under the normal commit-before-raise rule.
 
 **Per-person isolation on connection functions (R9-1, R9-4, R9-5).** A connection function acts only on records of the authenticated node's person, taken from the fenced node row, never from the call:
 
@@ -509,6 +517,16 @@ No job is involved, so enrolment works with core down.
 | Cost cap at 80% / 100% | TODAY / URGENT | |
 | Held turn expired (cap) | TODAY | In its session; supersedes the "held" item |
 | Node action succeeded (READ_ONLY) | SILENT | History only |
+
+**Optional inputs to a rule (R11-3).** A caller passes one typed context, `NotifyContext`. Every field is optional:
+
+| Field | Type | Use |
+|---|---|---|
+| `supersedes_id` | UUID | The item this one supersedes |
+| `expires_at` | timestamp with offset | When the item expires, for example with its approval |
+| `group_key` | text | Groups related items in the reconnect summary (§8.3). When absent it stays absent (NULL), never a placeholder, so unrelated items are never grouped together |
+| `text` | text | The reply text, for `turn.completed_after_hold` |
+| `authz` | the signed authorisation object (§7.1) | The core-signed approval card. It is carried as delivered. Delivery doesn't make it trusted: the node verifies it under §7.1, as for any authorisation |
 
 ### 8.2 Delivery to several nodes (exact rules)
 
@@ -960,3 +978,11 @@ Architecture direction approved; implementation approval pending these changes. 
 |---|---|---|
 | R10-1 | **`ledger.consume_approval` follows R7-1:** it returns `(execution_key, refusal)`. Refusals are `unknown_approval`, `not_approved`, `expired` and `already_consumed`, each audited in the same transaction. Success writes a `CONSUME` audit row. A caller commits a refusal and never rolls it back. | §5.5, §9.4 |
 | R10-2 | **The approval trigger is a backstop invariant:** it raises `check_violation` on an illegal write, with no audit row of its own. It is not the refusal path. | §5.5 |
+
+**Revision 11 (22 Nov 2026). Matching plan: revision 11.** Owner rulings on the Task 5 review:
+
+| # | Change | Where |
+|---|---|---|
+| R11-1 | **Audited refusals inside a job:** the job transaction is the audited call's transaction, through `audited_call_in_job`. A kept refusal makes the handler return normally and stop, and dispatch commits it with the job. This applies to every approval refusal. | §4.1 |
+| R11-2 | **An audit row always survives:** there's no informational exception. An outcome that needs no record is a non-audited no-op. For example, `create_outbox` skips superseding an already terminal item without an audit row. | §4.1 |
+| R11-3 | **Typed optional notification inputs** (`NotifyContext`): `supersedes_id`, `expires_at`, `group_key` (NULL when absent), `text`, and `authz`, which stays untrusted until the node verifies it | §8.1 |
