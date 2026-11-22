@@ -117,11 +117,22 @@ The gateway changes state **only** through these functions, and holds EXECUTE on
 | `gw.enrol_node(token, public_key, tailscale_identity)` | One-time node registration (§7.2) |
 | `gw.open_connection(node_id)` / `gw.close_connection(conn_id, reason)` | Connection rows; opening fences any older connection of the node |
 | `gw.touch_connection(conn_id)` | Heartbeat: `gw.node.last_seen_at` and `gw.node_connection.last_ping_at` |
-| `gw.current_node(conn_id)` | The node of an open, non-revoked connection, or the fenced-connection error. Used inside the other functions, and by the gateway's 60 s revocation re-check |
+| `gw.current_node(conn_id)` | The node of an open, non-revoked connection, or the fenced-connection error. Called first by every Task 3 and Task 7 function that works on an established connection (the `conv` and `comm` functions below), and by the gateway's 60 s revocation re-check. **Not** called by the `gw` functions themselves (R8-1) |
 | `conv.record_inbound(conn_id, message_id, kind, payload)` | Writes `conv.inbound` (person filled from the node row inside the function) and enqueues the matching fixed job kind |
 | `comm.record_sent(conn_id, outbox_id)` / `comm.record_received(conn_id, outbox_id)` / `comm.acknowledge(conn_id, outbox_id)` / `conv.record_chunk_received(conn_id, reply_id, seq)` | Delivery and stream-cursor transitions (§8.2, §6.2) |
 
-The five functions in the `gw` schema are the gateway's whole node and connection surface. Every function used on an established connection takes the connection ID and gets the node through `gw.current_node`. Only `gw.enrol_node` (before any connection exists) and `gw.open_connection` (which creates it) don't.
+The five functions in the `gw` schema are the gateway's whole node and connection surface. Which ones go through `gw.current_node` (R8-1):
+
+| Function | Calls `current_node`? | Instead |
+|---|---|---|
+| `gw.enrol_node` | No | Runs before any connection exists |
+| `gw.open_connection` | No | Opens and supersedes under its own locks (node `FOR UPDATE`, then the old connection `FOR UPDATE`) |
+| `gw.close_connection` | No | Its own locks (node `FOR SHARE`, then this connection `FOR UPDATE`). It checks the connection while holding them. An already closed connection is a no-op that returns without a second `DISCONNECT`; revocation doesn't prevent closing |
+| `gw.touch_connection` | No | Its own locks (node `FOR NO KEY UPDATE`, then this connection `FOR NO KEY UPDATE`), and it re-checks both fence conditions in its own `UPDATE … WHERE`. Calling `current_node` first would take share locks it then has to upgrade, which is the deadlock its stronger lock avoids |
+| `gw.current_node` | — | It is the fence |
+| every `conv` and `comm` function that takes a connection ID (Tasks 3 and 7) | **Yes, first**, in the same transaction | It takes no other lock on `gw.node` or `gw.node_connection` itself |
+
+All of these take the connection ID, except `gw.enrol_node` and `gw.open_connection`, which runs before the connection exists. All keep the one lock order: node row first, then connection rows.
 
 **Rules for every SECURITY DEFINER function** (gateway-facing and core-facing alike):
 - `SET search_path = pg_catalog, pg_temp`, and every object reference is schema-qualified.
@@ -144,7 +155,7 @@ The five functions in the `gw` schema are the gateway's whole node and connectio
 - **Never a momentary check:** a write never proceeds just because the connection was valid a moment earlier.
 
 **How the database enforces it:**
-- Every gateway write that runs on an established connection calls `gw.current_node(conn_id)` first, in the same transaction. That covers every connection function in §4.1 except opening and closing.
+- Every `conv` and `comm` function that runs on an established connection (Tasks 3 and 7) calls `gw.current_node(conn_id)` first, in the same transaction, and takes no other node or connection lock itself. The four `gw` connection functions don't call it. `enrol_node`, `open_connection`, `close_connection` and `touch_connection` each use their own locks in the table below, in the same node-then-connection order (see the table above).
 - `current_node` takes row locks and keeps them until that transaction ends.
 - Under READ COMMITTED, a lock request that waited re-reads the row's latest committed version, so the fence conditions (`closed_at IS NULL` on the connection, `revoked_at IS NULL` on the node) are checked against what has actually committed.
 - The heartbeat also repeats both conditions in its own `UPDATE … WHERE`, and raises `JF001` if no row matches.
@@ -153,7 +164,7 @@ The five functions in the `gw` schema are the gateway's whole node and connectio
 
 | Function | Node row | Connection row(s) |
 |---|---|---|
-| `gw.current_node` (all fenced writes in Tasks 3 and 7) | `FOR SHARE` | `FOR SHARE` (this connection) |
+| `gw.current_node` (called first by every Task 3 and Task 7 connection function) | `FOR SHARE` | `FOR SHARE` (this connection) |
 | `gw.touch_connection` (heartbeat) | `FOR NO KEY UPDATE` | `FOR NO KEY UPDATE` (this connection) |
 | `gw.close_connection` | `FOR SHARE` | `FOR UPDATE` (this connection) |
 | `gw.open_connection` (supersedes) | `FOR UPDATE` | `FOR UPDATE` (the node's open connection, if any) |
@@ -905,5 +916,5 @@ Architecture direction approved; implementation approval pending these changes. 
 
 | # | Change | Where |
 |---|---|---|
-| R8-1 | **Strict connection fencing.** A revocation or supersede that commits first refuses the old connection's write; a write that takes its locks first makes the revocation or supersede wait. `current_node` takes share locks held to commit; the heartbeat re-checks both conditions in its update. One lock order, node row then connection rows, with fixed modes per function. Applies to Tasks 2, 3 and 7. Races are tested in both orders. | §4.1 |
+| R8-1 | **Strict connection fencing.** Which functions call `current_node` is listed explicitly in §4.1: the `conv` and `comm` connection functions do, first; `enrol_node`, `open_connection`, `close_connection` and `touch_connection` don't, and use their own locks in the same order. A revocation or supersede that commits first refuses the old connection's write; a write that takes its locks first makes the revocation or supersede wait. `current_node` takes share locks held to commit; the heartbeat re-checks both conditions in its update. One lock order, node row then connection rows, with fixed modes per function. Applies to Tasks 2, 3 and 7. Races are tested in both orders. | §4.1 |
 | R8-2 | **Permanent connection audit:** `CONNECT` (node, connection, superseded connection) and `DISCONNECT` (node, connection, reason), with IDs and codes only, and no heartbeat audit. This makes R7-5's premise true. | §4.1, §5.1 |
