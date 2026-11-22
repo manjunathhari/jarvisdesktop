@@ -8,9 +8,9 @@
 
 **Tech Stack:** Python 3.12, uv, psycopg 3 (sync in core, async in the gateway), Alembic, FastAPI and uvicorn, `rfc8785`, `cryptography` (Ed25519), `httpx` (Claude), pytest, ruff, mypy; Postgres 17; Docker Compose; `tailscale/tailscale` sidecar.
 
-**Plan revision:** 8 (22 Nov 2026; corrected after Manj's review: the exact set of functions that do and don't call `current_node` is now explicit). Revision 8 applies Manj's rulings on the Task 2 review (spec R8-1, R8-2): strict fencing with one lock order and race tests in both orders (Tasks 2, 3 and 7), CONNECT / DISCONNECT audit, and five smaller points in Task 2. Revision 7 (corrected after Manj's review: Task 2 Step 3 now returns structured refusals instead of raising). Revision 7 applies Manj's rulings on Task 2 (spec R7-1 to R7-6): audited refusals return a structured result and the caller commits before raising, audited enrolment creation, the five-function `gw` surface, `last_ping_at`, the `JF001` fencing error and the 0008 rollback rule. They change Tasks 2 and 3. Revision 6 (corrected after Manj's review: Task 6's enrolment test ends with `welcome` and makes no second `hello`, and Task 12's key-source statements now separate enrolment from ordinary welcomes and rotation). Revision 6 adds Manj's handshake corrections (spec R6-6 to R6-8): the enrolment key-pinning `welcome` block, separate `hello` and `enrol` validation paths, per-sender `seq`, and stale-node refusal after the challenge. They change Task 1, Task 6 and Task 12's tests. Revision 5 applied Manj's Task 1 rulings (spec Revision 6): the `challenge` kind and nonce handshake, key-announcement expiry, gateway/core key separation cases and the timestamp rule. They change Task 1 (contracts and shared cases) and Task 6 (handshake tests). Revision 4 fixed the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
+**Plan revision:** 9 (22 Nov 2026). Revision 9 applies Manj's rulings on the Task 3 review (spec R9-1 to R9-6): stream-cursor isolation by session (Tasks 3, 7, 10 and 11), strict event details, `supersede` / `expire` outcomes, `id_conflict`, `unknown_item`, the `stream_cursor` grant, the stricter Task 2 mixed-load test, and two Task 7 notes. Revision 8 (corrected after Manj's review: the exact set of functions that do and don't call `current_node` is now explicit). Revision 8 applies Manj's rulings on the Task 2 review (spec R8-1, R8-2): strict fencing with one lock order and race tests in both orders (Tasks 2, 3 and 7), CONNECT / DISCONNECT audit, and five smaller points in Task 2. Revision 7 (corrected after Manj's review: Task 2 Step 3 now returns structured refusals instead of raising). Revision 7 applies Manj's rulings on Task 2 (spec R7-1 to R7-6): audited refusals return a structured result and the caller commits before raising, audited enrolment creation, the five-function `gw` surface, `last_ping_at`, the `JF001` fencing error and the 0008 rollback rule. They change Tasks 2 and 3. Revision 6 (corrected after Manj's review: Task 6's enrolment test ends with `welcome` and makes no second `hello`, and Task 12's key-source statements now separate enrolment from ordinary welcomes and rotation). Revision 6 adds Manj's handshake corrections (spec R6-6 to R6-8): the enrolment key-pinning `welcome` block, separate `hello` and `enrol` validation paths, per-sender `seq`, and stale-node refusal after the challenge. They change Task 1, Task 6 and Task 12's tests. Revision 5 applied Manj's Task 1 rulings (spec Revision 6): the `challenge` kind and nonce handshake, key-announcement expiry, gateway/core key separation cases and the timestamp rule. They change Task 1 (contracts and shared cases) and Task 6 (handshake tests). Revision 4 fixed the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
 
-**Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, **Revision 8** (R8-1, R8-2, on top of the approved Revisions 4 to 7). Implementers work from Revision 8 only. Section references (§) below point there. Read it alongside this plan.
+**Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, **Revision 9** (R9-1 to R9-6, on top of the approved Revisions 4 to 8). Implementers work from Revision 9 only. Section references (§) below point there. Read it alongside this plan.
 
 **Out of this plan (separate plans):**
 - **Plan B:** the Rust desktop node (spec §13).
@@ -400,19 +400,29 @@ git commit -am "Phase 2: gateway role, node registry, one-time enrolment (migrat
   - schema `conv`, with `conv.session` (partial unique index `UNIQUE (person_id) WHERE closed_at IS NULL`), `conv.inbound` (including `outcome text NULL`, which may be `ANSWERED`, `INDETERMINATE` or `REFUSED`), `conv.message`, `conv.stream_chunk` and `conv.session_ticket`, as in §5.2;
   - schema `comm`, with `comm.event` (append-only trigger), `comm.outbox` and `comm.delivery`, as in §5.3.
 - Produces (SQL functions):
-  - `conv.record_inbound(p_conn_id bigint, p_message_id uuid, p_kind text, p_payload jsonb) RETURNS TABLE (recorded boolean, refusal text)` (gateway EXECUTE): derives the node from `gw.current_node(p_conn_id)`, so a superseded or closed connection is **fenced** (raises `JF001`, spec R7-5); a duplicate `message_id` returns `(false, NULL)` with no audit row; fills `person_id` from `gw.node`; enqueues the fixed job kind by `p_kind`: `utterance` → `conv.turn`, `approval.decision` → `approval.decision`, `action.receipt` → `action.receipt`; any other kind returns `(false, 'unknown_kind')` with a REJECTED audit row (spec R7-1); NOTIFYs `jarvis_jobs`;
+  - `conv.record_inbound(p_conn_id bigint, p_message_id uuid, p_kind text, p_payload jsonb) RETURNS TABLE (recorded boolean, refusal text)` (gateway EXECUTE): derives the node from `gw.current_node(p_conn_id)`, so a superseded or closed connection is **fenced** (raises `JF001`, spec R7-5); a duplicate `message_id` **from the same node** returns `(false, NULL)` with no audit row; one already recorded **by a different node** returns `(false, 'id_conflict')` with a REJECTED audit row (spec R9-4); fills `person_id` from `gw.node`; enqueues the fixed job kind by `p_kind`: `utterance` → `conv.turn`, `approval.decision` → `approval.decision`, `action.receipt` → `action.receipt`; any other kind returns `(false, 'unknown_kind')` with a REJECTED audit row (spec R7-1); NOTIFYs `jarvis_jobs`;
   - `comm.record_sent(p_conn_id bigint, p_outbox_id uuid) RETURNS boolean`, which is false if the item is terminal; a fenced connection raises `JF001` (gateway);
-  - `comm.record_received(p_conn_id bigint, p_outbox_id uuid) RETURNS text` (gateway);
+  - `comm.record_received(p_conn_id bigint, p_outbox_id uuid) RETURNS text` (gateway). It returns the resulting state, or `'unknown_item'` (audited) when the item is unknown or belongs to another person (spec R9-5). `comm.acknowledge` and `record_sent` refuse the same way (`record_sent` returns false);
   - `comm.acknowledge(p_conn_id bigint, p_outbox_id uuid) RETURNS text` (gateway; NOTIFY `jarvis_outbox` with the id);
-  - `conv.record_chunk_received(p_conn_id bigint, p_reply_id uuid, p_seq int) RETURNS void` (gateway): sets `conv.stream_cursor.acked_seq = greatest(acked_seq, p_seq)` for `(reply_id, node)`;
+  - `conv.record_chunk_received(p_conn_id bigint, p_reply_id uuid, p_seq int) RETURNS TABLE (recorded boolean, refusal text)` (gateway): sets `conv.stream_cursor.acked_seq = greatest(acked_seq, p_seq)` for `(reply_id, node)`. If the chunk's `session_id` belongs to a person other than the node's, it returns `(false, 'other_person')` with a REJECTED audit row, and creates or changes no cursor row (spec R9-1). A chunk that doesn't exist still raises `invalid_parameter_value` here; Task 7 turns that case into a no-op;
+  - **`conv.stream_chunk.session_id`** (NOT NULL, FK → `conv.session`) is a new column, written by core (Tasks 10 and 11);
   - **durable stream cursor:** `conv.stream_cursor(reply_id uuid, node_id uuid, acked_seq int NOT NULL DEFAULT 0, PRIMARY KEY (reply_id, node_id))`. The gateway may SELECT it, and changes it only through the function above. It's deleted with its chunks after 24 h.
 
   **All gateway-facing functions take `p_conn_id`, never a node ID,** and get the node through `gw.current_node`, so a fenced connection can't record anything.
 
+  **The Task 2 mixed-load test is tightened in this task** (`tests/test_nodes.py::test_no_deadlock_under_mixed_load`, owner ruling):
+  - after every `JF001`, the test asserts that the connection really was unknown (including connection ID 0), closed, or its node revoked, checked from a separate connection after the call;
+  - a revoke refusal is accepted only as `already_revoked`;
+  - an open-connection refusal is accepted only when the node is revoked;
+  - nothing else is tolerated.
+
+  It must fail if a valid connection is fenced; prove that with a temporary mutation, recorded in the report.
+
   **Refusals follow spec R7-1:** an audited refusal is returned, never raised; fencing raises `JF001`. Python callers use `dbcall.audited_call` from Task 2.
 
   **Strict fencing (spec R8-1):** every function above that takes `p_conn_id` calls `gw.current_node(p_conn_id)` **first**, before any other read or write, in the same transaction. It holds its share locks to commit, and takes no other lock on `gw.node` or `gw.node_connection` (which keeps the single lock order). No function checks the connection and then writes in a separate transaction.
-  - `comm.supersede(p_outbox_id uuid) RETURNS void` and `comm.expire(p_outbox_id uuid) RETURNS void` (app; NOTIFY `jarvis_outbox`).
+  - `comm.supersede(p_outbox_id uuid) RETURNS text` and `comm.expire(p_outbox_id uuid) RETURNS text` (app; NOTIFY `jarvis_outbox`): `'applied'`, or `'terminal'` when the item was already terminal, with a REJECTED audit row (spec R9-3);
+  - **`comm.event.details`:** a strict `CHECK` (`jsonb_typeof(details) = 'object'` and every value a string, using a strict jsonpath, for example `NOT jsonb_path_exists(details, 'strict $.* ? (@.type() != "string")')`). It rejects arrays, nested objects, numbers, booleans and nulls (spec R9-2).
 
   Each function locks the row with `FOR UPDATE`, moves the state forward only, and writes an audit row.
 - Produces (Python), in `jarvis_server.comm`:
@@ -424,7 +434,18 @@ git commit -am "Phase 2: gateway role, node registry, one-time enrolment (migrat
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-def test_inbound_duplicate_is_noop(gateway, app):            # same message_id twice → True then False; one ops.job
+def test_inbound_duplicate_is_noop(gateway, app):            # same message_id twice from the same node → True then (False, NULL);
+                                                             #   one ops.job; no audit row
+def test_inbound_id_conflict_across_nodes(gateway, app):     # message_id recorded by node A, then sent by node B → (False,
+                                                             #   'id_conflict'); REJECTED audit row visible from a separate connection
+def test_chunk_receipt_for_other_persons_reply_refused(...): # two persons: B's node records receipt for A's reply → (False,
+                                                             #   'other_person'); REJECTED audit row; A's and B's cursor rows unchanged
+                                                             #   (none created for B)
+def test_outbox_unknown_or_other_person_refused(...):        # record_received / acknowledge on an unknown id and on another person's
+                                                             #   item → 'unknown_item', audited; record_sent → False, audited
+def test_supersede_and_expire_report_outcome(app):           # first call → 'applied'; on a terminal item → 'terminal' + REJECTED audit
+def test_event_details_strict(app):                          # {"k":"v"} accepted; {"k":["x"]}, {"k":[]}, {"k":{"a":"b"}}, {"k":1},
+                                                             #   {"k":true}, {"k":null}, [] and "x" rejected by the CHECK
 def test_inbound_person_comes_from_node_row(gateway, app):   # payload claims another person; row has node's person (P2-S2)
 def test_inbound_unknown_kind_refused(gateway):              # kind 'hello' → (false, 'unknown_kind'); no conv.inbound row;
                                                              #   the REJECTED audit row is visible from a separate connection
@@ -699,6 +720,9 @@ git commit -am "Phase 2: gateway handshake, enrolment, inbound recording; fake n
   - **Stream relay, with a durable cursor:**
     - The gateway LISTENs on `jarvis_stream` (payload: `reply_id`). For each connected node in the session it sends chunks with `seq > conv.stream_cursor.acked_seq` for that `(reply_id, node)`, read from the database, not from process memory.
     - The node acknowledges with `received {reply_id, seq}` → `conv.record_chunk_received`.
+    - **Cursor rows are never an authority (spec R9-1).** Reconnect never derives reply IDs from `conv.stream_cursor` rows. It selects candidate replies only from the reconnecting node's own person's sessions (`conv.stream_chunk.session_id` → `conv.session.person_id`), checked independently, and only then reads the cursor for the progress of those replies. A `resume` entry naming any other reply is ignored, as already specified.
+    - **A late acknowledgement for a pruned chunk** (deleted after 24 h) is a harmless no-op. This task changes `conv.record_chunk_received` so that a chunk which doesn't exist returns `(false, NULL)` with no audit row, instead of raising `invalid_parameter_value`.
+    - **Typed results at the boundary.** The gateway's wrappers for `comm.record_received` and `comm.acknowledge` map the text result at once: a state name becomes `OutboxState`, and `'unknown_item'` raises `OutboxRefused('unknown_item')` after the commit. Raw text never travels further.
     - **On (re)connect**, the gateway re-sends unacknowledged chunks of the node's session replies from the last 10 minutes. For each reply it **validates the node's `resume` entry first**, then picks the start:
 
       | `resume` entry for this reply | Start at |
@@ -731,6 +755,10 @@ def test_resume_beyond_stored_max_does_not_skip(...):   # 3 chunks stored, acked
 def test_resume_within_range_used(...):                 # 3 stored, acked 1, resume last_seq 2 → delivered == [3]; no event
 def test_resume_negative_treated_as_zero(...):          # 3 stored, acked 1, resume last_seq -5 → delivered == [2, 3]; no event
 def test_resume_for_foreign_reply_ignored(...):         # resume names another person's reply → nothing sent for it; event written
+def test_reconnect_never_uses_cursor_rows_as_authority(...):  # a cursor row exists for (A's reply, B's node) planted by the owner;
+                                                        #   B reconnects → nothing of A's reply is sent
+def test_ack_for_pruned_chunk_is_noop(...):             # chunk deleted by retention; node acks it → (False, NULL), no audit, no error
+def test_outbox_results_are_typed(...):                 # wrapper returns OutboxState; 'unknown_item' → OutboxRefused
 def test_core_restart_mid_stream(...):                  # core writes chunks 1..2 then dies (lease expiry); sweep runs →
                                                         #   node keeps 1..2, gets no final chunk, gets one
                                                         #   'turn.indeterminate' outbox item; brain called once (P2-E03, P2-B4)
@@ -920,7 +948,7 @@ git commit -am "Phase 2: atomic per-turn budget reservations, IST day/month, lap
     - computes the reservation with `prices.cost_paise`; `UnknownModelPrice` → no call, event `brain.config_error`, a TODAY notification, `outcome = 'REFUSED'`, and the job completes;
     - calls `budget.reserve`, and on anything but RESERVED follows the §10.1 table (on NO_BUDGET it holds: re-enqueues every 5 min, and after 1 h it expires with `turn.cap_expired`);
     - if the brain is DOWN, holds before reserving;
-    - streams SPEECH chunks with NOTIFY `jarvis_stream`;
+    - streams SPEECH chunks with NOTIFY `jarvis_stream`, each written with the turn's `session_id` (spec R9-1);
     - a CONNECT failure → `release`, then re-queue;
     - a SEND failure → `lapse` now, then the indeterminate path;
     - on success → `settle`, write the final chunk and the JARVIS message, and set `outcome = 'ANSWERED'`.
@@ -929,7 +957,8 @@ git commit -am "Phase 2: atomic per-turn budget reservations, IST day/month, lap
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-def test_turn_streams_and_stores_reply(app, engine):           # FakeBrain [Speech a, Speech b] → chunks seq 1,2,final; conv.message JARVIS
+def test_turn_streams_and_stores_reply(app, engine):           # FakeBrain [Speech a, Speech b] → chunks seq 1,2,final; conv.message JARVIS;
+                                                               #   every chunk carries the turn's session_id
 def test_same_session_across_nodes(app):                       # node A then node B within 30 min → same session (P2-E09)
 def test_new_session_after_30_min_idle(app): ...
 def test_concurrent_first_messages_one_session(dsns):          # two threads call open_or_join for the same person at once
@@ -986,7 +1015,7 @@ git commit -am "Phase 2: conversation turn with sessions, memory retrieval, hold
   - `policy.TIERS: Mapping[str, Tier]`, exactly the §9.1 table: `module.news`, `module.live_tv` and `screen.*` are READ_ONLY; `memory.write` is REVERSIBLE; `pc.list_test_folder` is READ_ONLY; `pc.delete_test_file` is IRREVERSIBLE. Anything else is refused.
   - `policy.decide_tool_call(conn, *, person_id: UUID, session_id: UUID, node_id: UUID, node_kind: str, call: ToolCall, memory_ids: Sequence[str]) -> Decision`, with `Decision = Allow(tier) | NeedsApproval | Refuse(code: str)`. It runs the five checks in §9.2, in order.
   - `atlas.Atlas.accept_plan(conn, plan: ApprovedPlan, *, by: Actor) -> list[UUID]` and `ApprovedPlan(title: str, definition_of_done: str, source_ref: str, owner_person_id: UUID)`. One plan becomes one task (ADR-014).
-  - `actions.issue_live(conn, *, reply_id: UUID, target_node_id: UUID, person_id: UUID, action_kind: str, args: dict, now: datetime) -> int`: writes a signed ACTION chunk with `valid_until = now + 2 min`, NOTIFYs, and returns its `seq`.
+  - `actions.issue_live(conn, *, reply_id: UUID, session_id: UUID, target_node_id: UUID, person_id: UUID, action_kind: str, args: dict, now: datetime) -> int`: writes a signed ACTION chunk with that `session_id` (spec R9-1) with `valid_until = now + 2 min`, NOTIFYs, and returns its `seq`.
   - `approvals.propose_delete(conn, *, session_id, person_id, node_id, name: str, now) -> UUID | None`: issues `pc.list_test_folder` and waits for its receipt (10 s); then creates the task (through Atlas) and the approval (expiry 10 min, `card_authz` signed); then the URGENT outbox card. It returns `None` if the file isn't listed.
   - Job handlers:
     - `approval.decision`: the §9.3 step 6 checks, then the decision, `consume_approval`, and the signed `node.action` outbox item, all in one transaction;

@@ -1,12 +1,13 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** **Revision 8, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, revision 8. Revision 8 adds R8-1 and R8-2 (§20): strict connection fencing with one lock order, and permanent CONNECT / DISCONNECT audit.
+**Status:** **Revision 9, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, revision 9. Revision 9 adds R9-1 to R9-6 (§20), all from the Task 3 review: per-person isolation of the stream cursor, strict event details, explicit `supersede` / `expire` outcomes, the `id_conflict` refusal, the `unknown_item` refusal, and the gateway's `stream_cursor` read grant.
 
 **Approval history:**
 - **Revision 4:** approved by Manj on 2026-11-22.
 - **Revision 5** (R5-1 offline-node re-enrolment, R5-2 validated resume): approved by Manj with plan revision 4 on 2026-11-22.
 - **Revision 6** (R6-1 to R6-8): approved by Manj with plan revision 6 (corrected) on 2026-11-22.
 - **Revision 7** (R7-1 to R7-6): approved by Manj with plan revision 7b on 2026-11-22.
+- **Revision 8** (R8-1, R8-2): approved by Manj with plan revision 8b on 2026-11-22.
 
 Authorises the implementation plan, not code. ADR-011 to 014 remain Proposed.
 **Date:** 2026-11-22
@@ -106,6 +107,7 @@ A new role, **`jarvis_gateway`**, gets only what the gateway needs. Everything n
 |---|---|
 | `gw.node` | SELECT (columns `id`, `person_id`, `kind`, `public_key`, `tailscale_identity`, `revoked_at`) |
 | `conv.stream_chunk` | SELECT |
+| `conv.stream_cursor` | SELECT (changed only through `conv.record_chunk_received`) |
 | `comm.outbox` | SELECT |
 | `comm.delivery` | SELECT |
 | everything in `ledger`, `audit`, `ops` (other than the functions below), `conv.message`, `conv.session`, `gw.enrolment`, memory | **nothing** |
@@ -148,6 +150,16 @@ All of these take the connection ID, except `gw.enrol_node` and `gw.open_connect
 
 - **The caller commits before it raises (R7-1).** The Python wrapper for an audited function runs the call in **its own transaction**, which it commits, and only then raises the matching application exception (for example `EnrolmentRefused(reason)`). It must never call an audited function inside a transaction it might roll back, because the refusal's audit row would disappear with it. The shared helper refuses to run unless the connection is idle, with no transaction open. Tests go through this Python boundary: after the exception, a **separate** connection must still see the audit row.
 - No second call writes an audit row afterwards: the function records the refusal atomically with its decision.
+
+**Per-person isolation on connection functions (R9-1, R9-4, R9-5).** A connection function acts only on records of the authenticated node's person, taken from the fenced node row, never from the call:
+
+| Function | Refusal | When | Audit |
+|---|---|---|---|
+| `conv.record_chunk_received` | `other_person` | The chunk's session (`conv.stream_chunk.session_id`) belongs to another person. No cursor row is created or advanced | REJECTED row |
+| `conv.record_inbound` | `id_conflict` | The `message_id` was already recorded **by a different node**. A repeat from the same node stays the existing idempotent `(false, NULL)` | REJECTED row |
+| `comm.record_sent` (returns false), `comm.record_received`, `comm.acknowledge` | `unknown_item` | The outbox item is unknown, or belongs to another person | REJECTED row |
+
+**Cursor rows are progress records only.** They are never an authority for choosing which conversations or replies a node may see (R9-1, §6.2).
 
 **Strict connection fencing (R8-1).** A write made on a connection is ordered against the revocation of its node, and against the closing or superseding of the connection:
 - **Revocation or supersede first:** if it commits first, the write is refused with `JF001`.
@@ -232,7 +244,7 @@ A revoked node (`revoked_at` set) is refused at the handshake, and its open conn
 | `conv.session` | `id`, `person_id`, `started_at`, `last_activity_at`, `closed_at` |
 | `conv.inbound` | `id` = the node's `message_id` (unique, so a resend is a no-op), `node_id`, `person_id` (filled from the node row, never from the message), `session_id`, `kind`, `payload`, `received_at` |
 | `conv.message` | `id`, `session_id`, `seq`, `role` (PERSON, JARVIS, SYSTEM), `person_id`, `node_id` (null for JARVIS), `text`, `inbound_id`, `created_at` |
-| `conv.stream_chunk` | `reply_id`, `seq`, `type` (SPEECH, ACTION), `text` or `authz` (jsonb, core-signed, for ACTION; §7.1), `final` (bool), `target_node_id` and `valid_until` (for ACTION), `created_at`. Primary key `(reply_id, seq)` |
+| `conv.stream_chunk` | `reply_id`, `session_id` (NOT NULL → `conv.session`; set by core when it writes the chunk; R9-1), `seq`, `type` (SPEECH, ACTION), `text` or `authz` (jsonb, core-signed, for ACTION; §7.1), `final` (bool), `target_node_id` and `valid_until` (for ACTION), `created_at`. Primary key `(reply_id, seq)` |
 | `conv.session_ticket` | `session_id`, `task_id` (v2 §8.4: sessions link to the tickets they create) |
 
 **Session rule (my call):** a person has at most one open session. A message after 30 minutes of inactivity starts a new one. Any node of that person joins the open session, which is how a conversation resumes on a different node (P2-E09).
@@ -241,11 +253,11 @@ A revoked node (`revoked_at` set) is refused at the handshake, and its open conn
 
 | Table | Key columns |
 |---|---|
-| `comm.event` | `id`, `kind`, `subject_type`, `subject_id`, `person_id`, `details` (codes and IDs, no free text), `occurred_at`. **Append-only**: the app roles have INSERT only, and a trigger refuses UPDATE and DELETE, as in `audit.event`. |
+| `comm.event` | `id`, `kind`, `subject_type`, `subject_id`, `person_id`, `details` (codes and IDs, no free text: a flat JSON object whose every value is a string. Arrays, nested objects, numbers, booleans and nulls are rejected by a strict `CHECK`; R9-2), `occurred_at`. **Append-only**: the app roles have INSERT only, and a trigger refuses UPDATE and DELETE, as in `audit.event`. |
 | `comm.outbox` | `id` (stable; P2-E04), `person_id`, `event_id`, `priority` (URGENT, TODAY, DIGEST, SILENT), `kind`, `body`, `authz` (core's signed authorisation, for approval cards; §7.1), `group_key`, `supersedes_id`, `expires_at`, `state`, `state_changed_at`, `created_at` |
 | `comm.delivery` | `outbox_id`, `node_id`, `attempts`, `first_sent_at`, `last_sent_at`, `received_at`. Primary key `(outbox_id, node_id)`: one row per item per node, updated on each retry. |
 
-The multi-node state rules are in §8.2. No content goes in `comm.event` or `audit.event`. Content lives in `comm.outbox.body` and `conv.message` (retention: §5.7).
+The multi-node state rules are in §8.2. `comm.supersede` and `comm.expire` return an explicit outcome: `applied`, or `terminal` when the item was already terminal, which also writes a REJECTED audit row (R9-3). No content goes in `comm.event` or `audit.event`. Content lives in `comm.outbox.body` and `conv.message` (retention: §5.7).
 
 ### 5.4 Jobs (ADR-013)
 
@@ -358,7 +370,7 @@ Core only.
    - `memory.retrieve_context(person, utterance, viewer=person)`;
    - the tool menu: the desktop modules (news, live TV, screen actions) plus `pc.delete_test_file`. `pc.list_test_folder` is called by core itself (§9.3), not offered to Claude.
 5. Core calls the router (§10). As speech arrives, core writes `conv.stream_chunk` rows (`seq` 1, 2, …) and NOTIFYs `jarvis_stream` with only the `reply_id`.
-6. The gateway, woken by NOTIFY, reads the new chunks from its last `seq` and sends them to every connected node in the session. **NOTIFY is only a wake-up; the chunks are the durable stream.** If either process restarts mid-reply, the gateway resumes from the node's durable acknowledged cursor (`conv.stream_cursor`). A `resume` position the node reports is used only when it is within the stored range; otherwise the cursor is used (P2-E03; R5-2).
+6. The gateway, woken by NOTIFY, reads the new chunks from its last `seq` and sends them to every connected node in the session. **NOTIFY is only a wake-up; the chunks are the durable stream.** If either process restarts mid-reply, the gateway resumes from the node's durable acknowledged cursor (`conv.stream_cursor`). A `resume` position the node reports is used only when it is within the stored range; otherwise the cursor is used (P2-E03; R5-2). The replies to resume are chosen only from the reconnecting node's own person's sessions; cursor rows record progress and are never used to pick replies (R9-1).
 7. When the reply is complete, core writes the final chunk (`final = true`) and the JARVIS `conv.message`.
 8. **Tool calls go to policy (§9), never straight to a node.** A READ_ONLY module call, such as "show the news", is part of the live reply: core writes it as a `conv.stream_chunk` of type ACTION with a core-signed `authz` (§7.1) and `valid_until` = now + 2 minutes, and the gateway sends it as `node.action` to the node that spoke. The gateway, the node and core each enforce `valid_until` (§9.4); a node that reconnects later never replays it. It does **not** go in the outbox. An IRREVERSIBLE call becomes an approval, which does go in the outbox (§9.3), and the action it leads to is sent only after approval.
 9. The node acknowledges what it rendered. The audit trail records the turn as codes only.
@@ -918,3 +930,14 @@ Architecture direction approved; implementation approval pending these changes. 
 |---|---|---|
 | R8-1 | **Strict connection fencing.** Which functions call `current_node` is listed explicitly in §4.1: the `conv` and `comm` connection functions do, first; `enrol_node`, `open_connection`, `close_connection` and `touch_connection` don't, and use their own locks in the same order. A revocation or supersede that commits first refuses the old connection's write; a write that takes its locks first makes the revocation or supersede wait. `current_node` takes share locks held to commit; the heartbeat re-checks both conditions in its update. One lock order, node row then connection rows, with fixed modes per function. Applies to Tasks 2, 3 and 7. Races are tested in both orders. | §4.1 |
 | R8-2 | **Permanent connection audit:** `CONNECT` (node, connection, superseded connection) and `DISCONNECT` (node, connection, reason), with IDs and codes only, and no heartbeat audit. This makes R7-5's premise true. | §4.1, §5.1 |
+
+**Revision 9 (22 Nov 2026). Matching plan: revision 9.** Owner rulings on the Task 3 review:
+
+| # | Change | Where |
+|---|---|---|
+| R9-1 | **Stream-cursor isolation:** `conv.stream_chunk` gains `session_id`, set by core. `record_chunk_received` refuses a chunk of another person's session with an audited `other_person` and doesn't touch the cursor. Reconnect never derives reply IDs from cursor rows (§6.2, plan Task 7). | §4.1, §5.2 |
+| R9-2 | **Event details are strict:** a flat object of string values only | §5.3 |
+| R9-3 | **`comm.supersede` / `comm.expire` return `applied` or `terminal`** | §5.3 |
+| R9-4 | **`id_conflict`:** a `message_id` already recorded by another node is an audited refusal; a same-node repeat stays idempotent | §4.1 |
+| R9-5 | **`unknown_item`:** an unknown outbox item, or another person's, is an audited refusal | §4.1 |
+| R9-6 | **Gateway grant:** SELECT on `conv.stream_cursor` | §4.1 |
