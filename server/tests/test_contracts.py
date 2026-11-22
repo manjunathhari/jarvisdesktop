@@ -75,6 +75,9 @@ ENUMS: list[tuple[str, str, type[StrEnum]]] = [
     ("audit-event", "outcome", c.AuditOutcome),
     ("approval", "tier", c.ApprovalTier),
     ("approval", "decision", c.ApprovalDecision),
+    ("memory-entry", "category", c.MemoryCategory),
+    ("memory-entry", "tag", c.MemoryTag),
+    ("memory-entry", "visibility", c.Visibility),
 ]
 
 

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/audit-event.schema.json",
   "title": "Audit event",
-  "description": "One append-only audit row: a creation or a state change, applied or rejected (ADR-008).",
+  "description": "One append-only audit row: a creation, state change or memory change, applied or rejected (ADR-008, ADR-010). Memory rows never carry memory content.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -46,7 +46,8 @@
     "entity_type": {
       "enum": [
         "task",
-        "commitment"
+        "commitment",
+        "memory"
       ]
     },
     "entity_id": {
@@ -56,7 +57,10 @@
     "action": {
       "enum": [
         "CREATE",
-        "TRANSITION"
+        "TRANSITION",
+        "UPDATE",
+        "CONFIRM",
+        "ARCHIVE"
       ]
     },
     "from_state": {

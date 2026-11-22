@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/memory-entry.schema.json",
+  "title": "Memory entry",
+  "description": "One memory entry (Architecture v2 §11; Phase 1 spec §4.3). STATED and CONFIRMED entries may drive actions; INFERRED and HISTORICAL are evidence only; EXPIRED is history.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "memory_id",
+    "subject",
+    "category",
+    "tag",
+    "content",
+    "source",
+    "recorded_on",
+    "by",
+    "visibility"
+  ],
+  "properties": {
+    "memory_id": {
+      "type": "string",
+      "pattern": "^m-[0-9]{4,}$"
+    },
+    "subject": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,30}$"
+    },
+    "category": {
+      "enum": [
+        "identity",
+        "preference",
+        "episodic",
+        "operational",
+        "learned"
+      ]
+    },
+    "domain": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[a-z_]{1,40}$"
+    },
+    "tag": {
+      "enum": [
+        "STATED",
+        "CONFIRMED",
+        "INFERRED",
+        "HISTORICAL",
+        "EXPIRED"
+      ]
+    },
+    "content": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "pattern": "^[^\\n\\r]+$"
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,100}$"
+    },
+    "recorded_on": {
+      "type": "string",
+      "format": "date"
+    },
+    "by": {
+      "type": "string",
+      "pattern": "^([a-z][a-z0-9-]{1,30}|agent:[a-z][a-z0-9-]{0,39}|system)$"
+    },
+    "confirmed_by": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[a-z][a-z0-9-]{1,30}$"
+    },
+    "confirmed_on": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date"
+    },
+    "visibility": {
+      "enum": [
+        "PRIVATE",
+        "SELECTED_PERSON",
+        "SELECTED_GROUP",
+        "FAMILY_SHARED",
+        "ORGANIZATION_SHARED"
+      ]
+    },
+    "shared_with": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]{1,30}$"
+      }
+    },
+    "topics": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9-]{1,30}$"
+      }
+    },
+    "happened_on": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date"
+    }
+  }
+}
