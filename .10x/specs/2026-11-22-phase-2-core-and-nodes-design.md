@@ -1,10 +1,11 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** **Revision 6, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, revision 6. Revision 6 adds R6-1 to R6-8 (§20): the `challenge` handshake, key-announcement expiry, gateway/core key separation, timestamps, the `resume` schema, the enrolment key-pinning response, per-sender `seq`, and stale-node refusal after the challenge.
+**Status:** **Revision 7, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, revision 7. Revision 7 adds R7-1 to R7-6 (§20): how audited refusals work (the function audits and returns a structured refusal, and the caller commits before raising); audited enrolment creation; the gateway's function surface; `last_ping_at`; the fenced-connection error code; and the 0008 rollback rule (in the plan).
 
 **Approval history:**
 - **Revision 4:** approved by Manj on 2026-11-22.
 - **Revision 5** (R5-1 offline-node re-enrolment, R5-2 validated resume): approved by Manj with plan revision 4 on 2026-11-22.
+- **Revision 6** (R6-1 to R6-8): approved by Manj with plan revision 6 (corrected) on 2026-11-22.
 
 Authorises the implementation plan, not code. ADR-011 to 014 remain Proposed.
 **Date:** 2026-11-22
@@ -113,15 +114,28 @@ The gateway changes state **only** through these functions, and holds EXECUTE on
 | Function | Does |
 |---|---|
 | `gw.enrol_node(token, public_key, tailscale_identity)` | One-time node registration (§7.2) |
-| `gw.open_connection(node_id)` / `gw.close_connection(conn_id, reason)` / `gw.touch_node(node_id)` | Connection rows and `last_seen_at` |
-| `conv.record_inbound(message_id, node_id, kind, payload)` | Writes `conv.inbound` (person filled from the node row inside the function) and enqueues the matching fixed job kind |
-| `comm.record_sent(outbox_id, node_id)` / `comm.record_received(outbox_id, node_id)` / `comm.acknowledge(outbox_id, node_id)` | Delivery transitions (§8.2) |
+| `gw.open_connection(node_id)` / `gw.close_connection(conn_id, reason)` | Connection rows; opening fences any older connection of the node |
+| `gw.touch_connection(conn_id)` | Heartbeat: `gw.node.last_seen_at` and `gw.node_connection.last_ping_at` |
+| `gw.current_node(conn_id)` | The node of an open, non-revoked connection, or the fenced-connection error. Used inside the other functions, and by the gateway's 60 s revocation re-check |
+| `conv.record_inbound(conn_id, message_id, kind, payload)` | Writes `conv.inbound` (person filled from the node row inside the function) and enqueues the matching fixed job kind |
+| `comm.record_sent(conn_id, outbox_id)` / `comm.record_received(conn_id, outbox_id)` / `comm.acknowledge(conn_id, outbox_id)` / `conv.record_chunk_received(conn_id, reply_id, seq)` | Delivery and stream-cursor transitions (§8.2, §6.2) |
+
+The five functions in the `gw` schema are the gateway's whole node and connection surface. Every function used on an established connection takes the connection ID and gets the node through `gw.current_node`. Only `gw.enrol_node` (before any connection exists) and `gw.open_connection` (which creates it) don't.
 
 **Rules for every SECURITY DEFINER function** (gateway-facing and core-facing alike):
 - `SET search_path = pg_catalog, pg_temp`, and every object reference is schema-qualified.
 - Owned by `jarvis_owner` (not a superuser). `REVOKE ALL ON FUNCTION … FROM PUBLIC`, then `GRANT EXECUTE` to the one role that needs it.
 - Arguments are checked inside the function. Node and person IDs are looked up from `gw.node`, never taken from a payload.
-- A refused call writes an audit row (REJECTED) and raises.
+- **Refusals (R7-1).** A function treats three kinds of failure differently, because in PostgreSQL an error rolls back the whole transaction, including any audit row written before it:
+
+  | Failure | The function | Audit |
+  |---|---|---|
+  | **A refused request:** a decision the database makes against a well-formed call (a bad or used token, a key already in use, an unknown inbound kind, revoking an unknown or already revoked node) | writes the REJECTED audit row and **returns a structured refusal**: a defined reason code, never a bare NULL. It does not raise. | Yes, in the same transaction as the decision |
+  | **A fenced connection** (§7.1, R7-5): the connection is closed, superseded or its node revoked | raises the dedicated error `connection_fenced` (SQLSTATE `JF001`), distinct from ordinary permission denial | No row of its own: the operation that caused the fencing (opening a newer connection, closing it, or revoking the node) is already audited |
+  | **A malformed call** (a missing or invalid argument: a programming error) | raises `invalid_parameter_value` | No |
+
+- **The caller commits before it raises (R7-1).** The Python wrapper for an audited function runs the call in **its own transaction**, which it commits, and only then raises the matching application exception (for example `EnrolmentRefused(reason)`). It must never call an audited function inside a transaction it might roll back, because the refusal's audit row would disappear with it. The shared helper refuses to run unless the connection is idle, with no transaction open. Tests go through this Python boundary: after the exception, a **separate** connection must still see the audit row.
+- No second call writes an audit row afterwards: the function records the refusal atomically with its decision.
 
 Its password is a new secret file, `pg_gateway_password`. Privilege tests: P2-S1 and P2-S6 (§14).
 
@@ -157,7 +171,8 @@ Three new schemas keep the boundaries visible: `gw` (nodes), `conv` (conversatio
 | Table | Key columns |
 |---|---|
 | `gw.node` | `id`, `person_id` → `ledger.person`, `kind` (DESKTOP, PHONE), `name`, `public_key` (Ed25519), `tailscale_identity`, `registered_at`, `revoked_at`, `last_seen_at` |
-| `gw.node_connection` | `id`, `node_id`, `opened_at`, `closed_at`, `close_reason` |
+| `gw.node_connection` | `id`, `node_id`, `opened_at`, `last_ping_at`, `closed_at`, `close_reason` |
+| `gw.enrolment` | `id`, `token_hash`, `person_id`, `kind`, `name`, `expires_at`, `used_at`, `node_id` (§7.2). Rows are created only through the audited core function `gw.create_enrolment(…)` (R7-2); no role inserts them directly, and the gateway has no grant on this table. |
 
 A revoked node (`revoked_at` set) is refused at the handshake, and its open connection is closed within one sweep (P2-E10).
 
@@ -387,12 +402,12 @@ Payload schemas go in `contracts/` with examples and contract tests, before feat
 
 ### 7.2 Registering a node (my call; hardened per review)
 
-1. **Manj creates an enrolment.** He runs `jarvis-core node enrol --person manj --kind desktop --name "study PC"` on the server over Tailscale SSH (`docker compose exec core …`). It writes a row in **`gw.enrolment`** (`id`, `token_hash` (SHA-256 of a 128-bit random token), `person_id`, `kind`, `name`, `expires_at` = now + 15 min, `used_at`, `node_id`). It prints an **enrolment code**: the token plus the core and gateway key fingerprints. Nothing in the repo or the build workspace sees it.
+1. **Manj creates an enrolment.** He runs `jarvis-core node enrol --person manj --kind desktop --name "study PC"` on the server over Tailscale SSH (`docker compose exec core …`). It calls **`gw.create_enrolment(token_hash, person_id, kind, name)`**, a SECURITY DEFINER function that only `jarvis_app` may execute (R7-2). It writes a row in **`gw.enrolment`** (`id`, `token_hash` (SHA-256 of a 128-bit random token), `person_id`, `kind`, `name`, `expires_at` = now + 15 min set by the database, `used_at`, `node_id`) and an `ENROL_CREATE` audit row, in one transaction. It prints an **enrolment code**: the token plus the core and gateway key fingerprints. Nothing in the repo or the build workspace sees it.
 2. **The desktop connects and checks the gateway.** It generates its key pair and stores the private key with Windows DPAPI. It connects; the first message is the gateway's `challenge` (§6.1 step 2). The device verifies it with the challenge's `public_key` **only if** `fingerprint(public_key)` equals the gateway fingerprint in the enrolment code, and if so pins that gateway key. Otherwise it closes and sends nothing.
 3. **The desktop sends `enrol`:** `{token, public_key, nonce}`, envelope `node_id` = the nil UUID, `seq` = 1, signed `node-msg` with the new key, which proves it holds that key.
 4. **The gateway registers it** (§6.1 step 6, path B). The gateway reads the peer's Tailscale identity from `whois` **for this connection**, never from the message, and calls `gw.enrol_node(token, public_key, tailscale_identity)`. In one transaction the function:
-   - runs `UPDATE gw.enrolment SET used_at = now() WHERE token_hash = sha256(token) AND used_at IS NULL AND expires_at > now() RETURNING …`. Zero rows → audit REJECTED and raise, so two concurrent uses of one token can't both succeed;
-   - **inserts** a new `gw.node` (new UUID, `person_id` and `kind` from the enrolment row, not from the caller), with unique constraints on `public_key` and on active `tailscale_identity`. It never updates an existing node, so it can't change another node's key or identity;
+   - runs `UPDATE gw.enrolment SET used_at = now() WHERE token_hash = sha256(token) AND used_at IS NULL AND expires_at > now() RETURNING …`. Zero rows → write the REJECTED audit row and return the refusal `bad_token` (no raise, R7-1), so two concurrent uses of one token can't both succeed and every failed attempt stays on the audit trail;
+   - **inserts** a new `gw.node` (new UUID, `person_id` and `kind` from the enrolment row, not from the caller), with unique constraints on `public_key` and on active `tailscale_identity`. A clash returns the refusal `key_in_use` or `identity_in_use`, audited, and the token stays unused because nothing in the transaction applied. It never updates an existing node, so it can't change another node's key or identity;
    - records `node_id` on the enrolment and writes an audit row.
 5. **The core key is pinned from the code, not from the gateway.** The gateway sends `welcome` with the `enrolment` block (`node_id`, `core_key_id`, `core_public_key`), as in §6.1 step 7.
    - **Match:** if `fingerprint(core_public_key)` equals the core fingerprint in the enrolment code, the device pins the key as a CORE key and stores `node_id`. The connection is then the authenticated connection of that new node. No second handshake is needed: the token, the proof of key possession and the Tailscale binding were all checked in step 4.
@@ -405,7 +420,7 @@ No job is involved, so enrolment works with core down.
 
 **Accepted limitation:** the database trusts the gateway's `tailscale_identity` argument, because only the gateway can see the connection. A compromised gateway could enrol a node only with a valid, unused, unexpired token, and the token is what limits it.
 
-**Revoking a node:** `jarvis-core node revoke <node>` (a core role call; the gateway has no grant). The gateway re-checks `revoked_at` on every handshake and every 60 s for open connections (P2-E10).
+**Revoking a node:** `jarvis-core node revoke <node>` calls `gw.revoke_node(node_id)` (a core role call; the gateway has no grant). It returns an explicit result: applied, or refused (`unknown_node`, `already_revoked`), audited either way, and the CLI exits non-zero on a refusal after the transaction commits. The gateway re-checks `revoked_at` on every handshake and every 60 s for open connections (P2-E10).
 
 ## 8. Notifications, delivery and reconnection
 
@@ -836,3 +851,14 @@ Architecture direction approved; implementation approval pending these changes. 
 | R6-6 | **Enrolment key pinning and stale-node refusal after the challenge:** after a successful enrolment, `welcome` carries `node_id`, `core_key_id` and `core_public_key`. The node pins the core key only if it matches the code's fingerprint, refuses all core-authorised content until then, and on a mismatch discards its keys and stores nothing. A STALE node gets the pre-authentication challenge, then 4409 instead of `welcome`, and no post-handshake content. | §6.1 step 7, §7.1, §7.2 |
 | R6-7 | **Separate `hello` and `enrol` validation paths:** path A (existing node: registered key, not revoked, Tailscale identity matches the row) is unchanged; path B (enrolment: signature by the message's own key, key not already registered, token rules and identity from the connection, through `gw.enrol_node`). Neither path can do the other's job. | §6.1 step 6 |
 | R6-8 | **`seq` per sender, per connection:** each side numbers its own messages from 1, increasing by exactly 1, and checks the peer's counter independently; a gap, repeat or decrease closes the connection | §7.1 |
+
+**Revision 7 (22 Nov 2026). Matching plan: revision 7.** Owner rulings on Task 2's NEEDS_CONTEXT report:
+
+| # | Change | Where |
+|---|---|---|
+| R7-1 | **Audited refusals return, they don't raise.** A function writes the REJECTED audit row and returns a structured refusal with a reason code. The Python wrapper commits its own transaction, then raises. Audited functions are never called inside a transaction that might roll back; the helper requires an idle connection. Tests check the audit row from a separate connection after the exception. Fenced connections raise `JF001`; malformed calls raise `invalid_parameter_value`. | §4.1, §7.2 |
+| R7-2 | **Enrolments are created only by the audited core function `gw.create_enrolment(…)`.** No direct inserts; the gateway has no grant on `gw.enrolment` | §5.1, §7.2 step 1 |
+| R7-3 | **The gateway's `gw` surface is five functions:** `enrol_node`, `open_connection`, `close_connection`, `touch_connection` (replacing `touch_node`) and `current_node` | §4.1 |
+| R7-4 | **`gw.node_connection.last_ping_at`** added | §5.1 |
+| R7-5 | **Fenced connections raise SQLSTATE `JF001`** (`connection_fenced`), distinct from permission denial. No audit row of its own; the cause is already audited | §4.1 |
+| R7-6 | **Rollback of migration 0008** refuses if any node audit row, node or enrolment exists, and leaves the schema intact. A down-and-up test covers the empty case (plan Task 2) | plan Task 2 |
