@@ -134,6 +134,7 @@ class MemoryEngine:
         self._people: dict[str, Person] = {}
         self._entries: dict[str, MemoryEntry] = {}
         self._household: dict[str, bool] = {}
+        self._terms: dict[str, frozenset[str]] = {}
 
     # --- opening -------------------------------------------------------------------------
 
@@ -175,6 +176,7 @@ class MemoryEngine:
             if e.subject != HOUSEHOLD and e.subject not in people:
                 raise MemoryFormatError(fmt.path_for(e), 0, f"{e.memory_id}: unknown subject")
         self._people, self._entries = people, entries
+        self._terms = {m: text.entry_terms(e.content, e.topics) for m, e in entries.items()}
         self._household = {}
         self._head = self.store.head()
 
@@ -263,7 +265,7 @@ class MemoryEngine:
                 and (category is None or e.category is category)
                 and (include_expired or e.tag is not MemoryTag.EXPIRED)
                 and self.can_see(e, viewer)
-                and text.matches(wanted, e.content, e.topics)
+                and bool(wanted & self._terms[e.memory_id])
             ]
             return _ranked(found)
 
@@ -285,7 +287,7 @@ class MemoryEngine:
                 and self.can_see(e, viewer)
                 and (
                     (e.category is MemoryCategory.IDENTITY and e.subject == person)
-                    or text.matches(wanted, e.content, e.topics)
+                    or bool(wanted & self._terms[e.memory_id])
                 )
             ]
             return _ranked(found)[: max(1, min(limit, MAX_CONTEXT))]
@@ -553,6 +555,7 @@ class MemoryEngine:
                 files, msg, by, ref, action, from_tag, entry.tag.value, reason or verb
             )
             self._entries = entries
+            self._terms[ref] = text.entry_terms(entry.content, entry.topics)
             return ref
 
     def _commit_and_audit(

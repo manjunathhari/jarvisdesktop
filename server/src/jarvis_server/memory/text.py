@@ -136,6 +136,10 @@ def terms(text: str) -> set[str]:
     return found | {ALIASES[w] for w in found if w in ALIASES}
 
 
+def entry_terms(content: str, topics: tuple[str, ...]) -> frozenset[str]:
+    """What an entry can be matched on; the engine computes this once per entry version."""
+    return frozenset(terms(content) | terms(" ".join(topics)))
+
+
 def matches(task_terms: set[str], content: str, topics: tuple[str, ...]) -> bool:
-    entry_terms = terms(content) | terms(" ".join(topics))
-    return bool(task_terms & entry_terms)
+    return bool(task_terms & entry_terms(content, topics))
