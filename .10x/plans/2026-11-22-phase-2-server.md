@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12, uv, psycopg 3 (sync in core, async in the gateway), Alembic, FastAPI and uvicorn, `rfc8785`, `cryptography` (Ed25519), `httpx` (Claude), pytest, ruff, mypy; Postgres 17; Docker Compose; `tailscale/tailscale` sidecar.
 
-**Plan revision:** 6 (22 Nov 2026). Revision 6 adds Manj's handshake corrections (spec R6-6 to R6-8): the enrolment key-pinning `welcome` block, separate `hello` and `enrol` validation paths, per-sender `seq`, and stale-node refusal after the challenge. They change Task 1, Task 6 and Task 12's tests. Revision 5 applied Manj's Task 1 rulings (spec Revision 6): the `challenge` kind and nonce handshake, key-announcement expiry, gateway/core key separation cases and the timestamp rule. They change Task 1 (contracts and shared cases) and Task 6 (handshake tests). Revision 4 fixed the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
+**Plan revision:** 6 (22 Nov 2026; corrected after Manj's review: Task 6's enrolment test ends with `welcome` and makes no second `hello`, and Task 12's key-source statements now separate enrolment from ordinary welcomes and rotation). Revision 6 adds Manj's handshake corrections (spec R6-6 to R6-8): the enrolment key-pinning `welcome` block, separate `hello` and `enrol` validation paths, per-sender `seq`, and stale-node refusal after the challenge. They change Task 1, Task 6 and Task 12's tests. Revision 5 applied Manj's Task 1 rulings (spec Revision 6): the `challenge` kind and nonce handshake, key-announcement expiry, gateway/core key separation cases and the timestamp rule. They change Task 1 (contracts and shared cases) and Task 6 (handshake tests). Revision 4 fixed the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
 
 **Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, **Revision 6** (R6-1 to R6-8). Revision 5 is the approved Revision 4 plus the offline-node and resume rules (R5-1, R5-2). Implementers work from Revision 6 only. Section references (§) below point there. Read it alongside this plan.
 
@@ -548,7 +548,15 @@ def test_message_before_hello_refused(...):                  # utterance as firs
 def test_nil_node_id_only_for_challenge_and_enrol(...):      # nil UUID on utterance → error/closed
 def test_clock_skew_recorded_not_trusted(...):               # hello with clock_skew_ms 120000 → event node.clock_skew; handshake proceeds
 def test_node_refuses_challenge_from_unpinned_key(...):      # FakeNode with pinned key K1; gateway signs with K2 → node closes, sends nothing
-def test_enrol_then_hello(gw_client, enrolment_code):       # FakeNode.enrol verifies challenge by the code's fingerprint, pins keys; hello → welcome
+def test_enrol_ends_with_welcome(gw_client, enrolment_code):  # challenge → FakeNode.enrol (pins the gateway key by the code's
+                                                             #   gateway fingerprint) → welcome with an enrolment block; NO second
+                                                             #   hello on this connection. Asserts: welcome.enrolment.node_id equals
+                                                             #   the new gw.node row; fingerprint(core_public_key) == code's core
+                                                             #   fingerprint; FakeNode pinned core_key_id → core_public_key as a CORE
+                                                             #   key and now sends that node_id in envelopes; a following utterance
+                                                             #   on the same connection is recorded as that node
+def test_reconnect_after_enrolment_uses_hello(...):          # a new connection by the enrolled FakeNode → challenge → hello (path A)
+                                                             #   → welcome with no enrolment block
 def test_enrol_refuses_keys_not_matching_fingerprints(...):  # gateway configured with a different core key → node refuses
 def test_unknown_tailscale_peer_closed(...):                 # FakeWhoIs returns None → close code 4401 (P2-S3)
 def test_tailscale_identity_mismatch_closed(...):            # registered "ts:pc", whois "ts:other" → closed, audit CONNECT_REFUSED
@@ -964,7 +972,7 @@ git commit -am "Phase 2: policy engine, approvals with signed cards, Atlas inter
   - `activate_ready(conn, now: datetime) -> list[str]`: a NEXT key becomes ACTIVE, and the previous ACTIVE of that role becomes RETIRED-pending. That happens when every `keyset` item for it is ACKNOWLEDGED, or after 24 h, whichever is first. In the **same transaction**, every active node whose `keyset` item was **not** acknowledged is marked `gw.node.key_state = 'STALE'` (a new column, default `'CURRENT'`; app-writable, gateway SELECT only). Runs from the scheduler every minute;
   - `retire(conn, key_id: str) -> None`.
 - **Offline-node recovery rule: a node that missed the overlap must re-enrol.**
-  - **The 24-hour activation policy stays.** A node that is offline when the key activates can't be brought up to date over the gateway, because nothing the gateway sends is trustworthy to it: the gateway may be signing with a key the node never received, and welcome messages carry no keys by design. Recovery therefore never asks the node to accept a key from the gateway.
+  - **The 24-hour activation policy stays.** A node that is offline when the key activates can't be brought up to date over the gateway, because nothing the gateway sends is trustworthy to it: the gateway may be signing with a key the node never received, and an ordinary `welcome` (after `hello`) carries no keys by design. The one `welcome` that carries a key, the enrolment `welcome`, is pinned only against the fingerprint in a new out-of-band enrolment code (spec R6-6). Recovery therefore never asks the node to accept a key from the gateway alone: it goes through re-enrolment and a new code.
   - **The gateway refuses STALE nodes (spec R6-6).** Every connection first gets the pre-authentication `challenge`, which authorises nothing and carries no Jarvis content. After a STALE node's `hello` passes path A, the gateway closes with **4409** (`reenrol_required`) **instead of** `welcome`. It sends no welcome, summary, outbox item, chunk or action. The close code authorises nothing, so it is safe unsigned. If the gateway key itself rotated, the stale node can't verify the challenge and closes before `hello`.
     - The node treats 4409 as "stop and ask for re-enrolment". It runs nothing, shows "Jarvis's keys have changed. Please re-enrol this device", and keeps its local journal.
     - A forged 4409 can only deny service, which an attacker on the path could do anyway.
@@ -983,7 +991,11 @@ git commit -am "Phase 2: policy engine, approvals with signed cards, Atlas inter
   - signs `gw-transport` with its ACTIVE GATEWAY key;
   - re-reads `gw.trusted_key` every 60 s and on startup;
   - refuses to start if its ACTIVE key's private secret file is missing;
-  - welcome messages carry nothing about keys: nodes learn keys only from enrolment pinning and core-signed `keyset`.
+  - **Where nodes get keys.** An ordinary `welcome` (after `hello`) carries no keys. A node learns keys only in two ways:
+    - at **initial enrolment or re-enrolment**: the gateway key from the `challenge` and the core key from the enrolment `welcome` block, each pinned only if it matches the fingerprint in the enrolment code;
+    - during **rotation**: from a core-signed, unexpired `keyset`.
+
+    No other message changes a node's pinned keys.
 - **Node behaviour (FakeNode, and Plan B):**
   - accepts a `keyset` only if its `authz` verifies with a pinned CORE key;
   - trusts both the old and the new key until a later `keyset` or 24 h after `not_before`;
