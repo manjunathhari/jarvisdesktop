@@ -51,7 +51,8 @@
         "node",
         "inbound",
         "outbox",
-        "stream"
+        "stream",
+        "approval"
       ]
     },
     "entity_id": {
@@ -77,7 +78,8 @@
         "ACK",
         "SUPERSEDE",
         "EXPIRE",
-        "CHUNK_RECEIVE"
+        "CHUNK_RECEIVE",
+        "CONSUME"
       ]
     },
     "from_state": {

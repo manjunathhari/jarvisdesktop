@@ -40,6 +40,11 @@ class ConnectRefused(Refused):
     """gw.open_connection refused: unknown_node or revoked."""
 
 
+class ConsumeRefused(Refused):
+    """ledger.consume_approval refused: unknown_approval, not_approved, expired or
+    already_consumed."""
+
+
 class TransactionNotIdle(Exception):
     """An audited call was attempted with a transaction open; its audit row could be lost."""
 

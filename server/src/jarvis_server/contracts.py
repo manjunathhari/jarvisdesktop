@@ -59,6 +59,7 @@ class EntityType(StrEnum):
     INBOUND = "inbound"
     OUTBOX = "outbox"
     STREAM = "stream"
+    APPROVAL = "approval"
 
 
 class AuditAction(StrEnum):
@@ -80,6 +81,7 @@ class AuditAction(StrEnum):
     SUPERSEDE = "SUPERSEDE"
     EXPIRE = "EXPIRE"
     CHUNK_RECEIVE = "CHUNK_RECEIVE"
+    CONSUME = "CONSUME"
 
 
 class AuditOutcome(StrEnum):
