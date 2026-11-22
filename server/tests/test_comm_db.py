@@ -65,7 +65,7 @@ SENT = "SELECT comm.record_sent(%s, %s)"
 RECEIVED = "SELECT comm.record_received(%s, %s)"
 ACK = "SELECT comm.acknowledge(%s, %s)"
 INBOUND = "SELECT recorded, refusal FROM conv.record_inbound(%s, %s, %s, %s)"
-CHUNK = "SELECT conv.record_chunk_received(%s, %s, %s)"
+CHUNK = "SELECT recorded, refusal FROM conv.record_chunk_received(%s, %s, %s)"
 
 TERMINAL = {"ACKNOWLEDGED", "SUPERSEDED", "EXPIRED"}
 ROW_LOCK_WAITS = ("transactionid", "tuple")  # pg_stat_activity.wait_event of a row-lock wait
@@ -143,6 +143,34 @@ def _item(app: Conn, person: uuid.UUID = MANJ, **kw: Any) -> uuid.UUID:
     )
 
 
+def _session(app: Conn, person: uuid.UUID = MANJ) -> uuid.UUID:
+    """The person's open session (one at most per person), created if there is none."""
+    app.execute(
+        "INSERT INTO conv.session (person_id) VALUES (%s)"
+        " ON CONFLICT (person_id) WHERE closed_at IS NULL DO NOTHING",
+        (person,),
+    )
+    return uuid.UUID(
+        str(
+            _one(
+                app,
+                "SELECT id FROM conv.session WHERE person_id = %s AND closed_at IS NULL",
+                (person,),
+            )
+        )
+    )
+
+
+def _chunks(app: Conn, reply: uuid.UUID, count: int, person: uuid.UUID = MANJ) -> None:
+    session = _session(app, person)
+    for seq in range(1, count + 1):
+        app.execute(
+            "INSERT INTO conv.stream_chunk (reply_id, session_id, seq, type, text, final)"
+            " VALUES (%s, %s, %s, 'SPEECH', 'A fictional reply', %s)",
+            (reply, session, seq, seq == count),
+        )
+
+
 def _state(app: Conn, item: uuid.UUID) -> str:
     row = app.execute("SELECT state FROM comm.outbox WHERE id = %s", (item,)).fetchone()
     assert row is not None
@@ -163,7 +191,8 @@ def _audit(conn: Conn, since: int, entity: str | None = None) -> list[tuple[Any,
     return conn.execute(
         "SELECT entity_type, entity_id, action::text, from_state, to_state, outcome::text,"
         " reason, details FROM audit.event WHERE seq > %s"
-        " AND entity_type IN ('inbound', 'outbox') AND (%s::text IS NULL OR entity_type = %s)"
+        " AND entity_type IN ('inbound', 'outbox', 'stream')"
+        " AND (%s::text IS NULL OR entity_type = %s)"
         " ORDER BY seq",
         (since, entity, entity),
     ).fetchall()
@@ -196,6 +225,41 @@ def test_inbound_duplicate_is_noop(gateway: Conn, app: Conn) -> None:
     assert _jobs_for(app, message_id) == [("conv.turn", {"inbound_id": str(message_id)})]
     assert _one(app, "SELECT count(*) FROM conv.inbound WHERE id = %s", (message_id,)) == 1
     assert _audit(app, since) == []  # a duplicate is not a refusal
+
+
+def test_inbound_id_conflict_across_nodes(gateway: Conn, app: Conn, dsns: Dsns) -> None:
+    node_a, conn_a = _connected(app, gateway)
+    node_b, conn_b = _connected(app, gateway)
+    message_id = uuid.uuid4()
+    payload = Jsonb({"text": "A fictional test phrase"})
+    assert gateway.execute(INBOUND, (conn_a, message_id, "utterance", payload)).fetchone() == (
+        True,
+        None,
+    )
+    since = _seq(app)
+    row = dbcall.audited_call(
+        gateway,
+        "SELECT recorded, refusal FROM conv.record_inbound(%s, %s, %s, %s)",
+        (conn_b, message_id, "utterance", payload),
+    )
+    assert row == (False, "id_conflict")
+    with psycopg.connect(dsns.app, autocommit=True) as other:  # R7-1: a separate connection
+        assert _audit(other, since) == [
+            (
+                "inbound",
+                message_id,
+                "INBOUND",
+                None,
+                None,
+                "REJECTED",
+                "id_conflict",
+                {"node_id": str(node_b)},
+            )
+        ]
+        assert _one(other, "SELECT node_id FROM conv.inbound WHERE id = %s", (message_id,)) == (
+            node_a
+        )
+        assert len(_jobs_for(other, message_id)) == 1
 
 
 @pytest.mark.parametrize(
@@ -317,6 +381,29 @@ def test_event_details_hold_codes_and_ids_only(app: Conn) -> None:
             " VALUES ('test.notice', 'test', 't-1', %s)",
             (Jsonb({"note": "free text with spaces"}),),
         )
+
+
+_EVENT_INSERT = (
+    "INSERT INTO comm.event (kind, subject_type, subject_id, details)"
+    " VALUES ('test.notice', 'test', 't-1', %s) RETURNING id"
+)
+
+
+def test_event_details_strict(app: Conn) -> None:
+    """R9-2: a flat object of string values only, checked by the database (strict jsonpath)."""
+    assert _one(app, _EVENT_INSERT, (Jsonb({"k": "v"}),)) is not None
+    for details in (
+        {"k": ["x"]},
+        {"k": []},
+        {"k": {"a": "b"}},
+        {"k": 1},
+        {"k": True},
+        {"k": None},
+        [],
+        "x",
+    ):
+        with pytest.raises(psycopg.errors.CheckViolation):
+            app.execute(_EVENT_INSERT, (Jsonb(details),))
 
 
 # --- outbox and delivery (§8.2) ----------------------------------------------------------------
@@ -453,15 +540,21 @@ def test_superseded_and_expired_remain_readable(app: Conn, dsns: Dsns) -> None:
     assert all(r[3] == {"text": "A fictional notice"} for r in rows)
 
 
-def test_supersede_and_expire_are_audited_and_final(app: Conn) -> None:
+def test_supersede_and_expire_report_outcome(app: Conn) -> None:
     item = _item(app)
+    other = _item(app)
     since = _seq(app)
-    app.execute("SELECT comm.expire(%s)", (item,))
-    app.execute("SELECT comm.supersede(%s)", (item,))
+    assert _one(app, "SELECT comm.expire(%s)", (item,)) == "applied"
+    assert _one(app, "SELECT comm.supersede(%s)", (item,)) == "terminal"
+    assert _one(app, "SELECT comm.expire(%s)", (item,)) == "terminal"
+    assert _one(app, "SELECT comm.supersede(%s)", (other,)) == "applied"
     assert _state(app, item) == "EXPIRED"
+    assert _state(app, other) == "SUPERSEDED"
     assert _audit(app, since) == [
         ("outbox", item, "EXPIRE", "PENDING", "EXPIRED", "APPLIED", "expired", {}),
         ("outbox", item, "SUPERSEDE", "EXPIRED", None, "REJECTED", "terminal", {}),
+        ("outbox", item, "EXPIRE", "EXPIRED", None, "REJECTED", "terminal", {}),
+        ("outbox", other, "SUPERSEDE", "PENDING", "SUPERSEDED", "APPLIED", "superseded", {}),
     ]
     with pytest.raises(psycopg.errors.InvalidParameterValue):
         app.execute("SELECT comm.supersede(%s)", (uuid.uuid4(),))
@@ -474,7 +567,7 @@ def test_create_outbox_refuses_superseding_another_persons_item(app: Conn) -> No
     assert _state(app, theirs) == "PENDING"
 
 
-def test_another_persons_item_is_refused(gateway: Conn, app: Conn, dsns: Dsns) -> None:
+def test_outbox_unknown_or_other_person_refused(gateway: Conn, app: Conn, dsns: Dsns) -> None:
     node_id, conn_id = _connected(app, gateway)
     theirs = _item(app, _person(app))
     unknown = uuid.uuid4()
@@ -525,8 +618,8 @@ def test_delivery_race_is_consistent(gateway: Conn, app: Conn, dsns: Dsns) -> No
                         if jitter.random() < 0.3:
                             time.sleep(jitter.random() * 0.0005)
                         if op == "supersede":
-                            c.execute("SELECT comm.supersede(%s)", (items[run],))
-                            results[actor][run].append((op, None))
+                            outcome = _one(c, "SELECT comm.supersede(%s)", (items[run],))
+                            results[actor][run].append((op, outcome))
                         else:
                             results[actor][run].append(
                                 (op, _one(c, sql[op], (conn_id, items[run])))
@@ -598,6 +691,11 @@ def test_delivery_race_is_consistent(gateway: Conn, app: Conn, dsns: Dsns) -> No
             assert final == "DELIVERED", run
         else:
             assert final == "DELIVERING", run
+        # Core's supersede reports the outcome its audit row records.
+        supersedes = [r for _, r in ops["core"]]
+        mine_core = [r for r in rows if r[0] == "SUPERSEDE"]
+        assert [r[3] == "APPLIED" for r in mine_core] == [o == "applied" for o in supersedes], run
+        assert set(supersedes) <= {"applied", "terminal"}, run
         # Each node's results match its audit rows and its delivery row.
         for actor in ("A", "B"):
             sends = [r for op, r in ops[actor] if op == "sent"]
@@ -734,11 +832,7 @@ def test_fenced_connection_refused_everywhere(gateway: Conn, app: Conn) -> None:
     item = _item(app)
     assert _one(gateway, SENT, (conn2, item)) is True
     reply = uuid.uuid4()
-    app.execute(
-        "INSERT INTO conv.stream_chunk (reply_id, seq, type, text, final)"
-        " VALUES (%s, 1, 'SPEECH', 'A fictional reply', true)",
-        (reply,),
-    )
+    _chunks(app, reply, 1)
     message_id = uuid.uuid4()
     since = _seq(app)
     for conn_id in (conn1, 10**12):  # superseded, and unknown
@@ -760,14 +854,9 @@ def test_fenced_connection_refused_everywhere(gateway: Conn, app: Conn) -> None:
 def test_chunk_cursor_only_moves_forward(gateway: Conn, app: Conn) -> None:
     node_id, conn_id = _connected(app, gateway)
     reply = uuid.uuid4()
-    for seq in range(1, 6):
-        app.execute(
-            "INSERT INTO conv.stream_chunk (reply_id, seq, type, text, final)"
-            " VALUES (%s, %s, 'SPEECH', 'A fictional reply', %s)",
-            (reply, seq, seq == 5),
-        )
-    gateway.execute(CHUNK, (conn_id, reply, 5))
-    gateway.execute(CHUNK, (conn_id, reply, 3))
+    _chunks(app, reply, 5)
+    assert gateway.execute(CHUNK, (conn_id, reply, 5)).fetchone() == (True, None)
+    assert gateway.execute(CHUNK, (conn_id, reply, 3)).fetchone() == (True, None)
     rows = gateway.execute(
         "SELECT node_id, acked_seq FROM conv.stream_cursor WHERE reply_id = %s", (reply,)
     ).fetchall()
@@ -782,18 +871,69 @@ def test_chunk_cursor_only_moves_forward(gateway: Conn, app: Conn) -> None:
 
 def test_stream_chunk_shape_is_checked(app: Conn) -> None:
     reply = uuid.uuid4()
+    session = _session(app)
     for stmt in (
-        "INSERT INTO conv.stream_chunk (reply_id, seq, type, final)"
-        " VALUES (%s, 1, 'SPEECH', false)",
-        "INSERT INTO conv.stream_chunk (reply_id, seq, type, text, authz, final)"
-        " VALUES (%s, 1, 'SPEECH', 'x', '{}', false)",
-        "INSERT INTO conv.stream_chunk (reply_id, seq, type, text, final)"
-        " VALUES (%s, 1, 'ACTION', 'x', false)",
-        "INSERT INTO conv.stream_chunk (reply_id, seq, type, text, final)"
-        " VALUES (%s, 0, 'SPEECH', 'x', false)",
+        "INSERT INTO conv.stream_chunk (reply_id, session_id, seq, type, final)"
+        " VALUES (%s, %s, 1, 'SPEECH', false)",
+        "INSERT INTO conv.stream_chunk (reply_id, session_id, seq, type, text, authz, final)"
+        " VALUES (%s, %s, 1, 'SPEECH', 'x', '{}', false)",
+        "INSERT INTO conv.stream_chunk (reply_id, session_id, seq, type, text, final)"
+        " VALUES (%s, %s, 1, 'ACTION', 'x', false)",
+        "INSERT INTO conv.stream_chunk (reply_id, session_id, seq, type, text, final)"
+        " VALUES (%s, %s, 0, 'SPEECH', 'x', false)",
     ):
         with pytest.raises(psycopg.errors.CheckViolation):
-            app.execute(stmt, (reply,))
+            app.execute(stmt, (reply, session))
+    with pytest.raises(psycopg.errors.NotNullViolation):  # every chunk belongs to a session
+        app.execute(
+            "INSERT INTO conv.stream_chunk (reply_id, seq, type, text, final)"
+            " VALUES (%s, 1, 'SPEECH', 'x', false)",
+            (reply,),
+        )
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        app.execute(
+            "INSERT INTO conv.stream_chunk (reply_id, session_id, seq, type, text, final)"
+            " VALUES (%s, %s, 1, 'SPEECH', 'x', false)",
+            (reply, uuid.uuid4()),
+        )
+
+
+def test_chunk_receipt_for_other_persons_reply_refused(
+    gateway: Conn, app: Conn, dsns: Dsns
+) -> None:
+    """R9-1: B's node records receipt for A's reply: refused, audited, no cursor touched."""
+    person_b = _person(app)
+    node_a, conn_a = _connected(app, gateway)  # person A = the seeded fictional MANJ
+    node_b, conn_b = _connected(app, gateway, person_b)
+    reply = uuid.uuid4()
+    _chunks(app, reply, 3)  # A's reply, in A's session
+    assert gateway.execute(CHUNK, (conn_a, reply, 2)).fetchone() == (True, None)
+    since = _seq(app)
+    row = dbcall.audited_call(
+        gateway,
+        "SELECT recorded, refusal FROM conv.record_chunk_received(%s, %s, %s)",
+        (conn_b, reply, 3),
+    )
+    assert row == (False, "other_person")
+    with psycopg.connect(dsns.app, autocommit=True) as other:  # R7-1: a separate connection
+        assert _audit(other, since) == [
+            (
+                "stream",
+                reply,
+                "CHUNK_RECEIVE",
+                None,
+                None,
+                "REJECTED",
+                "other_person",
+                {"node_id": str(node_b)},
+            )
+        ]
+        cursors = other.execute(
+            "SELECT node_id, acked_seq FROM conv.stream_cursor WHERE reply_id = %s"
+            " OR node_id = %s ORDER BY node_id",
+            (reply, node_b),
+        ).fetchall()
+        assert cursors == [(node_a, 2)]  # A's unchanged; none created for B
 
 
 def test_one_open_session_per_person(app: Conn) -> None:

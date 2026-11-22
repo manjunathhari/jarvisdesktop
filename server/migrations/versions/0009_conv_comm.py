@@ -13,11 +13,14 @@
   EXECUTEs comm.supersede and comm.expire. Outbox state changes only through these functions:
   each locks the item FOR UPDATE, moves its state forward only and writes one audit row per
   call. A trigger refuses any other change, for every role.
-- Refused requests (an unknown inbound kind; an item not addressed to the node) write the
-  REJECTED audit row and return a reason code (R7-1). A fenced connection raises JF001. A
+- Refused requests write the REJECTED audit row and return a reason code (R7-1): an unknown
+  inbound kind (unknown_kind); a message_id already recorded by another node (id_conflict,
+  R9-4); an outbox item unknown or of another person (unknown_item, R9-5); a stream chunk of
+  another person's session (other_person, R9-1). Each connection function acts only on records
+  of the fenced node's person. A fenced connection raises JF001. A
   malformed call raises invalid_parameter_value.
-- audit.event: entity types 'inbound' and 'outbox'; actions INBOUND, SEND, RECEIVE, ACK,
-  SUPERSEDE and EXPIRE. Rows carry codes and IDs only.
+- audit.event: entity types 'inbound', 'outbox' and 'stream'; actions INBOUND, SEND, RECEIVE,
+  ACK, SUPERSEDE, EXPIRE and CHUNK_RECEIVE. Rows carry codes and IDs only.
 
 Foreign keys from conv.inbound, comm.delivery and conv.stream_cursor to gw.node take a KEY SHARE
 lock on the same node row that gw.current_node already holds FOR SHARE in that transaction, so
@@ -85,6 +88,7 @@ CREATE TABLE conv.message (
 
 CREATE TABLE conv.stream_chunk (
     reply_id        uuid NOT NULL,
+    session_id      uuid NOT NULL REFERENCES conv.session(id),  -- whose reply it is (R9-1)
     seq             integer NOT NULL CHECK (seq >= 1),
     type            text NOT NULL CHECK (type IN ('SPEECH', 'ACTION')),
     text            text CHECK (length(text) BETWEEN 1 AND 4000),
@@ -124,10 +128,12 @@ CREATE TABLE comm.event (
     subject_id    text NOT NULL CHECK (subject_id ~ '^[A-Za-z0-9_.:-]{1,100}$'),
     person_id     uuid REFERENCES ledger.person(id),
     details       jsonb NOT NULL DEFAULT '{}' CHECK (
+        -- A flat object of code or ID strings (R9-2). Strict jsonpath: lax mode would unwrap
+        -- arrays and let {"k": ["x"]} or {"k": []} through.
         jsonb_typeof(details) = 'object'
-        AND NOT jsonb_path_exists(details, '$.* ? (@.type() != "string")')
-        AND NOT jsonb_path_exists(details, '$.* ? (!(@ like_regex "^[A-Za-z0-9_.:-]{1,100}$"))')
-        AND NOT jsonb_path_exists(details, '$.keyvalue() ? (!(@.key like_regex "^[a-z][a-z0-9_.]{0,63}$"))')
+        AND NOT jsonb_path_exists(details, 'strict $.* ? (@.type() != "string")', '{}', true)
+        AND NOT jsonb_path_exists(details, 'strict $.* ? (!(@ like_regex "^[A-Za-z0-9_.:-]{1,100}$"))', '{}', true)
+        AND NOT jsonb_path_exists(details, 'strict $.keyvalue() ? (!(@.key like_regex "^[a-z][a-z0-9_.]{0,63}$"))', '{}', true)
     ),
     occurred_at   timestamptz NOT NULL DEFAULT clock_timestamp()
 );
@@ -236,7 +242,8 @@ GRANT SELECT ON conv.stream_chunk, conv.stream_cursor, comm.outbox, comm.deliver
 
 FUNCTIONS = r"""
 -- Gateway: one message from a node (§6.2). The node and person come from the connection, never
--- from the message. A resend of the same message_id is a no-op, (false, NULL).
+-- from the message. A resend of the same message_id by the same node is a no-op, (false, NULL);
+-- one already recorded by a different node is refused, (false, 'id_conflict') (R9-4).
 CREATE FUNCTION conv.record_inbound(
     p_conn_id bigint, p_message_id uuid, p_kind text, p_payload jsonb
 ) RETURNS TABLE (recorded boolean, refusal text)
@@ -247,6 +254,7 @@ DECLARE
     v_person uuid;
     v_job_kind text;
     v_inserted uuid;
+    v_owner uuid;
     v_job bigint;
 BEGIN
     v_node := gw.current_node(p_conn_id);  -- the fence, first (R8-1)
@@ -273,6 +281,14 @@ BEGIN
         ON CONFLICT (id) DO NOTHING
         RETURNING id INTO v_inserted;
     IF v_inserted IS NULL THEN
+        SELECT i.node_id INTO v_owner FROM conv.inbound i WHERE i.id = p_message_id;
+        IF v_owner IS DISTINCT FROM v_node THEN
+            PERFORM audit.append('AGENT', 'gateway', 'inbound', p_message_id, 'INBOUND', NULL,
+                                 NULL, 'REJECTED', 'id_conflict', NULL,
+                                 jsonb_build_object('node_id', v_node));
+            RETURN QUERY SELECT false, 'id_conflict'::text;
+            RETURN;
+        END IF;
         RETURN QUERY SELECT false, NULL::text;
         RETURN;
     END IF;
@@ -414,30 +430,49 @@ END;
 $$;
 
 -- Gateway: the node has every chunk of the reply up to p_seq. The cursor only moves forward.
+-- A chunk of another person's session is refused, (false, 'other_person'), and no cursor row
+-- is created or changed (R9-1). A chunk that doesn't exist is a malformed call here.
 CREATE FUNCTION conv.record_chunk_received(p_conn_id bigint, p_reply_id uuid, p_seq integer)
-RETURNS void
+RETURNS TABLE (recorded boolean, refusal text)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+#variable_conflict use_column
 DECLARE
     v_node uuid;
+    v_person uuid;
+    v_owner uuid;
 BEGIN
     v_node := gw.current_node(p_conn_id);  -- the fence, first (R8-1)
-    IF p_reply_id IS NULL OR p_seq IS NULL OR p_seq < 1
-       OR NOT EXISTS (SELECT 1 FROM conv.stream_chunk s
-                      WHERE s.reply_id = p_reply_id AND s.seq = p_seq) THEN
+    IF p_reply_id IS NULL OR p_seq IS NULL OR p_seq < 1 THEN
         RAISE EXCEPTION 'malformed record_chunk_received call'
             USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    SELECT s.person_id INTO v_owner FROM conv.stream_chunk k
+        JOIN conv.session s ON s.id = k.session_id
+        WHERE k.reply_id = p_reply_id AND k.seq = p_seq;
+    IF v_owner IS NULL THEN
+        RAISE EXCEPTION 'malformed record_chunk_received call: no such chunk'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    SELECT n.person_id INTO v_person FROM gw.node n WHERE n.id = v_node;  -- no lock of its own
+    IF v_owner <> v_person THEN
+        PERFORM audit.append('AGENT', 'gateway', 'stream', p_reply_id, 'CHUNK_RECEIVE', NULL,
+                             NULL, 'REJECTED', 'other_person', NULL,
+                             jsonb_build_object('node_id', v_node));
+        RETURN QUERY SELECT false, 'other_person'::text;
+        RETURN;
     END IF;
     INSERT INTO conv.stream_cursor AS c (reply_id, node_id, acked_seq)
         VALUES (p_reply_id, v_node, p_seq)
         ON CONFLICT (reply_id, node_id) DO UPDATE
         SET acked_seq = greatest(c.acked_seq, EXCLUDED.acked_seq);
+    RETURN QUERY SELECT true, NULL::text;
 END;
 $$;
 
 -- Core: end an item's delivery. Same row lock as the gateway's transitions; NOTIFY
--- jarvis_outbox so the gateway sends outbox.cleared. A terminal item is left as it is, with a
--- REJECTED audit row.
-CREATE FUNCTION comm.supersede(p_outbox_id uuid) RETURNS void
+-- jarvis_outbox so the gateway sends outbox.cleared. Returns 'applied', or 'terminal' when the
+-- item was already terminal: left as it is, with a REJECTED audit row (R9-3).
+CREATE FUNCTION comm.supersede(p_outbox_id uuid) RETURNS text
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     v_state text;
@@ -449,17 +484,18 @@ BEGIN
     IF v_state IN ('ACKNOWLEDGED', 'SUPERSEDED', 'EXPIRED') THEN
         PERFORM audit.append('AGENT', 'core', 'outbox', p_outbox_id, 'SUPERSEDE', v_state, NULL,
                              'REJECTED', 'terminal', NULL, '{}'::jsonb);
-        RETURN;
+        RETURN 'terminal';
     END IF;
     UPDATE comm.outbox o SET state = 'SUPERSEDED', state_changed_at = now()
         WHERE o.id = p_outbox_id;
     PERFORM audit.append('AGENT', 'core', 'outbox', p_outbox_id, 'SUPERSEDE', v_state,
                          'SUPERSEDED', 'APPLIED', 'superseded', NULL, '{}'::jsonb);
     PERFORM pg_notify('jarvis_outbox', p_outbox_id::text);
+    RETURN 'applied';
 END;
 $$;
 
-CREATE FUNCTION comm.expire(p_outbox_id uuid) RETURNS void
+CREATE FUNCTION comm.expire(p_outbox_id uuid) RETURNS text
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     v_state text;
@@ -471,13 +507,14 @@ BEGIN
     IF v_state IN ('ACKNOWLEDGED', 'SUPERSEDED', 'EXPIRED') THEN
         PERFORM audit.append('AGENT', 'core', 'outbox', p_outbox_id, 'EXPIRE', v_state, NULL,
                              'REJECTED', 'terminal', NULL, '{}'::jsonb);
-        RETURN;
+        RETURN 'terminal';
     END IF;
     UPDATE comm.outbox o SET state = 'EXPIRED', state_changed_at = now()
         WHERE o.id = p_outbox_id;
     PERFORM audit.append('AGENT', 'core', 'outbox', p_outbox_id, 'EXPIRE', v_state, 'EXPIRED',
                          'APPLIED', 'expired', NULL, '{}'::jsonb);
     PERFORM pg_notify('jarvis_outbox', p_outbox_id::text);
+    RETURN 'applied';
 END;
 $$;
 
@@ -498,7 +535,7 @@ GRANT EXECUTE ON FUNCTION comm.supersede(uuid) TO jarvis_app;
 GRANT EXECUTE ON FUNCTION comm.expire(uuid) TO jarvis_app;
 """
 
-NEW_ACTIONS = ("INBOUND", "SEND", "RECEIVE", "ACK", "SUPERSEDE", "EXPIRE")
+NEW_ACTIONS = ("INBOUND", "SEND", "RECEIVE", "ACK", "SUPERSEDE", "EXPIRE", "CHUNK_RECEIVE")
 ACTIONS_0008 = (
     "CREATE",
     "TRANSITION",
@@ -531,7 +568,8 @@ def upgrade() -> None:
     op.execute("""
     ALTER TABLE audit.event DROP CONSTRAINT event_entity_type_check;
     ALTER TABLE audit.event ADD CONSTRAINT event_entity_type_check
-        CHECK (entity_type IN ('task', 'commitment', 'memory', 'node', 'inbound', 'outbox'));
+        CHECK (entity_type IN ('task', 'commitment', 'memory', 'node', 'inbound', 'outbox',
+                               'stream'));
     """)
     op.execute(TABLES)
     op.execute(FUNCTIONS)
@@ -544,7 +582,8 @@ def downgrade() -> None:
     DO $$
     BEGIN
         IF EXISTS (SELECT 1 FROM audit.event
-                   WHERE entity_type IN ('inbound', 'outbox') OR action::text IN ({actions}))
+                   WHERE entity_type IN ('inbound', 'outbox', 'stream')
+                      OR action::text IN ({actions}))
            OR {any_rows} THEN
             RAISE EXCEPTION 'conversation, event or outbox rows exist; 0009 cannot be undone '
                             'without destroying them or rewriting the append-only audit trail '

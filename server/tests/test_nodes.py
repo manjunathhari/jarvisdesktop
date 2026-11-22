@@ -8,7 +8,6 @@ identities are random test values; the only person is the seeded fictional house
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hashlib
 import random
 import secrets
@@ -590,6 +589,21 @@ def test_write_wins_supersede_waits(app: Conn, gateway: Conn, ndb: Dsns) -> None
     assert _conn_row(app, old)[:2] == (True, "superseded")
 
 
+def _node_revoked(conn: Conn, node_id: uuid.UUID) -> bool:
+    row = conn.execute("SELECT revoked_at IS NOT NULL FROM gw.node WHERE id = %s", (node_id,))
+    return row.fetchone() == (True,)
+
+
+def _connection_unusable(conn: Conn, conn_id: int) -> bool:
+    """True if the connection is unknown, closed, or its node is revoked (the fence)."""
+    row = conn.execute(
+        "SELECT c.closed_at IS NOT NULL OR n.revoked_at IS NOT NULL FROM gw.node_connection c"
+        " JOIN gw.node n ON n.id = c.node_id WHERE c.id = %s",
+        (conn_id,),
+    ).fetchone()
+    return row is None or row[0] is True
+
+
 def test_no_deadlock_under_mixed_load(app: Conn, gateway: Conn, ndb: Dsns) -> None:
     lock = threading.Lock()
     node_ids = [_node(app, gateway) for _ in range(2)]
@@ -617,14 +631,21 @@ def test_no_deadlock_under_mixed_load(app: Conn, gateway: Conn, ndb: Dsns) -> No
                         gw_conn.execute("SELECT gw.close_connection(%s, 'node_closed')", (conn_id,))
                     elif op == "open":
                         row = gw_conn.execute(
-                            "SELECT conn_id FROM gw.open_connection(%s)", (node_id,)
+                            "SELECT conn_id, refusal FROM gw.open_connection(%s)", (node_id,)
                         ).fetchone()
-                        if row is not None and row[0] is not None:
+                        assert row is not None
+                        if row[1] is not None:
+                            # Only a node another worker revoked may refuse a connection.
+                            assert row[1] == "revoked", row
+                            assert _node_revoked(app_conn, node_id), row
+                        else:
                             with lock:
                                 current[node_id] = int(row[0])
                     elif op == "revoke":
-                        with contextlib.suppress(RevokeRefused):
+                        try:
                             nodes.revoke(app_conn, node_id)
+                        except RevokeRefused as e:  # another worker revoked it first
+                            assert e.reason == "already_revoked", e.reason
                         new = nodes.enrol(
                             gw_conn,
                             token=_token(app_conn),
@@ -639,10 +660,13 @@ def test_no_deadlock_under_mixed_load(app: Conn, gateway: Conn, ndb: Dsns) -> No
                             gw_conn.execute("SELECT gw.current_node(%s)", (conn_id,))
                             time.sleep(0.001)  # hold the fence briefly, like a real write
                 except psycopg.Error as e:
-                    # Only the fence, and only where another worker may have closed,
-                    # superseded or revoked this connection (or none is open yet: id 0).
+                    # Only the fence, and only on a connection that really was unusable:
+                    # unknown (including 0, none opened yet), closed, or its node revoked.
+                    # Both conditions only ever become true, so checking afterwards, from a
+                    # separate connection, is sound.
                     if e.sqlstate != FENCED_SQLSTATE or op not in ("touch", "close", "current"):
                         raise
+                    assert _connection_unusable(app_conn, conn_id), (op, conn_id)
 
     run_all([lambda i=i: worker(i) for i in range(8)], timeout=120)
     # Final state: one open connection at most per node, none on a revoked node, and the

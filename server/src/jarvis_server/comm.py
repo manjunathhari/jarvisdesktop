@@ -86,7 +86,8 @@ def create_outbox(
     """Create a PENDING outbox item; supersede `supersedes_id` in the same transaction.
 
     NOTIFYs `jarvis_outbox` with the new id (and comm.supersede with the old one), delivered
-    when the transaction commits.
+    when the transaction commits. Superseding an item that has already ended is a recorded
+    no-op (comm.supersede returns 'terminal' and audits it); the new item is still created.
     """
     _check_code("kind", kind)
     with conn.transaction():
@@ -115,6 +116,10 @@ def create_outbox(
         assert row is not None
         outbox_id = UUID(str(row[0]))
         if supersedes_id is not None:
-            conn.execute("SELECT comm.supersede(%s)", (supersedes_id,))
+            # 'applied', or 'terminal' if it had already ended (acknowledged, expired or
+            # superseded): nothing to take back then, and the new item stands either way.
+            outcome = conn.execute("SELECT comm.supersede(%s)", (supersedes_id,)).fetchone()
+            if outcome is None or outcome[0] not in ("applied", "terminal"):
+                raise RuntimeError(f"comm.supersede returned {outcome!r}")
         conn.execute("SELECT pg_notify('jarvis_outbox', %s)", (str(outbox_id),))
     return outbox_id

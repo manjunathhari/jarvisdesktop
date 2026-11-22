@@ -50,7 +50,8 @@
         "memory",
         "node",
         "inbound",
-        "outbox"
+        "outbox",
+        "stream"
       ]
     },
     "entity_id": {
@@ -75,7 +76,8 @@
         "RECEIVE",
         "ACK",
         "SUPERSEDE",
-        "EXPIRE"
+        "EXPIRE",
+        "CHUNK_RECEIVE"
       ]
     },
     "from_state": {
