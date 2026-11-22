@@ -37,6 +37,9 @@ def bootstrap(superuser_dsn: str, database: str, owner_password: str, app_passwo
                 sql.Identifier(database), sql.Identifier(APP_ROLE)
             )
         )
+        # S5 (Phase 0 security review): nobody but the superuser connects to the default
+        # database, which holds nothing JARVIS needs.
+        conn.execute("REVOKE CONNECT ON DATABASE postgres FROM PUBLIC")
 
     db_dsn = psycopg.conninfo.make_conninfo(superuser_dsn, dbname=database)
     with psycopg.connect(db_dsn, autocommit=True) as conn:

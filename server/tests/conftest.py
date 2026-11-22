@@ -6,6 +6,7 @@ Tests connect as jarvis_app, exactly like the running services.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
 from collections.abc import Iterator
@@ -32,8 +33,9 @@ def _with(dsn: str, **kw: str) -> str:
     return psycopg.conninfo.make_conninfo(dsn, **kw)
 
 
-@pytest.fixture(scope="session")
-def dsns() -> Iterator[Dsns]:
+@contextlib.contextmanager
+def fresh_database() -> Iterator[Dsns]:
+    """A new database built from migrations alone; dropped afterwards."""
     superuser = os.environ.get("JARVIS_TEST_SUPERUSER_DSN")
     if not superuser:
         pytest.skip("JARVIS_TEST_SUPERUSER_DSN not set; database tests skipped")
@@ -47,9 +49,17 @@ def dsns() -> Iterator[Dsns]:
         database=database,
     )
     migrate.upgrade(d.owner)
-    yield d
-    with psycopg.connect(superuser, autocommit=True) as conn:
-        conn.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
+    try:
+        yield d
+    finally:
+        with psycopg.connect(superuser, autocommit=True) as conn:
+            conn.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database)))
+
+
+@pytest.fixture(scope="session")
+def dsns() -> Iterator[Dsns]:
+    with fresh_database() as d:
+        yield d
 
 
 @pytest.fixture
