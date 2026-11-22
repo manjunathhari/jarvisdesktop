@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): complete, PR #2 merged 2026-11-21; running on the shared server. Phase 1 (memory engine): built and reviewed 2026-11-22 on branch `phase-1-memory-engine` — 236 tests green, M1–M4 pass, no blocking review issues; awaiting PR, CI and the pre-merge live check.**
+**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): complete, PR #2 merged 2026-11-21; running on the shared server. Phase 1 (memory engine): built and reviewed 2026-11-22 on branch `phase-1-memory-engine` — 236 tests green, M1–M4 pass, no blocking review issues; PR #3 open; CI green (Postgres 17); **live check passed 2026-11-22** (commit 6e49572: migration 0007 applied, `SMOKE PASS` ×10, `memory ready: 0 entries`, first bundle written). Awaiting Manj's merge.**
 **Started:** 2026-11-21
 
 ## Known so far
@@ -96,10 +96,9 @@ Boundary: no embeddings, AI inference, consolidation, external memory services o
 - [x] T1.7 Deploy: git in image, memory volume, smoke, bundle, runbook
 - [x] T1.8 Independent QA and security review — `reviews/2026-11-22-phase-1-*`; 3 medium + 4 low findings fixed
 
-Build: 236 tests green locally (Postgres 16); ruff, format, mypy clean. Image not built in the build session (Docker Hub blocked) — CI builds it. Deviations from the spec: `decisions/sde/phase-1-memory-engine.md`.
+Build: 236 tests green locally (Postgres 16, password auth) and in CI (Postgres 17); ruff, format, mypy clean. CI caught two issues fixed before merge: test role passwords reset by a second test database; retrieval speed on a shared runner (now ~4 ms for 5,000 entries). Deviations from the spec: `decisions/sde/phase-1-memory-engine.md`.
 
 ### Next (Phase 1 close-out)
-1. Push the branch and open a PR (build session had no push access — Manj to grant, or push the bundle).
-2. CI green on Postgres 17; image published from the branch.
-3. Deploy that commit to project `jarvis`; check `SMOKE PASS` ×10 in `init` logs and `memory ready` in `core` logs.
-4. Merge; remove `phase-1-memory-engine` from the publish condition in `server.yml`.
+1. ~~Push and open PR~~ — PR #3. 2. ~~CI green~~. 3. ~~Live check~~ — passed 2026-11-22.
+4. Manj merges PR #3; then remove `phase-1-memory-engine` from the publish condition in `server.yml` and redeploy `main`.
+5. Next phase: Phase 2 (Jarvis core + nodes) — brainstorm + design doc first.

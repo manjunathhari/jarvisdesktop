@@ -1,5 +1,5 @@
 # Handoff
-**Now:** Phase 0 complete and live. Phase 1 (memory engine) built and reviewed 2026-11-22 on branch `phase-1-memory-engine`: 236 tests green, M1–M4 pass, QA + security reviews in `reviews/2026-11-22-phase-1-*` with no blocking issues. Next: push/PR, CI, pre-merge live check (`SMOKE PASS` ×10, `memory ready`), merge (status.md 'Next').
+**Now:** Phase 0 complete and live. Phase 1 (memory engine) built and reviewed 2026-11-22 on branch `phase-1-memory-engine`: 236 tests green, M1–M4 pass, QA + security reviews in `reviews/2026-11-22-phase-1-*` with no blocking issues. PR #3 open, CI green, live check passed (live server runs branch commit 6e49572). Next: Manj merges; then Phase 2.
 
 **Read first:** spec (§15 lists build changes) `.10x/specs/2026-11-21-phase-1-memory-engine-design.md`, ADR-010, `decisions/*/phase-1-memory-engine.md`.
 
