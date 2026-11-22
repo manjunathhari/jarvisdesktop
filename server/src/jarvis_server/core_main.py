@@ -29,6 +29,7 @@ import psycopg
 
 from jarvis_server import config, jobs, migrate, nodes, signing, smoke
 from jarvis_server.bootstrap import bootstrap
+from jarvis_server.core import dispatch
 from jarvis_server.dbcall import Refused
 from jarvis_server.memory import checks as memory_checks
 from jarvis_server.memory import format as memory_format
@@ -36,14 +37,58 @@ from jarvis_server.memory import service as memory_service
 
 log = logging.getLogger("jarvis.core")
 
-Handler = Callable[[psycopg.Connection[Any], jobs.Job], None]
+# Wakes the poll loop early; an optimisation only. The loop polls `ops.job` every
+# `poll_seconds` whether or not a NOTIFY ever arrives.
+JOBS_CHANNEL = "jarvis_jobs"
 
 
-def _noop(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
-    log.info("noop job %s ran (payload %s)", job.id, job.payload)
+def open_listener(dsn: str) -> psycopg.Connection[Any] | None:
+    """A separate autocommit connection that LISTENs on `jarvis_jobs`, or None if that fails."""
+    try:
+        listener = psycopg.connect(dsn, autocommit=True)
+        listener.execute(f"LISTEN {JOBS_CHANNEL}")
+    except psycopg.Error as e:
+        log.warning("LISTEN %s unavailable, polling only: %s", JOBS_CHANNEL, e)
+        return None
+    return listener
 
 
-HANDLERS: dict[str, Handler] = {"noop": _noop}
+def _wait_for_jobs(listener: psycopg.Connection[Any] | None, seconds: float) -> bool:
+    """Wait up to `seconds`, returning early on a NOTIFY. False if the listener broke."""
+    if listener is None:
+        time.sleep(seconds)
+        return True
+    try:
+        for _ in listener.notifies(timeout=seconds, stop_after=1):
+            pass
+    except psycopg.Error as e:
+        log.warning("LISTEN %s lost, polling only: %s", JOBS_CHANNEL, e)
+        return False
+    return True
+
+
+def run_loop(
+    conn: psycopg.Connection[Any],
+    listener: psycopg.Connection[Any] | None,
+    worker: str,
+    *,
+    poll_seconds: float,
+    should_stop: Callable[[], bool],
+    on_tick: Callable[[], None] | None = None,
+) -> None:
+    """Claim and dispatch jobs until `should_stop()`; wait between empty polls."""
+    while not should_stop():
+        if on_tick is not None:
+            on_tick()
+        job = jobs.claim(conn, worker)
+        if job is None:
+            if not _wait_for_jobs(listener, poll_seconds):
+                listener = None  # fall back to plain polling for the rest of this run
+            continue
+        try:
+            dispatch.handle(conn, job)  # records the failure itself before re-raising
+        except Exception as e:
+            log.warning("job %s (%s) not completed: %s: %s", job.id, job.kind, type(e).__name__, e)
 
 
 def serve(poll_seconds: float = 2.0) -> None:
@@ -60,7 +105,9 @@ def serve(poll_seconds: float = 2.0) -> None:
     with psycopg.connect(config.app_dsn(), autocommit=True) as conn:
         log.info("core started as %s", worker)
         memory = memory_service.open_engine(conn)  # refuses to start if memory does not load
-        while not stopping:
+
+        def _tick() -> None:
+            nonlocal last_beat
             if time.monotonic() - last_beat >= jobs.HEARTBEAT_INTERVAL.total_seconds():
                 jobs.beat(conn, "core")
                 jobs.sweep_abandoned(conn)
@@ -69,19 +116,20 @@ def serve(poll_seconds: float = 2.0) -> None:
                 except Exception as e:  # a failed backup must not stop core
                     log.warning("memory backup bundle failed: %s", e)
                 last_beat = time.monotonic()
-            job = jobs.claim(conn, worker)
-            if job is None:
-                time.sleep(poll_seconds)
-                continue
-            handler = HANDLERS.get(job.kind)
-            try:
-                if handler is None:
-                    raise LookupError(f"no handler for job kind {job.kind!r}")
-                handler(conn, job)
-                jobs.complete(conn, job.id)
-            except Exception as e:
-                status = jobs.fail(conn, job.id, f"{type(e).__name__}: {e}")
-                log.warning("job %s (%s) failed: %s -> %s", job.id, job.kind, e, status)
+
+        listener = open_listener(config.app_dsn())
+        try:
+            run_loop(
+                conn,
+                listener,
+                worker,
+                poll_seconds=poll_seconds,
+                should_stop=lambda: stopping,
+                on_tick=_tick,
+            )
+        finally:
+            if listener is not None:
+                listener.close()
     log.info("core stopped")
 
 
