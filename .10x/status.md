@@ -87,11 +87,13 @@ Decisions: P1 engine only (no real memories until Phase 2) · P2 markdown is the
 Boundary: no embeddings, AI inference, consolidation, external memory services or real personal data in Phase 1.
 
 ### Phase 1 task list
-- [ ] T1.1 ADR-010; interface, types, memory-entry contract
-- [ ] T1.2 Strict markdown parser and writer
-- [ ] T1.3 Private git store and history
-- [ ] T1.4 Lifecycle and tag rules
-- [ ] T1.5 Visibility, retrieval, M1–M4
-- [ ] T1.6 Migration 0007 (memory audit + S5) and recovery
-- [ ] T1.7 Deploy: git in image, memory volume, smoke, bundle, runbook
-- [ ] T1.8 Independent QA and security review
+- [x] T1.1 ADR-010; interface, types, memory-entry contract
+- [x] T1.2 Strict markdown parser and writer
+- [x] T1.3 Private git store and history
+- [x] T1.4 Lifecycle and tag rules
+- [x] T1.5 Visibility, retrieval, M1–M4
+- [x] T1.6 Migration 0007 (memory audit + S5) and recovery
+- [x] T1.7 Deploy: git in image, memory volume, smoke, bundle, runbook
+- [ ] T1.8 Independent QA and security review (in progress)
+
+Build: 217 tests green locally (Postgres 16); ruff, format, mypy clean. Deviations from the spec: `decisions/sde/phase-1-memory-engine.md`.
