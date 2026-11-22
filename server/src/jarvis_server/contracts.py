@@ -263,7 +263,11 @@ class Approval(_Contract):
     execution_key: UUID | None = None
 
 
+NIL_UUID = UUID(int=0)
+
+
 class MessageKind(StrEnum):
+    CHALLENGE = "challenge"
     ENROL = "enrol"
     HELLO = "hello"
     WELCOME = "welcome"
@@ -282,6 +286,9 @@ class MessageKind(StrEnum):
     ERROR = "error"
 
 
+NIL_NODE_ID_KINDS = frozenset({MessageKind.CHALLENGE, MessageKind.ENROL})
+
+
 class NodeEnvelope(_Contract):
     """Wrapper for node <-> gateway messages; ``sig`` covers every other field (spec §7.1)."""
 
@@ -295,25 +302,59 @@ class NodeEnvelope(_Contract):
     payload: dict[str, Any]
     sig: Sig
 
+    @model_validator(mode="after")
+    def _nil_node_id_only_before_the_node_is_known(self) -> NodeEnvelope:
+        if self.node_id == NIL_UUID and self.kind not in NIL_NODE_ID_KINDS:
+            raise ValueError("the nil node_id is allowed only on challenge and enrol")
+        return self
+
+
+def _absent_not_null(data: Any, *fields: str) -> Any:
+    """Optional fields may be left out, but never sent as null (the schemas say the same)."""
+    if isinstance(data, dict):
+        for field in fields:
+            if field in data and data[field] is None:
+                raise ValueError(f"{field} may be absent but not null")
+    return data
+
 
 # ---------------------------------------------------------------- message payloads
 
 Token = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{16,128}$")]
+Nonce = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{43}$")]
+"""32 random bytes, base64url without padding."""
+
+
+class Challenge(_Contract):
+    """The gateway's first message on every connection (spec §6.1 step 2, R6-1)."""
+
+    nonce: Nonce
+    issued_at: AwareDatetime
+    expires_at: AwareDatetime
+    key_id: KeyId
+    public_key: PublicKey
 
 
 class Enrol(_Contract):
     token: Token
     public_key: PublicKey
+    nonce: Nonce
 
 
 class ResumePosition(_Contract):
     reply_id: UUID
-    last_seq: Seq
+    last_seq: int  # any integer; the gateway validates it (R6-5)
 
 
 class Hello(_Contract):
-    nonce: Token
+    nonce: Nonce
     resume: tuple[ResumePosition, ...]
+    clock_skew_ms: int | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_null(cls, data: Any) -> Any:
+        return _absent_not_null(data, "clock_skew_ms")
 
 
 class SummaryPriority(StrEnum):
@@ -329,9 +370,23 @@ class SummaryGroup(_Contract):
     line: Annotated[str, Field(min_length=1, max_length=500)] | None
 
 
+class EnrolmentBlock(_Contract):
+    """Sent in ``welcome`` after an enrolment only (spec §6.1 step 7, R6-6)."""
+
+    node_id: UUID
+    core_key_id: KeyId
+    core_public_key: PublicKey
+
+
 class Welcome(_Contract):
     session_id: UUID | None
     summary: tuple[SummaryGroup, ...]
+    enrolment: EnrolmentBlock | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_null(cls, data: Any) -> Any:
+        return _absent_not_null(data, "enrolment")
 
 
 class Utterance(_Contract):
@@ -481,6 +536,7 @@ MODELS: dict[str, type[_Contract]] = {
 
 
 MESSAGE_MODELS: dict[str, type[BaseModel]] = {
+    "challenge": Challenge,
     "enrol": Enrol,
     "hello": Hello,
     "welcome": Welcome,

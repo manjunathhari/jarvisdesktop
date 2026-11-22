@@ -1,6 +1,7 @@
 [
   {
     "name": "accept-valid",
+    "check": "node_action",
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
@@ -31,6 +32,7 @@
   },
   {
     "name": "reject-gateway-key-only",
+    "check": "node_action",
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
@@ -60,7 +62,39 @@
     "reason": "untrusted_key_id"
   },
   {
+    "name": "reject-gateway-key-under-core-key-id",
+    "check": "node_action",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+    "now": "2026-11-22T10:01:00Z",
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "node.action",
+        "action_kind": "news.show",
+        "args": {
+          "channel": "headlines"
+        },
+        "target_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+        "person_id": "3e2d1c0b-9a8f-4e7d-8c6b-5a4f3e2d1c0b",
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-22T10:02:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "534-GDOKlc-giY3hUeWlidOdeobv4kHtMcjuiBdJjB_XTfuvQoNaJSkuKkjJAtRspzfNUEpDTxHM11r0iLLrBA"
+    },
+    "expect": "reject",
+    "reason": "bad_signature"
+  },
+  {
     "name": "reject-wrong-purpose",
+    "check": "node_action",
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
@@ -91,6 +125,7 @@
   },
   {
     "name": "reject-other-target-node",
+    "check": "node_action",
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
@@ -121,6 +156,7 @@
   },
   {
     "name": "reject-expired",
+    "check": "node_action",
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
@@ -151,6 +187,7 @@
   },
   {
     "name": "accept-within-tolerance",
+    "check": "node_action",
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
@@ -181,6 +218,7 @@
   },
   {
     "name": "accept-at-tolerance-limit",
+    "check": "node_action",
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
@@ -211,6 +249,7 @@
   },
   {
     "name": "reject-untrusted-key-id",
+    "check": "node_action",
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
@@ -241,6 +280,7 @@
   },
   {
     "name": "reject-tampered-args",
+    "check": "node_action",
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
@@ -271,6 +311,7 @@
   },
   {
     "name": "reject-naive-valid-until",
+    "check": "node_action",
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
@@ -300,81 +341,8 @@
     "reason": "malformed"
   },
   {
-    "name": "accept-keyset",
-    "trusted_keys": {
-      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
-    },
-    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
-    "now": "2026-11-22T10:01:00Z",
-    "authz": {
-      "object": {
-        "v": 1,
-        "kind": "keyset",
-        "action_kind": "keyset.add",
-        "args": {
-          "role": "core",
-          "key_id": "core-2",
-          "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
-        },
-        "target_node_id": null,
-        "person_id": null,
-        "approval_id": null,
-        "execution_key": null,
-        "reply_id": null,
-        "summary": null,
-        "issued_at": "2026-11-22T10:00:00Z",
-        "valid_until": "2026-11-23T10:00:00Z"
-      },
-      "key_id": "core-1",
-      "sig": "N6xJJwr8Zu_e1yPAUH6DyLPBN8vfCWFuNegh6B4zk81cKrFn8IW66Bl_IkPORTgsHiDhXJpXOA1Zn5MSxuE4Cg"
-    },
-    "expect": "accept",
-    "reason": null,
-    "payload": {
-      "role": "core",
-      "key_id": "core-2",
-      "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
-    }
-  },
-  {
-    "name": "reject-keyset-payload-mismatch",
-    "trusted_keys": {
-      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
-    },
-    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
-    "now": "2026-11-22T10:01:00Z",
-    "authz": {
-      "object": {
-        "v": 1,
-        "kind": "keyset",
-        "action_kind": "keyset.add",
-        "args": {
-          "role": "core",
-          "key_id": "core-2",
-          "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
-        },
-        "target_node_id": null,
-        "person_id": null,
-        "approval_id": null,
-        "execution_key": null,
-        "reply_id": null,
-        "summary": null,
-        "issued_at": "2026-11-22T10:00:00Z",
-        "valid_until": "2026-11-23T10:00:00Z"
-      },
-      "key_id": "core-1",
-      "sig": "N6xJJwr8Zu_e1yPAUH6DyLPBN8vfCWFuNegh6B4zk81cKrFn8IW66Bl_IkPORTgsHiDhXJpXOA1Zn5MSxuE4Cg"
-    },
-    "expect": "reject",
-    "reason": "keyset_mismatch",
-    "payload": {
-      "role": "core",
-      "key_id": "core-2",
-      "public_key": "_ilLyOLy_W3lT7WcMUilNZHEqDNgWaOpRVk8oAhTIjI"
-    }
-  },
-  {
     "name": "reject-card-as-action",
+    "check": "node_action",
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
@@ -402,5 +370,473 @@
     },
     "expect": "reject",
     "reason": "wrong_kind"
+  },
+  {
+    "name": "accept-keyset",
+    "check": "keyset",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "now": "2026-11-22T10:01:00Z",
+    "payload": {
+      "role": "core",
+      "key_id": "core-2",
+      "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
+    },
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "keyset",
+        "action_kind": "keyset.add",
+        "args": {
+          "role": "core",
+          "key_id": "core-2",
+          "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
+        },
+        "target_node_id": null,
+        "person_id": null,
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": null,
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-23T10:00:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "N6xJJwr8Zu_e1yPAUH6DyLPBN8vfCWFuNegh6B4zk81cKrFn8IW66Bl_IkPORTgsHiDhXJpXOA1Zn5MSxuE4Cg"
+    },
+    "expect": "accept",
+    "reason": null
+  },
+  {
+    "name": "reject-keyset-expired",
+    "check": "keyset",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "now": "2026-11-23T10:00:31Z",
+    "payload": {
+      "role": "core",
+      "key_id": "core-2",
+      "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
+    },
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "keyset",
+        "action_kind": "keyset.add",
+        "args": {
+          "role": "core",
+          "key_id": "core-2",
+          "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
+        },
+        "target_node_id": null,
+        "person_id": null,
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": null,
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-23T10:00:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "N6xJJwr8Zu_e1yPAUH6DyLPBN8vfCWFuNegh6B4zk81cKrFn8IW66Bl_IkPORTgsHiDhXJpXOA1Zn5MSxuE4Cg"
+    },
+    "expect": "reject",
+    "reason": "expired"
+  },
+  {
+    "name": "accept-keyset-within-tolerance",
+    "check": "keyset",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "now": "2026-11-23T10:00:29Z",
+    "payload": {
+      "role": "core",
+      "key_id": "core-2",
+      "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
+    },
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "keyset",
+        "action_kind": "keyset.add",
+        "args": {
+          "role": "core",
+          "key_id": "core-2",
+          "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
+        },
+        "target_node_id": null,
+        "person_id": null,
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": null,
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-23T10:00:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "N6xJJwr8Zu_e1yPAUH6DyLPBN8vfCWFuNegh6B4zk81cKrFn8IW66Bl_IkPORTgsHiDhXJpXOA1Zn5MSxuE4Cg"
+    },
+    "expect": "accept",
+    "reason": null
+  },
+  {
+    "name": "reject-keyset-payload-mismatch",
+    "check": "keyset",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "now": "2026-11-22T10:01:00Z",
+    "payload": {
+      "role": "core",
+      "key_id": "core-2",
+      "public_key": "_ilLyOLy_W3lT7WcMUilNZHEqDNgWaOpRVk8oAhTIjI"
+    },
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "keyset",
+        "action_kind": "keyset.add",
+        "args": {
+          "role": "core",
+          "key_id": "core-2",
+          "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
+        },
+        "target_node_id": null,
+        "person_id": null,
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": null,
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-23T10:00:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "N6xJJwr8Zu_e1yPAUH6DyLPBN8vfCWFuNegh6B4zk81cKrFn8IW66Bl_IkPORTgsHiDhXJpXOA1Zn5MSxuE4Cg"
+    },
+    "expect": "reject",
+    "reason": "keyset_mismatch"
+  },
+  {
+    "name": "reject-keyset-naive-valid-until",
+    "check": "keyset",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "now": "2026-11-22T10:01:00Z",
+    "payload": {
+      "role": "core",
+      "key_id": "core-2",
+      "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
+    },
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "keyset",
+        "action_kind": "keyset.add",
+        "args": {
+          "role": "core",
+          "key_id": "core-2",
+          "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
+        },
+        "target_node_id": null,
+        "person_id": null,
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": null,
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-23T10:00:00"
+      },
+      "key_id": "core-1",
+      "sig": "Fv53DWHb8qF2ijHJU8AAac1OqVEo7qNU_SeA7LarQaGdRWEM7oDPFRKLe7x-zrHyTrtpLp3JK9LXcK03egGgCg"
+    },
+    "expect": "reject",
+    "reason": "malformed"
+  },
+  {
+    "name": "accept-challenge",
+    "check": "challenge",
+    "envelope": {
+      "version": 1,
+      "message_id": "8e7d6c5b-4a39-4281-9f0e-1d2c3b4a5f60",
+      "node_id": "00000000-0000-0000-0000-000000000000",
+      "session_id": null,
+      "seq": 1,
+      "sent_at": "2026-11-22T10:00:00Z",
+      "kind": "challenge",
+      "payload": {
+        "nonce": "i600-f9kAXaIUL2wWxhe0Z0RoJCBbpZD-cigb7Be5xw",
+        "issued_at": "2026-11-22T10:00:00Z",
+        "expires_at": "2026-11-22T10:00:30Z",
+        "key_id": "gw-1",
+        "public_key": "Z9u0DlJ05A2uJKwXCBB0GMLc8M4oWW-OIxAYlawB44Q"
+      },
+      "sig": "pOOHRfF0cytgeWsnbND8BZhB6_GAhTvWgmXs56G6LIsLv9CUuXVF1eWb8NGmI2KkyHs2Iiuzv5z3Kv_95NAEDg"
+    },
+    "pinned_gateway": {
+      "gw-1": "67dbb40e5274e40dae24ac1708107418c2dcf0ce28596f8e23101895ac01e384"
+    },
+    "enrol_fingerprint": null,
+    "expect": "accept",
+    "reason": null
+  },
+  {
+    "name": "accept-challenge-enrol-by-fingerprint",
+    "check": "challenge",
+    "envelope": {
+      "version": 1,
+      "message_id": "8e7d6c5b-4a39-4281-9f0e-1d2c3b4a5f60",
+      "node_id": "00000000-0000-0000-0000-000000000000",
+      "session_id": null,
+      "seq": 1,
+      "sent_at": "2026-11-22T10:00:00Z",
+      "kind": "challenge",
+      "payload": {
+        "nonce": "i600-f9kAXaIUL2wWxhe0Z0RoJCBbpZD-cigb7Be5xw",
+        "issued_at": "2026-11-22T10:00:00Z",
+        "expires_at": "2026-11-22T10:00:30Z",
+        "key_id": "gw-1",
+        "public_key": "Z9u0DlJ05A2uJKwXCBB0GMLc8M4oWW-OIxAYlawB44Q"
+      },
+      "sig": "pOOHRfF0cytgeWsnbND8BZhB6_GAhTvWgmXs56G6LIsLv9CUuXVF1eWb8NGmI2KkyHs2Iiuzv5z3Kv_95NAEDg"
+    },
+    "pinned_gateway": null,
+    "enrol_fingerprint": "sr4gjr77227xthdz",
+    "expect": "accept",
+    "reason": null
+  },
+  {
+    "name": "reject-challenge-unpinned-key",
+    "check": "challenge",
+    "envelope": {
+      "version": 1,
+      "message_id": "8e7d6c5b-4a39-4281-9f0e-1d2c3b4a5f60",
+      "node_id": "00000000-0000-0000-0000-000000000000",
+      "session_id": null,
+      "seq": 1,
+      "sent_at": "2026-11-22T10:00:00Z",
+      "kind": "challenge",
+      "payload": {
+        "nonce": "i600-f9kAXaIUL2wWxhe0Z0RoJCBbpZD-cigb7Be5xw",
+        "issued_at": "2026-11-22T10:00:00Z",
+        "expires_at": "2026-11-22T10:00:30Z",
+        "key_id": "gw-2",
+        "public_key": "_ilLyOLy_W3lT7WcMUilNZHEqDNgWaOpRVk8oAhTIjI"
+      },
+      "sig": "8RZa66ywlb4G37-nEQkPJNJ42jMHrl-KFtCf2vwJtxlK33ihiezSHnV0C73B80rxWzH9skmM7ejWeZUTAfGACQ"
+    },
+    "pinned_gateway": {
+      "gw-1": "67dbb40e5274e40dae24ac1708107418c2dcf0ce28596f8e23101895ac01e384"
+    },
+    "enrol_fingerprint": null,
+    "expect": "reject",
+    "reason": "unpinned_key"
+  },
+  {
+    "name": "reject-challenge-fingerprint-mismatch",
+    "check": "challenge",
+    "envelope": {
+      "version": 1,
+      "message_id": "8e7d6c5b-4a39-4281-9f0e-1d2c3b4a5f60",
+      "node_id": "00000000-0000-0000-0000-000000000000",
+      "session_id": null,
+      "seq": 1,
+      "sent_at": "2026-11-22T10:00:00Z",
+      "kind": "challenge",
+      "payload": {
+        "nonce": "i600-f9kAXaIUL2wWxhe0Z0RoJCBbpZD-cigb7Be5xw",
+        "issued_at": "2026-11-22T10:00:00Z",
+        "expires_at": "2026-11-22T10:00:30Z",
+        "key_id": "gw-1",
+        "public_key": "Z9u0DlJ05A2uJKwXCBB0GMLc8M4oWW-OIxAYlawB44Q"
+      },
+      "sig": "pOOHRfF0cytgeWsnbND8BZhB6_GAhTvWgmXs56G6LIsLv9CUuXVF1eWb8NGmI2KkyHs2Iiuzv5z3Kv_95NAEDg"
+    },
+    "pinned_gateway": null,
+    "enrol_fingerprint": "f47kxnm657iwbb7l",
+    "expect": "reject",
+    "reason": "fingerprint_mismatch"
+  },
+  {
+    "name": "reject-challenge-bad-signature",
+    "check": "challenge",
+    "envelope": {
+      "version": 1,
+      "message_id": "8e7d6c5b-4a39-4281-9f0e-1d2c3b4a5f60",
+      "node_id": "00000000-0000-0000-0000-000000000000",
+      "session_id": null,
+      "seq": 1,
+      "sent_at": "2026-11-22T10:00:00Z",
+      "kind": "challenge",
+      "payload": {
+        "nonce": "A600-f9kAXaIUL2wWxhe0Z0RoJCBbpZD-cigb7Be5xw",
+        "issued_at": "2026-11-22T10:00:00Z",
+        "expires_at": "2026-11-22T10:00:30Z",
+        "key_id": "gw-1",
+        "public_key": "Z9u0DlJ05A2uJKwXCBB0GMLc8M4oWW-OIxAYlawB44Q"
+      },
+      "sig": "pOOHRfF0cytgeWsnbND8BZhB6_GAhTvWgmXs56G6LIsLv9CUuXVF1eWb8NGmI2KkyHs2Iiuzv5z3Kv_95NAEDg"
+    },
+    "pinned_gateway": {
+      "gw-1": "67dbb40e5274e40dae24ac1708107418c2dcf0ce28596f8e23101895ac01e384"
+    },
+    "enrol_fingerprint": null,
+    "expect": "reject",
+    "reason": "bad_signature"
+  },
+  {
+    "name": "reject-challenge-signed-by-core-key",
+    "check": "challenge",
+    "envelope": {
+      "version": 1,
+      "message_id": "8e7d6c5b-4a39-4281-9f0e-1d2c3b4a5f60",
+      "node_id": "00000000-0000-0000-0000-000000000000",
+      "session_id": null,
+      "seq": 1,
+      "sent_at": "2026-11-22T10:00:00Z",
+      "kind": "challenge",
+      "payload": {
+        "nonce": "i600-f9kAXaIUL2wWxhe0Z0RoJCBbpZD-cigb7Be5xw",
+        "issued_at": "2026-11-22T10:00:00Z",
+        "expires_at": "2026-11-22T10:00:30Z",
+        "key_id": "gw-1",
+        "public_key": "Z9u0DlJ05A2uJKwXCBB0GMLc8M4oWW-OIxAYlawB44Q"
+      },
+      "sig": "ncRBWYH2mp3CFUvAhDSYMHfGBFQoY8Z701ZKn3UYeVdc0o29QLz-GhYspz5z-Hk6DQh8rbT7-onWJMVZI9VFAg"
+    },
+    "pinned_gateway": {
+      "gw-1": "67dbb40e5274e40dae24ac1708107418c2dcf0ce28596f8e23101895ac01e384"
+    },
+    "enrol_fingerprint": null,
+    "expect": "reject",
+    "reason": "bad_signature"
+  },
+  {
+    "name": "reject-challenge-naive-time",
+    "check": "challenge",
+    "envelope": {
+      "version": 1,
+      "message_id": "8e7d6c5b-4a39-4281-9f0e-1d2c3b4a5f60",
+      "node_id": "00000000-0000-0000-0000-000000000000",
+      "session_id": null,
+      "seq": 1,
+      "sent_at": "2026-11-22T10:00:00Z",
+      "kind": "challenge",
+      "payload": {
+        "nonce": "i600-f9kAXaIUL2wWxhe0Z0RoJCBbpZD-cigb7Be5xw",
+        "issued_at": "2026-11-22T10:00:00",
+        "expires_at": "2026-11-22T10:00:30Z",
+        "key_id": "gw-1",
+        "public_key": "Z9u0DlJ05A2uJKwXCBB0GMLc8M4oWW-OIxAYlawB44Q"
+      },
+      "sig": "TianhT-dGgpyXR0MVFdvcRkl6vNOXDTb4MDttNELRRd39e85AZ9PGHEpR7IBU-CZ37YffgTWRySyuIv_FPXNAQ"
+    },
+    "pinned_gateway": {
+      "gw-1": "67dbb40e5274e40dae24ac1708107418c2dcf0ce28596f8e23101895ac01e384"
+    },
+    "enrol_fingerprint": null,
+    "expect": "reject",
+    "reason": "malformed"
+  },
+  {
+    "name": "accept-enrolment-welcome",
+    "check": "enrolment_welcome",
+    "welcome": {
+      "session_id": null,
+      "summary": [],
+      "enrolment": {
+        "node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+        "core_key_id": "core-1",
+        "core_public_key": "-LziJgkeR2m1UUOar0hpQYnM8Ic0NXg0GK2smOJsePY"
+      }
+    },
+    "core_fingerprint": "js77carfss44f3zf",
+    "expect": "accept",
+    "reason": null
+  },
+  {
+    "name": "reject-enrolment-core-fingerprint-mismatch",
+    "check": "enrolment_welcome",
+    "welcome": {
+      "session_id": null,
+      "summary": [],
+      "enrolment": {
+        "node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+        "core_key_id": "core-1",
+        "core_public_key": "Z9u0DlJ05A2uJKwXCBB0GMLc8M4oWW-OIxAYlawB44Q"
+      }
+    },
+    "core_fingerprint": "js77carfss44f3zf",
+    "expect": "reject",
+    "reason": "core_fingerprint_mismatch"
+  },
+  {
+    "name": "reject-enrolment-block-missing",
+    "check": "enrolment_welcome",
+    "welcome": {
+      "session_id": null,
+      "summary": []
+    },
+    "core_fingerprint": "js77carfss44f3zf",
+    "expect": "reject",
+    "reason": "enrolment_missing"
+  },
+  {
+    "name": "accept-consecutive",
+    "check": "seq",
+    "seqs": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "expect": "accept",
+    "reason": null
+  },
+  {
+    "name": "reject-gap",
+    "check": "seq",
+    "seqs": [
+      1,
+      2,
+      4
+    ],
+    "expect": "reject",
+    "reason": "bad_seq"
+  },
+  {
+    "name": "reject-repeat",
+    "check": "seq",
+    "seqs": [
+      1,
+      2,
+      2
+    ],
+    "expect": "reject",
+    "reason": "bad_seq"
+  },
+  {
+    "name": "reject-decrease",
+    "check": "seq",
+    "seqs": [
+      1,
+      2,
+      3,
+      2
+    ],
+    "expect": "reject",
+    "reason": "bad_seq"
+  },
+  {
+    "name": "reject-first-not-1",
+    "check": "seq",
+    "seqs": [
+      2
+    ],
+    "expect": "reject",
+    "reason": "bad_seq"
   }
 ]

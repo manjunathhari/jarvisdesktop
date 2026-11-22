@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/hello.schema.json",
   "title": "Payload of `hello`",
-  "description": "node → gateway: handshake (§6.1). The envelope signature (`node-msg`) covers the server-sent `nonce`. `resume` is the node's own record of what it has shown, per reply.",
+  "description": "node → gateway: an existing node's reply to `challenge` (§6.1 step 5). The envelope signature (`node-msg`) covers the challenge's `nonce`. `resume` is the node's own record of what it has shown, per reply; `last_seq` is any integer, validated by the gateway (R6-5). `clock_skew_ms` is present only when the node's clock differs from the challenge's `issued_at` by more than 30 s (advisory).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -12,7 +12,8 @@
   "properties": {
     "nonce": {
       "type": "string",
-      "pattern": "^[A-Za-z0-9_-]{16,128}$"
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "description": "32 random bytes, base64url without padding (43 characters); the challenge's nonce."
     },
     "resume": {
       "type": "array",
@@ -29,11 +30,13 @@
             "format": "uuid"
           },
           "last_seq": {
-            "type": "integer",
-            "minimum": 1
+            "type": "integer"
           }
         }
       }
+    },
+    "clock_skew_ms": {
+      "type": "integer"
     }
   }
 }

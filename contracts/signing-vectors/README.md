@@ -49,21 +49,22 @@ one key under different bindings, so their signatures must differ.
 
 ## `authz-cases.json`
 
-The node rules (spec §7.1), as `{name, trusted_keys, receiving_node_id, now, authz, expect,
-reason}`, plus `payload` on `keyset` cases:
+The node-side rules (spec §6.1, §7.1, §7.2). Every case has `name`, `check` (which reference
+rule it exercises), its inputs, `expect` (`accept` or `reject`) and `reason` (null for
+`accept`, otherwise the first rule that fails, in the order listed). Keys in `trusted_keys`
+and `pinned_gateway` are raw 32-byte public keys in hex; in messages they are base64url.
 
-- `trusted_keys` maps a trusted core `key_id` to its raw 32-byte public key, in hex;
-- `expect` is `accept` or `reject`;
-- `reason` is null for `accept`, otherwise the first rule that fails.
+| `check` | Inputs | Reasons, in order |
+|---|---|---|
+| `node_action` | `trusted_keys` (CORE keys only), `receiving_node_id`, `now`, `authz` | `malformed` (including a time without an offset), `untrusted_key_id`, `bad_signature`, `wrong_kind`, `wrong_target`, `expired` (`now` > `valid_until` + 30 s) |
+| `keyset` | `trusted_keys`, `now`, `payload` (the keyset payload without its `authz`), `authz` | `malformed`, `untrusted_key_id`, `bad_signature`, `wrong_kind`, `expired` (from the signed `authz.object.valid_until`, + 30 s), `keyset_mismatch` (payload `role`, `key_id` or `public_key` differs from `authz.object.args`) |
+| `challenge` | `envelope` (the full signed envelope), `pinned_gateway` (GATEWAY keys, or null while enrolling), `enrol_fingerprint` (the code's gateway fingerprint, or null) | `malformed`, `unpinned_key`, `fingerprint_mismatch`, `bad_signature` (`gw-transport`) |
+| `enrolment_welcome` | `welcome` (payload), `core_fingerprint` (from the code) | `malformed`, `enrolment_missing`, `core_fingerprint_mismatch` |
+| `seq` | `seqs`: a fresh checker is fed each value in order | `bad_seq` on the last value; every earlier one passes |
 
-**`node.action` cases** (no `payload`; rules 2 to 4) are checked in this order:
-`malformed` (including a time without a UTC offset), `untrusted_key_id`, `bad_signature`,
-`wrong_kind`, `wrong_target`, `expired` (`now` > `valid_until` + 30 s).
+A fingerprint is the first 10 bytes of SHA-256 of the raw public key, lower-case base32
+without padding (16 characters); the generator has its own RFC 4648 base32 encoder.
 
-**`keyset` cases** carry `payload`: the `keyset` message payload (`role`, `key_id`,
-`public_key`) without its `authz`, which is the case's `authz`. They are checked in this order:
-`malformed`, `untrusted_key_id`, `bad_signature`, `wrong_kind`, `keyset_mismatch` (the
-payload's `role`, `key_id` or `public_key` differs from the signed `authz.object.args`).
-
-Rule 1 (the `gw-transport` envelope) and rule 5 (an unused `execution_key` for an
-IRREVERSIBLE action) are not covered here: they need the connection and the node's journal.
+Rule 1 (the `gw-transport` envelope of a `node.action`) and rule 5 (an unused
+`execution_key` for an IRREVERSIBLE action) are not covered here: they need the connection
+and the node's journal.

@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import secrets
 from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
@@ -126,6 +127,11 @@ def check_authz(authz: Mapping[str, Any], trusted: Mapping[str, bytes]) -> dict[
     if not verify(Purpose.CORE_AUTHZ, trusted[key_id], key_id, obj, sig):
         raise AuthzInvalid("bad signature")
     return dict(obj)
+
+
+def new_nonce() -> str:
+    """32 bytes from the OS's cryptographic random source, base64url without padding (43 chars)."""
+    return _b64url(secrets.token_bytes(32))
 
 
 def fingerprint(public_key: bytes) -> str:

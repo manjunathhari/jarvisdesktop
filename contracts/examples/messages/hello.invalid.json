@@ -1,9 +1,10 @@
 {
-  "nonce": "n8Kd2Lq5Wm7Rt1Yv",
+  "nonce": "i600-f9kAXaIUL2wWxhe0Z0RoJCBbpZD-cigb7Be5xw",
   "resume": [
     {
       "reply_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
-      "last_seq": 0
+      "last_seq": 4
     }
-  ]
+  ],
+  "clock_skew_ms": "42s"
 }

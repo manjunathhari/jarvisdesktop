@@ -170,8 +170,10 @@ const authzOf = (object, { keyLabel = "core-1", keyId = "core-1", purpose = "cor
 
 const TRUSTED = { "core-1": KEYS["core-1"].pubRaw.toString("hex") };
 
+// Every case names the reference check it exercises (`check`), then its inputs.
 const authzCase = (name, now, authz, expect, reason) => ({
   name,
+  check: "node_action",
   trusted_keys: TRUSTED,
   receiving_node_id: ME,
   now,
@@ -180,7 +182,7 @@ const authzCase = (name, now, authz, expect, reason) => ({
   reason,
 });
 
-const keysetObject = (args) => ({
+const keysetObject = (args, overrides = {}) => ({
   v: 1,
   kind: "keyset",
   action_kind: "keyset.add",
@@ -193,6 +195,7 @@ const keysetObject = (args) => ({
   summary: null,
   issued_at: "2026-11-22T10:00:00Z",
   valid_until: "2026-11-23T10:00:00Z",
+  ...overrides,
 });
 
 // A keyset announcement: the new key is in the payload and, signed, in authz.object.args.
@@ -203,15 +206,122 @@ const NEW_CORE_KEY = {
   public_key: KEYS["core-2"].pubRaw.toString("base64url"),
 };
 
-const keysetCase = (name, payload, expect, reason) => ({
-  ...authzCase(name, "2026-11-22T10:01:00Z", authzOf(keysetObject(NEW_CORE_KEY)), expect, reason),
+const keysetCase = (name, now, payload, expect, reason, overrides = {}) => ({
+  name,
+  check: "keyset",
+  trusted_keys: TRUSTED,
+  now,
   payload,
+  authz: authzOf(keysetObject(NEW_CORE_KEY, overrides)),
+  expect,
+  reason,
 });
 
 const tampered = () => {
   const a = authzOf(actionObject());
   return { ...a, object: { ...a.object, args: { channel: "everything" } } };
 };
+
+// ---------------------------------------------------------------- fingerprints (RFC 4648 base32)
+
+const B32 = "abcdefghijklmnopqrstuvwxyz234567";
+const base32Lower = (bytes) => {
+  let bits = 0;
+  let value = 0;
+  let out = "";
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      out += B32[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) out += B32[(value << (5 - bits)) & 31];
+  return out;
+};
+// First 10 bytes of SHA-256, lower-case base32 without padding: 16 characters.
+const fingerprintOf = (pubRaw) =>
+  base32Lower(createHash("sha256").update(pubRaw).digest().subarray(0, 10));
+
+const b64 = (label) => KEYS[label].pubRaw.toString("base64url");
+const hexKey = (label) => KEYS[label].pubRaw.toString("hex");
+
+// ---------------------------------------------------------------- challenge cases
+
+const NIL = "00000000-0000-0000-0000-000000000000";
+const NONCE = createHash("sha256")
+  .update("jarvis-signing-vectors test nonce", "utf8")
+  .digest()
+  .toString("base64url");
+
+const challengeEnvelope = (
+  { keyLabel = "gw-1", keyId = "gw-1", claimedLabel = keyLabel, issuedAt = "2026-11-22T10:00:00Z" } = {},
+) => {
+  const body = {
+    version: 1,
+    message_id: "8e7d6c5b-4a39-4281-9f0e-1d2c3b4a5f60",
+    node_id: NIL,
+    session_id: null,
+    seq: 1,
+    sent_at: "2026-11-22T10:00:00Z",
+    kind: "challenge",
+    payload: {
+      nonce: NONCE,
+      issued_at: issuedAt,
+      expires_at: "2026-11-22T10:00:30Z",
+      key_id: keyId,
+      public_key: b64(claimedLabel),
+    },
+  };
+  return { ...body, sig: signWith(keyLabel, "gw-transport", keyId, body) };
+};
+
+const challengeCase = (name, envelope, pinnedGateway, enrolFingerprint, expect, reason) => ({
+  name,
+  check: "challenge",
+  envelope,
+  pinned_gateway: pinnedGateway,
+  enrol_fingerprint: enrolFingerprint,
+  expect,
+  reason,
+});
+
+const PINNED_GW = { "gw-1": hexKey("gw-1") };
+
+const tamperedChallenge = () => {
+  const env = challengeEnvelope();
+  return { ...env, payload: { ...env.payload, nonce: NONCE.replace(/^./, (c) => (c === "A" ? "B" : "A")) } };
+};
+
+// ---------------------------------------------------------------- enrolment-welcome cases
+
+const welcomeWith = (enrolment) => ({
+  session_id: null,
+  summary: [],
+  ...(enrolment === undefined ? {} : { enrolment }),
+});
+
+const enrolmentCase = (name, welcome, expect, reason) => ({
+  name,
+  check: "enrolment_welcome",
+  welcome,
+  core_fingerprint: fingerprintOf(KEYS["core-1"].pubRaw),
+  expect,
+  reason,
+});
+
+// ---------------------------------------------------------------- seq cases
+
+// A fresh checker per case; every value is fed in order. Accept: all pass.
+// Reject: the last value fails with `bad_seq`, and every earlier one passes.
+const seqCase = (name, seqs, expect) => ({
+  name,
+  check: "seq",
+  seqs,
+  expect,
+  reason: expect === "accept" ? null : "bad_seq",
+});
 
 const authzCases = () => [
   authzCase("accept-valid", "2026-11-22T10:01:00Z", authzOf(actionObject()), "accept", null),
@@ -221,6 +331,13 @@ const authzCases = () => [
     authzOf(actionObject(), { keyLabel: "gw-1", keyId: "gw-1" }),
     "reject",
     "untrusted_key_id",
+  ),
+  authzCase(
+    "reject-gateway-key-under-core-key-id",
+    "2026-11-22T10:01:00Z",
+    authzOf(actionObject(), { keyLabel: "gw-1", keyId: "core-1" }),
+    "reject",
+    "bad_signature",
   ),
   authzCase(
     "reject-wrong-purpose",
@@ -254,13 +371,6 @@ const authzCases = () => [
     "reject",
     "malformed",
   ),
-  keysetCase("accept-keyset", NEW_CORE_KEY, "accept", null),
-  keysetCase(
-    "reject-keyset-payload-mismatch",
-    { ...NEW_CORE_KEY, public_key: KEYS["unknown-1"].pubRaw.toString("base64url") },
-    "reject",
-    "keyset_mismatch",
-  ),
   authzCase(
     "reject-card-as-action",
     "2026-11-22T10:01:00Z",
@@ -268,6 +378,88 @@ const authzCases = () => [
     "reject",
     "wrong_kind",
   ),
+  // keyset (valid_until 2026-11-23T10:00:00Z)
+  keysetCase("accept-keyset", "2026-11-22T10:01:00Z", NEW_CORE_KEY, "accept", null),
+  keysetCase("reject-keyset-expired", "2026-11-23T10:00:31Z", NEW_CORE_KEY, "reject", "expired"),
+  keysetCase("accept-keyset-within-tolerance", "2026-11-23T10:00:29Z", NEW_CORE_KEY, "accept", null),
+  keysetCase(
+    "reject-keyset-payload-mismatch",
+    "2026-11-22T10:01:00Z",
+    { ...NEW_CORE_KEY, public_key: b64("unknown-1") },
+    "reject",
+    "keyset_mismatch",
+  ),
+  keysetCase(
+    "reject-keyset-naive-valid-until",
+    "2026-11-22T10:01:00Z",
+    NEW_CORE_KEY,
+    "reject",
+    "malformed",
+    { valid_until: "2026-11-23T10:00:00" },
+  ),
+  // challenge
+  challengeCase("accept-challenge", challengeEnvelope(), PINNED_GW, null, "accept", null),
+  challengeCase(
+    "accept-challenge-enrol-by-fingerprint",
+    challengeEnvelope(),
+    null,
+    fingerprintOf(KEYS["gw-1"].pubRaw),
+    "accept",
+    null,
+  ),
+  challengeCase(
+    "reject-challenge-unpinned-key",
+    challengeEnvelope({ keyLabel: "unknown-1", keyId: "gw-2" }),
+    PINNED_GW,
+    null,
+    "reject",
+    "unpinned_key",
+  ),
+  challengeCase(
+    "reject-challenge-fingerprint-mismatch",
+    challengeEnvelope(),
+    null,
+    fingerprintOf(KEYS["unknown-1"].pubRaw),
+    "reject",
+    "fingerprint_mismatch",
+  ),
+  challengeCase("reject-challenge-bad-signature", tamperedChallenge(), PINNED_GW, null, "reject", "bad_signature"),
+  challengeCase(
+    "reject-challenge-signed-by-core-key",
+    challengeEnvelope({ keyLabel: "core-1", keyId: "gw-1", claimedLabel: "gw-1" }),
+    PINNED_GW,
+    null,
+    "reject",
+    "bad_signature",
+  ),
+  challengeCase(
+    "reject-challenge-naive-time",
+    challengeEnvelope({ issuedAt: "2026-11-22T10:00:00" }),
+    PINNED_GW,
+    null,
+    "reject",
+    "malformed",
+  ),
+  // enrolment welcome
+  enrolmentCase(
+    "accept-enrolment-welcome",
+    welcomeWith({ node_id: ME, core_key_id: "core-1", core_public_key: b64("core-1") }),
+    "accept",
+    null,
+  ),
+  enrolmentCase(
+    "reject-enrolment-core-fingerprint-mismatch",
+    welcomeWith({ node_id: ME, core_key_id: "core-1", core_public_key: b64("gw-1") }),
+    "reject",
+    "core_fingerprint_mismatch",
+  ),
+  enrolmentCase("reject-enrolment-block-missing", welcomeWith(undefined), "reject", "enrolment_missing"),
+  // seq
+  seqCase("accept-consecutive", [1, 2, 3, 4], "accept"),
+  seqCase("reject-gap", [1, 2, 4], "reject"),
+  seqCase("reject-repeat", [1, 2, 2], "reject"),
+  seqCase("reject-decrease", [1, 2, 3, 2], "reject"),
+  seqCase("reject-first-not-1", [2], "reject"),
 ];
 
 // ---------------------------------------------------------------- main

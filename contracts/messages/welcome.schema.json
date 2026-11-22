@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/welcome.schema.json",
   "title": "Payload of `welcome`",
-  "description": "gateway → node: the open session (or null) and the reconnect summary (§8.3).",
+  "description": "gateway → node: the open session (or null) and the reconnect summary (§8.3). After an enrolment only, `enrolment` carries the new node's ID and the core key; the node pins that key only if its fingerprint matches the enrolment code (§6.1 step 7, R6-6).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -59,6 +59,30 @@
             "minLength": 1,
             "maxLength": 500
           }
+        }
+      }
+    },
+    "enrolment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "node_id",
+        "core_key_id",
+        "core_public_key"
+      ],
+      "properties": {
+        "node_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "core_key_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+        },
+        "core_public_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$",
+          "description": "Raw 32-byte Ed25519 public key, base64url without padding."
         }
       }
     }

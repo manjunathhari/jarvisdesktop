@@ -18,6 +18,7 @@ EXAMPLES = CONTRACTS / "examples" / "messages"
 NAMES = sorted(c.MESSAGE_MODELS)
 
 KINDS = [
+    "challenge",
     "enrol",
     "hello",
     "welcome",
@@ -168,18 +169,27 @@ AUTHZ_CASES = json.loads((CONTRACTS / "signing-vectors" / "authz-cases.json").re
 
 
 @pytest.mark.parametrize("case", AUTHZ_CASES, ids=lambda case: case["name"])
-def test_authz_case_objects_match_the_contract(case: dict[str, Any]) -> None:
+def test_shared_case_inputs_match_the_contracts(case: dict[str, Any]) -> None:
     ok = case["reason"] != "malformed"
-    assert validator(_schema("authz")).is_valid(case["authz"]) is ok
-    if ok:
-        c.Authz.model_validate(case["authz"])
-    else:
-        with pytest.raises(ValidationError):
+    if "authz" in case:
+        assert validator(_schema("authz")).is_valid(case["authz"]) is ok
+        if ok:
             c.Authz.model_validate(case["authz"])
-    if "payload" in case:
+        else:
+            with pytest.raises(ValidationError):
+                c.Authz.model_validate(case["authz"])
+    if case["check"] == "keyset" and ok:
         payload = {**case["payload"], "authz": case["authz"]}
         validator(_schema("keyset")).validate(payload)
         c.Keyset.model_validate(payload)
+    if case["check"] == "challenge":
+        envelope_schema = json.loads((CONTRACTS / "node-envelope.schema.json").read_text())
+        validator(envelope_schema).validate(case["envelope"])
+        c.NodeEnvelope.model_validate(case["envelope"])
+        assert validator(_schema("challenge")).is_valid(case["envelope"]["payload"]) is ok
+    if case["check"] == "enrolment_welcome":
+        validator(_schema("welcome")).validate(case["welcome"])
+        c.Welcome.model_validate(case["welcome"])
 
 
 def test_date_time_format_is_actually_checked() -> None:
@@ -212,3 +222,57 @@ def test_envelope_naive_sent_at_and_non_uuid_node_id_fail() -> None:
         assert not validator(envelope_schema).is_valid(broken)
         with pytest.raises(ValidationError):
             c.NodeEnvelope.model_validate(broken)
+
+
+NIL = "00000000-0000-0000-0000-000000000000"
+
+
+@pytest.mark.parametrize(("kind", "ok"), [("challenge", True), ("enrol", True), ("hello", False)])
+def test_nil_node_id_only_for_challenge_and_enrol(kind: str, ok: bool) -> None:
+    envelope_schema = json.loads((CONTRACTS / "node-envelope.schema.json").read_text())
+    example = json.loads((CONTRACTS / "examples" / "node-envelope.valid.json").read_text())
+    env = {**example, "node_id": NIL, "kind": kind}
+    assert validator(envelope_schema).is_valid(env) is ok
+    if ok:
+        c.NodeEnvelope.model_validate(env)
+    else:
+        with pytest.raises(ValidationError):
+            c.NodeEnvelope.model_validate(env)
+
+
+def test_envelope_describes_per_sender_seq() -> None:
+    envelope_schema = json.loads((CONTRACTS / "node-envelope.schema.json").read_text())
+    text = envelope_schema["properties"]["seq"]["description"].lower()
+    assert "per sender" in text and "exactly 1" in text
+
+
+@pytest.mark.parametrize("last_seq", [-5, 0, 1, 10**9])
+def test_hello_resume_last_seq_is_any_integer(last_seq: int) -> None:
+    payload = {
+        **_example("hello", "valid"),
+        "resume": [{"reply_id": SPEECH["reply_id"], "last_seq": last_seq}],
+    }
+    validator(_schema("hello")).validate(payload)
+    c.Hello.model_validate(payload)
+
+
+@pytest.mark.parametrize(("name", "field"), [("hello", "clock_skew_ms"), ("welcome", "enrolment")])
+def test_optional_fields_may_be_absent_but_not_null(name: str, field: str) -> None:
+    example = _example(name, "valid")
+    absent = {k: v for k, v in example.items() if k != field}
+    validator(_schema(name)).validate(absent)
+    c.MESSAGE_MODELS[name].model_validate(absent)
+    nulled = {**example, field: None}
+    assert not validator(_schema(name)).is_valid(nulled)
+    with pytest.raises(ValidationError):
+        c.MESSAGE_MODELS[name].model_validate(nulled)
+
+
+@pytest.mark.parametrize("name", ["challenge", "enrol", "hello"])
+def test_nonce_is_43_char_base64url(name: str) -> None:
+    example = _example(name, "valid")
+    assert len(example["nonce"]) == 43
+    short = {**example, "nonce": example["nonce"][:42]}
+    assert not validator(_schema(name)).is_valid(short)
+    with pytest.raises(ValidationError):
+        c.MESSAGE_MODELS[name].model_validate(short)

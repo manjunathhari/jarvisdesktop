@@ -23,6 +23,7 @@ from jarvis_server.signing import (
     fingerprint,
     load_private_key,
     make_authz,
+    new_nonce,
     public_bytes,
     sign,
     sign_envelope,
@@ -309,3 +310,11 @@ def test_load_private_key_refuses_a_non_ed25519_key(tmp_path: Path) -> None:
     path.write_bytes(pem)
     with pytest.raises(TypeError):
         load_private_key(path)
+
+
+def test_new_nonce_is_32_random_bytes_as_43_char_base64url() -> None:
+    nonces = {new_nonce() for _ in range(50)}
+    assert len(nonces) == 50
+    for nonce in nonces:
+        assert len(nonce) == 43 and "=" not in nonce
+        assert len(base64.urlsafe_b64decode(nonce + "=")) == 32
