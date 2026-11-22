@@ -53,17 +53,26 @@ def _b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
-def _decode_sig(sig: object) -> bytes | None:
-    """The 64 signature bytes, or None unless ``sig`` is exactly their unpadded base64url form."""
-    if not isinstance(sig, str) or len(sig) != 86:
+def b64url_decode(text: object, length: int) -> bytes | None:
+    """Exactly ``length`` bytes, or None unless ``text`` is their canonical unpadded base64url.
+
+    Strict: no padding, only the URL-safe alphabet, and no non-zero unused trailing bits
+    (checked by re-encoding), so every value has exactly one accepted spelling.
+    """
+    if not isinstance(text, str):
         return None
     try:
-        raw = base64.urlsafe_b64decode(sig + "==")
+        raw = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
     except (binascii.Error, ValueError):
         return None
-    if len(raw) != 64 or _b64url(raw) != sig:
+    if len(raw) != length or _b64url(raw) != text:
         return None
     return raw
+
+
+def _decode_sig(sig: object) -> bytes | None:
+    """The 64 signature bytes, or None unless ``sig`` is exactly their canonical base64url form."""
+    return b64url_decode(sig, 64)
 
 
 def sign(purpose: Purpose, key: Ed25519PrivateKey, key_id: str, obj: Mapping[str, Any]) -> str:

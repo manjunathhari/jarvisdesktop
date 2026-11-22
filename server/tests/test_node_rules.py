@@ -105,6 +105,7 @@ REQUIRED = {
     "reject-challenge-bad-signature",
     "reject-challenge-signed-by-core-key",
     "reject-challenge-naive-time",
+    "reject-non-canonical-base64url-key",
 }
 
 
@@ -214,3 +215,30 @@ def test_malformed_authz_is_rejected() -> None:
             now=datetime.fromisoformat("2026-11-22T10:00:00Z"),
         )
     assert excinfo.value.reason == "malformed"
+
+
+def test_non_canonical_base64url_key_is_rejected_not_normalised() -> None:
+    bad = BY_NAME["reject-non-canonical-base64url-key"]
+    good = BY_NAME["accept-enrolment-welcome"]
+    bad_key = bad["welcome"]["enrolment"]["core_public_key"]
+    good_key = good["welcome"]["enrolment"]["core_public_key"]
+    assert bad_key[:-1] == good_key[:-1] and bad_key != good_key
+    with pytest.raises(Rejected) as excinfo:
+        check_enrolment_welcome(bad["welcome"], core_fingerprint=bad["core_fingerprint"])
+    assert excinfo.value.reason == "malformed_key"
+
+
+def test_challenge_with_a_non_canonical_key_is_rejected() -> None:
+    case = BY_NAME["accept-challenge"]
+    env = case["envelope"]
+    key = env["payload"]["public_key"]
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    flipped = key[:-1] + alphabet[alphabet.index(key[-1]) | 1]
+    assert flipped != key
+    with pytest.raises(Rejected) as excinfo:
+        check_challenge(
+            {**env, "payload": {**env["payload"], "public_key": flipped}},
+            pinned_gateway=_keys(case["pinned_gateway"]),
+            enrol_fingerprint=None,
+        )
+    assert excinfo.value.reason == "malformed_key"

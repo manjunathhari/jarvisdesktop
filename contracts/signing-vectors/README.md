@@ -58,9 +58,11 @@ and `pinned_gateway` are raw 32-byte public keys in hex; in messages they are ba
 |---|---|---|
 | `node_action` | `trusted_keys` (CORE keys only), `receiving_node_id`, `now`, `authz` | `malformed` (including a time without an offset), `untrusted_key_id`, `bad_signature`, `wrong_kind`, `wrong_target`, `expired` (`now` > `valid_until` + 30 s) |
 | `keyset` | `trusted_keys`, `now`, `payload` (the keyset payload without its `authz`), `authz` | `malformed`, `untrusted_key_id`, `bad_signature`, `wrong_kind`, `expired` (from the signed `authz.object.valid_until`, + 30 s), `keyset_mismatch` (payload `role`, `key_id` or `public_key` differs from `authz.object.args`) |
-| `challenge` | `envelope` (the full signed envelope), `pinned_gateway` (GATEWAY keys, or null while enrolling), `enrol_fingerprint` (the code's gateway fingerprint, or null) | `malformed`, `unpinned_key`, `fingerprint_mismatch`, `bad_signature` (`gw-transport`) |
-| `enrolment_welcome` | `welcome` (payload), `core_fingerprint` (from the code) | `malformed`, `enrolment_missing`, `core_fingerprint_mismatch` |
+| `challenge` | `envelope` (the full signed envelope), `pinned_gateway` (GATEWAY keys, or null while enrolling), `enrol_fingerprint` (the code's gateway fingerprint, or null) | `malformed`, `malformed_key`, `unpinned_key`, `fingerprint_mismatch`, `bad_signature` (`gw-transport`) |
+| `enrolment_welcome` | `welcome` (payload), `core_fingerprint` (from the code) | `malformed`, `enrolment_missing`, `malformed_key`, `core_fingerprint_mismatch` |
 | `seq` | `seqs`: a fresh checker is fed each value in order | `bad_seq` on the last value; every earlier one passes |
+
+Base64url keys and signatures are decoded strictly: no padding, URL-safe alphabet only, and a final character with non-zero unused trailing bits is rejected (`malformed_key` for a key), never normalised (case `reject-non-canonical-base64url-key`).
 
 A fingerprint is the first 10 bytes of SHA-256 of the raw public key, lower-case base32
 without padding (16 characters); the generator has its own RFC 4648 base32 encoder.

@@ -18,7 +18,6 @@ one role is never accepted for the other (R6-3).
 
 from __future__ import annotations
 
-import base64
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 from typing import Any
@@ -35,7 +34,7 @@ from jarvis_server.contracts import (
     NodeEnvelope,
     Welcome,
 )
-from jarvis_server.signing import Purpose, fingerprint, verify, verify_envelope
+from jarvis_server.signing import Purpose, b64url_decode, fingerprint, verify, verify_envelope
 
 CLOCK_TOLERANCE = timedelta(seconds=30)
 
@@ -47,7 +46,11 @@ class Rejected(Exception):
 
 
 def _raw_key(b64url: str) -> bytes:
-    return base64.urlsafe_b64decode(b64url + "=")
+    """The raw 32-byte public key; ``malformed_key`` unless strictly canonical base64url."""
+    raw = b64url_decode(b64url, 32)
+    if raw is None:
+        raise Rejected("malformed_key")
+    return raw
 
 
 def _verified(authz: Mapping[str, Any], trusted: Mapping[str, bytes]) -> Authz:
@@ -128,8 +131,8 @@ def check_challenge(
     ``pinned_gateway=None`` and the gateway fingerprint from its enrolment code. That the
     challenge is the first message (``seq`` = 1) is ``SeqChecker``'s job. Server time is
     advisory, so expiry is not checked here. Reasons, in order: ``malformed`` (including any
-    kind other than ``challenge``), ``unpinned_key``, ``fingerprint_mismatch``,
-    ``bad_signature``.
+    kind other than ``challenge``), ``malformed_key`` (not canonical base64url),
+    ``unpinned_key``, ``fingerprint_mismatch``, ``bad_signature``.
     """
     if pinned_gateway is None and enrol_fingerprint is None:
         raise ValueError("pass the pinned gateway keys or the enrolment fingerprint")
@@ -156,7 +159,8 @@ def check_enrolment_welcome(
 ) -> tuple[UUID, str, bytes]:
     """``(node_id, core_key_id, core_public_key)`` to pin, or ``Rejected(reason)``.
 
-    Reasons, in order: ``malformed``, ``enrolment_missing``, ``core_fingerprint_mismatch``.
+    Reasons, in order: ``malformed``, ``enrolment_missing``, ``malformed_key`` (not canonical
+    base64url), ``core_fingerprint_mismatch``.
     On any rejection the device discards its new keys and stores nothing (§7.2 step 5).
     """
     try:

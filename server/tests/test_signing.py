@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from jarvis_server.signing import (
     AuthzInvalid,
     Purpose,
+    b64url_decode,
     canonical,
     check_authz,
     fingerprint,
@@ -318,3 +319,28 @@ def test_new_nonce_is_32_random_bytes_as_43_char_base64url() -> None:
     for nonce in nonces:
         assert len(nonce) == 43 and "=" not in nonce
         assert len(base64.urlsafe_b64decode(nonce + "=")) == 32
+
+
+ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def _flip_trailing_bit(text: str) -> str:
+    return text[:-1] + ALPHABET[ALPHABET.index(text[-1]) | 1]
+
+
+def test_b64url_decode_is_strict() -> None:
+    raw = bytes(range(32))
+    text = base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    assert b64url_decode(text, 32) == raw
+    assert b64url_decode(_flip_trailing_bit(text), 32) is None  # non-zero trailing bits
+    assert b64url_decode(text + "=", 32) is None  # padding
+    assert b64url_decode(text[:-1], 32) is None  # wrong length
+    assert b64url_decode(text[:-1] + "+", 32) is None  # standard alphabet
+    assert b64url_decode(42, 32) is None  # type: ignore[arg-type]
+
+
+def test_verify_rejects_a_signature_with_non_zero_trailing_bits() -> None:
+    sig = sign(Purpose.NODE_MSG, key, "n-1", obj)
+    flipped = _flip_trailing_bit(sig)
+    assert flipped != sig
+    assert not verify(Purpose.NODE_MSG, pub, "n-1", obj, flipped)

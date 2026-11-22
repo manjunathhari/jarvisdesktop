@@ -302,6 +302,15 @@ const welcomeWith = (enrolment) => ({
   ...(enrolment === undefined ? {} : { enrolment }),
 });
 
+// The same key with non-zero unused trailing bits in its last character: it decodes to the
+// same 32 bytes under a lax decoder, so only a strict (canonical) decoder rejects it.
+const nonCanonical = (b64url) => {
+  const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const last = ALPHABET.indexOf(b64url.at(-1));
+  if ((last & 3) !== 0) throw new Error("expected a canonical 43-character key");
+  return b64url.slice(0, -1) + ALPHABET[last | 1];
+};
+
 const enrolmentCase = (name, welcome, expect, reason) => ({
   name,
   check: "enrolment_welcome",
@@ -454,6 +463,12 @@ const authzCases = () => [
     "core_fingerprint_mismatch",
   ),
   enrolmentCase("reject-enrolment-block-missing", welcomeWith(undefined), "reject", "enrolment_missing"),
+  enrolmentCase(
+    "reject-non-canonical-base64url-key",
+    welcomeWith({ node_id: ME, core_key_id: "core-1", core_public_key: nonCanonical(b64("core-1")) }),
+    "reject",
+    "malformed_key",
+  ),
   // seq
   seqCase("accept-consecutive", [1, 2, 3, 4], "accept"),
   seqCase("reject-gap", [1, 2, 4], "reject"),

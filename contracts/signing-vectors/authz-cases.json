@@ -785,6 +785,22 @@
     "reason": "enrolment_missing"
   },
   {
+    "name": "reject-non-canonical-base64url-key",
+    "check": "enrolment_welcome",
+    "welcome": {
+      "session_id": null,
+      "summary": [],
+      "enrolment": {
+        "node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+        "core_key_id": "core-1",
+        "core_public_key": "-LziJgkeR2m1UUOar0hpQYnM8Ic0NXg0GK2smOJsePZ"
+      }
+    },
+    "core_fingerprint": "js77carfss44f3zf",
+    "expect": "reject",
+    "reason": "malformed_key"
+  },
+  {
     "name": "accept-consecutive",
     "check": "seq",
     "seqs": [
