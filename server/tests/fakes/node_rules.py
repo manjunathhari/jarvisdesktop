@@ -1,4 +1,7 @@
-"""Reference checker for the node-side authorisation rules (spec §7.1, rules 2 to 4).
+"""Reference checkers for the node-side authorisation rules (spec §7.1).
+
+``check_node_action`` covers rules 2 to 4 for a ``node.action``; ``check_keyset`` covers a
+``keyset`` announcement (a trusted core signature, and the payload's key equal to the signed one).
 
 Written once here and tested against contracts/signing-vectors/authz-cases.json, which are
 shared with the Rust node. Rule 1 (a valid ``gw-transport`` envelope on the authenticated
@@ -15,7 +18,7 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
-from jarvis_server.contracts import Authz, AuthzKind
+from jarvis_server.contracts import Authz, AuthzKind, Keyset
 from jarvis_server.signing import Purpose, verify
 
 CLOCK_TOLERANCE = timedelta(seconds=30)
@@ -35,6 +38,17 @@ def check_node_action(
     Reasons, checked in this order: ``malformed``, ``untrusted_key_id``, ``bad_signature``,
     ``wrong_kind``, ``wrong_target``, ``expired``.
     """
+    parsed = _verified(authz, trusted)
+    obj = parsed.object
+    if obj.kind is not AuthzKind.NODE_ACTION:
+        raise Rejected("wrong_kind")
+    if obj.target_node_id != me:
+        raise Rejected("wrong_target")
+    if now > obj.valid_until + CLOCK_TOLERANCE:
+        raise Rejected("expired")
+
+
+def _verified(authz: Mapping[str, Any], trusted: Mapping[str, bytes]) -> Authz:
     try:
         parsed = Authz.model_validate(authz)
     except ValidationError:
@@ -46,10 +60,30 @@ def check_node_action(
         Purpose.CORE_AUTHZ, trusted[parsed.key_id], parsed.key_id, authz["object"], parsed.sig
     ):
         raise Rejected("bad_signature")
-    obj = parsed.object
-    if obj.kind is not AuthzKind.NODE_ACTION:
+    return parsed
+
+
+KEYSET_FIELDS = ("role", "key_id", "public_key")
+
+
+def check_keyset(
+    payload: Mapping[str, Any], authz: Mapping[str, Any], *, trusted: Mapping[str, bytes]
+) -> dict[str, Any]:
+    """The signed keyset object, or ``Rejected(reason)``.
+
+    ``payload`` is the ``keyset`` message payload; its own ``authz`` key, if present, is
+    ignored in favour of ``authz``. Reasons, in order: ``malformed``, ``untrusted_key_id``,
+    ``bad_signature``, ``wrong_kind``, ``keyset_mismatch`` (the payload's role, key_id or
+    public_key differs from ``authz.object.args``).
+    """
+    try:
+        Keyset.model_validate({**payload, "authz": authz})
+    except ValidationError:
+        raise Rejected("malformed") from None
+    parsed = _verified(authz, trusted)
+    if parsed.object.kind is not AuthzKind.KEYSET:
         raise Rejected("wrong_kind")
-    if obj.target_node_id != me:
-        raise Rejected("wrong_target")
-    if now > obj.valid_until + CLOCK_TOLERANCE:
-        raise Rejected("expired")
+    args = parsed.object.args
+    if any(args.get(f) != payload[f] for f in KEYSET_FIELDS) or set(args) != set(KEYSET_FIELDS):
+        raise Rejected("keyset_mismatch")
+    return dict(authz["object"])

@@ -10,7 +10,7 @@ from uuid import UUID
 
 import pytest
 
-from .fakes.node_rules import Rejected, check_node_action
+from .fakes.node_rules import Rejected, check_keyset, check_node_action
 
 CASES: list[dict[str, Any]] = json.loads(
     (
@@ -36,17 +36,52 @@ def test_case_set_has_the_required_cases() -> None:
 @pytest.mark.parametrize("case", CASES, ids=[case["name"] for case in CASES])
 def test_node_rules_match_authz_cases(case: dict[str, Any]) -> None:
     trusted = {k: bytes.fromhex(v) for k, v in case["trusted_keys"].items()}
-    kwargs = {
-        "trusted": trusted,
-        "me": UUID(case["receiving_node_id"]),
-        "now": datetime.fromisoformat(case["now"]),
-    }
+
+    def check() -> None:
+        if "payload" in case:  # a keyset announcement
+            obj = check_keyset(case["payload"], case["authz"], trusted=trusted)
+            assert obj == case["authz"]["object"]
+        else:
+            check_node_action(
+                case["authz"],
+                trusted=trusted,
+                me=UUID(case["receiving_node_id"]),
+                now=datetime.fromisoformat(case["now"]),
+            )
+
     if case["expect"] == "accept":
-        check_node_action(case["authz"], **kwargs)
+        check()
     else:
         with pytest.raises(Rejected) as excinfo:
-            check_node_action(case["authz"], **kwargs)
+            check()
         assert excinfo.value.reason == case["reason"]
+
+
+def test_case_set_covers_naive_times_and_keyset_mismatch() -> None:
+    by_name = {case["name"]: case for case in CASES}
+    assert by_name["reject-naive-valid-until"]["reason"] == "malformed"
+    assert by_name["reject-keyset-payload-mismatch"]["reason"] == "keyset_mismatch"
+    assert by_name["accept-keyset"]["expect"] == "accept"
+
+
+@pytest.mark.parametrize("field", ["role", "key_id", "public_key"])
+def test_keyset_rejects_any_payload_field_that_differs(field: str) -> None:
+    case = next(c for c in CASES if c["name"] == "accept-keyset")
+    trusted = {k: bytes.fromhex(v) for k, v in case["trusted_keys"].items()}
+    other = {"role": "gateway", "key_id": "core-3", "public_key": "A" * 43}
+    payload = {**case["payload"], field: other[field]}
+    with pytest.raises(Rejected) as excinfo:
+        check_keyset(payload, case["authz"], trusted=trusted)
+    assert excinfo.value.reason == "keyset_mismatch"
+
+
+def test_keyset_rejects_an_action_authz() -> None:
+    action = next(c for c in CASES if c["name"] == "accept-valid")
+    keyset = next(c for c in CASES if c["name"] == "accept-keyset")
+    trusted = {k: bytes.fromhex(v) for k, v in action["trusted_keys"].items()}
+    with pytest.raises(Rejected) as excinfo:
+        check_keyset(keyset["payload"], action["authz"], trusted=trusted)
+    assert excinfo.value.reason == "wrong_kind"
 
 
 def test_malformed_authz_is_rejected() -> None:

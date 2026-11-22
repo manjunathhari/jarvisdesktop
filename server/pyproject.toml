@@ -20,6 +20,7 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "types-jsonschema",
+    "rfc3339-validator>=0.1.4",
 ]
 
 [project.scripts]

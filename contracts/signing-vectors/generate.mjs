@@ -180,6 +180,34 @@ const authzCase = (name, now, authz, expect, reason) => ({
   reason,
 });
 
+const keysetObject = (args) => ({
+  v: 1,
+  kind: "keyset",
+  action_kind: "keyset.add",
+  args,
+  target_node_id: null,
+  person_id: null,
+  approval_id: null,
+  execution_key: null,
+  reply_id: null,
+  summary: null,
+  issued_at: "2026-11-22T10:00:00Z",
+  valid_until: "2026-11-23T10:00:00Z",
+});
+
+// A keyset announcement: the new key is in the payload and, signed, in authz.object.args.
+// `payload` is the keyset message payload without its `authz` (which is the case's `authz`).
+const NEW_CORE_KEY = {
+  role: "core",
+  key_id: "core-2",
+  public_key: KEYS["core-2"].pubRaw.toString("base64url"),
+};
+
+const keysetCase = (name, payload, expect, reason) => ({
+  ...authzCase(name, "2026-11-22T10:01:00Z", authzOf(keysetObject(NEW_CORE_KEY)), expect, reason),
+  payload,
+});
+
 const tampered = () => {
   const a = authzOf(actionObject());
   return { ...a, object: { ...a.object, args: { channel: "everything" } } };
@@ -219,6 +247,20 @@ const authzCases = () => [
     "untrusted_key_id",
   ),
   authzCase("reject-tampered-args", "2026-11-22T10:01:00Z", tampered(), "reject", "bad_signature"),
+  authzCase(
+    "reject-naive-valid-until",
+    "2026-11-22T10:01:00Z",
+    authzOf(actionObject({ valid_until: "2026-11-22T10:02:00" })),
+    "reject",
+    "malformed",
+  ),
+  keysetCase("accept-keyset", NEW_CORE_KEY, "accept", null),
+  keysetCase(
+    "reject-keyset-payload-mismatch",
+    { ...NEW_CORE_KEY, public_key: KEYS["unknown-1"].pubRaw.toString("base64url") },
+    "reject",
+    "keyset_mismatch",
+  ),
   authzCase(
     "reject-card-as-action",
     "2026-11-22T10:01:00Z",

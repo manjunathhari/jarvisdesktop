@@ -10,7 +10,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, RootModel, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, RootModel, model_validator
 
 
 class Visibility(StrEnum):
@@ -228,8 +228,8 @@ class AuthzObject(_Contract):
     execution_key: UUID | None
     reply_id: UUID | None
     summary: Annotated[str, Field(min_length=1, max_length=500)] | None
-    issued_at: datetime
-    valid_until: datetime
+    issued_at: AwareDatetime
+    valid_until: AwareDatetime
 
 
 class Authz(_Contract):
@@ -287,10 +287,10 @@ class NodeEnvelope(_Contract):
 
     version: Literal[1]
     message_id: UUID
-    node_id: Text100
+    node_id: UUID
     session_id: UUID | None = None
     seq: Seq
-    sent_at: datetime
+    sent_at: AwareDatetime
     kind: MessageKind
     payload: dict[str, Any]
     sig: Sig
@@ -375,7 +375,7 @@ class OutboxItem(_Contract):
     priority: OutboxPriority
     kind: Code
     body: Annotated[str, Field(min_length=1, max_length=4000)]
-    expires_at: datetime | None
+    expires_at: AwareDatetime | None
     authz: Authz | None
 
 

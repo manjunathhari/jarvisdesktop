@@ -49,14 +49,21 @@ one key under different bindings, so their signatures must differ.
 
 ## `authz-cases.json`
 
-The node rules for running a `node.action` (spec §7.1, rules 2 to 4), as
-`{name, trusted_keys, receiving_node_id, now, authz, expect, reason}`:
+The node rules (spec §7.1), as `{name, trusted_keys, receiving_node_id, now, authz, expect,
+reason}`, plus `payload` on `keyset` cases:
 
 - `trusted_keys` maps a trusted core `key_id` to its raw 32-byte public key, in hex;
 - `expect` is `accept` or `reject`;
-- `reason` is null for `accept`; otherwise the first rule that fails, checked in this order:
-  `malformed`, `untrusted_key_id`, `bad_signature`, `wrong_kind`, `wrong_target`,
-  `expired` (`now` > `valid_until` + 30 s).
+- `reason` is null for `accept`, otherwise the first rule that fails.
+
+**`node.action` cases** (no `payload`; rules 2 to 4) are checked in this order:
+`malformed` (including a time without a UTC offset), `untrusted_key_id`, `bad_signature`,
+`wrong_kind`, `wrong_target`, `expired` (`now` > `valid_until` + 30 s).
+
+**`keyset` cases** carry `payload`: the `keyset` message payload (`role`, `key_id`,
+`public_key`) without its `authz`, which is the case's `authz`. They are checked in this order:
+`malformed`, `untrusted_key_id`, `bad_signature`, `wrong_kind`, `keyset_mismatch` (the
+payload's `role`, `key_id` or `public_key` differs from the signed `authz.object.args`).
 
 Rule 1 (the `gw-transport` envelope) and rule 5 (an unused `execution_key` for an
 IRREVERSIBLE action) are not covered here: they need the connection and the node's journal.

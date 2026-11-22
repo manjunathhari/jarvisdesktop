@@ -164,11 +164,51 @@ def test_signed_vectors_envelope_is_a_valid_envelope_body() -> None:
     c.MESSAGE_MODELS[full["kind"]].model_validate(full["payload"])
 
 
-@pytest.mark.parametrize(
-    "case",
-    json.loads((CONTRACTS / "signing-vectors" / "authz-cases.json").read_text()),
-    ids=lambda case: case["name"],
-)
-def test_authz_case_objects_are_valid_authz(case: dict[str, Any]) -> None:
-    validator(_schema("authz")).validate(case["authz"])
-    c.Authz.model_validate(case["authz"])
+AUTHZ_CASES = json.loads((CONTRACTS / "signing-vectors" / "authz-cases.json").read_text())
+
+
+@pytest.mark.parametrize("case", AUTHZ_CASES, ids=lambda case: case["name"])
+def test_authz_case_objects_match_the_contract(case: dict[str, Any]) -> None:
+    ok = case["reason"] != "malformed"
+    assert validator(_schema("authz")).is_valid(case["authz"]) is ok
+    if ok:
+        c.Authz.model_validate(case["authz"])
+    else:
+        with pytest.raises(ValidationError):
+            c.Authz.model_validate(case["authz"])
+    if "payload" in case:
+        payload = {**case["payload"], "authz": case["authz"]}
+        validator(_schema("keyset")).validate(payload)
+        c.Keyset.model_validate(payload)
+
+
+def test_date_time_format_is_actually_checked() -> None:
+    assert "date-time" in jsonschema.FormatChecker().checkers
+    schema = _schema("outbox.cleared")  # any schema: the validator's format checker is shared
+    check = validator(schema).format_checker
+    assert check is not None
+    assert not check.conforms("not-a-date", "date-time")
+    assert not check.conforms("2026-11-22T10:02:00", "date-time")
+    assert check.conforms("2026-11-22T10:02:00Z", "date-time")
+
+
+@pytest.mark.parametrize("model", ["authz", "outbox.item"])
+def test_naive_timestamps_fail_schema_and_model(model: str) -> None:
+    example = _example(model, "valid")
+    if model == "authz":
+        example = {**example, "object": {**example["object"], "valid_until": "2026-11-22T10:10:00"}}
+    else:
+        example = {**example, "expires_at": "2026-11-22T10:10:00"}
+    assert not validator(_schema(model)).is_valid(example)
+    with pytest.raises(ValidationError):
+        c.MESSAGE_MODELS[model].model_validate(example)
+
+
+def test_envelope_naive_sent_at_and_non_uuid_node_id_fail() -> None:
+    envelope_schema = json.loads((CONTRACTS / "node-envelope.schema.json").read_text())
+    example = json.loads((CONTRACTS / "examples" / "node-envelope.valid.json").read_text())
+    for bad in ({"sent_at": "2026-11-21T10:00:00"}, {"node_id": "desktop-manj"}):
+        broken = {**example, **bad}
+        assert not validator(envelope_schema).is_valid(broken)
+        with pytest.raises(ValidationError):
+            c.NodeEnvelope.model_validate(broken)
