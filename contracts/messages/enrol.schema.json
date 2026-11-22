@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/enrol.schema.json",
+  "title": "Payload of `enrol`",
+  "description": "node → gateway: enrolment token and the node's new public key (§7.2). The envelope is signed `node-msg` with that key.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "token",
+    "public_key"
+  ],
+  "properties": {
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{16,128}$"
+    },
+    "public_key": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "description": "Raw 32-byte Ed25519 public key, base64url without padding."
+    }
+  }
+}

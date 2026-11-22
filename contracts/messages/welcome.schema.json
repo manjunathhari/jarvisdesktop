@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/welcome.schema.json",
+  "title": "Payload of `welcome`",
+  "description": "gateway → node: the open session (or null) and the reconnect summary (§8.3).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "session_id",
+    "summary"
+  ],
+  "properties": {
+    "session_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "summary": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "priority",
+          "group_key",
+          "outbox_ids",
+          "line"
+        ],
+        "properties": {
+          "priority": {
+            "enum": [
+              "URGENT",
+              "TODAY",
+              "DIGEST"
+            ]
+          },
+          "group_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "outbox_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "line": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1,
+            "maxLength": 500
+          }
+        }
+      }
+    }
+  }
+}

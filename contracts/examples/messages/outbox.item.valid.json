@@ -1,0 +1,30 @@
+{
+  "outbox_id": "0b8f7c1e-3a8e-4d4f-9a55-2f6f1c3d9e01",
+  "priority": "URGENT",
+  "kind": "approval.request",
+  "body": "Approve deleting old-notes.txt?",
+  "expires_at": "2026-11-22T10:10:00Z",
+  "authz": {
+    "object": {
+      "v": 1,
+      "kind": "approval.card",
+      "action_kind": "pc.delete_test_file",
+      "args": {
+        "name": "old-notes.txt",
+        "size": 1234,
+        "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "file_id": "0x0000000000001a2b"
+      },
+      "target_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+      "person_id": "3e2d1c0b-9a8f-4e7d-8c6b-5a4f3e2d1c0b",
+      "approval_id": "c4b3a291-8f7e-4d6c-9b5a-4f3e2d1c0b9a",
+      "execution_key": null,
+      "reply_id": null,
+      "summary": "Delete old-notes.txt (1.2 KB) from the test folder",
+      "issued_at": "2026-11-22T10:00:00Z",
+      "valid_until": "2026-11-22T10:10:00Z"
+    },
+    "key_id": "core-1",
+    "sig": "ZhfS2x_X-EqCqyr0HA31EIegqtsUJwzvGGOA8Iz11VO5tdnjWaSExZgzTTIMVF6pc_GEdEo5tVTxw16ruZ6TDA"
+  }
+}

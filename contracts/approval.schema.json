@@ -2,14 +2,19 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/approval.schema.json",
   "title": "Approval",
-  "description": "A request for permission with an expiry (Architecture v2 \u00a713.1). STUB: shape may grow before it is used.",
+  "description": "A request for permission with an expiry (Architecture v2 §13.1; spec §5.5).",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "id",
     "task_id",
     "requested_from_person_id",
+    "requesting_node_id",
     "tier",
+    "action_kind",
+    "action_args",
+    "summary",
+    "card_authz",
     "expires_at",
     "decision"
   ],
@@ -26,12 +31,33 @@
       "type": "string",
       "format": "uuid"
     },
+    "requesting_node_id": {
+      "type": "string",
+      "format": "uuid"
+    },
     "tier": {
       "enum": [
         "READ_ONLY",
         "REVERSIBLE",
         "IRREVERSIBLE"
       ]
+    },
+    "action_kind": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.]{0,63}$"
+    },
+    "action_args": {
+      "type": "object",
+      "description": "For the delete test: file name, size, SHA-256 and Windows file ID (§9.3)."
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "card_authz": {
+      "$ref": "messages/authz.schema.json",
+      "description": "The core-signed approval.card authorisation exactly as sent (§7.1)."
     },
     "expires_at": {
       "type": "string",
@@ -51,6 +77,27 @@
         "null"
       ],
       "format": "date-time"
+    },
+    "decided_by_node_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "consumed_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "execution_key": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
     }
   }
 }

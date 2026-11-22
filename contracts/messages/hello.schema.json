@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/hello.schema.json",
+  "title": "Payload of `hello`",
+  "description": "node → gateway: handshake (§6.1). The envelope signature (`node-msg`) covers the server-sent `nonce`. `resume` is the node's own record of what it has shown, per reply.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "nonce",
+    "resume"
+  ],
+  "properties": {
+    "nonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{16,128}$"
+    },
+    "resume": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reply_id",
+          "last_seq"
+        ],
+        "properties": {
+          "reply_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_seq": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    }
+  }
+}

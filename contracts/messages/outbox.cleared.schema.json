@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/outbox.cleared.schema.json",
+  "title": "Payload of `outbox.cleared`",
+  "description": "gateway → node: remove an item from screen (§8.2).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "outbox_id",
+    "reason"
+  ],
+  "properties": {
+    "outbox_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "reason": {
+      "enum": [
+        "ACKNOWLEDGED",
+        "SUPERSEDED",
+        "EXPIRED"
+      ]
+    }
+  }
+}

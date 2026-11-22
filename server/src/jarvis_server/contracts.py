@@ -10,7 +10,7 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, RootModel, model_validator
 
 
 class Visibility(StrEnum):
@@ -198,28 +198,275 @@ class Receipt(_Contract):
     verified_by: str | None = None
 
 
+# ---------------------------------------------------------------- signing primitives (spec §7.1)
+
+Sig = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{86}$")]
+"""Ed25519 signature, base64url without padding."""
+PublicKey = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{43}$")]
+"""Raw 32-byte Ed25519 public key, base64url without padding."""
+KeyId = Annotated[str, Field(pattern=r"^[A-Za-z0-9_.:-]{1,64}$")]
+Code = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_.]{0,63}$")]
+Seq = Annotated[int, Field(ge=1)]
+
+
+class AuthzKind(StrEnum):
+    NODE_ACTION = "node.action"
+    APPROVAL_CARD = "approval.card"
+    KEYSET = "keyset"
+
+
+class AuthzObject(_Contract):
+    """The core-signed authorisation object. Every field is always present (null if unused)."""
+
+    v: Literal[1]
+    kind: AuthzKind
+    action_kind: Code
+    args: dict[str, Any]
+    target_node_id: UUID | None
+    person_id: UUID | None
+    approval_id: UUID | None
+    execution_key: UUID | None
+    reply_id: UUID | None
+    summary: Annotated[str, Field(min_length=1, max_length=500)] | None
+    issued_at: datetime
+    valid_until: datetime
+
+
+class Authz(_Contract):
+    """``{object, key_id, sig}``: ``sig`` is purpose ``core-authz`` over JCS(object).
+
+    Verify signatures over the raw JSON object, never over this model re-serialised.
+    """
+
+    object: AuthzObject
+    key_id: KeyId
+    sig: Sig
+
+
 class Approval(_Contract):
-    """Stub (Phase 2/3)."""
+    """A request for permission with an expiry (spec §5.5)."""
 
     id: UUID
     task_id: UUID
     requested_from_person_id: UUID
+    requesting_node_id: UUID
     tier: ApprovalTier
+    action_kind: Code
+    action_args: dict[str, Any]
+    summary: Annotated[str, Field(min_length=1, max_length=500)]
+    card_authz: Authz
     expires_at: datetime
     decision: ApprovalDecision
     decided_at: datetime | None = None
+    decided_by_node_id: UUID | None = None
+    consumed_at: datetime | None = None
+    execution_key: UUID | None = None
+
+
+class MessageKind(StrEnum):
+    ENROL = "enrol"
+    HELLO = "hello"
+    WELCOME = "welcome"
+    UTTERANCE = "utterance"
+    REPLY_CHUNK = "reply.chunk"
+    OUTBOX_ITEM = "outbox.item"
+    OUTBOX_CLEARED = "outbox.cleared"
+    RECEIVED = "received"
+    ACK = "ack"
+    APPROVAL_DECISION = "approval.decision"
+    NODE_ACTION = "node.action"
+    ACTION_RECEIPT = "action.receipt"
+    KEYSET = "keyset"
+    PING = "ping"
+    PONG = "pong"
+    ERROR = "error"
 
 
 class NodeEnvelope(_Contract):
-    """Stub (Phase 2): wrapper for node <-> gateway messages."""
+    """Wrapper for node <-> gateway messages; ``sig`` covers every other field (spec §7.1)."""
 
     version: Literal[1]
     message_id: UUID
     node_id: Text100
     session_id: UUID | None = None
+    seq: Seq
     sent_at: datetime
-    kind: Text100
+    kind: MessageKind
     payload: dict[str, Any]
+    sig: Sig
+
+
+# ---------------------------------------------------------------- message payloads
+
+Token = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{16,128}$")]
+
+
+class Enrol(_Contract):
+    token: Token
+    public_key: PublicKey
+
+
+class ResumePosition(_Contract):
+    reply_id: UUID
+    last_seq: Seq
+
+
+class Hello(_Contract):
+    nonce: Token
+    resume: tuple[ResumePosition, ...]
+
+
+class SummaryPriority(StrEnum):
+    URGENT = "URGENT"
+    TODAY = "TODAY"
+    DIGEST = "DIGEST"
+
+
+class SummaryGroup(_Contract):
+    priority: SummaryPriority
+    group_key: Text200 | None
+    outbox_ids: tuple[UUID, ...]
+    line: Annotated[str, Field(min_length=1, max_length=500)] | None
+
+
+class Welcome(_Contract):
+    session_id: UUID | None
+    summary: tuple[SummaryGroup, ...]
+
+
+class Utterance(_Contract):
+    text: Annotated[str, Field(min_length=1, max_length=4000)]
+    screen_summary: Annotated[str, Field(max_length=2000)] | None
+
+
+class ChunkType(StrEnum):
+    SPEECH = "SPEECH"
+    ACTION = "ACTION"
+
+
+class ReplyChunk(_Contract):
+    """SPEECH carries ``text`` (authz null); ACTION carries ``authz`` (text null)."""
+
+    reply_id: UUID
+    seq: Seq
+    type: ChunkType
+    text: Annotated[str, Field(min_length=1, max_length=4000)] | None
+    authz: Authz | None
+    final: bool
+
+    @model_validator(mode="after")
+    def _text_or_authz(self) -> ReplyChunk:
+        if self.type is ChunkType.SPEECH and (self.text is None or self.authz is not None):
+            raise ValueError("a SPEECH chunk has text and no authz")
+        if self.type is ChunkType.ACTION and (self.authz is None or self.text is not None):
+            raise ValueError("an ACTION chunk has authz and no text")
+        return self
+
+
+class OutboxPriority(StrEnum):
+    URGENT = "URGENT"
+    TODAY = "TODAY"
+    DIGEST = "DIGEST"
+    SILENT = "SILENT"
+
+
+class OutboxItem(_Contract):
+    outbox_id: UUID
+    priority: OutboxPriority
+    kind: Code
+    body: Annotated[str, Field(min_length=1, max_length=4000)]
+    expires_at: datetime | None
+    authz: Authz | None
+
+
+class ClearedReason(StrEnum):
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    SUPERSEDED = "SUPERSEDED"
+    EXPIRED = "EXPIRED"
+
+
+class OutboxCleared(_Contract):
+    outbox_id: UUID
+    reason: ClearedReason
+
+
+class OutboxRef(_Contract):
+    outbox_id: UUID
+
+
+class ReplyPosition(_Contract):
+    """Every chunk of ``reply_id`` up to and including ``seq``."""
+
+    reply_id: UUID
+    seq: Seq
+
+
+class Received(RootModel[OutboxRef | ReplyPosition]):
+    pass
+
+
+class Ack(RootModel[OutboxRef | ReplyPosition]):
+    pass
+
+
+class Decision(StrEnum):
+    APPROVED = "APPROVED"
+    DENIED = "DENIED"
+
+
+class ApprovalDecisionMessage(_Contract):
+    approval_id: UUID
+    decision: Decision
+    card_sig: Sig
+
+
+class NodeAction(_Contract):
+    authz: Authz
+
+
+ResultCode = Annotated[str, Field(pattern=r"^[A-Z][A-Z_]{0,39}$")]
+
+
+class ApprovedActionReceipt(_Contract):
+    execution_key: UUID
+    result: ResultCode
+    evidence: dict[str, Any]
+
+
+class LiveActionReceipt(_Contract):
+    reply_id: UUID
+    seq: Seq
+    result: ResultCode
+    evidence: dict[str, Any]
+
+
+class ActionReceipt(RootModel[ApprovedActionReceipt | LiveActionReceipt]):
+    pass
+
+
+class KeyRole(StrEnum):
+    CORE = "core"
+    GATEWAY = "gateway"
+
+
+class Keyset(_Contract):
+    role: KeyRole
+    key_id: KeyId
+    public_key: PublicKey
+    authz: Authz
+
+
+class Ping(_Contract):
+    pass
+
+
+class Pong(_Contract):
+    pass
+
+
+class Error(_Contract):
+    code: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+    detail: Annotated[str, Field(max_length=500)]
 
 
 MODELS: dict[str, type[_Contract]] = {
@@ -230,4 +477,25 @@ MODELS: dict[str, type[_Contract]] = {
     "receipt": Receipt,
     "approval": Approval,
     "node-envelope": NodeEnvelope,
+}
+
+
+MESSAGE_MODELS: dict[str, type[BaseModel]] = {
+    "enrol": Enrol,
+    "hello": Hello,
+    "welcome": Welcome,
+    "utterance": Utterance,
+    "reply.chunk": ReplyChunk,
+    "outbox.item": OutboxItem,
+    "outbox.cleared": OutboxCleared,
+    "received": Received,
+    "ack": Ack,
+    "approval.decision": ApprovalDecisionMessage,
+    "node.action": NodeAction,
+    "action.receipt": ActionReceipt,
+    "keyset": Keyset,
+    "ping": Ping,
+    "pong": Pong,
+    "error": Error,
+    "authz": Authz,
 }

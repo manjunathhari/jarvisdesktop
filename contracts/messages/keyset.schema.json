@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/keyset.schema.json",
+  "title": "Payload of `keyset`",
+  "description": "gateway → node: a new core or gateway public key, announced in an `authz` (kind `keyset`) signed by the current core key. The node accepts it only if `authz.object.args` names the same role, key_id and public_key.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "role",
+    "key_id",
+    "public_key",
+    "authz"
+  ],
+  "properties": {
+    "role": {
+      "enum": [
+        "core",
+        "gateway"
+      ]
+    },
+    "key_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+    },
+    "public_key": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "description": "Raw 32-byte Ed25519 public key, base64url without padding."
+    },
+    "authz": {
+      "$ref": "authz.schema.json"
+    }
+  }
+}

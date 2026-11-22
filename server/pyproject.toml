@@ -9,6 +9,8 @@ dependencies = [
     "alembic>=1.14",
     "sqlalchemy>=2.0",
     "pydantic>=2.9",
+    "rfc8785>=0.1.4",
+    "cryptography>=50.0.2",
 ]
 
 [dependency-groups]

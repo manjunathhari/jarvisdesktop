@@ -1,0 +1,8 @@
+{
+  "outbox_id": "0b8f7c1e-3a8e-4d4f-9a55-2f6f1c3d9e01",
+  "priority": "NOW",
+  "kind": "approval.request",
+  "body": "Approve deleting old-notes.txt?",
+  "expires_at": null,
+  "authz": null
+}

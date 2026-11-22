@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from enum import StrEnum
-from pathlib import Path
 from typing import Any
 
 import jsonschema
@@ -13,7 +12,8 @@ from pydantic import ValidationError
 
 from jarvis_server import contracts as c
 
-CONTRACTS = Path(__file__).resolve().parents[2] / "contracts"
+from .schema_registry import CONTRACTS, validator
+
 NAMES = sorted(c.MODELS)
 
 
@@ -38,19 +38,14 @@ def test_schema_is_valid_draft_2020_12(name: str) -> None:
 @pytest.mark.parametrize("name", NAMES)
 def test_valid_example_passes_schema_and_model(name: str) -> None:
     example = _example(name, "valid")
-    jsonschema.Draft202012Validator(
-        _schema(name), format_checker=jsonschema.FormatChecker()
-    ).validate(example)
+    validator(_schema(name)).validate(example)
     c.MODELS[name].model_validate(example)
 
 
 @pytest.mark.parametrize("name", NAMES)
 def test_invalid_example_fails_schema_and_model(name: str) -> None:
     example = _example(name, "invalid")
-    validator = jsonschema.Draft202012Validator(
-        _schema(name), format_checker=jsonschema.FormatChecker()
-    )
-    assert not validator.is_valid(example)
+    assert not validator(_schema(name)).is_valid(example)
     with pytest.raises(ValidationError):
         c.MODELS[name].model_validate(example)
 

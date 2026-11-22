@@ -1,0 +1,14 @@
+{
+  "name": "jarvis-signing-vectors",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Independent generator of the JCS + Ed25519 golden signing vectors (no repo code).",
+  "type": "module",
+  "license": "UNLICENSED",
+  "scripts": {
+    "generate": "node generate.mjs"
+  },
+  "dependencies": {
+    "canonicalize": "5.1.0"
+  }
+}

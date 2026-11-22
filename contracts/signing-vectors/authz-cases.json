@@ -1,0 +1,302 @@
+[
+  {
+    "name": "accept-valid",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+    "now": "2026-11-22T10:01:00Z",
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "node.action",
+        "action_kind": "news.show",
+        "args": {
+          "channel": "headlines"
+        },
+        "target_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+        "person_id": "3e2d1c0b-9a8f-4e7d-8c6b-5a4f3e2d1c0b",
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-22T10:02:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "BkOICZDztzn1BZorjf6J3gHLk2X6jPHL6QQNtVE1g6ctdEjf7UFUp0yVd3k_VeC5zM8I9b3fUNiH8qTPQFWnAQ"
+    },
+    "expect": "accept",
+    "reason": null
+  },
+  {
+    "name": "reject-gateway-key-only",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+    "now": "2026-11-22T10:01:00Z",
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "node.action",
+        "action_kind": "news.show",
+        "args": {
+          "channel": "headlines"
+        },
+        "target_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+        "person_id": "3e2d1c0b-9a8f-4e7d-8c6b-5a4f3e2d1c0b",
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-22T10:02:00Z"
+      },
+      "key_id": "gw-1",
+      "sig": "8dpQQd_36iWpKi87S1yZRuQBPopVujZLFpvOxxMEHJYvGW-aFxrxBDNw7dpwLrVjIii1LjU6vL18ATqUlA3NBg"
+    },
+    "expect": "reject",
+    "reason": "untrusted_key_id"
+  },
+  {
+    "name": "reject-wrong-purpose",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+    "now": "2026-11-22T10:01:00Z",
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "node.action",
+        "action_kind": "news.show",
+        "args": {
+          "channel": "headlines"
+        },
+        "target_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+        "person_id": "3e2d1c0b-9a8f-4e7d-8c6b-5a4f3e2d1c0b",
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-22T10:02:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "hVRdefGl-RoBqOQkYnEBgpryMCb4p_cEpjzKUk9j6UFtnDuG26an53zHJdc3jlSuDUQCvGfxZaznNlwXmCkoAw"
+    },
+    "expect": "reject",
+    "reason": "bad_signature"
+  },
+  {
+    "name": "reject-other-target-node",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+    "now": "2026-11-22T10:01:00Z",
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "node.action",
+        "action_kind": "news.show",
+        "args": {
+          "channel": "headlines"
+        },
+        "target_node_id": "9c8b7a6f-5e4d-4c3b-8a29-1f0e0d0c0b0a",
+        "person_id": "3e2d1c0b-9a8f-4e7d-8c6b-5a4f3e2d1c0b",
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-22T10:02:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "7hdRNMeL2ms5pHUtAA4DLQq8v4D8AdLP4PODvfKlwoMsI5FWSJNvcUHCU_ITiknQ50ufp4qYFXADuNFBkB7xBA"
+    },
+    "expect": "reject",
+    "reason": "wrong_target"
+  },
+  {
+    "name": "reject-expired",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+    "now": "2026-11-22T10:02:31Z",
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "node.action",
+        "action_kind": "news.show",
+        "args": {
+          "channel": "headlines"
+        },
+        "target_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+        "person_id": "3e2d1c0b-9a8f-4e7d-8c6b-5a4f3e2d1c0b",
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-22T10:02:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "BkOICZDztzn1BZorjf6J3gHLk2X6jPHL6QQNtVE1g6ctdEjf7UFUp0yVd3k_VeC5zM8I9b3fUNiH8qTPQFWnAQ"
+    },
+    "expect": "reject",
+    "reason": "expired"
+  },
+  {
+    "name": "accept-within-tolerance",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+    "now": "2026-11-22T10:02:29Z",
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "node.action",
+        "action_kind": "news.show",
+        "args": {
+          "channel": "headlines"
+        },
+        "target_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+        "person_id": "3e2d1c0b-9a8f-4e7d-8c6b-5a4f3e2d1c0b",
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-22T10:02:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "BkOICZDztzn1BZorjf6J3gHLk2X6jPHL6QQNtVE1g6ctdEjf7UFUp0yVd3k_VeC5zM8I9b3fUNiH8qTPQFWnAQ"
+    },
+    "expect": "accept",
+    "reason": null
+  },
+  {
+    "name": "accept-at-tolerance-limit",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+    "now": "2026-11-22T10:02:30Z",
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "node.action",
+        "action_kind": "news.show",
+        "args": {
+          "channel": "headlines"
+        },
+        "target_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+        "person_id": "3e2d1c0b-9a8f-4e7d-8c6b-5a4f3e2d1c0b",
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-22T10:02:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "BkOICZDztzn1BZorjf6J3gHLk2X6jPHL6QQNtVE1g6ctdEjf7UFUp0yVd3k_VeC5zM8I9b3fUNiH8qTPQFWnAQ"
+    },
+    "expect": "accept",
+    "reason": null
+  },
+  {
+    "name": "reject-untrusted-key-id",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+    "now": "2026-11-22T10:01:00Z",
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "node.action",
+        "action_kind": "news.show",
+        "args": {
+          "channel": "headlines"
+        },
+        "target_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+        "person_id": "3e2d1c0b-9a8f-4e7d-8c6b-5a4f3e2d1c0b",
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-22T10:02:00Z"
+      },
+      "key_id": "core-9",
+      "sig": "Iy2VaWf5UwgBsMLUlyVZ7IKWDVrAvOS7tXrwndkgtXtwXjZPWnC2qzUnorgvG_OWyMTNVxCPYscyBH7CoYMwBA"
+    },
+    "expect": "reject",
+    "reason": "untrusted_key_id"
+  },
+  {
+    "name": "reject-tampered-args",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+    "now": "2026-11-22T10:01:00Z",
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "node.action",
+        "action_kind": "news.show",
+        "args": {
+          "channel": "everything"
+        },
+        "target_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+        "person_id": "3e2d1c0b-9a8f-4e7d-8c6b-5a4f3e2d1c0b",
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-22T10:02:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "BkOICZDztzn1BZorjf6J3gHLk2X6jPHL6QQNtVE1g6ctdEjf7UFUp0yVd3k_VeC5zM8I9b3fUNiH8qTPQFWnAQ"
+    },
+    "expect": "reject",
+    "reason": "bad_signature"
+  },
+  {
+    "name": "reject-card-as-action",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+    "now": "2026-11-22T10:01:00Z",
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "approval.card",
+        "action_kind": "news.show",
+        "args": {
+          "channel": "headlines"
+        },
+        "target_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+        "person_id": "3e2d1c0b-9a8f-4e7d-8c6b-5a4f3e2d1c0b",
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": null,
+        "summary": "Delete a test file",
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-22T10:02:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "kLNpM-yDmyj_NFXSz5glOAKqM1ZV2q_dEvJb2E9J24Et3AgM1uPSP3KivgxAL1BTxDc9N-yK7wKtyLyVq_98Cw"
+    },
+    "expect": "reject",
+    "reason": "wrong_kind"
+  }
+]

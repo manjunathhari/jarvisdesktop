@@ -30,6 +30,17 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Signing vectors are reproducible (independent generator)
+        working-directory: contracts/signing-vectors
+        run: |
+          npm ci
+          node generate.mjs vectors > /tmp/v.json
+          node generate.mjs authz-cases > /tmp/a.json
+          diff vectors.json /tmp/v.json
+          diff authz-cases.json /tmp/a.json
       - name: Install
         run: uv sync --locked --python 3.12
       - name: Lint
