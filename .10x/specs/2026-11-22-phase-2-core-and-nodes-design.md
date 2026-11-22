@@ -1,6 +1,6 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** Revision 3 for Manj's final approval. Architecture and ADR-011 to 014 decisions approved 22 Nov; review blockers and final points resolved (§20).
+**Status:** Revision 4 for Manj's final approval. Architecture and ADR-011 to 014 decisions approved 22 Nov; review blockers and final points resolved (§20).
 **Date:** 2026-11-22
 **Feature slug:** `phase-2-core-and-nodes`
 **Inputs:** Architecture v2 §5–§9, §13–§15 (project doc `Jarvis_Architecture_v2.md`), decisions D1–D8, `phase-1-handover.md`, Phase 0 and Phase 1 designs, the Phase 2 kick-off conversation (22 Nov 2026).
@@ -541,13 +541,37 @@ Every Claude call reserves its worst-case cost **before** it starts, under a row
    - add `reserve_inr` to `reserved_inr`;
    - insert an ACTIVE `ops.brain_reservation`, with `lease_until` = the job's lease.
 3. **Settle** after the call, in one transaction: compute the actual cost from the API's reported usage; move the reservation to SETTLED with `actual_inr`; move the amount from `reserved_inr` to `settled_inr`; write `ops.brain_usage`.
-4. **Release** if the call failed before any tokens were billed (connection refused, or 4xx/5xx before the stream started): the reservation becomes RELEASED and `reserved_inr` goes down.
+4. **Release only when no request reached Claude.** The router runs every call in two phases, so the boundary is in the code, not guessed from error types:
+   - **Connect phase:** open the connection through the egress proxy (`CONNECT`), then finish the TLS handshake with `api.anthropic.com`. No request bytes have been written yet.
+   - **Send phase:** begins the moment the first byte of the HTTP request is written to the established TLS connection.
+
+   **RELEASED** (the reservation is given back, and the turn may be tried again) only for failures in the connect phase:
+   - proxy unreachable;
+   - the proxy refusing `CONNECT`, which is our own proxy, so the request never went upstream;
+   - DNS failure or TCP connect timeout;
+   - a TLS handshake failure.
+
+   **Any outcome after the send phase began that is not a complete, successful response is indeterminate** (step 6): every HTTP status (4xx, 429, 5xx, 529), any timeout, and any cut stream. The reservation becomes LAPSED, counted at full value. A response arriving doesn't prove the provider didn't process the request.
+
+   An exception the router can't place in one phase or the other is treated as send phase (fail closed).
 5. **Lapse after a crash:** a scheduler sweep finds ACTIVE reservations past `lease_until`. Each becomes LAPSED and its **full reserved amount counts as settled**, because tokens may have been billed and we can't tell. This is conservative: a crash can only make the meter over-count, never under-count.
 6. **A lapsed call is indeterminate and is never retried as a new call.** Each reservation records the turn it serves (`turn_id` = the `conv.inbound` id). A LAPSED reservation means Claude may already have processed that turn.
-   - **Before reserving**, the `conv.turn` handler checks for any earlier reservation for the same `turn_id`:
-     - none, or only RELEASED ones (which failed before anything was billed) → it may call Claude;
-     - an ACTIVE one past its lease, or a LAPSED one → it must **not** call Claude again.
-   - **When it must not call**, it lapses the reservation if not already done, marks the turn `INDETERMINATE` (a new column, `conv.inbound.outcome`), and writes an event. A TODAY notification goes to the session: "I may not have finished answering that. Please ask again if you still need it." It then completes the job. Any chunks already streamed stay in history, with no final chunk.
+   - **One owner per turn, enforced by the database:**
+     - a partial unique index, `UNIQUE (turn_id) WHERE state IN ('ACTIVE', 'SETTLED', 'LAPSED')`, allows at most one live or spent reservation per turn. RELEASED rows are left out, so a turn whose call never reached Claude can reserve again;
+     - the reservation transaction also locks the turn's `conv.inbound` row (`SELECT … FOR UPDATE`) **before** the month's budget row. That fixed lock order (turn, then budget) is used everywhere, so there are no deadlocks. It then checks the turn's existing reservations and inserts the new one in the same transaction;
+     - two jobs for the same turn therefore serialise on the turn row. If they still race, the unique index refuses the second insert. A unique-violation error means "another job owns this turn".
+   - **What a job does, by the turn's existing reservation:**
+
+     | Existing reservation for this `turn_id` | The job |
+     |---|---|
+     | None, or only RELEASED | Reserves and may call Claude (it is now the owner) |
+     | ACTIVE, lease **not** expired | **Does not call Claude.** Completes at once without changing anything: the owning job is still working and will finish the turn. |
+     | ACTIVE, lease expired, or LAPSED | **Does not call Claude.** Lapses the reservation if not already done, then follows the indeterminate path below. |
+     | SETTLED | **Does not call Claude.** The turn was answered; it completes without changing anything. |
+     | Unique violation on insert | Same as "ACTIVE, lease not expired" |
+
+   - **If the owning job crashes**, nothing waits on the second job. The reservation sweep lapses the reservation and, in the same transaction, marks the turn indeterminate and sends the notification. So the indeterminate path runs exactly once, from whichever comes first: the sweep or a later job. It is guarded by the same row lock and by `conv.inbound.outcome` being empty.
+   - **The indeterminate path:** mark the turn `INDETERMINATE` (a new column, `conv.inbound.outcome`) and write an event. A TODAY notification goes to the session: "I may not have finished answering that. Please ask again if you still need it." It then completes the job. Any chunks already streamed stay in history, with no final chunk.
    - **The person asking again** is a new turn with a new reservation, which is the only way that turn's work runs again.
    - **A provider-side check could change this rule only by a later decision.** The Anthropic API offers no mechanism that reliably proves a request did not run, so Phase 2 assumes it might have.
 
@@ -567,7 +591,11 @@ P2-B2 covers the thresholds. P2-B3: 20 concurrent turns against a budget with ro
 ### 10.2 Failure handling
 
 - A Claude timeout or 5xx marks the brain DOWN after 2 consecutive failures.
-- Held `conv.turn` jobs are re-queued with a delay, not failed, and Jarvis tells the person (CLAUDE_DOWN, §8.1). **Only turns whose reservation was RELEASED are re-queued for another Claude call.** A failure that may have reached Claude, such as a timeout after the request was sent or a stream cut mid-reply, settles the reservation as LAPSED and follows the indeterminate rule (§10.1, step 6). That turn isn't sent again.
+- Jarvis tells the person (CLAUDE_DOWN, §8.1). Which turns wait for Claude to come back:
+  - turns that arrive while the brain is DOWN: they are held **before** any reservation is made, so nothing has been sent;
+  - turns whose call failed in the **connect phase**, whose reservation was RELEASED (§10.1 step 4).
+
+  These are re-queued with a delay, not failed, and run once when Claude is back. A turn whose call entered the **send phase** and did not complete successfully is never re-queued for another call. That includes 4xx, 429, 5xx and 529 responses, timeouts and cut streams. It is LAPSED and indeterminate (§10.1 step 6), and the person is told. Both kinds of failure count towards marking the brain DOWN.
 - `brain.probe` runs every 2 minutes, with a minimal request whose cost is reserved like any other. On success, CLAUDE_BACK is emitted and held turns run once, in order.
 - Reminders, expiries, delivery and verification never call Claude, so they continue (P2-B1).
 - **No direct desktop fallback (my call):** after cutover the desktop holds no Claude key. If the server is unreachable, the desktop says so locally ("I can't reach the server right now"). This keeps F1 true.
@@ -629,7 +657,8 @@ Flow tests:
 | P2-B1 | Claude down: turn held, person told, reminders, expiries and delivery continue; Claude back: held turn runs exactly once |
 | P2-B2 | Cost cap: 80% warns; 100% refuses new calls; the daily ceiling holds; a cap-held turn expires after 1 hour with a notification and never runs later |
 | P2-B3 | Budget under concurrency: 20 concurrent turns, room for 3 → exactly 3 reserved; a crashed call's reservation lapses at full value |
-| P2-B4 | Core killed after Claude was called but before the reply was stored: the retried job makes **no** second Claude call; the turn is INDETERMINATE and the person is notified; a timeout after sending does the same, while a refused connection is re-queued and answered once |
+| P2-B4 | Core killed after Claude was called but before the reply was stored: the retried job makes **no** second Claude call; the turn is INDETERMINATE and the person is notified once. A 5xx, 429 or timeout after the request was sent does the same. A proxy-refused or TLS-failed connection is RELEASED, re-queued and answered exactly once. |
+| P2-B5 | Two jobs for the same turn claimed concurrently (and, separately, a duplicate inserted by hand): exactly one Claude call; the second job completes without calling; if the owner is then killed, the sweep marks the turn indeterminate exactly once |
 | P2-S1 | Gateway role can't read memory, call `ledger.transition()` or write `audit.event` |
 | P2-S2 | Person and viewer come from the node row even when the message claims another person |
 | P2-S3 | A bad signature, a replayed `seq` or an unknown Tailscale peer is refused |
@@ -722,3 +751,5 @@ Architecture direction approved; implementation approval pending these changes. 
 | R1 | An uncertain Claude call must not be retried as a new call | §10.1 step 6, §10.2; P2-B4 |
 | R2 | Protect staging → Recycle Bin against a swap | §9.4 step 4 (own protected folder, fresh subfolder, verify by handle immediately before, check after, fail closed); P2-A10 |
 | R3 | Verify the card signature when processing a decision | §5.5 `card_authz`, §9.3 step 6; P2-A9 |
+| R1a | Concurrent jobs for the same turn | §10.1 step 6: per-turn row lock (turn, then budget), partial unique index, a table of what each job does, the sweep owns crash cleanup; P2-B5 |
+| R1b | What qualifies for RELEASED | §10.1 step 4: connect phase vs send phase; RELEASED only for connect-phase failures; any send-phase outcome short of success is indeterminate; unclassifiable counts as send; §10.2; P2-B4 |
