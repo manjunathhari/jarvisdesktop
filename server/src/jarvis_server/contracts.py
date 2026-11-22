@@ -55,6 +55,7 @@ class EntityType(StrEnum):
     TASK = "task"
     COMMITMENT = "commitment"
     MEMORY = "memory"
+    NODE = "node"
 
 
 class AuditAction(StrEnum):
@@ -63,6 +64,10 @@ class AuditAction(StrEnum):
     UPDATE = "UPDATE"
     CONFIRM = "CONFIRM"
     ARCHIVE = "ARCHIVE"
+    ENROL_CREATE = "ENROL_CREATE"
+    ENROL = "ENROL"
+    REVOKE = "REVOKE"
+    CONNECT_REFUSED = "CONNECT_REFUSED"
 
 
 class AuditOutcome(StrEnum):

@@ -11,11 +11,24 @@ from psycopg import sql
 
 OWNER_ROLE = "jarvis_owner"
 APP_ROLE = "jarvis_app"
+# Phase 2 (spec §4.1): the gateway's restricted role. Migration 0008 grants its whole surface.
+GATEWAY_ROLE = "jarvis_gateway"
 
 
-def bootstrap(superuser_dsn: str, database: str, owner_password: str, app_password: str) -> None:
+def bootstrap(
+    superuser_dsn: str,
+    database: str,
+    owner_password: str,
+    app_password: str,
+    gateway_password: str,
+) -> None:
+    roles = (
+        (OWNER_ROLE, owner_password),
+        (APP_ROLE, app_password),
+        (GATEWAY_ROLE, gateway_password),
+    )
     with psycopg.connect(superuser_dsn, autocommit=True) as conn:
-        for role, password in ((OWNER_ROLE, owner_password), (APP_ROLE, app_password)):
+        for role, password in roles:
             exists = conn.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)).fetchone()
             verb = "ALTER" if exists else "CREATE"
             conn.execute(
@@ -32,11 +45,12 @@ def bootstrap(superuser_dsn: str, database: str, owner_password: str, app_passwo
         conn.execute(
             sql.SQL("REVOKE ALL ON DATABASE {} FROM PUBLIC").format(sql.Identifier(database))
         )
-        conn.execute(
-            sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
-                sql.Identifier(database), sql.Identifier(APP_ROLE)
+        for role in (APP_ROLE, GATEWAY_ROLE):
+            conn.execute(
+                sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                    sql.Identifier(database), sql.Identifier(role)
+                )
             )
-        )
         # S5 (Phase 0 security review): nobody but the superuser connects to the default
         # database or the template, which hold nothing JARVIS needs.
         conn.execute("REVOKE CONNECT ON DATABASE postgres FROM PUBLIC")

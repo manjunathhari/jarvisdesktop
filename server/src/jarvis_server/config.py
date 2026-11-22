@@ -44,6 +44,10 @@ def app_dsn() -> str:
     return dsn("jarvis_app", "pg_app_password")
 
 
+def gateway_dsn() -> str:
+    return dsn("jarvis_gateway", "pg_gateway_password")
+
+
 def owner_dsn() -> str:
     return dsn("jarvis_owner", "pg_owner_password")
 
