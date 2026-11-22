@@ -10,8 +10,10 @@
   the REJECTED audit row and return a reason code; they never raise, so the audit row
   survives (R7-1). A fenced connection raises 'connection_fenced' (SQLSTATE JF001, R7-5).
   A malformed call raises invalid_parameter_value.
-- audit.event: entity_type 'node'; actions ENROL_CREATE, ENROL, REVOKE, CONNECT_REFUSED.
-  Audit rows carry codes and IDs only, never names or keys.
+- audit.event: entity_type 'node'; actions ENROL_CREATE, ENROL, REVOKE, CONNECT_REFUSED,
+  CONNECT and DISCONNECT (R8-2). Audit rows carry codes and IDs only, never names or keys;
+  heartbeats aren't audited.
+- Strict connection fencing with one lock order, node row then connection rows (R8-1).
 
 Downgrade refuses once a node audit row, node or enrolment exists (R7-6). The jarvis_gateway
 role is cluster-wide and belongs to bootstrap, so it stays.
@@ -122,7 +124,8 @@ DECLARE
     v_refusal text;
     v_constraint text;
 BEGIN
-    IF p_token IS NULL OR p_public_key IS NULL OR length(p_public_key) <> 32
+    IF p_token IS NULL OR length(p_token) <> 26  -- the 128-bit token, base32 without padding
+       OR p_public_key IS NULL OR length(p_public_key) <> 32
        OR p_tailscale_identity IS NULL OR length(p_tailscale_identity) NOT BETWEEN 1 AND 200 THEN
         RAISE EXCEPTION 'malformed enrol_node call' USING ERRCODE = 'invalid_parameter_value';
     END IF;
@@ -155,8 +158,10 @@ BEGIN
         IF v_enrolment IS NULL THEN
             SELECT e.id INTO v_enrolment FROM gw.enrolment e WHERE e.token_hash = v_hash;
         END IF;
-        PERFORM audit.append('AGENT', 'gateway', 'node', '00000000-0000-0000-0000-000000000000'::uuid, 'ENROL', NULL, NULL,
-                             'REJECTED', v_refusal, NULL,
+        -- The enrolment's ID when the token matched one (used or expired), else the nil UUID.
+        PERFORM audit.append('AGENT', 'gateway', 'node',
+                             coalesce(v_enrolment, '00000000-0000-0000-0000-000000000000'::uuid),
+                             'ENROL', NULL, NULL, 'REJECTED', v_refusal, NULL,
                              jsonb_strip_nulls(jsonb_build_object('enrolment_id', v_enrolment)));
         RETURN QUERY SELECT NULL::uuid, v_refusal;
         RETURN;
@@ -169,7 +174,23 @@ BEGIN
 END;
 $$;
 
--- Gateway: the node of an open connection whose node is not revoked; otherwise fenced (R7-5).
+-- Strict fencing (R8-1). One lock order everywhere: the node row first, then connection rows.
+-- A connection's node_id never changes, so reading it before taking any lock is safe. Under
+-- READ COMMITTED a lock request that waited re-reads the committed row, so the fence
+-- conditions below are checked against what has actually committed.
+--
+--   function           node row            connection row(s)
+--   current_node       FOR SHARE           FOR SHARE (this one)
+--   touch_connection   FOR NO KEY UPDATE   FOR NO KEY UPDATE (this one)
+--   close_connection   FOR SHARE           FOR UPDATE (this one)
+--   open_connection    FOR UPDATE          FOR UPDATE (the node's open one, if any)
+--   revoke_node        FOR UPDATE          FOR UPDATE (all the node's open ones)
+--
+-- DISCONNECT and CONNECT audit rows (R8-2) are written in the same transaction as the change.
+
+-- The fence, called first by every conv and comm connection function (Tasks 3 and 7). Its
+-- share locks are held until that transaction ends, so a revocation or supersede waits for
+-- the write, and a write after one is refused with JF001 (R7-5).
 CREATE FUNCTION gw.current_node(p_conn_id bigint) RETURNS uuid
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
@@ -178,10 +199,15 @@ BEGIN
     IF p_conn_id IS NULL THEN
         RAISE EXCEPTION 'malformed current_node call' USING ERRCODE = 'invalid_parameter_value';
     END IF;
-    SELECT n.id INTO v_node
-        FROM gw.node_connection c JOIN gw.node n ON n.id = c.node_id
-        WHERE c.id = p_conn_id AND c.closed_at IS NULL AND n.revoked_at IS NULL;
-    IF v_node IS NULL THEN
+    SELECT c.node_id INTO v_node FROM gw.node_connection c WHERE c.id = p_conn_id;
+    IF FOUND THEN
+        PERFORM 1 FROM gw.node n WHERE n.id = v_node AND n.revoked_at IS NULL FOR SHARE;
+    END IF;
+    IF FOUND THEN
+        PERFORM 1 FROM gw.node_connection c WHERE c.id = p_conn_id AND c.closed_at IS NULL
+            FOR SHARE;
+    END IF;
+    IF NOT FOUND THEN
         RAISE EXCEPTION 'connection_fenced' USING ERRCODE = 'JF001';
     END IF;
     RETURN v_node;
@@ -189,7 +215,7 @@ END;
 $$;
 
 -- Gateway: open a connection for a node, superseding (closing) any open one in the same
--- transaction. The node row is locked so concurrent opens and a revocation serialise.
+-- transaction.
 CREATE FUNCTION gw.open_connection(p_node_id uuid)
 RETURNS TABLE (conn_id bigint, refusal text)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
@@ -198,6 +224,7 @@ DECLARE
     v_found boolean;
     v_revoked timestamptz;
     v_refusal text;
+    v_old bigint;
     v_conn bigint;
 BEGIN
     IF p_node_id IS NULL THEN
@@ -216,37 +243,88 @@ BEGIN
         RETURN QUERY SELECT NULL::bigint, v_refusal;
         RETURN;
     END IF;
-    UPDATE gw.node_connection c SET closed_at = now(), close_reason = 'superseded'
-        WHERE c.node_id = p_node_id AND c.closed_at IS NULL;
+    SELECT c.id INTO v_old FROM gw.node_connection c
+        WHERE c.node_id = p_node_id AND c.closed_at IS NULL FOR UPDATE;
+    IF v_old IS NOT NULL THEN
+        UPDATE gw.node_connection c SET closed_at = now(), close_reason = 'superseded'
+            WHERE c.id = v_old;
+        PERFORM audit.append('AGENT', 'gateway', 'node', p_node_id, 'DISCONNECT', NULL, NULL,
+                             'APPLIED', 'superseded', NULL,
+                             jsonb_build_object('node_id', p_node_id, 'conn_id', v_old,
+                                                'reason', 'superseded'));
+    END IF;
     INSERT INTO gw.node_connection (node_id) VALUES (p_node_id) RETURNING id INTO v_conn;
+    PERFORM audit.append('AGENT', 'gateway', 'node', p_node_id, 'CONNECT', NULL, NULL, 'APPLIED',
+                         'connected', NULL,
+                         jsonb_build_object('node_id', p_node_id, 'conn_id', v_conn,
+                                            'superseded_conn_id', v_old));
     RETURN QUERY SELECT v_conn, NULL::text;
 END;
 $$;
 
--- Gateway: close a connection with a reason code. Closing a closed connection changes nothing.
-CREATE FUNCTION gw.close_connection(p_conn_id bigint, p_reason text) RETURNS void
+-- Gateway: close a connection with a reason code. True when it closed it; false, with no
+-- second DISCONNECT, when it was already closed (also after a revocation, which closes it).
+CREATE FUNCTION gw.close_connection(p_conn_id bigint, p_reason text) RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_node uuid;
+    v_closed timestamptz;
 BEGIN
     IF p_conn_id IS NULL OR p_reason IS NULL OR p_reason !~ '^[a-z][a-z0-9_]{0,63}$' THEN
         RAISE EXCEPTION 'malformed close_connection call' USING ERRCODE = 'invalid_parameter_value';
     END IF;
+    SELECT c.node_id INTO v_node FROM gw.node_connection c WHERE c.id = p_conn_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'unknown connection' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    PERFORM 1 FROM gw.node n WHERE n.id = v_node FOR SHARE;
+    SELECT c.closed_at INTO v_closed FROM gw.node_connection c WHERE c.id = p_conn_id FOR UPDATE;
+    IF v_closed IS NOT NULL THEN
+        RETURN false;
+    END IF;
     UPDATE gw.node_connection c SET closed_at = now(), close_reason = p_reason
-        WHERE c.id = p_conn_id AND c.closed_at IS NULL;
+        WHERE c.id = p_conn_id;
+    PERFORM audit.append('AGENT', 'gateway', 'node', v_node, 'DISCONNECT', NULL, NULL, 'APPLIED',
+                         p_reason, NULL,
+                         jsonb_build_object('node_id', v_node, 'conn_id', p_conn_id,
+                                            'reason', p_reason));
+    RETURN true;
 END;
 $$;
 
--- Gateway: the heartbeat. Only an open, unfenced connection can touch anything.
+-- Gateway: the heartbeat. Takes its stronger locks from the start (no share lock to upgrade),
+-- and repeats both fence conditions in its own updates. Not audited.
 CREATE FUNCTION gw.touch_connection(p_conn_id bigint) RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
-    v_node uuid := gw.current_node(p_conn_id);
+    v_node uuid;
 BEGIN
-    UPDATE gw.node n SET last_seen_at = now() WHERE n.id = v_node;
-    UPDATE gw.node_connection c SET last_ping_at = now() WHERE c.id = p_conn_id;
+    IF p_conn_id IS NULL THEN
+        RAISE EXCEPTION 'malformed touch_connection call' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    SELECT c.node_id INTO v_node FROM gw.node_connection c WHERE c.id = p_conn_id;
+    IF FOUND THEN
+        PERFORM 1 FROM gw.node n WHERE n.id = v_node AND n.revoked_at IS NULL
+            FOR NO KEY UPDATE;
+    END IF;
+    IF FOUND THEN
+        PERFORM 1 FROM gw.node_connection c WHERE c.id = p_conn_id AND c.closed_at IS NULL
+            FOR NO KEY UPDATE;
+    END IF;
+    IF FOUND THEN
+        UPDATE gw.node n SET last_seen_at = now() WHERE n.id = v_node AND n.revoked_at IS NULL;
+    END IF;
+    IF FOUND THEN
+        UPDATE gw.node_connection c SET last_ping_at = now()
+            WHERE c.id = p_conn_id AND c.closed_at IS NULL;
+    END IF;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'connection_fenced' USING ERRCODE = 'JF001';
+    END IF;
 END;
 $$;
 
--- Core: revoke a node and close its open connection, which fences it at once.
+-- Core: revoke a node and close its open connections, which fences them at once.
 CREATE FUNCTION gw.revoke_node(p_node_id uuid)
 RETURNS TABLE (applied boolean, refusal text)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
@@ -255,6 +333,7 @@ DECLARE
     v_found boolean;
     v_revoked timestamptz;
     v_refusal text;
+    v_conn bigint;
 BEGIN
     IF p_node_id IS NULL THEN
         RAISE EXCEPTION 'malformed revoke_node call' USING ERRCODE = 'invalid_parameter_value';
@@ -273,10 +352,19 @@ BEGIN
         RETURN;
     END IF;
     UPDATE gw.node n SET revoked_at = now() WHERE n.id = p_node_id;
-    UPDATE gw.node_connection c SET closed_at = now(), close_reason = 'revoked'
-        WHERE c.node_id = p_node_id AND c.closed_at IS NULL;
     PERFORM audit.append('AGENT', 'core', 'node', p_node_id, 'REVOKE', NULL, NULL, 'APPLIED',
                          'revoked', NULL, '{}'::jsonb);
+    FOR v_conn IN
+        SELECT c.id FROM gw.node_connection c
+            WHERE c.node_id = p_node_id AND c.closed_at IS NULL ORDER BY c.id FOR UPDATE
+    LOOP
+        UPDATE gw.node_connection c SET closed_at = now(), close_reason = 'revoked'
+            WHERE c.id = v_conn;
+        PERFORM audit.append('AGENT', 'core', 'node', p_node_id, 'DISCONNECT', NULL, NULL,
+                             'APPLIED', 'revoked', NULL,
+                             jsonb_build_object('node_id', p_node_id, 'conn_id', v_conn,
+                                                'reason', 'revoked'));
+    END LOOP;
     RETURN QUERY SELECT true, NULL::text;
 END;
 $$;
@@ -298,7 +386,7 @@ GRANT EXECUTE ON FUNCTION gw.touch_connection(bigint) TO jarvis_gateway;
 GRANT EXECUTE ON FUNCTION gw.current_node(bigint) TO jarvis_gateway;
 """
 
-NEW_ACTIONS = ("ENROL_CREATE", "ENROL", "REVOKE", "CONNECT_REFUSED")
+NEW_ACTIONS = ("ENROL_CREATE", "ENROL", "REVOKE", "CONNECT_REFUSED", "CONNECT", "DISCONNECT")
 
 
 def upgrade() -> None:

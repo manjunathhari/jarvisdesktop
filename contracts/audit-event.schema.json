@@ -65,7 +65,9 @@
         "ENROL_CREATE",
         "ENROL",
         "REVOKE",
-        "CONNECT_REFUSED"
+        "CONNECT_REFUSED",
+        "CONNECT",
+        "DISCONNECT"
       ]
     },
     "from_state": {

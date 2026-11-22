@@ -68,6 +68,8 @@ class AuditAction(StrEnum):
     ENROL = "ENROL"
     REVOKE = "REVOKE"
     CONNECT_REFUSED = "CONNECT_REFUSED"
+    CONNECT = "CONNECT"
+    DISCONNECT = "DISCONNECT"
 
 
 class AuditOutcome(StrEnum):

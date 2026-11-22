@@ -8,9 +8,12 @@ identities are random test values; the only person is the seeded fictional house
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
+import random
 import secrets
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -497,6 +500,327 @@ def test_at_most_one_open_connection_per_node(app: Conn, gateway: Conn, owner: C
     _open(gateway, node_id)
     with pytest.raises(psycopg.errors.UniqueViolation):
         owner.execute("INSERT INTO gw.node_connection (node_id) VALUES (%s)", (node_id,))
+
+
+# --- strict fencing (R8-1): races in both orders, one lock order ------------------------------
+
+NIL = uuid.UUID(int=0)
+
+
+class _InThread:
+    """Run `fn(conn)` on a new autocommit connection in a thread; keep its pid and outcome."""
+
+    def __init__(self, dsn: str, fn: Any) -> None:
+        self.pid: int | None = None
+        self.result: Any = None
+        self.error: BaseException | None = None
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(dsn, fn))
+        self._thread.start()
+        assert self._ready.wait(10)
+
+    def _run(self, dsn: str, fn: Any) -> None:
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            self.pid = conn.info.backend_pid
+            self._ready.set()
+            try:
+                self.result = fn(conn)
+            except BaseException as e:
+                self.error = e
+
+    def join(self) -> None:
+        self._thread.join(15)
+        assert not self._thread.is_alive()
+
+
+def _wait_until_lock_blocked(ndb: Dsns, pid: int | None) -> None:
+    """Proves a real lock wait (pg_stat_activity), not a sleep."""
+    with psycopg.connect(ndb.superuser, autocommit=True) as su:
+        for _ in range(400):
+            row = su.execute(
+                "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s", (pid,)
+            ).fetchone()
+            if row is not None and row[0] == "Lock":
+                return
+            time.sleep(0.025)
+    pytest.fail(f"backend {pid} never waited on a lock")
+
+
+def _conn_row(app: Conn, conn_id: int) -> tuple[Any, ...]:
+    row = app.execute(
+        "SELECT closed_at IS NOT NULL, close_reason, last_ping_at FROM gw.node_connection"
+        " WHERE id = %s",
+        (conn_id,),
+    ).fetchone()
+    assert row is not None
+    return tuple(row)
+
+
+def test_revoke_wins_heartbeat_refused(app: Conn, gateway: Conn, ndb: Dsns) -> None:
+    node_id = _node(app, gateway)
+    conn_id = _open(gateway, node_id)
+    with psycopg.connect(ndb.app) as holder:  # revoke_node, transaction held open
+        holder.execute("SELECT * FROM gw.revoke_node(%s)", (node_id,))
+        touch = _InThread(
+            ndb.gateway, lambda c: c.execute("SELECT gw.touch_connection(%s)", (conn_id,))
+        )
+        _wait_until_lock_blocked(ndb, touch.pid)
+        holder.commit()
+    touch.join()
+    assert isinstance(touch.error, psycopg.Error) and touch.error.sqlstate == FENCED_SQLSTATE
+    assert _node_row(app, node_id)["last_seen_at"] is None
+    assert _conn_row(app, conn_id) == (True, "revoked", None)
+
+
+def test_heartbeat_wins_revoke_waits(app: Conn, gateway: Conn, ndb: Dsns) -> None:
+    node_id = _node(app, gateway)
+    conn_id = _open(gateway, node_id)
+    with psycopg.connect(ndb.gateway) as holder:  # touch_connection, transaction held open
+        holder.execute("SELECT gw.touch_connection(%s)", (conn_id,))
+        revoke = _InThread(ndb.app, lambda c: nodes.revoke(c, node_id))
+        _wait_until_lock_blocked(ndb, revoke.pid)
+        holder.commit()
+    revoke.join()
+    assert revoke.error is None
+    node = _node_row(app, node_id)
+    assert node["revoked_at"] is not None and node["last_seen_at"] is not None
+    closed, reason, ping = _conn_row(app, conn_id)
+    assert (closed, reason) == (True, "revoked") and ping is not None
+
+
+def test_supersede_wins_write_refused(app: Conn, gateway: Conn, ndb: Dsns) -> None:
+    node_id = _node(app, gateway)
+    old = _open(gateway, node_id)
+    with psycopg.connect(ndb.gateway) as holder:  # open_connection(new), held open
+        row = holder.execute("SELECT conn_id FROM gw.open_connection(%s)", (node_id,)).fetchone()
+        assert row is not None
+        write = _InThread(
+            ndb.gateway, lambda c: c.execute("SELECT gw.current_node(%s)", (old,)).fetchone()
+        )
+        _wait_until_lock_blocked(ndb, write.pid)
+        holder.commit()
+    write.join()
+    assert isinstance(write.error, psycopg.Error) and write.error.sqlstate == FENCED_SQLSTATE
+    with pytest.raises(psycopg.Error) as e:
+        gateway.execute("SELECT gw.current_node(%s)", (old,))
+    assert e.value.sqlstate == FENCED_SQLSTATE
+
+
+def test_write_wins_supersede_waits(app: Conn, gateway: Conn, ndb: Dsns) -> None:
+    node_id = _node(app, gateway)
+    old = _open(gateway, node_id)
+    with psycopg.connect(ndb.gateway) as holder:  # a write's fence: current_node(old), held
+        row = holder.execute("SELECT gw.current_node(%s)", (old,)).fetchone()
+        assert row == (node_id,)
+        opener = _InThread(
+            ndb.gateway,
+            lambda c: c.execute(
+                "SELECT conn_id, refusal FROM gw.open_connection(%s)", (node_id,)
+            ).fetchone(),
+        )
+        _wait_until_lock_blocked(ndb, opener.pid)
+        assert _conn_row(app, old)[0] is False  # the old connection is still open meanwhile
+        holder.commit()
+    opener.join()
+    assert opener.error is None and opener.result[1] is None
+    assert _conn_row(app, old)[:2] == (True, "superseded")
+
+
+def test_no_deadlock_under_mixed_load(app: Conn, gateway: Conn, ndb: Dsns) -> None:
+    lock = threading.Lock()
+    node_ids = [_node(app, gateway) for _ in range(2)]
+    current: dict[uuid.UUID, int] = {n: _open(gateway, n) for n in node_ids}
+    all_nodes = list(node_ids)
+    failures: list[BaseException] = []
+
+    def worker(seed: int) -> None:
+        rnd = random.Random(seed)  # noqa: S311  # a reproducible test load, not crypto
+        with (
+            psycopg.connect(ndb.gateway, autocommit=True) as gw_conn,
+            psycopg.connect(ndb.app, autocommit=True) as app_conn,
+        ):
+            for _ in range(200):
+                with lock:
+                    slot = rnd.randrange(len(node_ids))
+                    node_id = node_ids[slot]
+                    conn_id = current.get(node_id, 0)
+                op = rnd.choices(
+                    ["touch", "close", "open", "revoke", "current"], [40, 10, 15, 2, 33]
+                )[0]
+                try:
+                    if op == "touch":
+                        gw_conn.execute("SELECT gw.touch_connection(%s)", (conn_id,))
+                    elif op == "close":
+                        gw_conn.execute("SELECT gw.close_connection(%s, 'node_closed')", (conn_id,))
+                    elif op == "open":
+                        row = gw_conn.execute(
+                            "SELECT conn_id FROM gw.open_connection(%s)", (node_id,)
+                        ).fetchone()
+                        if row is not None and row[0] is not None:
+                            with lock:
+                                current[node_id] = int(row[0])
+                    elif op == "revoke":
+                        with contextlib.suppress(RevokeRefused):
+                            nodes.revoke(app_conn, node_id)
+                        new = nodes.enrol(
+                            gw_conn,
+                            token=_token(app_conn),
+                            public_key=_key(),
+                            tailscale_identity=_ts(),
+                        )
+                        with lock:
+                            node_ids[slot] = new
+                            all_nodes.append(new)
+                    else:
+                        with gw_conn.transaction():
+                            gw_conn.execute("SELECT gw.current_node(%s)", (conn_id,))
+                            time.sleep(0.001)  # hold the fence briefly, like a real write
+                except psycopg.Error as e:
+                    if e.sqlstate not in (FENCED_SQLSTATE, "22023"):  # fenced or unknown conn
+                        failures.append(e)
+                except BaseException as e:
+                    failures.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(120)
+    assert not any(t.is_alive() for t in threads)
+    assert failures == []
+    # Final state: one open connection at most per node, none on a revoked node, and the
+    # permanent audit agrees with the connection rows.
+    bad = app.execute(
+        "SELECT count(*) FROM gw.node_connection c JOIN gw.node n ON n.id = c.node_id"
+        " WHERE n.id = ANY(%s) AND c.closed_at IS NULL AND n.revoked_at IS NOT NULL",
+        (all_nodes,),
+    ).fetchone()
+    assert bad == (0,)
+    counts = app.execute(
+        "SELECT (SELECT count(*) FROM gw.node_connection WHERE node_id = ANY(%(n)s)),"
+        " (SELECT count(*) FROM gw.node_connection WHERE node_id = ANY(%(n)s)"
+        "  AND closed_at IS NOT NULL),"
+        " (SELECT count(*) FROM audit.event WHERE action = 'CONNECT'"
+        "  AND entity_id = ANY(%(n)s)),"
+        " (SELECT count(*) FROM audit.event WHERE action = 'DISCONNECT'"
+        "  AND entity_id = ANY(%(n)s))",
+        {"n": all_nodes},
+    ).fetchone()
+    assert counts is not None and counts[0] == counts[2] and counts[1] == counts[3]
+
+
+def test_gw_connection_functions_do_not_call_current_node(owner: Conn) -> None:
+    for signature in (
+        "gw.open_connection(uuid)",
+        "gw.close_connection(bigint,text)",
+        "gw.touch_connection(bigint)",
+        "gw.enrol_node(text,bytea,text)",
+    ):
+        row = owner.execute(
+            "SELECT prosrc FROM pg_proc WHERE oid = %s::regprocedure", (signature,)
+        ).fetchone()
+        assert row is not None and "current_node" not in row[0], signature
+
+
+# --- connection audit (R8-2) ---------------------------------------------------------------
+
+
+def _audit_rows(app: Conn, since: int) -> list[tuple[Any, ...]]:
+    return app.execute(
+        "SELECT action::text, outcome::text, reason, entity_id, details FROM audit.event"
+        " WHERE seq > %s AND entity_type = 'node' ORDER BY seq",
+        (since,),
+    ).fetchall()
+
+
+def test_connect_disconnect_audited(app: Conn, gateway: Conn) -> None:
+    node_id = _node(app, gateway)
+    n = str(node_id)
+    since = _seq(app)
+    first = _open(gateway, node_id)
+    gateway.execute("SELECT gw.touch_connection(%s)", (first,))  # heartbeats aren't audited
+    second = _open(gateway, node_id)
+    row = gateway.execute("SELECT gw.close_connection(%s, 'node_closed')", (second,)).fetchone()
+    assert row == (True,)
+    third = _open(gateway, node_id)
+    nodes.revoke(app, node_id)
+    rows = _audit_rows(app, since)
+    assert [(r[0], r[1], r[2], r[3]) for r in rows] == [
+        ("CONNECT", "APPLIED", "connected", node_id),
+        ("DISCONNECT", "APPLIED", "superseded", node_id),
+        ("CONNECT", "APPLIED", "connected", node_id),
+        ("DISCONNECT", "APPLIED", "node_closed", node_id),
+        ("CONNECT", "APPLIED", "connected", node_id),
+        ("REVOKE", "APPLIED", "revoked", node_id),
+        ("DISCONNECT", "APPLIED", "revoked", node_id),
+    ]
+    assert [r[4] for r in rows] == [
+        {"node_id": n, "conn_id": first, "superseded_conn_id": None},
+        {"node_id": n, "conn_id": first, "reason": "superseded"},
+        {"node_id": n, "conn_id": second, "superseded_conn_id": first},
+        {"node_id": n, "conn_id": second, "reason": "node_closed"},
+        {"node_id": n, "conn_id": third, "superseded_conn_id": None},
+        {},
+        {"node_id": n, "conn_id": third, "reason": "revoked"},
+    ]
+
+
+def test_connection_audit_outlives_connection_rows(app: Conn, gateway: Conn, owner: Conn) -> None:
+    node_id = _node(app, gateway)
+    since = _seq(app)
+    _open(gateway, node_id)
+    _open(gateway, node_id)
+    owner.execute("DELETE FROM gw.node_connection WHERE node_id = %s", (node_id,))  # retention
+    assert [r[0] for r in _audit_rows(app, since)] == ["CONNECT", "DISCONNECT", "CONNECT"]
+
+
+def test_close_connection_twice_is_noop(app: Conn, gateway: Conn) -> None:
+    conn_id = _open(gateway, _node(app, gateway))
+    since = _seq(app)
+    results = [
+        gateway.execute("SELECT gw.close_connection(%s, 'node_closed')", (conn_id,)).fetchone()
+        for _ in range(2)
+    ]
+    assert results == [(True,), (False,)]
+    assert [r[0] for r in _audit_rows(app, since)] == ["DISCONNECT"]
+
+
+def test_close_after_revoke_allowed(app: Conn, gateway: Conn) -> None:
+    node_id = _node(app, gateway)
+    conn_id = _open(gateway, node_id)
+    nodes.revoke(app, node_id)
+    since = _seq(app)
+    row = gateway.execute("SELECT gw.close_connection(%s, 'node_closed')", (conn_id,)).fetchone()
+    assert row == (False,)
+    assert _audit_rows(app, since) == []
+    assert _conn_row(app, conn_id)[:2] == (True, "revoked")
+
+
+def test_refused_enrolment_audit_uses_enrolment_id(app: Conn, gateway: Conn, owner: Conn) -> None:
+    used = _token(app)
+    nodes.enrol(gateway, token=used, public_key=_key(), tailscale_identity=_ts())
+    expired = _token(app)
+    owner.execute(
+        "UPDATE gw.enrolment SET expires_at = now() - interval '1 second' WHERE id = %s",
+        (_enrolment(app, expired)[0],),
+    )
+    since = _seq(app)
+    for token in (used, expired, "a" * 26):
+        with pytest.raises(EnrolmentRefused, match="bad_token"):
+            nodes.enrol(gateway, token=token, public_key=_key(), tailscale_identity=_ts())
+    assert [r[3] for r in _audit_rows(app, since)] == [
+        _enrolment(app, used)[0],
+        _enrolment(app, expired)[0],
+        NIL,
+    ]
+
+
+def test_token_length_checked(app: Conn, gateway: Conn) -> None:
+    since = _seq(app)
+    for token in ("a" * 25, "a" * 27):
+        with pytest.raises(psycopg.errors.InvalidParameterValue):
+            gateway.execute("SELECT * FROM gw.enrol_node(%s, %s, %s)", (token, _key(), _ts()))
+    assert _audit_rows(app, since) == []
 
 
 # --- the gateway's privileges (P2-S6) ----------------------------------------------------------
