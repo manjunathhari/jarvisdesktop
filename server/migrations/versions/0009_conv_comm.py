@@ -23,6 +23,9 @@
   malformed call raises invalid_parameter_value.
 - audit.event: entity types 'inbound', 'outbox' and 'stream'; actions INBOUND, SEND, RECEIVE,
   ACK, SUPERSEDE, EXPIRE and CHUNK_RECEIVE. Rows carry codes and IDs only.
+- gw.record_clock_skew, 0008's internal stub, becomes the recorder of event node.clock_skew
+  (R12-4): CREATE OR REPLACE with the same signature, so its owner and its grants (none) stay.
+  It writes no outbox item, no job and no NOTIFY. The downgrade restores the stub.
 
 The trigger functions comm.refuse_change and comm.outbox_guard have PUBLIC EXECUTE revoked
 like every other function here.
@@ -248,6 +251,22 @@ GRANT SELECT ON conv.stream_chunk, conv.stream_cursor, comm.outbox, comm.deliver
 """
 
 FUNCTIONS = r"""
+-- Internal (R12-4), called only by gw.open_connection after its CONNECT row, for a skew above
+-- the 30 s tolerance. The person comes from the node row; details are codes and IDs only.
+CREATE OR REPLACE FUNCTION gw.record_clock_skew(p_node_id uuid, p_skew_ms bigint) RETURNS void
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    INSERT INTO comm.event (kind, subject_type, subject_id, person_id, details)
+        SELECT 'node.clock_skew', 'node', n.id::text, n.person_id,
+               jsonb_build_object('node_id', n.id::text, 'skew_ms', p_skew_ms::text)
+        FROM gw.node n WHERE n.id = p_node_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'malformed record_clock_skew call'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+END;
+$$;
+
 -- Gateway: one message from a node (§6.2). The node and person come from the connection, never
 -- from the message. A resend of the same message_id by the same node is a no-op, (false, NULL);
 -- one already recorded by a different node is refused, (false, 'id_conflict') (R9-4).
@@ -623,6 +642,16 @@ def downgrade() -> None:
                             '(ADR-008)';
         END IF;
     END $$;
+    """)
+    # 0008's stub again: same signature, so owner and grants stay (R12-4).
+    op.execute("""
+    CREATE OR REPLACE FUNCTION gw.record_clock_skew(p_node_id uuid, p_skew_ms bigint)
+    RETURNS void
+    LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $$
+    BEGIN
+        RETURN;
+    END;
+    $$;
     """)
     op.execute(f"""
     DROP FUNCTION comm.expire(uuid);

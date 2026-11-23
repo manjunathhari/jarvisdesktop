@@ -1239,10 +1239,11 @@ GATEWAY_NODE_COLUMNS = {
 }
 GATEWAY_EXECUTE = {
     "gw.enrol_node(text,bytea,text)",
-    "gw.open_connection(uuid)",
+    "gw.open_connection(uuid,bigint)",
     "gw.close_connection(bigint,text)",
     "gw.touch_connection(bigint)",
     "gw.current_node(bigint)",
+    "gw.refuse_handshake(text,text,uuid)",
 } | CONN_FUNCTIONS
 
 
@@ -1305,6 +1306,91 @@ def test_gateway_has_no_memory_function_or_table(gateway: Conn, owner: Conn) -> 
             (signature,),
         ).fetchone()
         assert row == (True, ["jarvis_app"]), signature
+
+
+# --- clock skew computed by the gateway (R12-4) -------------------------------------------------
+
+OPEN_SKEW = "SELECT conn_id, refusal FROM gw.open_connection(%s, %s)"
+
+
+def _skew_events(conn: Conn, node_id: uuid.UUID) -> list[tuple[Any, ...]]:
+    return conn.execute(
+        "SELECT subject_type, person_id, details FROM comm.event"
+        " WHERE kind = 'node.clock_skew' AND subject_id = %s ORDER BY occurred_at",
+        (str(node_id),),
+    ).fetchall()
+
+
+def _node_audit(conn: Conn, since: int) -> list[tuple[Any, ...]]:
+    return conn.execute(
+        "SELECT action::text, reason, details FROM audit.event"
+        " WHERE seq > %s AND entity_type = 'node' ORDER BY seq",
+        (since,),
+    ).fetchall()
+
+
+def _side_effects(conn: Conn) -> tuple[int, int]:
+    return (
+        _one(conn, "SELECT count(*) FROM comm.outbox", ()),
+        _one(conn, "SELECT count(*) FROM ops.job", ()),
+    )
+
+
+def test_open_connection_records_clock_skew(gateway: Conn, app: Conn) -> None:
+    person = _person(app)  # the person comes from the node row, never from the caller
+    node_id = _node(app, gateway, person)
+    n = str(node_id)
+    effects = _side_effects(app)
+    for skew in (45210, -45210):
+        since = _seq(app)
+        row = gateway.execute(OPEN_SKEW, (node_id, skew)).fetchone()
+        assert row is not None and row[1] is None
+        connect = _node_audit(app, since)[-1]  # after any superseded connection's DISCONNECT
+        assert connect[:2] == ("CONNECT", "connected") and connect[2]["conn_id"] == row[0]
+    assert _skew_events(app, node_id) == [
+        ("node", person, {"node_id": n, "skew_ms": "45210"}),
+        ("node", person, {"node_id": n, "skew_ms": "-45210"}),
+    ]
+    for skew in (30000, -30000, None):  # within the 30 s tolerance, or not given
+        row = gateway.execute(OPEN_SKEW, (node_id, skew)).fetchone()
+        assert row is not None and row[1] is None
+    assert len(_skew_events(app, node_id)) == 2
+    assert _side_effects(app) == effects  # no outbox item, no job
+    src = _one(
+        app,
+        "SELECT prosrc FROM pg_proc WHERE oid = %s::regprocedure",
+        ("gw.record_clock_skew(uuid,bigint)",),
+    )
+    assert "notify" not in src.lower()
+
+
+def test_open_connection_skew_is_atomic(dsns: Dsns) -> None:
+    with (
+        psycopg.connect(dsns.app, autocommit=True) as app,
+        psycopg.connect(dsns.gateway, autocommit=True) as gateway,
+    ):
+        node_id = _node(app, gateway)
+        since = _seq(app)
+        with psycopg.connect(dsns.gateway) as tx:  # an explicit transaction, rolled back
+            row = tx.execute(OPEN_SKEW, (node_id, 45210)).fetchone()
+            assert row is not None and row[1] is None
+            tx.rollback()
+        assert _one(app, "SELECT count(*) FROM gw.node_connection WHERE id = %s", (row[0],)) == 0
+        assert _node_audit(app, since) == []
+        assert _skew_events(app, node_id) == []
+
+
+def test_open_connection_skew_bounds(gateway: Conn, app: Conn) -> None:
+    node_id = _node(app, gateway)
+    since = _seq(app)
+    for skew in (10**12 + 1, -(10**12) - 1, 2**63 - 1, -(2**63)):
+        with pytest.raises(psycopg.errors.InvalidParameterValue):
+            gateway.execute(OPEN_SKEW, (node_id, skew))
+    assert _one(app, "SELECT count(*) FROM gw.node_connection WHERE node_id = %s", (node_id,)) == 0
+    assert _node_audit(app, since) == []
+    row = gateway.execute(OPEN_SKEW, (node_id, -(10**12))).fetchone()  # the clamp itself is valid
+    assert row is not None and row[1] is None
+    assert [r[2]["skew_ms"] for r in _skew_events(app, node_id)] == ["-1000000000000"]
 
 
 # --- migration 0009 rollback -------------------------------------------------------------------
@@ -1398,3 +1484,43 @@ def test_thread_helper_propagates_errors(dsns: Dsns) -> None:
 
     with pytest.raises(RuntimeError, match="worker failed"):
         run_all([boom, lambda: None], timeout=10)
+
+
+def test_0009_downgrade_restores_skew_stub() -> None:
+    with fresh_database() as d:
+        migrate.downgrade(d.owner, "0008")
+        with (
+            psycopg.connect(d.app, autocommit=True) as app,
+            psycopg.connect(d.gateway, autocommit=True) as gateway,
+            psycopg.connect(d.owner, autocommit=True) as owner,
+        ):
+            assert _one(owner, "SELECT to_regclass('comm.event')", ()) is None
+            node_id = _node(app, gateway)
+            row = gateway.execute(OPEN_SKEW, (node_id, 45210)).fetchone()
+            assert row is not None and row[1] is None  # the stub writes nothing, and works
+            stub_acl = _one(
+                owner,
+                "SELECT proacl::text FROM pg_proc WHERE oid = %s::regprocedure",
+                ("gw.record_clock_skew(uuid,bigint)",),
+            )
+        migrate.upgrade(d.owner, "head")
+        with (
+            psycopg.connect(d.app, autocommit=True) as app,
+            psycopg.connect(d.gateway, autocommit=True) as gateway,
+            psycopg.connect(d.owner, autocommit=True) as owner,
+        ):
+            assert _skew_events(app, node_id) == []
+            row = gateway.execute(OPEN_SKEW, (node_id, 45210)).fetchone()
+            assert row is not None and row[1] is None
+            assert [r[2] for r in _skew_events(app, node_id)] == [
+                {"node_id": str(node_id), "skew_ms": "45210"}
+            ]
+            # CREATE OR REPLACE kept the owner and the (empty) grants.
+            assert (
+                _one(
+                    owner,
+                    "SELECT proacl::text FROM pg_proc WHERE oid = %s::regprocedure",
+                    ("gw.record_clock_skew(uuid,bigint)",),
+                )
+                == stub_acl
+            )

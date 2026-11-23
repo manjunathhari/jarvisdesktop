@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -46,12 +47,21 @@ GFP = fingerprint(bytes(range(32, 64)))
 
 ACTIONS_0007 = ["CREATE", "TRANSITION", "UPDATE", "CONFIRM", "ARCHIVE"]
 
-GATEWAY_FUNCTIONS = {
+# The gateway's six gw functions (spec R12-2; R7-3 listed five).
+GATEWAY_GW_FUNCTIONS = {
     "gw.enrol_node(text,bytea,text)",
-    "gw.open_connection(uuid)",
+    "gw.open_connection(uuid,bigint)",
     "gw.close_connection(bigint,text)",
     "gw.touch_connection(bigint)",
     "gw.current_node(bigint)",
+    "gw.refuse_handshake(text,text,uuid)",
+}
+# Internal to the owner's SECURITY DEFINER functions: executable by nobody (R12-3, R12-4).
+INTERNAL_GW_FUNCTIONS = (
+    "gw.tally_refusal(text,text,text,uuid,uuid,uuid,jsonb)",
+    "gw.record_clock_skew(uuid,bigint)",
+)
+GATEWAY_FUNCTIONS = GATEWAY_GW_FUNCTIONS | {
     # Migration 0009 (Task 3): the conv and comm connection functions (§4.1).
     "conv.record_inbound(bigint,uuid,text,jsonb)",
     "comm.record_sent(bigint,uuid)",
@@ -83,6 +93,23 @@ def owner(ndb: Dsns) -> Iterator[Conn]:
 def gateway(ndb: Dsns) -> Iterator[Conn]:
     with psycopg.connect(ndb.gateway, autocommit=True) as conn:
         yield conn
+
+
+@pytest.fixture(autouse=True)
+def _empty_refusal_tally(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Every database test starts with an empty refusal tally and a fresh window, so the
+    global ceiling of 30 audit rows per window (R12-3), shared by the whole module database,
+    never decides another test's outcome."""
+    if "ndb" in request.fixturenames:
+        ndb: Dsns = request.getfixturevalue("ndb")
+        with psycopg.connect(ndb.owner, autocommit=True) as conn:
+            row = conn.execute("SELECT to_regclass('gw.refusal_window')").fetchone()
+            if row is not None and row[0] is not None:
+                conn.execute("DELETE FROM gw.refusal_tally")
+                conn.execute(
+                    "UPDATE gw.refusal_window SET window_start = '2000-01-01 00:00+00', audited = 0"
+                )
+    yield
 
 
 def _key() -> bytes:
@@ -176,7 +203,8 @@ def test_token_reuse_refused_and_audited(app: Conn, gateway: Conn, ndb: Dsns) ->
     enrolment_id = _enrolment(app, token)[0]
     rows = _audit_seen_elsewhere(ndb.app, since)
     assert [(r[0], r[1], r[2]) for r in rows] == [("ENROL", "REJECTED", "bad_token")]
-    assert rows[0][4] == {"enrolment_id": str(enrolment_id)}
+    # The refusal tally adds the key's suppressed count (R12-3).
+    assert rows[0][4] == {"enrolment_id": str(enrolment_id), "suppressed": "0"}
     assert app.execute("SELECT count(*) FROM gw.node WHERE id = %s", (first,)).fetchone() == (1,)
 
 
@@ -708,10 +736,12 @@ def test_unknown_connection_is_fenced_everywhere(app: Conn, gateway: Conn) -> No
 
 def test_gw_connection_functions_do_not_call_current_node(owner: Conn) -> None:
     for signature in (
-        "gw.open_connection(uuid)",
+        "gw.open_connection(uuid,bigint)",
         "gw.close_connection(bigint,text)",
         "gw.touch_connection(bigint)",
         "gw.enrol_node(text,bytea,text)",
+        "gw.refuse_handshake(text,text,uuid)",
+        "gw.tally_refusal(text,text,text,uuid,uuid,uuid,jsonb)",
     ):
         row = owner.execute(
             "SELECT prosrc FROM pg_proc WHERE oid = %s::regprocedure", (signature,)
@@ -924,9 +954,10 @@ def test_gateway_has_no_write_privilege_anywhere(owner: Conn) -> None:
     assert granted == []
 
 
-def test_gateway_execute_surface_is_exactly_the_spec_list(owner: Conn) -> None:
+def test_gateway_execute_surface_is_exactly_six(owner: Conn) -> None:
     """Every non-system, non-trigger function. Trigger functions are excluded: they can only
-    run as triggers, never be called."""
+    run as triggers, never be called. In gw, exactly the six of R12-2; elsewhere, only the
+    0009 connection functions."""
     rows = owner.execute(
         "SELECT p.oid::regprocedure::text FROM pg_proc p"
         " JOIN pg_namespace n ON n.oid = p.pronamespace"
@@ -936,6 +967,8 @@ def test_gateway_execute_surface_is_exactly_the_spec_list(owner: Conn) -> None:
         (GATEWAY_ROLE,),
     ).fetchall()
     assert {r[0].replace(" ", "") for r in rows} == GATEWAY_FUNCTIONS
+    gw_only = {r[0].replace(" ", "") for r in rows if r[0].startswith("gw.")}
+    assert gw_only == GATEWAY_GW_FUNCTIONS and len(gw_only) == 6
     # Each is SECURITY DEFINER, owned by jarvis_owner, and executable by exactly one role.
     for signature in GATEWAY_FUNCTIONS:
         row = owner.execute(
@@ -956,6 +989,25 @@ def test_gateway_execute_surface_is_exactly_the_spec_list(owner: Conn) -> None:
             (signature,),
         ).fetchone()
         assert row == (True, ["jarvis_app"]), signature
+    # The tally and the skew recorder: SECURITY INVOKER, owned by jarvis_owner, fixed
+    # search_path, and no EXECUTE for anyone but the owner (not PUBLIC, app or gateway).
+    for signature in INTERNAL_GW_FUNCTIONS:
+        row = owner.execute(
+            "SELECT p.prosecdef, pg_get_userbyid(p.proowner), p.proconfig,"
+            " (SELECT array_agg(a.grantee::regrole::text) FROM aclexplode(p.proacl) a"
+            "  WHERE a.grantee <> p.proowner)"
+            " FROM pg_proc p WHERE p.oid = %s::regprocedure",
+            (signature,),
+        ).fetchone()
+        assert row == (False, "jarvis_owner", ["search_path=pg_catalog, pg_temp"], None), signature
+        assert owner.execute(
+            "SELECT p.proacl IS NOT NULL FROM pg_proc p WHERE p.oid = %s::regprocedure",
+            (signature,),
+        ).fetchone() == (True,), signature  # NULL would mean the default PUBLIC EXECUTE
+        for role in ("jarvis_app", GATEWAY_ROLE):
+            assert owner.execute(
+                "SELECT has_function_privilege(%s, %s, 'EXECUTE')", (role, signature)
+            ).fetchone() == (False,), (role, signature)
 
 
 # --- P2-S6 catalogue tests (cover every later migration too) -----------------------------------
@@ -1010,6 +1062,283 @@ def test_no_function_in_jarvis_schemas_executable_by_public(owner: Conn) -> None
     ).fetchone()
     assert triggers is not None and triggers[0] > 0
     assert [r[0] for r in rows] == PHASE_0_PUBLIC_TRIGGER_FUNCTIONS
+
+
+# --- handshake refusals and the refusal tally (R12-1 to R12-3; P2-S8) ---------------------------
+
+GATEWAY_CODES = (
+    "not_first",
+    "bad_seq",
+    "bad_nonce",
+    "challenge_expired",
+    "bad_signature",
+    "identity_mismatch",
+    "revoked",
+    "unknown_node",
+    "reenrol_required",
+    "malformed",
+    "unknown_peer",
+)
+REFUSE = "SELECT gw.refuse_handshake(%s, %s, %s)"
+TALLY_KEY = (
+    "(action, code, tailscale_identity, node_id, enrolment_id)"
+    " IS NOT DISTINCT FROM (%s::text, %s::text, %s::text, %s::uuid, %s::uuid)"
+)
+
+
+def _avoid_window_edge(conn: Conn, margin: float = 20.0) -> None:
+    """Tests that count within one 15-minute window must not straddle a real quarter-hour
+    boundary (now() is never mocked): wait for the next window when this one is about to end."""
+    row = conn.execute(
+        "SELECT extract(epoch FROM date_bin('15 minutes', now(), '2000-01-01 00:00+00')"
+        " + interval '15 minutes' - now())"
+    ).fetchone()
+    assert row is not None
+    if float(row[0]) < margin:
+        time.sleep(float(row[0]) + 0.5)
+
+
+def _next_window(owner: Conn) -> None:
+    """As if 15 minutes had passed: the window row and every key's last audited window move
+    back by one window (no clock is mocked)."""
+    owner.execute(
+        "UPDATE gw.refusal_window SET window_start = window_start - interval '15 minutes'"
+    )
+    owner.execute(
+        "UPDATE gw.refusal_tally SET last_audited_window = last_audited_window"
+        " - interval '15 minutes'"
+    )
+
+
+def _refuse(gateway: Conn, code: str | None, ts: str | None = None, node: Any = None) -> str:
+    row = gateway.execute(REFUSE, (code, ts, node)).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+def _tally(
+    conn: Conn,
+    action: str,
+    code: str,
+    ts: str | None = None,
+    node: Any = None,
+    enrolment: Any = None,
+) -> int | None:
+    row = conn.execute(
+        f"SELECT suppressed FROM gw.refusal_tally WHERE {TALLY_KEY}",
+        (action, code, ts, node, enrolment),
+    ).fetchone()
+    return None if row is None else int(row[0])
+
+
+def _count(conn: Conn, query: str, params: tuple[Any, ...] = ()) -> int:
+    row = conn.execute(query, params).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def test_refuse_handshake_records_each_code(app: Conn, gateway: Conn, owner: Conn) -> None:
+    _avoid_window_edge(owner)
+    node_id = _node(app, gateway)
+    before = _node_row(app, node_id)
+    ts = _ts()
+    with_node = {"bad_signature", "revoked", "identity_mismatch", "reenrol_required"}
+    since = _seq(app)
+    for code in GATEWAY_CODES:
+        identity = None if code == "unknown_peer" else ts
+        node = node_id if code in with_node else None
+        assert _refuse(gateway, code, identity, node) == "recorded", code
+    rows = _audit_rows(app, since)
+    assert [(r[0], r[1], r[2]) for r in rows] == [
+        ("CONNECT_REFUSED", "REJECTED", code) for code in GATEWAY_CODES
+    ]
+    for _, _, code, entity_id, details in rows:
+        assert set(details) <= {"node_id", "tailscale_identity", "suppressed"}, code
+        expected: dict[str, str] = {"suppressed": "0"}
+        if code != "unknown_peer":
+            expected["tailscale_identity"] = ts
+        if code in with_node:
+            expected["node_id"] = str(node_id)
+        assert details == expected, code
+        assert entity_id == (node_id if code in with_node else NIL), code
+    assert (
+        _count(app, "SELECT count(*) FROM gw.node_connection WHERE node_id = %s", (node_id,)) == 0
+    )
+    assert _node_row(app, node_id) == before
+
+
+def test_refuse_handshake_rejects_other_codes(app: Conn, gateway: Conn, owner: Conn) -> None:
+    since = _seq(app)
+    for code in ("bad_token", "key_in_use", "identity_in_use", "bogus", None, ""):
+        with pytest.raises(psycopg.errors.InvalidParameterValue):
+            gateway.execute(REFUSE, (code, _ts(), None))
+    assert _audit_rows(app, since) == []
+    assert _count(owner, "SELECT count(*) FROM gw.refusal_tally") == 0
+    assert _count(owner, "SELECT audited FROM gw.refusal_window") == 0
+
+
+def test_refuse_handshake_argument_checks(app: Conn, gateway: Conn, owner: Conn) -> None:
+    since = _seq(app)
+    for code, ts, node in (
+        ("unknown_node", _ts(), uuid.uuid4()),  # an unregistered node is never stored
+        ("malformed", "", None),
+        ("malformed", "x" * 201, None),
+    ):
+        with pytest.raises(psycopg.errors.InvalidParameterValue):
+            gateway.execute(REFUSE, (code, ts, node))
+    assert _audit_rows(app, since) == []
+    assert _count(owner, "SELECT count(*) FROM gw.refusal_tally") == 0
+    assert _refuse(gateway, "malformed", "x" * 200) == "recorded"  # the upper bound is allowed
+
+
+def test_refuse_handshake_takes_no_node_lock(app: Conn, gateway: Conn, ndb: Dsns) -> None:
+    node_id = _node(app, gateway)
+    _open(gateway, node_id)
+    with psycopg.connect(ndb.app) as holder:  # revoke_node: node and connection FOR UPDATE, held
+        holder.execute("SELECT * FROM gw.revoke_node(%s)", (node_id,))
+        with psycopg.connect(ndb.gateway, autocommit=True) as conn:
+            conn.execute("SET lock_timeout = '1s'")
+            assert _refuse(conn, "revoked", _ts(), node_id) == "recorded"
+        holder.rollback()
+    assert _node_row(app, node_id)["revoked_at"] is None
+
+
+def test_refusal_tally_one_row_per_key_per_window(app: Conn, gateway: Conn, owner: Conn) -> None:
+    _avoid_window_edge(owner)
+    node_id = _node(app, gateway)
+    ts = _ts()
+    since = _seq(app)
+    results = [_refuse(gateway, "bad_signature", ts, node_id) for _ in range(500)]
+    assert results[0] == "recorded" and results[1:] == ["counted"] * 499
+    assert len(_audit_rows(app, since)) == 1
+    assert _tally(app, "CONNECT_REFUSED", "bad_signature", ts, node_id) == 499
+    _next_window(owner)
+    since = _seq(app)
+    assert _refuse(gateway, "bad_signature", ts, node_id) == "recorded"
+    rows = _audit_rows(app, since)
+    assert len(rows) == 1 and rows[0][4]["suppressed"] == "499"
+    assert _tally(app, "CONNECT_REFUSED", "bad_signature", ts, node_id) == 0
+
+
+def test_refusal_tally_keys_are_distinct(app: Conn, gateway: Conn, owner: Conn) -> None:
+    _avoid_window_edge(owner)
+    node_id = _node(app, gateway)
+    ts1, ts2 = _ts(), _ts()
+    since = _seq(app)
+    keys: list[tuple[str, str | None, Any]] = [
+        ("malformed", ts1, None),
+        ("bad_nonce", ts1, None),  # another code
+        ("malformed", ts2, None),  # another identity
+        ("malformed", ts1, node_id),  # another node
+        ("unknown_peer", None, None),  # no identity, no node
+    ]
+    assert [_refuse(gateway, *k) for k in keys] == ["recorded"] * 5
+    # Absent values compare as equal (NULLS NOT DISTINCT): repeats are counted.
+    assert [_refuse(gateway, *k) for k in keys] == ["counted"] * 5
+    assert len(_audit_rows(app, since)) == 5
+    assert _count(owner, "SELECT count(*) FROM gw.refusal_tally") == 5
+    for code, ts, node in keys:
+        assert _tally(app, "CONNECT_REFUSED", code, ts, node) == 1
+
+
+def test_refusal_global_ceiling(app: Conn, gateway: Conn, owner: Conn) -> None:
+    _avoid_window_edge(owner)
+    identities = [_ts() for _ in range(40)]
+    since = _seq(app)
+    results = [_refuse(gateway, "bad_signature", ts) for ts in identities]
+    assert results == ["recorded"] * 30 + ["counted"] * 10
+    assert len(_audit_rows(app, since)) == 30
+    assert _count(app, "SELECT audited FROM gw.refusal_window") == 30
+    _next_window(owner)
+    since = _seq(app)
+    assert [_refuse(gateway, "bad_signature", ts) for ts in identities[30:]] == ["recorded"] * 10
+    rows = _audit_rows(app, since)
+    assert [r[4] for r in rows] == [
+        {"tailscale_identity": ts, "suppressed": "1"} for ts in identities[30:]
+    ]
+
+
+def test_refusal_tally_concurrent(app: Conn, owner: Conn, ndb: Dsns) -> None:
+    _avoid_window_edge(owner, margin=60)
+    ts = _ts()
+    since = _seq(app)
+    results: list[str] = []
+    lock = threading.Lock()
+
+    def hammer(identities: list[str]) -> None:
+        with psycopg.connect(ndb.gateway, autocommit=True) as conn:
+            barrier.wait()
+            mine = [_refuse(conn, "bad_nonce", i) for i in identities]
+        with lock:
+            results.extend(mine)
+
+    barrier = threading.Barrier(2)
+    run_all([lambda: hammer([ts] * 50), lambda: hammer([ts] * 50)], timeout=60)
+    assert sorted(results) == ["counted"] * 99 + ["recorded"]
+    assert len(_audit_rows(app, since)) == 1
+    assert _tally(app, "CONNECT_REFUSED", "bad_nonce", ts) == 99
+
+    # Two sessions, the same 40 distinct keys in opposite orders: never more than 30 rows.
+    _next_window(owner)
+    identities = [_ts() for _ in range(40)]
+    results.clear()
+    since = _seq(app)
+    barrier = threading.Barrier(2)
+    run_all(
+        [lambda: hammer(identities), lambda: hammer(identities[::-1])],
+        timeout=60,
+    )
+    assert results.count("recorded") == 30 and results.count("counted") == 50
+    assert len(_audit_rows(app, since)) == 30
+    assert _count(app, "SELECT audited FROM gw.refusal_window") == 30
+    total = _count(
+        app,
+        "SELECT sum(suppressed) FROM gw.refusal_tally WHERE tailscale_identity = ANY(%s)",
+        (identities,),
+    )
+    assert total == 50  # every refusal is either an audit row or counted
+
+
+def test_enrol_refusals_tallied(app: Conn, gateway: Conn, owner: Conn) -> None:
+    _avoid_window_edge(owner)
+    ts = _ts()
+    since = _seq(app)
+    alphabet = "abcdefghijklmnopqrstuvwxyz234567"
+    for _ in range(5):
+        token = "".join(secrets.choice(alphabet) for _ in range(26))  # matches no enrolment
+        row = gateway.execute(
+            "SELECT node_id, refusal FROM gw.enrol_node(%s, %s, %s)", (token, _key(), ts)
+        ).fetchone()
+        assert row == (None, "bad_token")
+    rows = _audit_rows(app, since)
+    assert [(r[0], r[1], r[2], r[3]) for r in rows] == [("ENROL", "REJECTED", "bad_token", NIL)]
+    assert rows[0][4] == {"suppressed": "0"}
+    assert _tally(app, "ENROL", "bad_token", ts) == 4
+
+
+def test_gateway_cannot_touch_tally_or_events(app: Conn, gateway: Conn) -> None:
+    for stmt in (
+        "SELECT * FROM gw.refusal_tally",
+        "SELECT * FROM gw.refusal_window",
+        "INSERT INTO gw.refusal_tally (action, code) VALUES ('ENROL', 'bad_token')",
+        "UPDATE gw.refusal_window SET audited = 0",
+        "INSERT INTO comm.event (kind, subject_type, subject_id) VALUES ('x', 'node', 'x')",
+        "SELECT gw.tally_refusal('ENROL', 'bad_token', NULL, NULL, NULL, NULL, '{}')",
+        "SELECT gw.record_clock_skew(NULL, NULL)",
+    ):
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            gateway.execute(stmt)
+    # The core may read both tables, and nothing more.
+    app.execute("SELECT * FROM gw.refusal_tally").fetchall()
+    assert _count(app, "SELECT count(*) FROM gw.refusal_window") == 1
+    for stmt in (
+        "UPDATE gw.refusal_window SET audited = 0",
+        "DELETE FROM gw.refusal_tally",
+        "SELECT gw.tally_refusal('ENROL', 'bad_token', NULL, NULL, NULL, NULL, '{}')",
+        "SELECT gw.record_clock_skew(NULL, NULL)",
+    ):
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            app.execute(stmt)
 
 
 # --- the CLI (jarvis-core node enrol / node revoke) -------------------------------------------
@@ -1124,3 +1453,39 @@ def test_0008_downgrade_refuses_once_an_enrolment_exists() -> None:
             migrate.downgrade(d.owner, "0007")
         with psycopg.connect(d.owner, autocommit=True) as conn:
             assert conn.execute("SELECT count(*) FROM gw.enrolment").fetchone() == (1,)
+
+
+R12_OBJECTS = (
+    "SELECT to_regclass('gw.refusal_tally')::text, to_regclass('gw.refusal_window')::text,"
+    " to_regprocedure('gw.refuse_handshake(text,text,uuid)')::text,"
+    " to_regprocedure('gw.tally_refusal(text,text,text,uuid,uuid,uuid,jsonb)')::text,"
+    " to_regprocedure('gw.record_clock_skew(uuid,bigint)')::text,"
+    " to_regprocedure('gw.open_connection(uuid,bigint)')::text,"
+    " to_regprocedure('gw.open_connection(uuid)')::text"
+)
+
+
+def test_0008_down_and_up_with_tally() -> None:
+    with fresh_database() as d:
+        with psycopg.connect(d.owner, autocommit=True) as conn:
+            present = conn.execute(R12_OBJECTS).fetchone()
+            assert present is not None and None not in present[:6] and present[6] is None
+            grants_before = _gateway_acl_entries(conn)
+        migrate.downgrade(d.owner, "0007")
+        with psycopg.connect(d.owner, autocommit=True) as conn:
+            assert conn.execute(R12_OBJECTS).fetchone() == (None,) * 7
+        migrate.upgrade(d.owner, "head")
+        with psycopg.connect(d.owner, autocommit=True) as conn:
+            assert conn.execute(R12_OBJECTS).fetchone() == present
+            assert _gateway_acl_entries(conn) == grants_before
+            window = conn.execute("SELECT id, window_start, audited FROM gw.refusal_window")
+            assert window.fetchall() == [(1, datetime(2000, 1, 1, tzinfo=UTC), 0)]
+        # A CONNECT_REFUSED row (and nothing else of 0008's) blocks the downgrade.
+        with psycopg.connect(d.gateway, autocommit=True) as gateway:
+            assert _refuse(gateway, "unknown_peer") == "recorded"
+        with pytest.raises(Exception, match="node rows exist"):
+            migrate.downgrade(d.owner, "0007")
+        with psycopg.connect(d.owner, autocommit=True) as conn:
+            assert conn.execute(R12_OBJECTS).fetchone() == present
+            assert conn.execute("SELECT count(*) FROM gw.refusal_tally").fetchone() == (1,)
+            assert conn.execute("SELECT version_num FROM alembic_version").fetchone() == ("0008",)
