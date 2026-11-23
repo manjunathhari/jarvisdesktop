@@ -13,6 +13,7 @@ One job runs one utterance (`conv.inbound`) through these steps:
 6. `budget.reserve`, then the step-6 table of §10.1: RESERVED calls; OWNED_ELSEWHERE and
    ANSWERED change nothing; INDETERMINATE was handled by `reserve`; NO_BUDGET holds the turn
    for at most `CAP_HOLD`, retried every `CAP_RETRY`, then expires (`turn.cap_expired`).
+   A model without a price notifies the owner, not the turn's person (R12-19).
 7. Call the brain, streaming SPEECH chunks with NOTIFY `jarvis_stream` (only the reply_id),
    each carrying the turn's `session_id` (R9-1). Each ToolCall goes to `decide_tool_call`
    (a stub that refuses everything until Task 11): a refused call is not executed, writes no
@@ -20,8 +21,10 @@ One job runs one utterance (`conv.inbound`) through these steps:
 8. After the call: CONNECT failure -> `release`, hold, re-run (the turn may try again);
    SEND failure, any unplaceable exception, or a completed stream with no usage -> `lapse`
    now, which runs the indeterminate path once (Task 9); success -> `settle`, the final chunk,
-   the JARVIS message and `ANSWERED`, in one transaction; a turn answered after a hold sends
-   `turn.completed_after_hold` with the reply.
+   the JARVIS message and `ANSWERED`, in one transaction. A turn whose person was told about
+   its hold (`brain.down.with_held`, recorded as `told_held` in the held job's payload) sends
+   `turn.completed_after_hold` with the reply; a quiet re-queue or a cap hold sends none
+   (R12-20).
 
 Transactions and locks (R12-13, Task 9's lesson). Every step that touches the turn row, the
 session or the budget runs on `budget.committing_connection(conn)`, a sibling connection whose
@@ -35,7 +38,9 @@ budget rows, then the session row.
 A turn reaches Claude at most once without the person asking again (P2-B4, P2-B5): a re-run
 job meets the turn's outcome, or its live reservation in `budget.reserve`.
 
-Holds re-enqueue a new `conv.turn` job with `hold` in its payload. When the brain comes back
+Holds re-enqueue a new `conv.turn` job with `hold` in its payload. A turn held for the brain
+(DOWN, or re-queued after a CONNECT failure) that has not run within `DOWN_HOLD` (1 h) of its
+arrival expires: `REFUSED`, `turn.down_expired`, no call (R12-18). When the brain comes back
 (`health.came_back`), `release_held` makes every brain-held turn job ready at once, ordered by
 the turn's arrival (`run_at` = `received_at`), so held turns run once each, in order.
 
@@ -58,7 +63,7 @@ from uuid import UUID
 
 import psycopg
 
-from jarvis_server import comm, jobs
+from jarvis_server import comm, config, jobs
 from jarvis_server.brain import budget, health, prices
 from jarvis_server.brain.claude import count_input_tokens
 from jarvis_server.brain.types import (
@@ -78,6 +83,7 @@ log = logging.getLogger("jarvis.core.turn")
 __all__ = [
     "CAP_HOLD",
     "CAP_RETRY",
+    "DOWN_HOLD",
     "TURN_MAX_TOKENS",
     "NoMemory",
     "NoTurnBrain",
@@ -93,6 +99,7 @@ __all__ = [
 CAP_HOLD = timedelta(hours=1)  # a cap-held turn waits at most this (§10.1, K2-5)
 CAP_RETRY = timedelta(minutes=5)  # and retries its reservation this often
 BRAIN_RETRY = timedelta(minutes=2)  # a brain-held turn re-checks at the probe's interval
+DOWN_HOLD = timedelta(hours=1)  # and expires this long after it arrived (R12-18)
 CHUNK_MAX = 4000  # conv.stream_chunk.text
 MESSAGE_MAX = 20000  # conv.message.text
 
@@ -175,19 +182,27 @@ class _Inbound:
     kind: str
     payload: dict[str, Any]
     outcome: str | None
+    received_at: datetime
 
 
 def _read(conn: psycopg.Connection[Any], turn_id: UUID) -> _Inbound | None:
     """The turn, without a lock (the job's transaction never locks it)."""
     row = conn.execute(
-        "SELECT i.node_id, n.kind, i.person_id, i.kind, i.payload, i.outcome"
+        "SELECT i.node_id, n.kind, i.person_id, i.kind, i.payload, i.outcome, i.received_at"
         " FROM conv.inbound i JOIN gw.node n ON n.id = i.node_id WHERE i.id = %s",
         (turn_id,),
     ).fetchone()
     if row is None:
         return None
     return _Inbound(
-        turn_id, UUID(str(row[0])), str(row[1]), UUID(str(row[2])), str(row[3]), row[4], row[5]
+        turn_id,
+        UUID(str(row[0])),
+        str(row[1]),
+        UUID(str(row[2])),
+        str(row[3]),
+        row[4],
+        row[5],
+        row[6],
     )
 
 
@@ -226,8 +241,11 @@ def _finish(
     event: str | None = None,
     details: dict[str, str] | None = None,
     context: rules.NotifyContext | None = None,
+    *,
+    recipient: UUID | None = None,
 ) -> None:
-    """Set the turn's outcome once, with its event and notification, in one transaction."""
+    """Set the turn's outcome once, with its event and notification, in one transaction. The
+    notification goes to `recipient`, by default the turn's person."""
     with c.transaction():
         updated = c.execute(
             "UPDATE conv.inbound SET outcome = %s WHERE id = %s AND outcome IS NULL",
@@ -235,11 +253,12 @@ def _finish(
         )
         if updated.rowcount != 1 or event is None:
             return
+        person_id = turn.person_id if recipient is None else recipient
         event_id = comm.record_event(
-            c, event, subject_type="inbound", subject_id=str(turn.id), person_id=turn.person_id,
+            c, event, subject_type="inbound", subject_id=str(turn.id), person_id=person_id,
             details=details or {},
         )  # fmt: skip
-        rules.notify(c, event, person_id=turn.person_id, event_id=event_id, context=context or {})
+        rules.notify(c, event, person_id=person_id, event_id=event_id, context=context or {})
 
 
 def _person_message(
@@ -290,16 +309,18 @@ _TOLD = (
 )
 
 
-def _tell_down(conn: psycopg.Connection[Any], turn: _Inbound, *, held: bool) -> None:
+def _tell_down(conn: psycopg.Connection[Any], turn: _Inbound, *, held: bool) -> bool:
     """CLAUDE_DOWN to the turn's person, once per outage: `brain.down.with_held` (TODAY) when
-    their turn is on hold, superseding their open plain `brain.down`; else `brain.down`."""
+    their turn is on hold, superseding their open plain `brain.down`; else `brain.down`.
+    True: the person has been sent the notice for this outage (now or earlier), so a held
+    turn of theirs counts as told about its hold (R12-20)."""
     kind = "brain.down.with_held" if held else "brain.down"
     told = ["brain.down.with_held"] if held else ["brain.down", "brain.down.with_held"]
     conn.execute(
         "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"brain.down:{turn.person_id}",)
     )
     if conn.execute(_TOLD, {"p": turn.person_id, "k": told}).fetchone() is not None:
-        return
+        return True
     context: rules.NotifyContext = {}
     if held:
         row = conn.execute(
@@ -314,13 +335,23 @@ def _tell_down(conn: psycopg.Connection[Any], turn: _Inbound, *, held: bool) -> 
         details={},
     )  # fmt: skip
     rules.notify(conn, kind, person_id=turn.person_id, event_id=event_id, context=context)
+    return True
 
 
 def _hold(
-    conn: psycopg.Connection[Any], job: jobs.Job, reason: str, delay: timedelta, **extra: str
+    conn: psycopg.Connection[Any],
+    job: jobs.Job,
+    reason: str,
+    delay: timedelta,
+    *,
+    told: bool = False,
+    **extra: str,
 ) -> None:
-    """Re-enqueue the turn as a new job (it commits with this job's completion)."""
-    payload = {**job.payload, "hold": reason, "held": True, **extra}
+    """Re-enqueue the turn as a new job (it commits with this job's completion). `told`: the
+    person has been sent the hold notice; it stays in the payload of every later hold."""
+    payload: dict[str, Any] = {**job.payload, "hold": reason, "held": True, **extra}
+    if told:
+        payload["told_held"] = True
     jobs.enqueue(conn, "conv.turn", payload, delay=delay)
 
 
@@ -442,7 +473,7 @@ def _settle(
     stream: _Stream,
     model: str,
     usage: tuple[int, int],
-    held: bool,
+    told_held: bool,
     now: datetime,
 ) -> None:
     """Settle, the final chunk, the JARVIS message and ANSWERED, all or nothing. Raises
@@ -463,7 +494,7 @@ def _settle(
             "UPDATE conv.inbound SET outcome = 'ANSWERED' WHERE id = %s AND outcome IS NULL",
             (turn.id,),
         )
-        if held:
+        if told_held:  # R12-20: only for a person told about the hold
             event_id = comm.record_event(
                 c, "turn.completed_after_hold", subject_type="inbound", subject_id=str(turn.id),
                 person_id=turn.person_id, details={},
@@ -479,7 +510,7 @@ def _settle(
 
 @dispatch.register("conv.turn")
 def run(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
-    """Handler of `conv.turn`, payload `{inbound_id, [hold, held, cap_held_since]}`."""
+    """Handler of `conv.turn`, payload `{inbound_id, [hold, held, told_held, cap_held_since]}`."""
     turn = _read(conn, UUID(job.payload["inbound_id"]))
     if turn is None:  # pruned (30 days): nothing to answer
         log.info("turn job %s: no turn %s", job.id, job.payload["inbound_id"])
@@ -506,9 +537,12 @@ def run(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
         session_id = _person_message(c, turn, text, now)
         if session_id is None:
             return
+        if job.payload.get("hold") == "brain" and now - turn.received_at >= DOWN_HOLD:
+            _finish(c, turn, "REFUSED", "turn.down_expired")  # R12-18: never sent to Claude
+            return
         if health.is_down(conn):  # held before any reservation (§10.2)
-            _hold(conn, job, "brain", BRAIN_RETRY)
-            _tell_down(conn, turn, held=True)
+            told = _tell_down(conn, turn, held=True)
+            _hold(conn, job, "brain", BRAIN_RETRY, told=told)
             return
         if _brain is None:
             raise NoTurnBrain("conv.turn ran with no brain configured")
@@ -524,7 +558,10 @@ def run(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
             ceiling = prices.cost_paise(model, count_input_tokens(req), req.max_tokens)
         except prices.UnknownModelPrice:
             log.error("turn %s: the configured model has no price; not calling", turn.id)
-            _finish(c, turn, "REFUSED", "brain.config_error", {"code": "unknown_model_price"})
+            _finish(
+                c, turn, "REFUSED", "brain.config_error", {"code": "unknown_model_price"},
+                recipient=config.OWNER_PERSON_ID,  # R12-19
+            )  # fmt: skip
             return
         db_now, lease_until = _lease(conn, job.id)
         owner, reservation = budget.reserve(
@@ -545,15 +582,20 @@ def run(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
         if phase is None and usage is None:  # completed but unmetered: fail closed (carry-over c)
             phase = CallPhase.SEND
         if phase is CallPhase.CONNECT:  # nothing reached Claude: give it back, try again later
-            budget.release(c, reservation)
-            just_down = health.record_failure(conn)
-            _hold(conn, job, "brain", BRAIN_RETRY)
-            if just_down:
-                _tell_down(conn, turn, held=True)
+            try:
+                budget.release(c, reservation)
+            except budget.ReservationStateError:  # outlived its lease: the sweep lapsed it
+                log.warning("turn %s: reservation no longer active at release", turn.id)
+                health.record_failure(conn)
+                return  # indeterminate already; never re-queued for another call
+            health.record_failure(conn)
+            # Told at once whenever the brain is DOWN, not only when this failure flipped it.
+            told = health.is_down(conn) and _tell_down(conn, turn, held=True)
+            _hold(conn, job, "brain", BRAIN_RETRY, told=told)
             return
         if phase is CallPhase.SEND:  # indeterminate: never called again (§10.1 step 6)
+            budget.lapse(c, reservation)  # first: the indeterminate path, notified once (Task 9)
             stream.flush()
-            budget.lapse(c, reservation)  # the indeterminate path, notified once (Task 9)
             if health.record_failure(conn):
                 _tell_down(conn, turn, held=False)
             return
@@ -561,7 +603,7 @@ def run(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
         try:
             _settle(
                 c, reservation, turn=turn, stream=stream, model=model, usage=usage,
-                held=bool(job.payload.get("held")), now=now,
+                told_held=bool(job.payload.get("told_held")), now=now,
             )  # fmt: skip
         except budget.ReservationStateError:  # the call outlived its lease: already lapsed
             log.warning("turn %s: reservation no longer active at settle", turn.id)

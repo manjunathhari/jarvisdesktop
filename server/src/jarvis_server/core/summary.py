@@ -31,6 +31,7 @@ LINE: dict[str, str] = {
     "budget.100": "Claude budget used up this month",
     "budget.daily": "Claude budget used up for today",
     "turn.cap_expired": "A held request expired",
+    "turn.down_expired": "A held request expired while Claude was unavailable",
     "turn.indeterminate": "A request ended without a clear outcome",
     "turn.completed_after_hold": "A held request has been answered",
     "action.readonly_ok": "Action completed",

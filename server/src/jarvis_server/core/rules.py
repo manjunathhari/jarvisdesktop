@@ -86,6 +86,9 @@ RULES: dict[str, Rule] = {
     "turn.cap_expired": Rule(
         Priority.TODAY, "turn", "A held request expired before the budget allowed it"
     ),
+    "turn.down_expired": Rule(  # R12-18
+        Priority.TODAY, "turn", "A held request expired while Claude was unavailable"
+    ),
     "turn.indeterminate": Rule(Priority.TODAY, "turn", "A request ended without a clear outcome"),
     "turn.completed_after_hold": Rule(Priority.TODAY, "turn", "A held request has been answered"),
     "action.readonly_ok": Rule(Priority.SILENT, "action", "Action completed"),

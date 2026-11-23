@@ -19,7 +19,7 @@ from typing import Any
 import psycopg
 import pytest
 
-from jarvis_server import comm, jobs
+from jarvis_server import comm, config, jobs
 from jarvis_server.brain import (
     BrainCallFailed,
     BrainEvent,
@@ -490,9 +490,14 @@ def test_unknown_model_price_refuses_turn(
     assert brains.calls == 0
     assert _reservations(app, tid) == []
     assert _events(app, "brain.config_error", tid) == 1
-    assert _items(app, person, "brain.config_error") == [
-        ("TODAY", "PENDING", "Claude configuration error")
-    ]
+    # R12-19: the owner is told, whoever's turn it was; the turn's person is not.
+    config_items = app.execute(
+        "SELECT o.person_id, o.priority FROM comm.outbox o JOIN comm.event e ON e.id = o.event_id"
+        " WHERE o.kind = 'brain.config_error' AND e.subject_id = %s",
+        (str(tid),),
+    ).fetchall()
+    assert config_items == [(config.OWNER_PERSON_ID, "TODAY")]
+    assert _items(app, person, "brain.config_error") == []
     assert _outcome(app, tid) == "REFUSED"
     status = app.execute(
         "SELECT status FROM ops.job WHERE payload->>'inbound_id' = %s", (str(tid),)
@@ -597,6 +602,9 @@ def test_connect_failure_released_and_answered_once(
     assert _outcome(app, tid) == "ANSWERED"
     assert _messages(app, tid) == [("PERSON", "What is on today?"), ("JARVIS", "All done.")]
     assert _queued_turn_jobs(app, tid) == []
+    # A quiet re-queue (the brain never went DOWN, no hold notice): no extra notice (R12-20).
+    assert _items(app, person, "brain.down.with_held") == []
+    assert _items(app, person, "turn.completed_after_hold") == []
 
 
 def test_connect_failure_after_events_is_send_phase(
@@ -607,6 +615,130 @@ def test_connect_failure_after_events_is_send_phase(
     assert _reservations(app, tid) == ["LAPSED"]
     assert _outcome(app, tid) == "INDETERMINATE"
     assert _queued_turn_jobs(app, tid) == []
+
+
+def _down(app: Conn) -> None:
+    health.record_failure(app)
+    health.record_failure(app)
+    assert health.is_down(app)
+
+
+def _probe_back(app: Conn) -> None:
+    health.set_probe_brain(lambda: (FakeBrain([Speech("OK")], usage=(10, 1)), MODEL))
+    _run(app, jobs.enqueue(app, "brain.probe"))
+    assert not health.is_down(app)
+
+
+def test_down_hold_expires_after_one_hour(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine
+) -> None:  # R12-18
+    _down(app)
+    brains = Brains()
+    turn.set_brain(brains)
+    tid = _turn(app, owner, node, person)
+    [(held, _)] = _queued_turn_jobs(app, tid)
+    received = app.execute("SELECT received_at FROM conv.inbound WHERE id = %s", (tid,))
+    arrived = received.fetchone()[0]  # type: ignore[index]
+    turn.set_clock(lambda _conn: arrived + timedelta(minutes=61))
+    _make_ready(app, held)
+    _run(app, held)
+    assert brains.calls == 0 and _reservations(app, tid) == []
+    assert _outcome(app, tid) == "REFUSED"
+    assert _queued_turn_jobs(app, tid) == []
+    assert _events(app, "turn.down_expired", tid) == 1
+    assert _items(app, person, "turn.down_expired") == [
+        ("TODAY", "PENDING", "A held request expired while Claude was unavailable")
+    ]
+    # Even with the brain back, the expired turn never runs later.
+    _probe_back(app)
+    _run(app, _enqueue(app, tid))
+    assert brains.calls == 0 and len(_items(app, person, "turn.down_expired")) == 1
+
+
+def test_down_hold_runs_if_back_within_the_hour_and_told_once(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine
+) -> None:  # R12-18, R12-20: told about the hold, then answered -> one notice
+    _down(app)
+    brains = Brains([Speech("Back with you.")])
+    turn.set_brain(brains)
+    tid = _turn(app, owner, node, person)
+    assert len(_items(app, person, "brain.down.with_held")) == 1
+    [(held, payload)] = _queued_turn_jobs(app, tid)
+    assert payload["told_held"] is True
+    arrived = app.execute("SELECT received_at FROM conv.inbound WHERE id = %s", (tid,))
+    at = arrived.fetchone()[0]  # type: ignore[index]
+    turn.set_clock(lambda _conn: at + timedelta(minutes=59))
+    _probe_back(app)  # releases the held job at once
+    job = jobs.claim(app, "test")
+    assert job is not None and job.id == held
+    dispatch.handle(app, job)
+    assert brains.calls == 1 and _outcome(app, tid) == "ANSWERED"
+    assert [(p, t) for p, _, t in _items(app, person, "turn.completed_after_hold")] == [
+        ("TODAY", "Back with you.")
+    ]
+    assert _items(app, person, "turn.down_expired") == []
+
+
+class DownDuringCall:
+    """While the call runs, other calls mark the brain DOWN; then this one fails to connect."""
+
+    def __init__(self, dsn: str) -> None:
+        self.dsn = dsn
+        self.usage: tuple[int, int] | None = None
+
+    def think(self, req: BrainRequest) -> Iterator[BrainEvent]:
+        with psycopg.connect(self.dsn, autocommit=True) as other:
+            _down(other)
+        raise BrainCallFailed(CallPhase.CONNECT)
+        yield Speech("never")
+
+
+def test_connect_failure_while_already_down_tells_at_once(
+    app: Conn, owner: Conn, dsns: Dsns, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine
+) -> None:  # review Minor 1: not only when this failure flipped the brain DOWN
+    turn.set_brain(lambda: (DownDuringCall(dsns.app), MODEL))
+    tid = _turn(app, owner, node, person)
+    assert _reservations(app, tid) == ["RELEASED"]
+    assert [i[:2] for i in _items(app, person, "brain.down.with_held")] == [("TODAY", "PENDING")]
+    [(_, payload)] = _queued_turn_jobs(app, tid)
+    assert payload["hold"] == "brain" and payload["told_held"] is True
+
+
+class LapsedDuringCall:
+    """The call outlives its lease: the sweep lapses the reservation, then CONNECT fails."""
+
+    def __init__(self, dsn: str) -> None:
+        self.dsn = dsn
+        self.usage: tuple[int, int] | None = None
+
+    def think(self, req: BrainRequest) -> Iterator[BrainEvent]:
+        with psycopg.connect(self.dsn, autocommit=True) as other:
+            other.execute(
+                "UPDATE ops.brain_reservation SET lease_until = now() - interval '1 second'"
+                " WHERE state = 'ACTIVE'"
+            )
+            assert budget.lapse_expired(other, _db_now(other)) == 1
+        raise BrainCallFailed(CallPhase.CONNECT)
+        yield Speech("never")
+
+
+def test_connect_release_after_lapse_does_not_fail_the_job(
+    app: Conn, owner: Conn, dsns: Dsns, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine
+) -> None:  # review Minor 6
+    turn.set_brain(lambda: (LapsedDuringCall(dsns.app), MODEL))
+    tid = _utter(owner, node, person)
+    job_id = _enqueue(app, tid)
+    _run(app, job_id)  # does not raise
+    status = app.execute("SELECT status FROM ops.job WHERE id = %s", (job_id,)).fetchone()
+    assert status == ("DONE",)
+    assert _reservations(app, tid) == ["LAPSED"]
+    assert _outcome(app, tid) == "INDETERMINATE"
+    assert _queued_turn_jobs(app, tid) == []  # never re-queued for another call
+    assert len(_items(app, person, "turn.indeterminate")) == 1
+    beat = app.execute(
+        "SELECT details->>'consecutive_failures' FROM ops.heartbeat WHERE process = 'brain'"
+    ).fetchone()
+    assert beat == ("1",)  # the failure is still counted
 
 
 # --- indeterminate: never a second call (P2-B4, P2-B5) ---------------------------------------
@@ -825,9 +957,7 @@ def test_cap_raised_within_hour_runs_once(
     assert _reservations(app, tid) == ["SETTLED"]
     assert _outcome(app, tid) == "ANSWERED"
     assert _queued_turn_jobs(app, tid) == []
-    assert [(p, t) for p, _, t in _items(app, person, "turn.completed_after_hold")] == [
-        ("TODAY", "Answered at last.")
-    ]
+    assert _items(app, person, "turn.completed_after_hold") == []  # a cap hold: no notice (R12-20)
 
 
 # --- no nodes online (P2-E12, P2-E02) --------------------------------------------------------

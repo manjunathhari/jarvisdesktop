@@ -93,6 +93,7 @@ def _in(minutes: float) -> datetime:
         ("budget.100", Priority.URGENT),
         ("budget.daily", Priority.URGENT),  # R12-14
         ("turn.cap_expired", Priority.TODAY),
+        ("turn.down_expired", Priority.TODAY),  # R12-18
         ("turn.indeterminate", Priority.TODAY),
         ("turn.completed_after_hold", Priority.TODAY),  # controller ruling 1
         ("action.readonly_ok", Priority.SILENT),
@@ -114,7 +115,7 @@ def test_event_kinds_are_exactly_the_shared_interface() -> None:
     assert set(rules.EVENT_KINDS) == {
         "approval.requested", "approval.expiring", "approval.expired", "brain.down",
         "brain.down.with_held", "brain.back", "budget.80", "budget.100", "budget.daily",
-        "turn.cap_expired",
+        "turn.cap_expired", "turn.down_expired",
         "turn.indeterminate", "turn.completed_after_hold", "action.readonly_ok",
         "brain.config_error",
     }  # fmt: skip
