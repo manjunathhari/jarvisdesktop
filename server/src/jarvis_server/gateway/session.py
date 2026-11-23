@@ -21,6 +21,8 @@ another node, with a bad `node-msg` signature or a `seq` that isn't the previous
 connection through `gw.close_connection(conn_id, code)`, which writes its DISCONNECT row.
 `utterance`, `approval.decision` and `action.receipt` go to `conv.record_inbound`; `ping` to
 `gw.touch_connection` and `pong`; `received` and `ack` are accepted and dropped until Task 7.
+Any other database error on an established connection sends `error server_error` and closes
+through `gw.close_connection(conn_id, 'server_error')`.
 
 **Fencing.** Every connection-scoped database call relies on the database fence: SQLSTATE
 `JF001` closes the socket. A re-check every `recheck_interval` seconds (60 in service) calls
@@ -71,6 +73,9 @@ HANDSHAKE_TIMEOUT_S = 30.0  # real time: a peer that never replies is closed
 SKEW_TOLERANCE_MS = 30_000
 SKEW_CLAMP_MS = 10**12
 TOKEN_LENGTH = 26  # the 128-bit token, base32 without padding, as gw.enrol_node requires
+
+# The gw.close_connection reason for a database failure other than the fence (JF001).
+SERVER_ERROR = "server_error"
 
 CLOSE_REFUSED = 4401
 CLOSE_REENROL = 4409
@@ -432,6 +437,13 @@ class Session:
             except Fenced:
                 log.info("connection %s fenced", self.conn_id)
                 return
+            except psycopg.Error as e:
+                # Any other database failure: its audited transaction rolled back, so nothing
+                # partial remains. Tell the node, then close through gw.close_connection.
+                log.warning("database error on connection %s (%s)", self.conn_id, e.sqlstate)
+                await self._error(SERVER_ERROR, "the server could not process the message")
+                await self._db_close(SERVER_ERROR)
+                return
 
     async def _handle(self, text: str | None, data: bytes | None) -> None:
         size = len(text.encode("utf-8")) if text is not None else len(data or b"")
@@ -510,8 +522,8 @@ class Session:
                     conn, "SELECT gw.close_connection(%s, %s)", (self.conn_id, reason)
                 )
         except psycopg.Error as e:
-            if not _fenced(e):
-                raise
+            if not _fenced(e):  # the database is unreachable: open_connection supersedes later
+                log.warning("could not close connection %s (%s)", self.conn_id, e.sqlstate)
 
     async def _recheck(self) -> None:
         """Every `recheck_interval` seconds: `gw.current_node`, returning once fenced (P2-E10)."""

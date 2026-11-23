@@ -1012,3 +1012,53 @@ def test_gateway_never_binds_all_interfaces(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(gateway_app, "tailnet_ipv4", lambda socket_path: "100.101.102.103")
     assert gateway_app.main() == 0
     assert [(c["host"], c["port"]) for c in calls] == [("100.101.102.103", 8443)]
+
+
+# ------------------------------------------------------------------------------ fix round 1 (I-1)
+
+
+def _connections(dsns: Dsns, node_id: uuid.UUID | None) -> list[tuple[Any, ...]]:
+    """(closed?, close_reason) of the node's connection rows, read on a new connection."""
+    with psycopg.connect(dsns.app, autocommit=True) as conn:
+        return conn.execute(
+            "SELECT closed_at IS NOT NULL, close_reason FROM gw.node_connection"
+            " WHERE node_id = %s ORDER BY id",
+            (node_id,),
+        ).fetchall()
+
+
+def _closed_after_db_error(gw: Gw, a: FakeNode, since: int) -> None:
+    reply = a.recv()
+    assert (reply["kind"], reply["payload"]["code"]) == ("error", "server_error")
+    _closed_with(a)
+    rows = _audit(gw.dsns, since, "DISCONNECT")
+    assert [(r["reason"], r["details"]["node_id"]) for r in rows] == [
+        ("server_error", str(a.node_id))
+    ]
+    assert _connections(gw.dsns, a.node_id) == [(True, "server_error")]
+
+
+def test_db_error_on_inbound_closes_connection(gw_client: Gw) -> None:
+    a = gw_client.enrolled()
+    since = _seq(gw_client.dsns)
+    # Valid for the Utterance schema, but Postgres jsonb refuses U+0000.
+    message_id = a.send("utterance", _utterance("a\u0000b"))
+    _closed_after_db_error(gw_client, a, since)
+    assert _inbound(gw_client.dsns, message_id) == []  # the failed call left nothing behind
+
+
+def test_generic_db_error_closes_connection(gw_client: Gw, monkeypatch: pytest.MonkeyPatch) -> None:
+    from jarvis_server.gateway import session as gateway_session
+
+    real = gateway_session.audited_call_async
+
+    async def failing(conn: Any, sql: Any, params: Any) -> Any:
+        if "record_inbound" in sql:
+            raise psycopg.errors.InternalError("injected")
+        return await real(conn, sql, params)
+
+    a = gw_client.enrolled()
+    monkeypatch.setattr(gateway_session, "audited_call_async", failing)
+    since = _seq(gw_client.dsns)
+    a.send("utterance", _utterance())
+    _closed_after_db_error(gw_client, a, since)
