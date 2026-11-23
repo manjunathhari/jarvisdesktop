@@ -261,6 +261,30 @@ def _finish(
         rules.notify(c, event, person_id=person_id, event_id=event_id, context=context or {})
 
 
+def _expire_unreached(
+    c: psycopg.Connection[Any],
+    turn: _Inbound,
+    event: str,
+    details: dict[str, str] | None = None,
+    context: rules.NotifyContext | None = None,
+) -> bool:
+    """Expire a held turn (`REFUSED`, `event`) only if it has never reached Claude: no
+    ACTIVE, SETTLED or LAPSED reservation (a RELEASED one never reached it). Under the turn
+    lock, in one transaction; reserve inserts live reservations under the same lock. False
+    when such a reservation exists: the caller leaves the turn to the step-6 table."""
+    with c.transaction():
+        c.execute("SELECT 1 FROM conv.inbound WHERE id = %s FOR UPDATE", (turn.id,))
+        live = c.execute(
+            "SELECT 1 FROM ops.brain_reservation WHERE turn_id = %s"
+            " AND state IN ('ACTIVE', 'SETTLED', 'LAPSED') LIMIT 1",
+            (turn.id,),
+        ).fetchone()
+        if live is not None:
+            return False
+        _finish(c, turn, "REFUSED", event, details, context)
+        return True
+
+
 def _person_message(
     c: psycopg.Connection[Any], turn: _Inbound, text: str, now: datetime
 ) -> UUID | None:
@@ -537,9 +561,13 @@ def run(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
         session_id = _person_message(c, turn, text, now)
         if session_id is None:
             return
-        if job.payload.get("hold") == "brain" and now - turn.received_at >= DOWN_HOLD:
-            _finish(c, turn, "REFUSED", "turn.down_expired")  # R12-18: never sent to Claude
+        if (
+            job.payload.get("hold") == "brain"
+            and now - turn.received_at >= DOWN_HOLD
+            and _expire_unreached(c, turn, "turn.down_expired")  # R12-18: never sent to Claude
+        ):
             return
+        # A held turn that has already reached Claude goes on to `reserve`: the step-6 table.
         if health.is_down(conn):  # held before any reservation (§10.2)
             told = _tell_down(conn, turn, held=True)
             _hold(conn, job, "brain", BRAIN_RETRY, told=told)
@@ -626,9 +654,9 @@ def _cap_hold(
     since = datetime.fromisoformat(since_raw) if isinstance(since_raw, str) else now
     if now - since >= CAP_HOLD:
         reason = _cap_reason(conn, db_now, ceiling)
-        _finish(
-            c, turn, "REFUSED", "turn.cap_expired", {"reason": reason},
-            {"text": CAP_EXPIRED_TEXT[reason]},
-        )  # fmt: skip
+        # A duplicate job may have reserved since our NO_BUDGET: then it owns the turn.
+        _expire_unreached(
+            c, turn, "turn.cap_expired", {"reason": reason}, {"text": CAP_EXPIRED_TEXT[reason]}
+        )
         return
     _hold(conn, job, "cap", CAP_RETRY, cap_held_since=since.isoformat())

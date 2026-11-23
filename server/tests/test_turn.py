@@ -679,6 +679,141 @@ def test_down_hold_runs_if_back_within_the_hour_and_told_once(
     assert _items(app, person, "turn.down_expired") == []
 
 
+def _arrived(app: Conn, tid: uuid.UUID) -> datetime:
+    row = app.execute("SELECT received_at FROM conv.inbound WHERE id = %s", (tid,)).fetchone()
+    assert row is not None
+    return row[0]  # type: ignore[no-any-return]
+
+
+def _expire_leases(owner: Conn, job_id: int, tid: uuid.UUID) -> None:
+    owner.execute(
+        "UPDATE ops.job SET locked_until = now() - interval '1 second' WHERE id = %s", (job_id,)
+    )
+    owner.execute(
+        "UPDATE ops.brain_reservation SET lease_until = now() - interval '1 second'"
+        " WHERE turn_id = %s AND state = 'ACTIVE'",
+        (tid,),
+    )
+
+
+def test_down_hold_reached_claude_is_never_expired(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """Fix round 2, case 1: the held turn reserved and called at +58 min, core crashed after
+    the call; re-claimed at +61 min it is INDETERMINATE (step 6), not `turn.down_expired`."""
+    _down(app)
+    brains = Brains([Speech("Reached.")])
+    turn.set_brain(brains)
+    tid = _turn(app, owner, node, person)
+    [(held, _)] = _queued_turn_jobs(app, tid)
+    at = _arrived(app, tid)
+    _probe_back(app)
+    turn.set_clock(lambda _conn: at + timedelta(minutes=58))
+    monkeypatch.setattr(turn, "_settle", _crash)
+    with pytest.raises(Crash):
+        dispatch.handle(app, _claim(app, held))
+    monkeypatch.undo()
+    assert brains.calls == 1 and _reservations(app, tid) == ["ACTIVE"]
+    _expire_leases(owner, held, tid)
+    turn.set_clock(lambda _conn: at + timedelta(minutes=61))
+    retried = jobs.claim(app, "test")
+    assert retried is not None and retried.id == held and retried.payload["hold"] == "brain"
+    dispatch.handle(app, retried)
+    assert brains.calls == 1  # no second call
+    assert _outcome(app, tid) == "INDETERMINATE"
+    assert _reservations(app, tid) == ["LAPSED"]
+    assert _events(app, "turn.down_expired", tid) == 0
+    assert _items(app, person, "turn.down_expired") == []
+    assert len(_items(app, person, "turn.indeterminate")) == 1
+
+
+def test_duplicate_down_hold_does_not_expire_a_turn_in_its_call(
+    dsns: Dsns, app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID,
+    engine: MemoryEngine,
+) -> None:  # fmt: skip
+    """Fix round 2, case 2: job A owns the turn and is inside the call (ACTIVE, in lease); a
+    duplicate held job at +61 min finds the reservation, does not expire, is OWNED_ELSEWHERE."""
+    gate = GateBrain()
+    turn.set_brain(lambda: (gate, MODEL))
+    tid = _utter(owner, node, person)
+    at = _arrived(app, tid)
+    held = {"inbound_id": str(tid), "hold": "brain", "held": True}
+    job_a = _claim(app, jobs.enqueue(app, "conv.turn", held))
+    job_b = _claim(app, jobs.enqueue(app, "conv.turn", held))
+    turn.set_clock(lambda _conn: at + timedelta(minutes=58))
+    a = InThread(dsns.app, lambda conn: dispatch.handle(conn, job_a))
+    assert gate.entered.wait(15)  # A has read its clock, reserved and is calling
+    turn.set_clock(lambda _conn: at + timedelta(minutes=61))
+    InThread(dsns.app, lambda conn: dispatch.handle(conn, job_b)).join()
+    assert _outcome(app, tid) is None  # B neither expired the turn nor called
+    gate.release.set()
+    a.join()
+    assert gate.calls == 1
+    assert _outcome(app, tid) == "ANSWERED"
+    assert _reservations(app, tid) == ["SETTLED"]
+    assert _items(app, person, "turn.down_expired") == []
+
+
+def test_cap_hold_reached_claude_is_never_expired(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """Fix round 2, cap case 1: the cap-held turn reserved (cap raised) and crashed after the
+    call; with the budget gone again, its re-run at +61 min is INDETERMINATE, not expired."""
+    _exhaust_budget(app, owner)
+    brains = Brains([Speech("Unused.")], [Speech("Reached.")])
+    turn.set_brain(brains)
+    tid = _turn(app, owner, node, person)
+    [(held, _)] = _queued_turn_jobs(app, tid)
+    start = _db_now(app)
+    monkeypatch.setattr(budget, "MONTHLY_CAP_PAISE", budget.MONTHLY_CAP_PAISE * 2)
+    monkeypatch.setattr(turn, "_settle", _crash)
+    _make_ready(app, held)
+    with pytest.raises(Crash):
+        dispatch.handle(app, _claim(app, held))
+    monkeypatch.undo()
+    assert brains.calls == 1 and _reservations(app, tid) == ["ACTIVE"]
+    _exhaust_budget(app, owner)
+    _expire_leases(owner, held, tid)
+    turn.set_clock(lambda _conn: start + timedelta(minutes=61))
+    retried = jobs.claim(app, "test")
+    assert retried is not None and retried.id == held
+    dispatch.handle(app, retried)
+    assert brains.calls == 1
+    assert _outcome(app, tid) == "INDETERMINATE"
+    assert _items(app, person, "turn.cap_expired") == []
+
+
+def test_cap_expiry_skips_a_turn_another_job_reserved(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """Fix round 2, cap case 2: after this job's NO_BUDGET, a duplicate reserves the turn
+    (simulated: reserve answers NO_BUDGET although a live reservation exists). At +61 min the
+    expiry finds it and leaves the turn to its owner: no `turn.cap_expired`, not re-queued."""
+    brains = Brains()
+    turn.set_brain(brains)
+    tid = _utter(owner, node, person)
+    other = _claim(app, _enqueue(app, tid))
+    lease = app.execute("SELECT locked_until FROM ops.job WHERE id = %s", (other.id,)).fetchone()
+    assert lease is not None
+    got, _ = budget.reserve(app, job_id=other.id, turn_id=tid, reserve_paise=10,
+                            lease_until=lease[0], now=_db_now(app))  # fmt: skip
+    assert got is budget.Owner.RESERVED
+    since = _db_now(app)
+    monkeypatch.setattr(budget, "reserve", lambda *a, **k: (budget.Owner.NO_BUDGET, None))
+    turn.set_clock(lambda _conn: since + timedelta(minutes=61))
+    payload = {"inbound_id": str(tid), "hold": "cap", "held": True,
+               "cap_held_since": since.isoformat()}  # fmt: skip
+    _run(app, jobs.enqueue(app, "conv.turn", payload))
+    assert brains.calls == 0
+    assert _outcome(app, tid) is None
+    assert _reservations(app, tid) == ["ACTIVE"]
+    assert _items(app, person, "turn.cap_expired") == []
+    assert _queued_turn_jobs(app, tid) == []
+
+
 class DownDuringCall:
     """While the call runs, other calls mark the brain DOWN; then this one fails to connect."""
 
