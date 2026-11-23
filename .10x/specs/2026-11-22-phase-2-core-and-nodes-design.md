@@ -1,6 +1,6 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** **Revision 12, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, **revision 12**. Revision 12 adds R12-1 to R12-9 (§20), from Manj's ruling of 23 Nov on the gateway audit gap: a sixth gateway function, `gw.refuse_handshake`; a bounded refusal tally against audit flooding; the gateway-computed clock skew, recorded by `gw.open_connection`; and a restricted Task 7 record for the resume event.
+**Status:** **Revision 12, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, **revision 12**. Revision 12 adds R12-1 to R12-10 (§20), from Manj's ruling of 23 Nov on the gateway audit gap: a sixth gateway function, `gw.refuse_handshake`; a bounded refusal tally against audit flooding; the gateway-computed clock skew, recorded by `gw.open_connection`; and a restricted Task 7 record for the resume event.
 
 **Approval history:**
 - **Revision 4:** approved by Manj on 2026-11-22.
@@ -606,6 +606,22 @@ States only move forward (PENDING < DELIVERING < DELIVERED < ACKNOWLEDGED), and 
 
 **Retries keep the ID:** the sweep (every 60 s) re-sends items in DELIVERING or DELIVERED whose `last_sent_at` on a connected node is more than 2 minutes old. It's always the same `outbox_id`. Each node keeps a durable seen-list of `outbox_id`s (in its local journal, §13) and shows an ID only once, even across restarts. That's P2-E04.
 
+**Per-device confirmation and re-sending (R12-10):**
+1. Confirmation is scoped to one device. A `comm.delivery` row with `received_at` set means that node has the item.
+2. The 60 s pass doesn't re-send an item to a node whose delivery row has `received_at` set.
+3. One node's confirmation never stops delivery to another node. The 60 s pass re-sends to every other connected node of the person whose delivery row isn't confirmed.
+4. An item a node hasn't confirmed stays eligible for re-sending to that node, as long as the item isn't terminal.
+5. Reconnect and resume follow the same per-node rules:
+   - an item never sent to the node goes out on connect;
+   - an item sent but not confirmed goes out on the next 60 s pass, with the same `outbox_id`;
+   - a confirmed item isn't sent again, unless it's terminal, in which case only `outbox.cleared` applies, as above.
+   - This keeps every item delivered at most once per connection across a supersede.
+
+**Per-device send isolation (R12-10):**
+- Each connected node has its own send queue and sender. A blocked or slow node never delays delivery, heartbeats, the re-send pass or cleanup for any other node.
+- Every socket send is bounded by a 10 s timeout. A timeout closes that node's connection through `gw.close_connection(conn_id, 'send_timeout')`. If recording that fails, the gateway logs it and still closes the socket.
+- The fenced database call (`comm.record_sent`, or `gw.current_node` for frames with no record function) still runs immediately before each frame is written, in that node's own sender.
+
 **Serialisation:**
 - Every transition function locks the item row (`SELECT … FOR UPDATE`) and checks the current state before changing it.
 - `record_sent` refuses (returns "don't send") if the item is already terminal, so a send racing an acknowledgement either completes before the acknowledgement, and the node then receives `outbox.cleared`, or is refused.
@@ -1051,3 +1067,4 @@ Architecture direction approved; implementation approval pending these changes. 
 | R12-7 | **Gateway's copy of the core public key** (owner, 23 Nov): the gateway reads it from a non-secret file `core_signing_key.pub` (raw 32-byte public key) in the secrets directory, alongside `gateway_signing_key.pub`, with `core_key_id = fingerprint(public)`. The gateway never reads `core_signing_key`. Task 14 supplies the file in deployment, and Task 12 replaces this source with `gw.trusted_key`. | §7.1 |
 | R12-8 | **`conv.record_resume_out_of_range(p_conn_id bigint, p_reply_id uuid, p_last_seq numeric) RETURNS boolean`** (owner, 23 Nov, with the Task 7 brief): SECURITY DEFINER with a fixed search path, owned by `jarvis_owner`, executable only by `jarvis_gateway`. It calls `gw.current_node(p_conn_id)` first; node and person come from the connection. The database decides the reason: a reply that is not in the node's person's sessions, or does not exist, is `unknown_reply` (foreign and nonexistent are indistinguishable); the person's own reply with `p_last_seq` above the highest stored chunk `seq` is `beyond_max`; otherwise nothing is written and it returns false. `p_last_seq` is `numeric` so it is no narrower than the protocol's "any integer"; NULL, non-finite or non-integral values are refused (`invalid_parameter_value`). It writes one fixed `comm.event` `node.resume_out_of_range` (subject the node, person the node's person) with details exactly `node_id`, `reply_id`, `reason`; `last_seq` is never stored, and the caller supplies no event content. It does not use the refusal tally. Suppression: at most one event per (node, reply_id, reason) in a rolling 15-minute window, concurrency-safe (two simultaneous calls never write two events); `unknown_reply` and `beyond_max` are separate keys. The gateway considers only the first 64 `resume` entries of a `hello`, in order, and ignores the rest. No notification rule and no generic event-to-notification path. It lives in `conv`, so the `gw` schema keeps exactly six gateway functions (R12-2). It is added to migration 0009 in place; 0011 stays Task 12's. In the same task, `conv.record_chunk_received` returns `(false, NULL)` with no audit row for a nonexistent or pruned chunk, keeping the foreign-person refusal. | §4.1, §6.2 step 6 |
 | R12-9 | **The gateway reads session ownership** (owner, 23 Nov, on Task 7's NEEDS_CONTEXT): `GRANT SELECT (id, person_id, closed_at) ON conv.session TO jarvis_gateway`, in migration 0009 in place. IDs and a timestamp only, with no conversation content and no new function, so `gw` keeps six functions. It is used for the live relay (a reply's session → person → that person's connected nodes), for reconnect candidate replies (R9-1) and for `welcome.session_id`. `started_at` and `last_activity_at` stay denied, and tests pin the exact columns. | §4.1 |
+| R12-10 | **Per-device confirmation and send isolation** (owner, 23 Nov, on Task 7's review). Confirmation (`received`) is per node: the 60 s pass skips a node that has confirmed, and one node's confirmation never stops delivery to another. An unconfirmed item stays eligible. On reconnect, never-sent items go at once and sent-but-unconfirmed items on the next pass, with the same ID. Each node has its own send queue; every send is bounded at 10 s, and a timeout closes through `gw.close_connection(conn_id, 'send_timeout')`. The fenced call stays immediately before each write. The protocol's numeric range is unchanged: a signed `last_seq` is limited by JCS to ±(2^53 − 1). | §8.2 |
