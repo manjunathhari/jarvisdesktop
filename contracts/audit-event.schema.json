@@ -79,7 +79,8 @@
         "SUPERSEDE",
         "EXPIRE",
         "CHUNK_RECEIVE",
-        "CONSUME"
+        "CONSUME",
+        "DECIDE"
       ]
     },
     "from_state": {

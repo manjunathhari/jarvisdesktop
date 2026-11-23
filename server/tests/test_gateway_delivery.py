@@ -211,6 +211,7 @@ def item(
     priority: Priority = Priority.TODAY,
     kind: str = "test.notice",
     group_key: str = "test",
+    target: uuid.UUID | None = None,
 ) -> uuid.UUID:
     event = comm.record_event(
         app,
@@ -229,6 +230,7 @@ def item(
         body={"event": kind, "text": "A fictional notice"},
         group_key=group_key,
         expires_at=None,
+        target_node_id=target,
     )
 
 
@@ -618,6 +620,42 @@ def test_outbox_delivered_to_all_person_nodes(gw: Gw, app_conn: Conn) -> None:
         assert fake.displays[outbox_id] == 1
     assert item_ids(guest.drain(0.3)) == []
     _wait_for(lambda: state(app_conn, outbox_id) == "DELIVERED")
+
+
+def test_targeted_item_reaches_only_its_node(gw: Gw, app_conn: Conn) -> None:
+    """R12-23: an item with a target node is offered, re-sent and cleared only on that node;
+    the person's other node gets nothing, and an item without a target still goes to both."""
+    a = enrolled(gw)
+    b = enrolled(gw)
+    a.auto_received = False
+    targeted = str(item(app_conn, target=a.node_id))
+    everyone = str(item(app_conn))
+    got_a = collect(a, lambda e: {targeted, everyone} <= set(item_ids(e)))
+    assert sorted(item_ids(got_a)) == sorted([targeted, everyone])
+    got_b = collect(b, lambda e: everyone in item_ids(e))
+    assert item_ids(got_b + b.sync() + b.drain(0.2)) == [everyone]  # no offer
+    gw.clock.advance(150)
+    _sweep(gw)
+    assert targeted in item_ids(a.drain(0.3))  # re-sent to its node (unconfirmed)
+    assert item_ids(b.sync() + b.drain(0.2)) == []  # no re-send
+    b2 = reborn(gw, b)  # a reconnect offers it nothing either
+    b2.hello()
+    assert targeted not in item_ids(b2.sync() + b2.drain(0.2))
+    assert attempts(app_conn, targeted, b.node_id) is None
+    since = audit_seq(app_conn)
+    b2.received(uuid.UUID(targeted))  # not b's item: refused like another person's
+    b2.sync()
+    rows = app_conn.execute(
+        "SELECT action::text, outcome::text, reason FROM audit.event WHERE seq > %s"
+        " AND entity_id = %s",
+        (since, targeted),
+    ).fetchall()
+    assert rows == [("RECEIVE", "REJECTED", "unknown_item")]
+    a.ack(uuid.UUID(targeted))
+    a.sync()
+    assert state(app_conn, targeted) == "ACKNOWLEDGED"
+    assert item_ids(b2.sync() + b2.drain(0.3), "outbox.cleared") == []  # no clear
+    assert b.displays[targeted] == 0 and b2.displays[targeted] == 0
 
 
 def test_ack_on_a_clears_on_b(gw: Gw, app_conn: Conn) -> None:

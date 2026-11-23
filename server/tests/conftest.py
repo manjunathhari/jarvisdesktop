@@ -16,9 +16,11 @@ from typing import Any
 
 import psycopg
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from psycopg import sql
 
-from jarvis_server import migrate
+from jarvis_server import config, migrate
 from jarvis_server.bootstrap import APP_ROLE, GATEWAY_ROLE, OWNER_ROLE, bootstrap
 
 
@@ -86,3 +88,20 @@ def owner(dsns: Dsns) -> Iterator[psycopg.Connection[Any]]:
 def gateway(dsns: Dsns) -> Iterator[psycopg.Connection[Any]]:
     with psycopg.connect(dsns.gateway, autocommit=True) as conn:
         yield conn
+
+
+@pytest.fixture
+def core_key(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A throwaway core signing key, served as the secret `core_signing_key` from a temporary
+    secrets directory (`core.keys.active_core_key` reads it through `config.secret`)."""
+    key = Ed25519PrivateKey.generate()
+    directory = tmp_path_factory.mktemp("secrets")
+    (directory / "core_signing_key").write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    monkeypatch.setattr(config, "SECRETS_DIR", directory)
+    return key

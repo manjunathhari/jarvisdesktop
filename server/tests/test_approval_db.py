@@ -583,6 +583,7 @@ def test_gateway_has_no_access(gateway: Conn) -> None:
         "SELECT * FROM ops.brain_reservation",
         "SELECT * FROM ops.brain_usage",
         "SELECT * FROM ledger.consume_approval(gen_random_uuid())",
+        "SELECT ledger.refuse_decision(gen_random_uuid(), gen_random_uuid(), 'expired')",  # R12-21
     ):
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             gateway.execute(statement.encode())

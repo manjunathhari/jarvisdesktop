@@ -117,7 +117,7 @@ def test_event_kinds_are_exactly_the_shared_interface() -> None:
         "brain.down.with_held", "brain.back", "budget.80", "budget.100", "budget.daily",
         "turn.cap_expired", "turn.down_expired",
         "turn.indeterminate", "turn.completed_after_hold", "action.readonly_ok",
-        "brain.config_error",
+        "brain.config_error", "action.approved", "memory.written", "approval.decision_refused",
     }  # fmt: skip
 
 

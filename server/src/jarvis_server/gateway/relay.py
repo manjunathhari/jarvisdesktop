@@ -33,10 +33,11 @@ whose `last_seq` is above the reply's highest stored `seq`, is ignored and goes 
 Otherwise a candidate restarts at `max(acked_seq, max(last_seq, 0)) + 1`.
 
 **The outbox.** An open item goes to every connected node of its person that hasn't been sent it
-(on its NOTIFY and on connect). The sweep re-sends, with the same ID, items a connected node was
-sent more than 2 minutes ago and hasn't confirmed (`received`). A terminal item's NOTIFY sends
-`outbox.cleared` with the state as reason to the connected nodes that were sent it, other than
-a node that acknowledged it here.
+(on its NOTIFY and on connect); an item with a `target_node_id` goes to that node only, and only
+that node is re-sent it or sent its `outbox.cleared` (R12-23). The sweep re-sends, with the same
+ID, items a connected node was sent more than 2 minutes ago and hasn't confirmed (`received`).
+A terminal item's NOTIFY sends `outbox.cleared` with the state as reason to the connected nodes
+that were sent it, other than a node that acknowledged it here.
 
 Nothing here logs content.
 """
@@ -194,6 +195,7 @@ _UNSENT: LiteralString = """
 SELECT o.id, o.priority, o.kind, o.body, o.expires_at, o.authz FROM comm.outbox o
 LEFT JOIN comm.delivery d ON d.outbox_id = o.id AND d.node_id = %(node)s
 WHERE o.person_id = %(person)s AND o.state IN ('PENDING', 'DELIVERING', 'DELIVERED')
+  AND (o.target_node_id IS NULL OR o.target_node_id = %(node)s)
   AND coalesce(d.attempts, 0) = 0
   AND (%(item)s::uuid IS NULL OR o.id = %(item)s::uuid)
 ORDER BY o.created_at, o.id
@@ -203,6 +205,7 @@ _DUE: LiteralString = """
 SELECT o.id, o.priority, o.kind, o.body, o.expires_at, o.authz FROM comm.outbox o
 LEFT JOIN comm.delivery d ON d.outbox_id = o.id AND d.node_id = %(node)s
 WHERE o.person_id = %(person)s AND o.state IN ('PENDING', 'DELIVERING', 'DELIVERED')
+  AND (o.target_node_id IS NULL OR o.target_node_id = %(node)s)
   AND (coalesce(d.attempts, 0) = 0
        OR (d.received_at IS NULL AND d.last_sent_at < %(before)s))
 ORDER BY o.created_at, o.id
@@ -627,13 +630,16 @@ class Relay:
     async def _on_outbox(self, outbox_id: UUID) -> None:
         async with self.pool.connection() as conn:
             cur = await conn.execute(
-                "SELECT person_id, state FROM comm.outbox WHERE id = %s", (outbox_id,)
+                "SELECT person_id, state, target_node_id FROM comm.outbox WHERE id = %s",
+                (outbox_id,),
             )
             row = await cur.fetchone()
         if row is None:
             return
-        person_id, state = UUID(str(row[0])), str(row[1])
+        person_id, state, target = UUID(str(row[0])), str(row[1]), row[2]
         for link in self._of(person_id):
+            if target is not None and link.node_id != target:
+                continue  # an item for one node only (R12-23)
             if state in ("PENDING", "DELIVERING", "DELIVERED"):
                 link.offer(outbox_id)
             else:

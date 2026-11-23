@@ -17,6 +17,10 @@
   UPDATE and moves its state forward only. Every call writes one audit row, except a 'skipped'
   comm.supersede_for_create, which is a non-audited no-op (R11-2). A trigger refuses any other
   change, for every role.
+- An outbox item may name one target node (R12-23): comm.outbox.target_node_id, NULL for every
+  node of the person. A target must be a node of the item's person (comm.outbox_guard). For
+  comm.record_sent, comm.record_received and comm.acknowledge an item targeted at another node
+  is not this node's: unknown_item, like another person's item.
 - Refused requests write the REJECTED audit row and return a reason code (R7-1): an unknown
   inbound kind (unknown_kind); a message_id already recorded by another node (id_conflict,
   R9-4); an outbox item unknown or of another person (unknown_item, R9-5); a stream chunk of
@@ -171,6 +175,9 @@ CREATE TABLE comm.outbox (
     kind              text NOT NULL CHECK (kind ~ '^[a-z][a-z0-9_.]{0,63}$'),
     body              jsonb NOT NULL CHECK (jsonb_typeof(body) = 'object'),
     authz             jsonb CHECK (jsonb_typeof(authz) = 'object'),
+    -- R12-23: NULL = every node of the person; set = this one node only (it must be the
+    -- person's own, checked by comm.outbox_guard).
+    target_node_id    uuid REFERENCES gw.node(id),
     group_key         text NOT NULL CHECK (group_key ~ '^[A-Za-z0-9_.:-]{1,200}$'),
     supersedes_id     uuid REFERENCES comm.outbox(id),
     expires_at        timestamptz,
@@ -192,16 +199,22 @@ DECLARE
     v_order text[] := ARRAY['PENDING', 'DELIVERING', 'DELIVERED', 'ACKNOWLEDGED'];
 BEGIN
     IF TG_OP = 'INSERT' THEN
+        IF NEW.target_node_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM gw.node n
+            WHERE n.id = NEW.target_node_id AND n.person_id = NEW.person_id) THEN
+            RAISE EXCEPTION 'an outbox item''s target node belongs to its person'
+                USING ERRCODE = 'check_violation';
+        END IF;
         NEW.state := 'PENDING';
         NEW.state_changed_at := now();
         NEW.created_at := now();
         RETURN NEW;
     END IF;
     IF (NEW.id, NEW.person_id, NEW.event_id, NEW.priority, NEW.kind, NEW.body, NEW.authz,
-        NEW.group_key, NEW.supersedes_id, NEW.expires_at, NEW.created_at)
+        NEW.target_node_id, NEW.group_key, NEW.supersedes_id, NEW.expires_at, NEW.created_at)
        IS DISTINCT FROM
        (OLD.id, OLD.person_id, OLD.event_id, OLD.priority, OLD.kind, OLD.body, OLD.authz,
-        OLD.group_key, OLD.supersedes_id, OLD.expires_at, OLD.created_at) THEN
+        OLD.target_node_id, OLD.group_key, OLD.supersedes_id, OLD.expires_at, OLD.created_at) THEN
         RAISE EXCEPTION 'an outbox item changes only its state' USING ERRCODE = 'check_violation';
     END IF;
     IF NEW.state IS DISTINCT FROM OLD.state AND NOT (
@@ -333,7 +346,7 @@ END;
 $$;
 
 -- Gateway: the item is about to be sent to this connection's node (§8.2). False ("don't send")
--- when it is terminal, or not addressed to this node's person. Creates or updates the
+-- when it is terminal, or not addressed to this node (its person's, and its target if set). Creates or updates the
 -- (item, node) delivery row: attempts + 1.
 CREATE FUNCTION comm.record_sent(p_conn_id bigint, p_outbox_id uuid) RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
@@ -349,7 +362,8 @@ BEGIN
     END IF;
     SELECT n.person_id INTO v_person FROM gw.node n WHERE n.id = v_node;  -- no lock of its own
     SELECT o.state INTO v_state FROM comm.outbox o
-        WHERE o.id = p_outbox_id AND o.person_id = v_person FOR UPDATE;
+        WHERE o.id = p_outbox_id AND o.person_id = v_person
+          AND (o.target_node_id IS NULL OR o.target_node_id = v_node) FOR UPDATE;
     IF v_state IS NULL THEN
         PERFORM audit.append('AGENT', 'gateway', 'outbox', p_outbox_id, 'SEND', NULL, NULL,
                              'REJECTED', 'unknown_item', NULL,
@@ -395,7 +409,8 @@ BEGIN
     END IF;
     SELECT n.person_id INTO v_person FROM gw.node n WHERE n.id = v_node;  -- no lock of its own
     SELECT o.state INTO v_state FROM comm.outbox o
-        WHERE o.id = p_outbox_id AND o.person_id = v_person FOR UPDATE;
+        WHERE o.id = p_outbox_id AND o.person_id = v_person
+          AND (o.target_node_id IS NULL OR o.target_node_id = v_node) FOR UPDATE;
     IF v_state IS NULL THEN
         PERFORM audit.append('AGENT', 'gateway', 'outbox', p_outbox_id, 'RECEIVE', NULL, NULL,
                              'REJECTED', 'unknown_item', NULL,
@@ -436,7 +451,8 @@ BEGIN
     END IF;
     SELECT n.person_id INTO v_person FROM gw.node n WHERE n.id = v_node;  -- no lock of its own
     SELECT o.state INTO v_state FROM comm.outbox o
-        WHERE o.id = p_outbox_id AND o.person_id = v_person FOR UPDATE;
+        WHERE o.id = p_outbox_id AND o.person_id = v_person
+          AND (o.target_node_id IS NULL OR o.target_node_id = v_node) FOR UPDATE;
     IF v_state IS NULL THEN
         PERFORM audit.append('AGENT', 'gateway', 'outbox', p_outbox_id, 'ACK', NULL, NULL,
                              'REJECTED', 'unknown_item', NULL,

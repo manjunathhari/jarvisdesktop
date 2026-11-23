@@ -15,6 +15,10 @@ Its pins, node ID and seen-list live in a JSON file (``state_path``), reloaded b
 envelope) carries no ``seq`` the gateway could count, so building one with ``envelope()`` and
 sending it with ``send_raw()`` doesn't move the node's counter.
 
+An ``outbox.item`` whose ``authz`` is a ``node.action`` (an approved action, Task 11) goes
+through ``check_node_action`` like a ``node.action`` frame, and needs an ``approval_id`` and an
+unused ``execution_key`` (§7.1 rule 5); a rejected one is not shown.
+
 Delivery (Task 7): it sends ``received`` automatically when an outbox item arrives
 (``auto_received``) and for every reply chunk (``ack_chunks``), answers the gateway's ``ping``
 with ``pong`` (``answer_pings``), shows a ``(reply_id, seq)`` at most once, and never shows an
@@ -142,6 +146,7 @@ class FakeNode:
         self.displays: Counter[str] = Counter()
         self.shown_chunks: dict[str, list[int]] = defaultdict(list)
         self.actions: list[dict[str, Any]] = []
+        self.used_keys: set[str] = set()  # execution keys run (the desktop's journal, §9.4)
         self.received_envelopes: list[dict[str, Any]] = []
         self.discarded = False
         self.challenge: dict[str, Any] | None = None
@@ -431,11 +436,15 @@ class FakeNode:
                 target[obj["args"]["key_id"]] = raw
                 self._save()
             elif kind == "outbox.item":
-                if payload.get("authz") is not None:
+                authz = payload.get("authz")
+                if authz is not None:
                     try:
-                        check_authz(payload["authz"], self.trusted_core)
+                        check_authz(authz, self.trusted_core)
                     except AuthzInvalid:
                         raise Rejected("bad_signature") from None
+                    fresh = payload["outbox_id"] not in self.seen_outbox
+                    if authz["object"].get("kind") == "node.action" and fresh:
+                        self._approved_action(authz)  # a re-send of a seen item never re-runs
                 outbox_id = payload["outbox_id"]
                 if outbox_id not in self.seen_outbox and outbox_id not in self.cleared:
                     self.seen_outbox.add(outbox_id)
@@ -452,6 +461,20 @@ class FakeNode:
                 self._chunk(payload)
         except Rejected as e:
             self.rejected.append((kind, e.reason))
+
+    def _approved_action(self, authz: dict[str, Any]) -> None:
+        """§7.1 rules 2 to 4 (``check_node_action``), then rule 5: an IRREVERSIBLE action needs
+        an ``approval_id`` and an ``execution_key`` this node hasn't used."""
+        assert self.node_id is not None
+        check_node_action(authz, trusted=self.trusted_core, me=self.node_id, now=self.clock())
+        obj = authz["object"]
+        key = obj.get("execution_key")
+        if obj.get("approval_id") is None or key is None:
+            raise Rejected("no_approval")
+        if key in self.used_keys:
+            raise Rejected("used_execution_key")
+        self.used_keys.add(key)
+        self.actions.append(dict(obj))
 
     def _chunk(self, payload: dict[str, Any]) -> None:
         reply_id, seq = payload["reply_id"], payload["seq"]

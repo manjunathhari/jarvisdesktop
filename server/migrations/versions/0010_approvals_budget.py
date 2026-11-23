@@ -26,7 +26,14 @@
 - ops.brain_budget, ops.brain_reservation and ops.brain_usage (§5.6): tables only, amounts in
   paise. At most one live (ACTIVE, SETTLED or LAPSED) reservation per turn. The reserve, settle
   and lapse logic (§10.1) comes in a later task.
-- audit.event: entity type 'approval'; action CONSUME. Rows carry codes and IDs only.
+- audit.event: entity type 'approval'; actions CONSUME and DECIDE. Rows carry codes and IDs
+  only.
+- Approval audit (R12-21): an AFTER INSERT trigger writes the CREATE row; an AFTER UPDATE OF
+  decision trigger writes DECIDE APPLIED (APPROVED, DENIED, EXPIRED); and
+  ledger.refuse_decision(approval_id, node_id, code) writes the DECIDE REJECTED row of a decision
+  core refused under §9.3 step 6 and changes nothing else. Its codes are fixed, in check order:
+  unknown_approval, bad_card_sig, other_person, node_revoked, not_pending, expired. Any other
+  code is a malformed call. EXECUTE for jarvis_app only.
 - All of it is for the core (jarvis_app); the gateway has no grant on any 0010 object, and
   PUBLIC has no EXECUTE on either function, the trigger function included.
 - An APPROVED or DENIED approval records both decided_at and decided_by_node_id (CHECK
@@ -198,6 +205,74 @@ REVOKE ALL ON FUNCTION ledger.consume_approval(uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION ledger.consume_approval(uuid) TO jarvis_app;
 """
 
+# R12-21: the approval's own audit rows. Creation and every decision change are audited by
+# triggers in the same transaction as the write; a refused decision (§9.3 step 6) is recorded by
+# ledger.refuse_decision, which writes the REJECTED row and changes nothing else.
+APPROVAL_AUDIT = r"""
+-- CREATE, APPLIED, to_state PENDING. The actor comes from jarvis.actor_kind / jarvis.actor_id
+-- (ledger._declare) when the caller set them; approvals are created only by core, so the
+-- default is AGENT core.
+CREATE FUNCTION ledger.approval_audit_create() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_kind text := coalesce(nullif(current_setting('jarvis.actor_kind', true), ''), 'AGENT');
+    v_actor text := coalesce(nullif(current_setting('jarvis.actor_id', true), ''), 'core');
+BEGIN
+    PERFORM audit.append(v_kind, v_actor, 'approval', NEW.id, 'CREATE', NULL, 'PENDING',
+                         'APPLIED', 'created', NULL,
+                         jsonb_build_object('task_id', NEW.task_id,
+                                            'requesting_node_id', NEW.requesting_node_id));
+    RETURN NULL;
+END;
+$$;
+CREATE TRIGGER approval_audit_create AFTER INSERT ON ledger.approval
+    FOR EACH ROW EXECUTE FUNCTION ledger.approval_audit_create();
+REVOKE ALL ON FUNCTION ledger.approval_audit_create() FROM PUBLIC;  -- a trigger function
+
+-- DECIDE, APPLIED, from the old decision to the new one (APPROVED, DENIED or EXPIRED). It runs
+-- after approval_guard accepted the change, so it records only legal decisions.
+CREATE FUNCTION ledger.approval_audit_decide() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    PERFORM audit.append('AGENT', 'core', 'approval', NEW.id, 'DECIDE', OLD.decision,
+                         NEW.decision, 'APPLIED', lower(NEW.decision), NULL,
+                         jsonb_strip_nulls(jsonb_build_object(
+                             'task_id', NEW.task_id,
+                             'decided_by_node_id', NEW.decided_by_node_id)));
+    RETURN NULL;
+END;
+$$;
+CREATE TRIGGER approval_audit_decide AFTER UPDATE OF decision ON ledger.approval
+    FOR EACH ROW WHEN (OLD.decision IS DISTINCT FROM NEW.decision)
+    EXECUTE FUNCTION ledger.approval_audit_decide();
+REVOKE ALL ON FUNCTION ledger.approval_audit_decide() FROM PUBLIC;  -- a trigger function
+
+-- §9.3 step 6: a decision refused by core's checks (made under the approval's row lock). Writes
+-- one DECIDE REJECTED row with the failing check as its reason and changes nothing else. The
+-- codes are fixed, in check order; any other code, or a NULL argument, is a malformed call.
+CREATE FUNCTION ledger.refuse_decision(p_approval_id uuid, p_node_id uuid, p_code text)
+RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_decision text;
+BEGIN
+    IF p_approval_id IS NULL OR p_node_id IS NULL OR p_code IS NULL
+       OR p_code NOT IN ('unknown_approval', 'bad_card_sig', 'other_person', 'node_revoked',
+                         'not_pending', 'expired') THEN
+        RAISE EXCEPTION 'malformed refuse_decision call' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    SELECT a.decision INTO v_decision FROM ledger.approval a WHERE a.id = p_approval_id;
+    PERFORM audit.append('AGENT', 'core', 'approval', p_approval_id, 'DECIDE', v_decision, NULL,
+                         'REJECTED', p_code, NULL,
+                         jsonb_strip_nulls(jsonb_build_object('node_id', p_node_id,
+                                                              'decision', v_decision)));
+    RETURN p_code;
+END;
+$$;
+REVOKE ALL ON FUNCTION ledger.refuse_decision(uuid, uuid, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION ledger.refuse_decision(uuid, uuid, text) TO jarvis_app;
+"""
+
 BUDGET = r"""
 -- §5.6. Amounts are integers in paise. "This month" and "today" are Asia/Kolkata dates.
 CREATE TABLE ops.brain_budget (
@@ -250,7 +325,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ops.brain_reservation TO jarvis_app;
 GRANT SELECT, INSERT, DELETE ON ops.brain_usage TO jarvis_app;
 """
 
-NEW_ACTIONS = ("CONSUME",)
+NEW_ACTIONS = ("CONSUME", "DECIDE")
 ACTIONS_0009 = (
     "CREATE",
     "TRANSITION",
@@ -289,6 +364,7 @@ def upgrade() -> None:
         op.execute(f"ALTER TYPE audit.action ADD VALUE IF NOT EXISTS '{action}'")
     op.execute(_entity_check((*ENTITY_TYPES_0009, "approval")))
     op.execute(APPROVAL)
+    op.execute(APPROVAL_AUDIT)
     op.execute(BUDGET)
 
 
@@ -310,8 +386,11 @@ def downgrade() -> None:
     DROP TABLE ops.brain_usage;
     DROP TABLE ops.brain_reservation;
     DROP TABLE ops.brain_budget;
+    DROP FUNCTION ledger.refuse_decision(uuid, uuid, text);
     DROP FUNCTION ledger.consume_approval(uuid);
     DROP TABLE ledger.approval;
+    DROP FUNCTION ledger.approval_audit_decide();
+    DROP FUNCTION ledger.approval_audit_create();
     DROP FUNCTION ledger.approval_guard();
     """)
     op.execute(_entity_check(ENTITY_TYPES_0009))

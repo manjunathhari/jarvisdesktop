@@ -15,9 +15,14 @@ One job runs one utterance (`conv.inbound`) through these steps:
    for at most `CAP_HOLD`, retried every `CAP_RETRY`, then expires (`turn.cap_expired`).
    A model without a price notifies the owner, not the turn's person (R12-19).
 7. Call the brain, streaming SPEECH chunks with NOTIFY `jarvis_stream` (only the reply_id),
-   each carrying the turn's `session_id` (R9-1). Each ToolCall goes to `decide_tool_call`
-   (a stub that refuses everything until Task 11): a refused call is not executed, writes no
-   ACTION chunk and does not end the turn.
+   each carrying the turn's `session_id` (R9-1). Each ToolCall's wire name is mapped to its
+   action kind (`prompt.TOOL_ACTIONS`; an unmapped name is refused as `unknown_action`), then
+   decided by `policy.decide_tool_call` for the node that spoke, with the memory the request
+   was built with. A refused call is not executed, writes no ACTION chunk, records event
+   `policy.refused` (codes only) and is explained once in the reply; the turn goes on. READ_ONLY:
+   a signed live ACTION chunk in this reply (`actions.issue_live`). REVERSIBLE (`memory.write`):
+   a STATED entry by the authenticated person. IRREVERSIBLE (`pc.delete_test_file`):
+   `approvals.propose_delete`, which lists the folder and proposes the approval.
 8. After the call: CONNECT failure -> `release`, hold, re-run (the turn may try again);
    SEND failure, any unplaceable exception, or a completed stream with no usage -> `lapse`
    now, which runs the indeterminate path once (Task 9); success -> `settle`, the final chunk,
@@ -55,7 +60,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -63,7 +68,7 @@ from uuid import UUID
 
 import psycopg
 
-from jarvis_server import comm, config, jobs
+from jarvis_server import comm, config, jobs, policy
 from jarvis_server.brain import budget, health, prices
 from jarvis_server.brain.claude import count_input_tokens
 from jarvis_server.brain.types import (
@@ -74,9 +79,12 @@ from jarvis_server.brain.types import (
     Speech,
     ToolCall,
 )
-from jarvis_server.core import dispatch, identity, prompt, rules, sessions
+from jarvis_server.contracts import MemoryCategory
+from jarvis_server.core import actions, approvals, dispatch, identity, prompt, rules, sessions
 from jarvis_server.core.prompt import TURN_MAX_TOKENS
 from jarvis_server.memory.engine import MemoryEngine
+from jarvis_server.memory.errors import MemoryEngineError
+from jarvis_server.policy import NeedsApproval, Refuse, Tier, decide_tool_call
 
 log = logging.getLogger("jarvis.core.turn")
 
@@ -103,9 +111,18 @@ DOWN_HOLD = timedelta(hours=1)  # and expires this long after it arrived (R12-18
 CHUNK_MAX = 4000  # conv.stream_chunk.text
 MESSAGE_MAX = 20000  # conv.message.text
 
-# The reply when the brain answered with no speech (only tool calls, all refused until Task
-# 11, or nothing): a turn always ends with a final chunk and a JARVIS message.
+# The reply when the brain answered with no speech (only tool calls, or nothing): a turn always
+# ends with a final chunk and a JARVIS message.
 NO_SPEECH_TEXT = "I can't do that from here yet."
+# What Jarvis says about a tool call (§9.2: a refusal is explained in the reply).
+REFUSED_TEXT = "I'm not allowed to do that."
+APPROVAL_TEXT = "That needs your approval."
+NOT_LISTED_TEXT = "I can't find {name} in the test folder."
+NO_LISTING_TEXT = "I couldn't check the test folder just now."
+REMEMBERED_TEXT = "I'll remember that."
+NOT_REMEMBERED_TEXT = "I couldn't remember that."
+# A fact the person states about themselves: their own identity file (no domain or date needed).
+MEMORY_CATEGORY = MemoryCategory.IDENTITY
 CAP_EXPIRED_TEXT = {
     "monthly": "I couldn't answer that: the monthly limit is reached.",
     "daily": "I couldn't answer that: today's limit is reached.",
@@ -135,39 +152,16 @@ def set_brain(provider: BrainProvider | None) -> None:
 
 
 def set_memory(engine: MemoryEngine | None) -> None:
+    """The memory engine for the prompt, the policy's memory check and `memory.write`."""
     global _memory
     _memory = engine
+    policy.set_memory(engine)
 
 
 def set_clock(clock: Clock | None) -> None:
     """Tests only: the time sessions and holds use. None: the database's `now()`."""
     global _clock
     _clock = clock
-
-
-# --- policy (Task 11 replaces this stub) -----------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Refuse:
-    code: str
-
-
-Decision = Refuse
-
-
-def decide_tool_call(
-    conn: psycopg.Connection[Any],
-    *,
-    person_id: UUID,
-    session_id: UUID,
-    node_id: UUID,
-    node_kind: str,
-    call: ToolCall,
-    memory_ids: Sequence[str],
-) -> Decision:
-    """Stub of `policy.decide_tool_call` (Task 11): refuses every call."""
-    return Refuse("policy_not_ready")
 
 
 # --- the turn row ----------------------------------------------------------------------------
@@ -418,8 +412,12 @@ class _Stream:
         self.seq = 0
         self.pieces: list[str] = []
         self._pending: str | None = None
+        self._space_next = False  # after Jarvis's own words, the brain's next piece is spaced
 
     def speech(self, text: str) -> None:
+        if self._space_next and text and not text[0].isspace():
+            text = " " + text
+        self._space_next = False
         for start in range(0, len(text), CHUNK_MAX):
             piece = text[start : start + CHUNK_MAX]
             self.pieces.append(piece)
@@ -446,6 +444,21 @@ class _Stream:
         self._pending = None
         return reply
 
+    def say(self, text: str) -> None:
+        """Jarvis's own words about a tool call, spoken as part of the reply."""
+        if self.pieces and not self.pieces[-1][-1:].isspace():
+            text = " " + text
+        self.speech(text)
+        self._space_next = True
+
+    def action(self, *, target: UUID, person_id: UUID, kind: str, args: dict[str, Any],
+               now: datetime) -> None:  # fmt: skip
+        """A live ACTION chunk of this reply. The piece kept back keeps its place after it."""
+        self.seq = actions.issue_live(
+            self.c, reply_id=self.reply_id, session_id=self.session_id, target_node_id=target,
+            person_id=person_id, action_kind=kind, args=args, now=now,
+        )  # fmt: skip
+
     def _write(self, text: str, *, final: bool) -> None:
         self.seq += 1
         self.c.execute(
@@ -465,6 +478,7 @@ def _call(
 ) -> CallPhase | None:
     """Run the call. None if it completed; else the phase it failed in (§10.1 step 4)."""
     received = False
+    told: set[str] = set()  # what this reply has already said about refusals
     try:
         for event in brain.think(req):
             received = True
@@ -472,12 +486,7 @@ def _call(
                 if event.text:
                     stream.speech(event.text)
             else:
-                decision = decide_tool_call(
-                    c, person_id=turn.person_id, session_id=stream.session_id,
-                    node_id=turn.node_id, node_kind=turn.node_kind, call=event,
-                    memory_ids=prompt.memory_ids(req),
-                )  # fmt: skip
-                log.info("turn %s: tool call refused (%s)", turn.id, decision.code)
+                _tool(c, turn, stream, event, prompt.memory_ids(req), told)
     except BrainCallFailed as failure:
         # Events from the provider prove a request was sent: never CONNECT after one.
         if failure.phase is CallPhase.CONNECT and not received:
@@ -487,6 +496,88 @@ def _call(
         log.warning("turn %s: unexpected %s during the call", turn.id, type(exc).__name__)
         return CallPhase.SEND
     return None
+
+
+def _tool(
+    c: psycopg.Connection[Any],
+    turn: _Inbound,
+    stream: _Stream,
+    call: ToolCall,
+    memory_ids: list[str],
+    told: set[str],
+) -> None:
+    """One tool call: map, decide (§9.2), then act or refuse (§9.1)."""
+    kind = prompt.TOOL_ACTIONS.get(call.name)
+    if kind is None:  # a wire name never reaches the policy as an action kind
+        decision: policy.Decision = Refuse("unknown_action")
+    else:
+        decision = decide_tool_call(
+            c, person_id=turn.person_id, session_id=stream.session_id, node_id=turn.node_id,
+            node_kind=turn.node_kind, call=ToolCall(kind, call.args), memory_ids=memory_ids,
+        )  # fmt: skip
+    if isinstance(decision, Refuse):
+        log.info("turn %s: tool call refused (%s)", turn.id, decision.code)
+        details = {"reason": decision.code}
+        if kind is not None:
+            details["action_kind"] = kind
+        with c.transaction():
+            comm.record_event(
+                c, "policy.refused", subject_type="inbound", subject_id=str(turn.id),
+                person_id=turn.person_id, details=details,
+            )  # fmt: skip
+        if "refused" not in told:
+            told.add("refused")
+            stream.say(REFUSED_TEXT)
+        return
+    assert kind is not None
+    if isinstance(decision, NeedsApproval):
+        _propose(c, turn, stream, call)
+    elif decision.tier is Tier.REVERSIBLE:
+        _remember(c, turn, stream, call)
+    else:
+        stream.action(
+            target=turn.node_id, person_id=turn.person_id, kind=kind,
+            args={"tool": call.name, "input": call.args}, now=_now(c),
+        )  # fmt: skip
+
+
+def _propose(c: psycopg.Connection[Any], turn: _Inbound, stream: _Stream, call: ToolCall) -> None:
+    name = call.args.get("name")
+    if not isinstance(name, str):
+        stream.say(REFUSED_TEXT)
+        return
+    try:
+        approval = approvals.propose_delete(
+            c, session_id=stream.session_id, person_id=turn.person_id, node_id=turn.node_id,
+            name=name, now=_now(c),
+        )  # fmt: skip
+    except approvals.ListingUnavailable:
+        log.info("turn %s: no usable listing", turn.id)
+        stream.say(NO_LISTING_TEXT)
+        return
+    if approval is None:
+        stream.say(NOT_LISTED_TEXT.format(name=name if actions.NAME.fullmatch(name) else "it"))
+    else:
+        stream.say(APPROVAL_TEXT)
+
+
+def _remember(c: psycopg.Connection[Any], turn: _Inbound, stream: _Stream, call: ToolCall) -> None:
+    """`memory.write`: by and about the authenticated person, never from the call (P2-S2)."""
+    assert _memory is not None
+    content = call.args.get("content")  # the only argument read: the tool takes no other
+    if not isinstance(content, str) or not content.strip():
+        stream.say(NOT_REMEMBERED_TEXT)
+        return
+    try:
+        actions.memory_write(
+            c, _memory, person_id=turn.person_id, inbound_id=turn.id, content=content.strip(),
+            category=MEMORY_CATEGORY.value, topics=(),
+        )  # fmt: skip
+    except (MemoryEngineError, ValueError):
+        log.info("turn %s: memory.write refused", turn.id)
+        stream.say(NOT_REMEMBERED_TEXT)
+        return
+    stream.say(REMEMBERED_TEXT)
 
 
 def _settle(

@@ -333,34 +333,65 @@ def test_history_is_the_sessions_last_twenty_messages(
     assert last.history[-1].role == "jarvis" and last.history[-1].text == "Reply 10."
 
 
-def test_tool_calls_go_to_the_policy_stub_and_speech_continues(
+def test_tool_calls_are_mapped_decided_and_speech_continues(
     app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine,
-    monkeypatch: pytest.MonkeyPatch,
+    core_key: Any, monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # fmt: skip
+    """The wire name is mapped to its action kind before the policy decides; a READ_ONLY call
+    is a live ACTION chunk in the reply, and the speech goes on around it."""
     seen: list[ToolCall] = []
     real = turn.decide_tool_call
 
     def spy(conn: Conn, **kw: Any) -> Any:
         seen.append(kw["call"])
+        assert kw["node_id"] == node and kw["node_kind"] == "DESKTOP"
         return real(conn, **kw)
 
     monkeypatch.setattr(turn, "decide_tool_call", spy)
     turn.set_brain(Brains([Speech("Here "), ToolCall("show_news", {"region": "india"}),
                            Speech("you are.")]))  # fmt: skip
     tid = _turn(app, owner, node, person)
-    assert seen == [ToolCall("show_news", {"region": "india"})]
-    types = app.execute(
-        "SELECT type FROM conv.stream_chunk WHERE session_id = %s", (_session(app, tid),)
+    assert seen == [ToolCall("module.news", {"region": "india"})]
+    rows = app.execute(
+        "SELECT type, authz->'object'->>'action_kind', authz->'object'->'args', session_id"
+        " FROM conv.stream_chunk WHERE session_id = %s ORDER BY seq",
+        (_session(app, tid),),
     ).fetchall()
-    assert types == [("SPEECH",), ("SPEECH",)]  # refused: no ACTION chunk, the turn goes on
+    assert [r[0] for r in rows] == ["ACTION", "SPEECH", "SPEECH"]
+    assert rows[0][1:3] == ("module.news", {"tool": "show_news", "input": {"region": "india"}})
     assert _messages(app, tid)[-1] == ("JARVIS", "Here you are.")
     assert _outcome(app, tid) == "ANSWERED"
 
 
-def test_tool_only_reply_gets_the_fallback_text(
+def test_refused_tool_call_writes_no_action_and_speech_continues(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """An unmapped wire name never reaches the policy: refused (`unknown_action`), recorded,
+    explained once, and the turn goes on (a wire name is never taken as an action kind)."""
+    seen: list[ToolCall] = []
+    monkeypatch.setattr(turn, "decide_tool_call", lambda conn, **kw: seen.append(kw["call"]))
+    turn.set_brain(Brains([Speech("Here "), ToolCall("pc.delete_test_file", {"name": "a.txt"}),
+                           ToolCall("run_shell", {}), Speech("you are.")]))  # fmt: skip
+    tid = _turn(app, owner, node, person)
+    assert seen == []
+    types = app.execute(
+        "SELECT type FROM conv.stream_chunk WHERE session_id = %s", (_session(app, tid),)
+    ).fetchall()
+    assert {t[0] for t in types} == {"SPEECH"}
+    assert _messages(app, tid)[-1] == ("JARVIS", f"Here {turn.REFUSED_TEXT} you are.")
+    events = app.execute(
+        "SELECT details FROM comm.event WHERE kind = 'policy.refused' AND subject_id = %s",
+        (str(tid),),
+    ).fetchall()
+    assert [e[0] for e in events] == [{"reason": "unknown_action"}] * 2
+    assert _outcome(app, tid) == "ANSWERED"
+
+
+def test_reply_without_speech_gets_the_fallback_text(
     app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine
 ) -> None:
-    turn.set_brain(Brains([ToolCall("pc_delete_test_file", {"name": "a.txt"})]))
+    turn.set_brain(Brains([]))
     tid = _turn(app, owner, node, person)
     assert _messages(app, tid)[-1] == ("JARVIS", turn.NO_SPEECH_TEXT)
     final = app.execute(

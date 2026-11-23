@@ -87,8 +87,12 @@ def create_outbox(
     expires_at: datetime | None,
     supersedes_id: UUID | None = None,
     authz: dict[str, Any] | None = None,
+    target_node_id: UUID | None = None,
 ) -> UUID:
     """Create a PENDING outbox item; supersede `supersedes_id` in the same transaction.
+
+    `target_node_id` addresses the item to that one node of the person (R12-23); None, to every
+    node of the person. The database refuses a target that is not the person's node.
 
     NOTIFYs `jarvis_outbox` with the new id (and the supersede with the old one), delivered
     when the transaction commits. The supersede goes through comm.supersede_for_create, which
@@ -107,8 +111,8 @@ def create_outbox(
                 raise ValueError("an item can only supersede an item of the same person")
         row = conn.execute(
             "INSERT INTO comm.outbox (person_id, event_id, priority, kind, body, authz,"
-            " group_key, supersedes_id, expires_at)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+            " target_node_id, group_key, supersedes_id, expires_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
             (
                 person_id,
                 event_id,
@@ -116,6 +120,7 @@ def create_outbox(
                 kind,
                 Jsonb(body),
                 None if authz is None else Jsonb(authz),
+                target_node_id,
                 group_key,
                 supersedes_id,
                 expires_at,

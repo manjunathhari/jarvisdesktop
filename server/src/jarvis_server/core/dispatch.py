@@ -6,6 +6,9 @@ Transactions (controller ruling 5):
   so a job re-run after a crash finds either everything or nothing.
 - A handler that raises: its transaction is rolled back (nothing it wrote survives), then
   `jobs.fail` records the failure in a separate transaction, and the error is re-raised.
+- Inside the job transaction, `dbcall.audited_call_in_job` is the way to call an audited
+  function (R11-1): dispatch marks the transaction with a context variable for the handler's
+  run, and the helper refuses to run anywhere else (`NotInJob`).
 - A handler that has to keep an audited refusal writes it and **returns normally**; the refusal
   then commits with the job's completion and is never rolled back (R7-1, R10-1). A handler
   never raises after writing a refusal it must keep.
@@ -27,7 +30,7 @@ from psycopg.pq import TransactionStatus
 
 from jarvis_server import jobs
 from jarvis_server.core import rules
-from jarvis_server.dbcall import TransactionNotIdle
+from jarvis_server.dbcall import TransactionNotIdle, job_transaction
 
 log = logging.getLogger("jarvis.core.dispatch")
 
@@ -65,7 +68,7 @@ def handle(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
         handler = _HANDLERS.get(job.kind)
         if handler is None:
             raise UnknownJob(f"no handler for job kind {job.kind!r}")
-        with conn.transaction():
+        with conn.transaction(), job_transaction(conn):
             handler(conn, job)
             jobs.complete(conn, job.id)
     except Exception as e:
@@ -102,12 +105,13 @@ def _system_event(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
 
 
 def _context(raw: dict[str, Any]) -> rules.NotifyContext:
-    """A job payload is JSON: turn its `supersedes_id` and `expires_at` strings back into a UUID
-    and a datetime. Every other value goes on as it is; `rules.notify` checks the whole context
-    (unknown keys, types, a naive `expires_at`, the authz shape)."""
+    """A job payload is JSON: turn its `supersedes_id` and `target_node_id` strings back into
+    UUIDs and `expires_at` into a datetime. Every other value goes on as it is; `rules.notify`
+    checks the whole context (unknown keys, types, a naive `expires_at`, the authz shape)."""
     context = dict(raw)
-    if isinstance(context.get("supersedes_id"), str):
-        context["supersedes_id"] = UUID(context["supersedes_id"])
+    for key in ("supersedes_id", "target_node_id"):
+        if isinstance(context.get(key), str):
+            context[key] = UUID(context[key])
     if isinstance(context.get("expires_at"), str):
         context["expires_at"] = datetime.fromisoformat(context["expires_at"])
     return cast(rules.NotifyContext, context)

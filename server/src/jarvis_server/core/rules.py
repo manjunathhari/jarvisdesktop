@@ -12,6 +12,8 @@ The caller passes one typed `NotifyContext` (R11-3, 11b). Every field is optiona
 - `group_key`: a non-empty key wins; omitted, `None` or empty falls back to the kind's fixed
   default group, never a placeholder such as "None" (comm.outbox.group_key stays NOT NULL).
 - `text`: replaces the fixed text (the reply itself, for `turn.completed_after_hold`).
+- `target_node_id`: the one node the item is for (R12-23); omitted, every node of the person.
+  Required for `action.approved`: the signed action goes to the requesting node only.
 - `authz`: the raw signed dict `{object, key_id, sig}`, checked for exactly that shape and
   carried unchanged. It is never parsed into a model and rebuilt, and nothing here checks its
   signature or marks it trusted: the node does that under §7.1.
@@ -50,6 +52,7 @@ class NotifyContext(TypedDict, total=False):
     group_key: str | None
     text: str
     authz: AuthzDict
+    target_node_id: UUID
 
 
 _CONTEXT_KEYS = frozenset(NotifyContext.__annotations__)
@@ -92,6 +95,12 @@ RULES: dict[str, Rule] = {
     "turn.indeterminate": Rule(Priority.TODAY, "turn", "A request ended without a clear outcome"),
     "turn.completed_after_hold": Rule(Priority.TODAY, "turn", "A held request has been answered"),
     "action.readonly_ok": Rule(Priority.SILENT, "action", "Action completed"),
+    # R12-22: the approval flow (§9.3, §12).
+    "action.approved": Rule(Priority.URGENT, "action", "Running the approved action"),
+    "memory.written": Rule(Priority.SILENT, "memory", "Remembered"),
+    "approval.decision_refused": Rule(
+        Priority.URGENT, "approval", "That decision could not be applied"
+    ),
     "brain.config_error": Rule(Priority.TODAY, "brain.config", "Claude configuration error"),
 }
 
@@ -129,6 +138,9 @@ def _checked(context: NotifyContext) -> NotifyContext:
         raise ValueError("context['text'] must be a non-empty string")
     if "authz" in context:
         _check_authz(context["authz"])
+    target = context.get("target_node_id")
+    if target is not None and not isinstance(target, UUID):
+        raise ValueError("context['target_node_id'] must be a UUID")
     return context
 
 
@@ -179,6 +191,10 @@ def notify(
     if rule is None:
         raise UnknownEvent(f"no notification rule for event kind {event_kind!r}")
     context = _checked(context)
+    if event_kind == "action.approved" and (
+        context.get("target_node_id") is None or "authz" not in context
+    ):
+        raise ValueError("action.approved needs context['target_node_id'] and ['authz']")
     expires_at = context.get("expires_at")
     supersedes_id = context.get("supersedes_id")
     group_key = context.get("group_key") or rule.group_key  # None or "" -> the kind's default
@@ -208,5 +224,6 @@ def notify(
             expires_at=expires_at,
             supersedes_id=supersedes_id,
             authz=None if authz is None else cast("dict[str, Any]", authz),  # unchanged
+            target_node_id=context.get("target_node_id"),
         )
     return [outbox_id]

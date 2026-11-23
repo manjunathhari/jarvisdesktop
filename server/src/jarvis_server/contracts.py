@@ -82,6 +82,7 @@ class AuditAction(StrEnum):
     EXPIRE = "EXPIRE"
     CHUNK_RECEIVE = "CHUNK_RECEIVE"
     CONSUME = "CONSUME"
+    DECIDE = "DECIDE"
 
 
 class AuditOutcome(StrEnum):

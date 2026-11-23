@@ -5,11 +5,19 @@ returns a structured refusal (a reason code), because in PostgreSQL an error wou
 audit row back with everything else. The caller commits that transaction first and raises only
 afterwards: `audited_call` runs the call in its own transaction, which commits on exit, and
 refuses to run inside a transaction the caller might still roll back.
+
+Inside a job (R11-1) the job transaction is the audited call's transaction: a handler calls
+audited functions through `audited_call_in_job`, which runs only inside dispatch's job
+transaction (marked with `job_transaction`) and never opens, commits or rolls back anything. A
+handler that gets a refusal it must keep returns normally, so dispatch commits the refusal's
+audit row with the job.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, LiteralString
 
 import psycopg
@@ -50,6 +58,14 @@ class ConsumeRefused(Refused):
     already_consumed."""
 
 
+class NotInJob(Exception):
+    """`audited_call_in_job` outside dispatch's job transaction; nothing was run."""
+
+
+# The connection whose job transaction dispatch is running a handler in, if any.
+_JOB_CONN: ContextVar[psycopg.Connection[Any] | None] = ContextVar("jarvis_job_conn", default=None)
+
+
 class TransactionNotIdle(Exception):
     """An audited call was attempted with a transaction open; its audit row could be lost."""
 
@@ -86,3 +102,28 @@ async def audited_call_async(
         cur = await conn.execute(sql, params)
         row = await cur.fetchone()
     return _row(row)
+
+
+@contextmanager
+def job_transaction(conn: psycopg.Connection[Any]) -> Iterator[None]:
+    """Dispatch only: mark `conn`'s open transaction as a job transaction for the block."""
+    if conn.info.transaction_status != TransactionStatus.INTRANS:
+        raise NotInJob("job_transaction needs the job's open transaction")
+    token = _JOB_CONN.set(conn)
+    try:
+        yield
+    finally:
+        _JOB_CONN.reset(token)
+
+
+def audited_call_in_job(
+    conn: psycopg.Connection[Any], sql: LiteralString, params: Sequence[Any]
+) -> tuple[Any, ...]:
+    """Run one audited function call in dispatch's open job transaction; return its row.
+
+    Raises `NotInJob`, and runs nothing, unless `conn` is the connection of the job transaction
+    dispatch is running a handler in, with that transaction still open.
+    """
+    if _JOB_CONN.get() is not conn or conn.info.transaction_status != TransactionStatus.INTRANS:
+        raise NotInJob("audited_call_in_job runs only inside dispatch's job transaction")
+    return _row(conn.execute(sql, params).fetchone())
