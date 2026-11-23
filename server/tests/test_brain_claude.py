@@ -37,7 +37,12 @@ from jarvis_server.brain import (
     Turn,
     count_input_tokens,
 )
-from jarvis_server.brain.claude import API_URL, build_payload
+from jarvis_server.brain.claude import (
+    API_URL,
+    BYTES_PER_TOKEN_FLOOR,
+    TOOL_PROMPT_ALLOWANCE,
+    build_payload,
+)
 
 API_KEY = "sk-test-key-must-never-leak"
 MODEL = "claude-test-model"
@@ -246,10 +251,35 @@ def test_malformed_tool_json_is_send_phase() -> None:
     assert phase_of(mock_brain(lambda r: stream_response(body))).phase is CallPhase.SEND
 
 
-def test_failure_never_carries_the_api_key() -> None:
-    err = phase_of(mock_brain(fail_with(RuntimeError("boom"))))
-    assert API_KEY not in str(err)
-    assert API_KEY not in repr(err)
+def _chain(err: BaseException) -> Iterator[BaseException]:
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [err]
+    while stack:
+        e = stack.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        yield e
+        stack += [e.__cause__, e.__context__]
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [RuntimeError("boom"), httpx.ConnectError("x"), httpx.ReadError("x")],
+)
+def test_failure_never_carries_the_api_key_or_body(exc: Exception) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        exc.request = request  # type: ignore[attr-defined]  # as real transport errors do
+        raise exc
+
+    err = phase_of(mock_brain(handler))
+    assert err.__cause__ is None
+    assert err.__context__ is None
+    for e in _chain(err):
+        assert API_KEY not in str(e)
+        assert API_KEY not in repr(e)
+        assert "What is on my calendar?" not in str(e) + repr(e)
+    assert err.__traceback__ is not None
 
 
 # ---------------------------------------------------------------- real local TLS server
@@ -572,29 +602,32 @@ def test_memory_text_cannot_break_out_of_its_section() -> None:
 # ---------------------------------------------------------------- token counting
 
 
-def test_count_input_tokens_is_local_conservative_and_rounds_up() -> None:
-    small = make_request()
-    big = make_request(utterance="x" * 3000, history=[Turn("person", "é" * 600)])
-    n_small = count_input_tokens(small)
-    n_big = count_input_tokens(big)
-    assert n_small > 0
-    assert n_big > n_small
-    payload = build_payload(big)
-    raw = len(
-        json.dumps(
-            {k: payload[k] for k in ("system", "messages", "tools") if k in payload},
-            ensure_ascii=False,
-        ).encode("utf-8")
-    )
-    assert n_big == -(-raw // 3)
-    assert n_big >= 3000 // 3 + 1200 // 3  # never below bytes / 3 of the visible text
+def _raw_bytes(req: BrainRequest) -> int:
+    payload = build_payload(req)
+    body = {k: payload[k] for k in ("system", "messages", "tools") if k in payload}
+    return len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
 
 
-def test_count_input_tokens_includes_tools() -> None:
-    tool = ToolSpec("t", "d" * 900, {"type": "object"})
-    assert (
-        count_input_tokens(make_request(tools=[tool])) >= count_input_tokens(make_request()) + 300
-    )
+def test_count_input_tokens_without_tools_is_bytes_over_two_rounded_up() -> None:
+    req = make_request(utterance="x" * 3001, history=[Turn("person", "é" * 600)])
+    assert BYTES_PER_TOKEN_FLOOR == 2
+    assert count_input_tokens(req) == -(-_raw_bytes(req) // 2)
+    assert count_input_tokens(make_request()) < count_input_tokens(req)
+
+
+def test_tool_prompt_allowance_is_added_only_with_tools() -> None:
+    tool = ToolSpec("t", "d", {"type": "object"})
+    plain = make_request()
+    with_tools = make_request(tools=[tool])
+    assert TOOL_PROMPT_ALLOWANCE == 1000
+    assert count_input_tokens(plain) == -(-_raw_bytes(plain) // 2)
+    assert count_input_tokens(with_tools) == -(-_raw_bytes(with_tools) // 2) + 1000
+
+
+def test_count_input_tokens_is_a_ceiling_for_dense_digits() -> None:
+    dense = "3141592653589793" * 200  # digits tokenise at far more than 1 token per 3 bytes
+    req = make_request(utterance=dense)
+    assert count_input_tokens(req) >= len(dense) // 2  # at least 1 token per 2 bytes
 
 
 # ---------------------------------------------------------------- FakeBrain

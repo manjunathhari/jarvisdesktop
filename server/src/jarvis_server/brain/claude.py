@@ -62,6 +62,10 @@ ANTHROPIC_VERSION = "2023-06-01"
 # Bounded on every axis. `read` is the longest silence allowed between two stream chunks.
 TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0)
 
+# Ceiling parameters for `count_input_tokens`.
+BYTES_PER_TOKEN_FLOOR = 2
+TOOL_PROMPT_ALLOWANCE = 1000
+
 _CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError)
 
 _MEMORY_NOTICE = (
@@ -126,15 +130,19 @@ def build_payload(req: BrainRequest) -> dict[str, Any]:
 
 
 def count_input_tokens(req: BrainRequest) -> int:
-    """A local, conservative ceiling on the input tokens: UTF-8 bytes of the prompt ÷ 3, rounded up.
+    """A local ceiling on the input tokens of `req`, for the budget reservation (§10.1 step 1).
 
-    It counts the serialised system prompt, messages and tools, so it over-counts rather than
-    under-counts (§10.1 step 1).
+    ceil(UTF-8 bytes of the serialised system prompt, messages and tools / BYTES_PER_TOKEN_FLOOR),
+    plus TOOL_PROMPT_ALLOWANCE when tools are sent. The allowance exists because Anthropic adds a
+    hidden tool-use system prompt (about 346 input tokens) that is billed but is not in the
+    payload. One token per 2 bytes is a pessimistic floor, safe even for dense digits and symbols.
+    Over-counting only reserves more: settlement uses the real `usage` the API reports.
     """
     payload = build_payload(req)
     body = {k: payload[k] for k in ("system", "messages", "tools") if k in payload}
     raw = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
-    return -(-raw // 3)
+    tokens = -(-raw // BYTES_PER_TOKEN_FLOOR)
+    return tokens + (TOOL_PROMPT_ALLOWANCE if req.tools else 0)
 
 
 class ClaudeBrain:
@@ -180,9 +188,15 @@ class ClaudeBrain:
         except BrainCallFailed:
             raise
         except _CONNECT_ERRORS as exc:
-            raise BrainCallFailed(CallPhase.CONNECT, detail=type(exc).__name__) from None
+            failure = BrainCallFailed(CallPhase.CONNECT, detail=type(exc).__name__)
         except Exception as exc:
-            raise BrainCallFailed(CallPhase.SEND, detail=type(exc).__name__) from None
+            failure = BrainCallFailed(CallPhase.SEND, detail=type(exc).__name__)
+        else:
+            return
+        # Raised outside the `except` blocks on purpose: inside them Python would set
+        # `__context__` to the original exception, and an httpx.TransportError carries its
+        # `.request` (the x-api-key header and the body). `failure` holds only safe fields.
+        raise failure
 
     def _parse(self, lines: Iterator[str]) -> Iterator[BrainEvent]:
         input_tokens = 0
