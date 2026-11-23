@@ -32,7 +32,8 @@ def main() -> int:
         log.info("scheduler started")
         while not stopping:
             jobs.beat(conn, "scheduler")
-            silent = [p for p in jobs.silent_processes(conn) if p != "scheduler"]
+            # "brain" is the brain-health row (brain.health), not a process with a heartbeat.
+            silent = [p for p in jobs.silent_processes(conn) if p not in ("scheduler", "brain")]
             if silent:
                 log.warning("silent processes (3 missed heartbeats): %s", ", ".join(silent))
             for _ in range(int(interval)):

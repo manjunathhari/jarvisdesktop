@@ -29,6 +29,8 @@ import psycopg
 
 from jarvis_server import config, jobs, migrate, nodes, signing, smoke
 from jarvis_server.bootstrap import bootstrap
+from jarvis_server.brain import budget as _budget_jobs  # noqa: F401  registers job kinds
+from jarvis_server.brain import health as _health_jobs  # noqa: F401  registers job kinds
 from jarvis_server.core import dispatch
 from jarvis_server.dbcall import Refused
 from jarvis_server.memory import checks as memory_checks

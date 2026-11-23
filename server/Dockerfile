@@ -19,6 +19,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
 COPY alembic.ini ./
 COPY migrations ./migrations
+COPY config ./config
 COPY src ./src
 RUN uv sync --locked --no-dev \
  && groupadd --system --gid 10001 jarvis \
