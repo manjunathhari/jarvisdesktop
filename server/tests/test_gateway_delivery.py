@@ -1,0 +1,947 @@
+"""Gateway, part 2: the stream relay with its durable cursor, outbox delivery and
+acknowledgement, the welcome summary, duplicate connections, fencing and the heartbeat (spec
+§6.2, §8.2, §8.3; R8-1, R9-1, R12-8, R12-9; P2-E03, P2-E04, P2-E05, P2-E07, P2-E13).
+
+Runs in its own database. The gateway connects as jarvis_gateway; tests write chunks, items and
+sessions as jarvis_app (core's role) and NOTIFY as core does, and plant cursor rows as the
+owner. The gateway clock is a FakeClock that starts at the real time, so the database's own
+`last_sent_at` and `created_at` line up with it; advancing it stands in for waiting. Every
+person is fictional.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import os
+import random
+import secrets
+import threading
+import uuid
+from collections import Counter
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import psycopg
+import pytest
+from psycopg.types.json import Jsonb
+from starlette.websockets import WebSocketDisconnect
+
+from jarvis_server import comm, nodes
+from jarvis_server.comm import OutboxState, Priority
+from jarvis_server.contracts import Welcome
+from jarvis_server.core import rules
+from jarvis_server.dbcall import OutboxRefused
+from jarvis_server.gateway import relay
+from jarvis_server.signing import fingerprint, public_bytes
+
+from .conftest import Dsns, fresh_database
+from .fakes.fake_node import FakeNode
+from .helpers.threads import InThread
+from .test_gateway_handshake import MANJ, FakeClock, Gw, _wait_for, running_gateway
+
+Conn = psycopg.Connection[Any]
+HOUSEHOLD = uuid.UUID("00000000-0000-4000-8000-000000000001")
+TRACE_PATH = Path(__file__).parent / "fakes" / "traces" / "e13.jsonl"
+
+
+# ------------------------------------------------------------------------------ fixtures
+
+
+@pytest.fixture(scope="module")
+def ddb() -> Iterator[Dsns]:
+    with fresh_database() as d:
+        yield d
+
+
+@pytest.fixture
+def app_conn(ddb: Dsns) -> Iterator[Conn]:
+    with psycopg.connect(ddb.app, autocommit=True) as conn:
+        yield conn
+
+
+@contextmanager
+def gateway(
+    dsns: Dsns,
+    tmp: Path,
+    *,
+    keys_from: Gw | None = None,
+    recheck_interval: float = 0.1,
+    tick_interval: float = 0.02,
+    clock: FakeClock | None = None,
+) -> Iterator[Gw]:
+    """A gateway app; `keys_from` restarts with an earlier one's keys (and clock), as a new
+    process would: nothing else carries over."""
+    with running_gateway(
+        dsns,
+        tmp,
+        gw_key=keys_from.gw_key if keys_from else None,
+        core_key=keys_from.core_key if keys_from else None,
+        recheck_interval=recheck_interval,
+        tick_interval=tick_interval,
+        clock=clock or (keys_from.clock if keys_from else FakeClock(datetime.now(UTC))),
+    ) as gw:
+        yield gw
+
+
+@pytest.fixture
+def gw(ddb: Dsns, tmp_path: Path) -> Iterator[Gw]:
+    with gateway(ddb, tmp_path) as g:
+        yield g
+
+
+# ------------------------------------------------------------------------------ helpers
+
+
+def _relay(g: Gw) -> relay.Relay:
+    return g.app.state.gateway.relay
+
+
+def _sweep(g: Gw) -> None:
+    """Run one re-send sweep to completion inside the app's event loop."""
+    g.client.portal.call(_relay(g).sweep)
+
+
+def reborn(g: Gw, fake: FakeNode, identity: str | None = None) -> FakeNode:
+    """The same device (key, address, state file) as a new FakeNode on gateway `g`."""
+    g.whois.table[fake.peer_ip] = identity or _identity(fake)
+    return g.node(key=fake.key, peer_ip=fake.peer_ip, state=fake.state_path)
+
+
+_IDENTITIES: dict[str, str] = {}
+
+
+def _identity(fake: FakeNode) -> str:
+    return _IDENTITIES[fake.peer_ip]
+
+
+def enrolled(g: Gw, person: uuid.UUID = MANJ) -> FakeNode:
+    fake = g.node()
+    if person == MANJ:
+        code = g.code()
+    else:
+        with psycopg.connect(g.dsns.app, autocommit=True) as conn:
+            code = nodes.create_enrolment(
+                conn,
+                person_id=person,
+                kind="DESKTOP",
+                name="guest pc",
+                core_fp=fingerprint(public_bytes(g.core_key)),
+                gw_fp=fingerprint(public_bytes(g.gw_key)),
+            )
+    fake.enrol(code)
+    _IDENTITIES[fake.peer_ip] = g.whois.table[fake.peer_ip]
+    fake.sync()
+    return fake
+
+
+def person(app: Conn) -> uuid.UUID:
+    row = app.execute(
+        "INSERT INTO ledger.person (display_name, organization_id, source_ref)"
+        " VALUES ('Fictional Guest', %s, 'test') RETURNING id",
+        (HOUSEHOLD,),
+    ).fetchone()
+    assert row is not None
+    return uuid.UUID(str(row[0]))
+
+
+def session_of(app: Conn, who: uuid.UUID = MANJ) -> uuid.UUID:
+    app.execute(
+        "INSERT INTO conv.session (person_id) VALUES (%s)"
+        " ON CONFLICT (person_id) WHERE closed_at IS NULL DO NOTHING",
+        (who,),
+    )
+    row = app.execute(
+        "SELECT id FROM conv.session WHERE person_id = %s AND closed_at IS NULL", (who,)
+    ).fetchone()
+    assert row is not None
+    return uuid.UUID(str(row[0]))
+
+
+def speech(
+    app: Conn,
+    reply: uuid.UUID,
+    seqs: list[int],
+    *,
+    who: uuid.UUID = MANJ,
+    final: int | None = None,
+    notify: bool = True,
+) -> None:
+    """Write SPEECH chunks as core does, then NOTIFY jarvis_stream with the reply ID only."""
+    session = session_of(app, who)
+    for seq in seqs:
+        app.execute(
+            "INSERT INTO conv.stream_chunk (reply_id, session_id, seq, type, text, final)"
+            " VALUES (%s, %s, %s, 'SPEECH', 'A fictional reply', %s)",
+            (reply, session, seq, seq == final),
+        )
+    if notify:
+        app.execute("SELECT pg_notify('jarvis_stream', %s)", (str(reply),))
+
+
+def action(
+    app: Conn,
+    reply: uuid.UUID,
+    seq: int,
+    *,
+    authz: dict[str, Any],
+    target: uuid.UUID,
+    valid_until: datetime,
+) -> None:
+    app.execute(
+        "INSERT INTO conv.stream_chunk (reply_id, session_id, seq, type, authz, final,"
+        " target_node_id, valid_until) VALUES (%s, %s, %s, 'ACTION', %s, false, %s, %s)",
+        (reply, session_of(app), seq, Jsonb(authz), target, valid_until),
+    )
+
+
+def item(
+    app: Conn,
+    *,
+    who: uuid.UUID = MANJ,
+    priority: Priority = Priority.TODAY,
+    kind: str = "test.notice",
+    group_key: str = "test",
+) -> uuid.UUID:
+    event = comm.record_event(
+        app,
+        "test.notice",
+        subject_type="test",
+        subject_id=f"t-{secrets.token_hex(4)}",
+        person_id=who,
+        details={"code": "fictional"},
+    )
+    return comm.create_outbox(
+        app,
+        person_id=who,
+        event_id=event,
+        priority=priority,
+        kind=kind,
+        body={"event": kind, "text": "A fictional notice"},
+        group_key=group_key,
+        expires_at=None,
+    )
+
+
+def chunk_seqs(envs: list[dict[str, Any]], reply: uuid.UUID) -> list[int]:
+    return [
+        e["payload"]["seq"]
+        for e in envs
+        if e["kind"] == "reply.chunk" and e["payload"]["reply_id"] == str(reply)
+    ]
+
+
+def item_ids(envs: list[dict[str, Any]], kind: str = "outbox.item") -> list[str]:
+    return [e["payload"]["outbox_id"] for e in envs if e["kind"] == kind]
+
+
+def collect(
+    fake: FakeNode, done: Callable[[list[dict[str, Any]]], bool], timeout: float = 5.0
+) -> list[dict[str, Any]]:
+    """Receive until `done(received)` holds (or fail), then whatever else is queued."""
+    out: list[dict[str, Any]] = []
+    deadline = datetime.now(UTC) + timedelta(seconds=timeout)
+    while not done(out):
+        assert datetime.now(UTC) < deadline, [e["kind"] for e in out]
+        with contextlib.suppress(TimeoutError):
+            out.append(fake.recv(0.05))
+    return out + fake.drain(0.1)
+
+
+def cursor(app: Conn, reply: uuid.UUID, node: uuid.UUID | None) -> int | None:
+    row = app.execute(
+        "SELECT acked_seq FROM conv.stream_cursor WHERE reply_id = %s AND node_id = %s",
+        (reply, node),
+    ).fetchone()
+    return None if row is None else int(row[0])
+
+
+def plant_cursor(dsns: Dsns, reply: uuid.UUID, node: uuid.UUID | None, acked: int) -> None:
+    with psycopg.connect(dsns.owner, autocommit=True) as owner:
+        owner.execute(
+            "INSERT INTO conv.stream_cursor (reply_id, node_id, acked_seq) VALUES (%s, %s, %s)",
+            (reply, node, acked),
+        )
+
+
+def resume_events(app: Conn, node: uuid.UUID | None) -> list[dict[str, Any]]:
+    rows = app.execute(
+        "SELECT details FROM comm.event WHERE kind = 'node.resume_out_of_range'"
+        " AND subject_id = %s ORDER BY occurred_at, id",
+        (str(node),),
+    ).fetchall()
+    return [dict(r[0]) for r in rows]
+
+
+def audit_seq(app: Conn) -> int:
+    row = app.execute("SELECT coalesce(max(seq), 0) FROM audit.event").fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def state(app: Conn, outbox_id: uuid.UUID | str) -> str:
+    row = app.execute("SELECT state FROM comm.outbox WHERE id = %s", (outbox_id,)).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+def attempts(app: Conn, outbox_id: uuid.UUID | str, node: uuid.UUID | None) -> int | None:
+    row = app.execute(
+        "SELECT attempts FROM comm.delivery WHERE outbox_id = %s AND node_id = %s",
+        (outbox_id, node),
+    ).fetchone()
+    return None if row is None else int(row[0])
+
+
+def closed(fake: FakeNode, timeout: float = 5.0) -> list[dict[str, Any]]:
+    """Every message up to the gateway closing the socket (which must happen)."""
+    out: list[dict[str, Any]] = []
+    deadline = datetime.now(UTC) + timedelta(seconds=timeout)
+    while True:
+        assert datetime.now(UTC) < deadline, "the gateway never closed the connection"
+        try:
+            out.append(fake.recv(0.05))
+        except TimeoutError:
+            continue
+        except WebSocketDisconnect:
+            return out
+
+
+def close_reason(app: Conn, node: uuid.UUID | None) -> list[Any]:
+    rows = app.execute(
+        "SELECT close_reason FROM gw.node_connection WHERE node_id = %s ORDER BY id", (node,)
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+class _FencedError(psycopg.Error):
+    sqlstate = "JF001"
+
+
+# ------------------------------------------------------------------------------ stream relay
+
+
+def test_stream_resumes_after_gateway_restart(ddb: Dsns, tmp_path: Path, app_conn: Conn) -> None:
+    """P2-E03: the cursor, not the process, carries the stream across a gateway restart."""
+    reply = uuid.uuid4()
+    with gateway(ddb, tmp_path) as first:
+        a = enrolled(first)
+        speech(app_conn, reply, [1, 2, 3])
+        collect(a, lambda envs: len(chunk_seqs(envs, reply)) == 3)
+        a.sync()  # its `received` messages are recorded
+        assert cursor(app_conn, reply, a.node_id) == 3
+        shown_before = list(a.shown_chunks[str(reply)])
+        a.close()
+    with gateway(ddb, tmp_path, keys_from=first) as second:  # nothing in memory carries over
+        b = reborn(second, a)
+        b.hello()
+        assert chunk_seqs(b.sync(), reply) == []
+        speech(app_conn, reply, [4, 5], final=5)
+        envs = collect(b, lambda e: len(chunk_seqs(e, reply)) == 2)
+        assert chunk_seqs(envs, reply) == [4, 5]
+        assert shown_before + b.shown_chunks[str(reply)] == [1, 2, 3, 4, 5]
+
+
+def test_unacked_chunks_resent_after_restart(ddb: Dsns, tmp_path: Path, app_conn: Conn) -> None:
+    reply = uuid.uuid4()
+    with gateway(ddb, tmp_path) as first:
+        a = enrolled(first)
+        a.ack_chunks = False
+        speech(app_conn, reply, [1, 2, 3])
+        collect(a, lambda envs: len(chunk_seqs(envs, reply)) == 3)
+        a.send("received", {"reply_id": str(reply), "seq": 2})
+        a.sync()
+        assert cursor(app_conn, reply, a.node_id) == 2
+        shown_before = list(a.shown_chunks[str(reply)])
+        a.close()
+    with gateway(ddb, tmp_path, keys_from=first) as second:
+        b = reborn(second, a)
+        b.hello(resume=[])  # no resume position: the cursor alone decides
+        assert chunk_seqs(b.sync(), reply) == [3]
+        assert shown_before == [1, 2, 3] and b.shown_chunks[str(reply)] == []  # shown once
+
+
+def _stored_three_acked_one(g: Gw, app: Conn, dsns: Dsns) -> tuple[FakeNode, uuid.UUID]:
+    a = enrolled(g)
+    a.close()
+    reply = uuid.uuid4()
+    speech(app, reply, [1, 2, 3], final=3, notify=False)
+    plant_cursor(dsns, reply, a.node_id, 1)
+    return a, reply
+
+
+def test_resume_beyond_stored_max_does_not_skip(gw: Gw, app_conn: Conn, ddb: Dsns) -> None:
+    a, reply = _stored_three_acked_one(gw, app_conn, ddb)
+    b = reborn(gw, a)
+    b.hello(resume=[{"reply_id": str(reply), "last_seq": 99}])
+    assert chunk_seqs(b.sync(), reply) == [2, 3]
+    assert resume_events(app_conn, a.node_id) == [
+        {"node_id": str(a.node_id), "reply_id": str(reply), "reason": "beyond_max"}
+    ]
+
+
+def test_resume_within_range_used(gw: Gw, app_conn: Conn, ddb: Dsns) -> None:
+    a, reply = _stored_three_acked_one(gw, app_conn, ddb)
+    b = reborn(gw, a)
+    b.hello(resume=[{"reply_id": str(reply), "last_seq": 2}])
+    assert chunk_seqs(b.sync(), reply) == [3]
+    assert resume_events(app_conn, a.node_id) == []
+
+
+def test_resume_negative_treated_as_zero(gw: Gw, app_conn: Conn, ddb: Dsns) -> None:
+    a, reply = _stored_three_acked_one(gw, app_conn, ddb)
+    b = reborn(gw, a)
+    b.hello(resume=[{"reply_id": str(reply), "last_seq": -5}])
+    assert chunk_seqs(b.sync(), reply) == [2, 3]
+    assert resume_events(app_conn, a.node_id) == []
+
+
+def test_resume_huge_last_seq_reaches_the_database(gw: Gw, app_conn: Conn, ddb: Dsns) -> None:
+    """The largest `last_seq` a signed `hello` can carry (JCS limits signed integers to
+    2^53 - 1, so a larger one can never verify) reaches the database as numeric: ignored,
+    recorded, nothing skipped. Beyond 64 bits is covered at the SQL boundary (test_comm_db)."""
+    a, reply = _stored_three_acked_one(gw, app_conn, ddb)
+    b = reborn(gw, a)
+    b.hello(resume=[{"reply_id": str(reply), "last_seq": 2**53 - 1}])
+    assert chunk_seqs(b.sync(), reply) == [2, 3]
+    assert [e["reason"] for e in resume_events(app_conn, a.node_id)] == ["beyond_max"]
+
+
+def test_resume_for_foreign_reply_ignored(gw: Gw, app_conn: Conn) -> None:
+    guest = person(app_conn)
+    foreign = uuid.uuid4()
+    speech(app_conn, foreign, [1, 2], who=guest, notify=False)
+    a = enrolled(gw)
+    a.close()
+    b = reborn(gw, a)
+    b.hello(resume=[{"reply_id": str(foreign), "last_seq": 1}])
+    assert chunk_seqs(b.sync(), foreign) == []
+    assert resume_events(app_conn, a.node_id) == [
+        {"node_id": str(a.node_id), "reply_id": str(foreign), "reason": "unknown_reply"}
+    ]
+
+
+def test_resume_only_first_64_entries_checked(gw: Gw, app_conn: Conn) -> None:
+    a = enrolled(gw)
+    a.close()
+    unknown = [str(uuid.uuid4()) for _ in range(70)]
+    b = reborn(gw, a)
+    b.hello(resume=[{"reply_id": r, "last_seq": 1} for r in unknown])
+    b.sync()
+    assert [e["reply_id"] for e in resume_events(app_conn, a.node_id)] == unknown[:64]
+
+
+def test_reconnect_never_uses_cursor_rows_as_authority(gw: Gw, app_conn: Conn, ddb: Dsns) -> None:
+    """R9-1: a cursor row for (A's reply, B's node), planted by the owner, gives B nothing."""
+    reply_a = uuid.uuid4()
+    speech(app_conn, reply_a, [1, 2, 3], notify=False)  # A = the seeded fictional person
+    guest = person(app_conn)
+    b = enrolled(gw, guest)
+    plant_cursor(ddb, reply_a, b.node_id, 0)
+    b.close()
+    b2 = reborn(gw, b)
+    b2.hello(resume=[])
+    assert chunk_seqs(b2.sync(), reply_a) == []
+    speech(app_conn, reply_a, [4])  # a live wake-up for A's reply reaches A's nodes only
+    assert chunk_seqs(b2.drain(0.3), reply_a) == []
+    assert cursor(app_conn, reply_a, b.node_id) == 0
+
+
+def test_ack_for_pruned_chunk_is_noop(gw: Gw, app_conn: Conn) -> None:
+    a = enrolled(gw)
+    reply = uuid.uuid4()
+    speech(app_conn, reply, [1, 2], final=2)
+    collect(a, lambda envs: len(chunk_seqs(envs, reply)) == 2)
+    a.sync()
+    app_conn.execute("DELETE FROM conv.stream_cursor WHERE reply_id = %s", (reply,))
+    app_conn.execute("DELETE FROM conv.stream_chunk WHERE reply_id = %s", (reply,))  # retention
+    since = audit_seq(app_conn)
+    a.send("received", {"reply_id": str(reply), "seq": 2})  # a late ack
+    assert a.sync() == []  # no error, and the connection stays open
+    rows = app_conn.execute("SELECT count(*) FROM audit.event WHERE seq > %s", (since,))
+    assert rows.fetchone() == (0,)
+    assert cursor(app_conn, reply, a.node_id) is None
+
+
+def test_core_restart_mid_stream(gw: Gw, app_conn: Conn) -> None:
+    """P2-E03, P2-B4, gateway half only (controller ruling G3): core wrote chunks 1..2 and
+    died. Standing in for the lease-expiry sweep, the core role creates one
+    `turn.indeterminate` item. The node keeps 1..2, gets no final chunk and exactly one such
+    item. "Brain called once" and the real lease-expiry path are tested in Task 10."""
+    a = enrolled(gw)
+    reply = uuid.uuid4()
+    speech(app_conn, reply, [1, 2])
+    envs = collect(a, lambda e: len(chunk_seqs(e, reply)) == 2)
+    event = comm.record_event(
+        app_conn,
+        "turn.indeterminate",
+        subject_type="reply",
+        subject_id=str(reply),
+        person_id=MANJ,
+        details={"reply_id": str(reply)},
+    )
+    [made] = rules.notify(
+        app_conn, "turn.indeterminate", person_id=MANJ, event_id=event, context={}
+    )
+    envs += collect(a, lambda e: str(made) in item_ids(e))
+    envs += a.sync()
+    assert a.shown_chunks[str(reply)] == [1, 2]
+    assert not any(e["payload"].get("final") for e in envs if e["kind"] == "reply.chunk")
+    items = [e["payload"] for e in envs if e["kind"] == "outbox.item"]
+    assert [(i["outbox_id"], i["kind"]) for i in items] == [(str(made), "turn.indeterminate")]
+    assert items[0]["body"] == "A request ended without a clear outcome"  # body["text"] (G4.1)
+
+
+def test_action_chunk_only_to_target_and_before_valid_until(gw: Gw, app_conn: Conn) -> None:
+    """G4.2: a live ACTION chunk goes as `node.action {authz}` to its target only, and only
+    while now() <= valid_until. Never as `reply.chunk` type ACTION."""
+    a = enrolled(gw)
+    b = enrolled(gw)
+    reply = uuid.uuid4()
+    now = gw.clock()
+    live = gw.authz(a.node_id)
+    expired = gw.authz(a.node_id)
+    speech(app_conn, reply, [1], notify=False)
+    action(app_conn, reply, 2, authz=live, target=a.node_id, valid_until=now + timedelta(minutes=2))
+    action(
+        app_conn, reply, 3, authz=expired, target=a.node_id, valid_until=now - timedelta(seconds=1)
+    )
+    speech(app_conn, reply, [4], final=4)
+    envs_a = collect(a, lambda e: len(chunk_seqs(e, reply)) == 2)
+    envs_b = collect(b, lambda e: len(chunk_seqs(e, reply)) == 2)
+    relevant = [e for e in envs_a if e["kind"] in ("reply.chunk", "node.action")]
+    assert [(e["kind"], e["payload"].get("seq")) for e in relevant] == [
+        ("reply.chunk", 1),
+        ("node.action", None),
+        ("reply.chunk", 4),
+    ]
+    assert relevant[1]["payload"] == {"authz": live}
+    assert a.actions == [live["object"]] and a.rejected == []
+    assert [e["kind"] for e in envs_b if e["kind"] in ("reply.chunk", "node.action")] == [
+        "reply.chunk",
+        "reply.chunk",
+    ]
+    assert chunk_seqs(envs_b, reply) == [1, 4] and b.actions == []
+    assert cursor(app_conn, reply, a.node_id) == 4  # SPEECH acks move the cursor past ACTIONs
+
+
+def test_action_chunk_never_resent_on_reconnect(gw: Gw, app_conn: Conn) -> None:
+    a = enrolled(gw)
+    a.ack_chunks = False
+    reply = uuid.uuid4()
+    speech(app_conn, reply, [1], notify=False)
+    action(
+        app_conn,
+        reply,
+        2,
+        authz=gw.authz(a.node_id),
+        target=a.node_id,
+        valid_until=gw.clock() + timedelta(minutes=2),
+    )
+    speech(app_conn, reply, [3], final=3)
+    envs = collect(a, lambda e: len(chunk_seqs(e, reply)) == 2)
+    assert [e["kind"] for e in envs if e["kind"] == "node.action"] == ["node.action"]
+    a.close()
+    b = reborn(gw, a)
+    b.hello(resume=[])  # nothing acknowledged: every SPEECH chunk again, never the action
+    again = b.sync()
+    assert chunk_seqs(again, reply) == [1, 3]
+    assert [e for e in again if e["kind"] == "node.action"] == []
+
+
+# ------------------------------------------------------------------------------ outbox
+
+
+def test_outbox_results_are_typed(ddb: Dsns, app_conn: Conn) -> None:
+    with psycopg.connect(ddb.gateway, autocommit=True) as gwc:
+        code = nodes.create_enrolment(
+            app_conn,
+            person_id=MANJ,
+            kind="DESKTOP",
+            name="pc",
+            core_fp=fingerprint(bytes(range(32))),
+            gw_fp=fingerprint(bytes(range(32, 64))),
+        )
+        token, _, _ = nodes.parse_enrolment_code(code)
+        node = nodes.enrol(
+            gwc,
+            token=token,
+            public_key=secrets.token_bytes(32),
+            tailscale_identity=f"ts:pc-{secrets.token_hex(4)}",
+        )
+        row = gwc.execute("SELECT conn_id FROM gw.open_connection(%s)", (node,)).fetchone()
+        assert row is not None
+        conn_id = int(row[0])
+    outbox_id = item(app_conn)
+    unknown = uuid.uuid4()
+    since = audit_seq(app_conn)
+
+    async def run() -> tuple[Any, Any, Any]:
+        async with await psycopg.AsyncConnection.connect(ddb.gateway, autocommit=True) as c:
+            got = await relay.record_received(c, conn_id, outbox_id)
+            acked = await relay.acknowledge(c, conn_id, outbox_id)
+            with pytest.raises(OutboxRefused) as refused:
+                await relay.acknowledge(c, conn_id, unknown)
+            with pytest.raises(OutboxRefused):
+                await relay.record_received(c, conn_id, unknown)
+            return got, acked, refused.value.reason
+
+    got, acked, reason = asyncio.run(run())
+    assert type(got) is OutboxState and got is OutboxState.DELIVERED
+    assert type(acked) is OutboxState and acked is OutboxState.ACKNOWLEDGED
+    assert reason == "unknown_item"
+    with psycopg.connect(ddb.app, autocommit=True) as other:  # the refusals committed first
+        rows = other.execute(
+            "SELECT action::text, reason FROM audit.event WHERE seq > %s AND outcome = 'REJECTED'"
+            " ORDER BY seq",
+            (since,),
+        ).fetchall()
+    assert rows == [("ACK", "unknown_item"), ("RECEIVE", "unknown_item")]
+
+
+def test_outbox_delivered_to_all_person_nodes(gw: Gw, app_conn: Conn) -> None:
+    a = enrolled(gw)
+    b = enrolled(gw)
+    guest = enrolled(gw, person(app_conn))
+    outbox_id = str(item(app_conn))
+    for fake in (a, b):
+        assert item_ids(collect(fake, lambda e: outbox_id in item_ids(e))) == [outbox_id]
+        assert fake.displays[outbox_id] == 1
+    assert item_ids(guest.drain(0.3)) == []
+    _wait_for(lambda: state(app_conn, outbox_id) == "DELIVERED")
+
+
+def test_ack_on_a_clears_on_b(gw: Gw, app_conn: Conn) -> None:
+    """P2-E05."""
+    a = enrolled(gw)
+    b = enrolled(gw)
+    outbox_id = str(item(app_conn))
+    collect(a, lambda e: outbox_id in item_ids(e))
+    collect(b, lambda e: outbox_id in item_ids(e))
+    a.ack(uuid.UUID(outbox_id))
+    cleared = collect(b, lambda e: outbox_id in item_ids(e, "outbox.cleared"))
+    assert [e["payload"] for e in cleared if e["kind"] == "outbox.cleared"] == [
+        {"outbox_id": outbox_id, "reason": "ACKNOWLEDGED"}
+    ]
+    assert state(app_conn, outbox_id) == "ACKNOWLEDGED"
+    assert item_ids(a.sync() + a.drain(0.2), "outbox.cleared") == []  # not to the acker
+
+
+def test_offline_node_sees_acked_item_only_in_history(gw: Gw, app_conn: Conn) -> None:
+    a = enrolled(gw)
+    b = enrolled(gw)
+    b.close()
+    outbox_id = str(item(app_conn))
+    collect(a, lambda e: outbox_id in item_ids(e))
+    a.ack(uuid.UUID(outbox_id))
+    a.sync()
+    b2 = reborn(gw, b)
+    welcome = b2.hello()
+    assert all(outbox_id not in g["outbox_ids"] for g in welcome["summary"])
+    assert outbox_id not in item_ids(b2.sync() + b2.drain(0.2))
+    assert b2.displays[outbox_id] == 0
+
+
+def test_resend_after_two_minutes_same_id(gw: Gw, app_conn: Conn) -> None:
+    """P2-E04: the sweep re-sends an unconfirmed item with the same ID; shown once."""
+    a = enrolled(gw)
+    a.auto_received = False
+    outbox_id = str(item(app_conn))
+    collect(a, lambda e: outbox_id in item_ids(e))
+    _sweep(gw)
+    assert item_ids(a.drain(0.2)) == []  # not yet two minutes
+    gw.clock.advance(150)
+    again = collect(a, lambda e: outbox_id in item_ids(e))  # the 60 s ticker's sweep
+    assert item_ids(again) == [outbox_id]
+    assert attempts(app_conn, outbox_id, a.node_id) == 2
+    assert a.displays[outbox_id] == 1
+
+
+def test_outbox_survives_restart(ddb: Dsns, tmp_path: Path, app_conn: Conn) -> None:
+    """P2-E03: a PENDING item reaches a node that connects to a new gateway process."""
+    with gateway(ddb, tmp_path) as first:
+        a = enrolled(first)
+        a.close()
+    outbox_id = str(item(app_conn))
+    assert state(app_conn, outbox_id) == "PENDING"
+    with gateway(ddb, tmp_path, keys_from=first) as second:
+        b = reborn(second, a)
+        b.hello()
+        assert item_ids(b.sync()) == [outbox_id]
+        b.sync()
+        assert state(app_conn, outbox_id) == "DELIVERED"
+
+
+def test_second_connection_supersedes_first(gw: Gw, app_conn: Conn) -> None:
+    """Review Focus 3: the first socket is closed `superseded`; each item reaches the node
+    once in total."""
+    a1 = enrolled(gw)
+    before = str(item(app_conn))
+    collect(a1, lambda e: before in item_ids(e))
+    a2 = reborn(gw, a1)
+    a2.hello()
+    first_frames = closed(a1)
+    assert close_reason(app_conn, a1.node_id)[-2] == "superseded"
+    after = str(item(app_conn))
+    second_frames = collect(a2, lambda e: after in item_ids(e))
+    total = Counter(item_ids(first_frames) + item_ids(second_frames)) + Counter([before])
+    assert total == Counter({before: 1, after: 1})
+    assert attempts(app_conn, before, a1.node_id) == 1
+    assert attempts(app_conn, after, a1.node_id) == 1
+
+
+def test_frame_written_only_after_fenced_record(
+    gw: Gw, app_conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = relay.audited_call_async
+
+    async def failing(conn: Any, sql: Any, params: Any) -> Any:
+        if "record_sent" in sql:
+            raise _FencedError("injected connection_fenced")
+        return await real(conn, sql, params)
+
+    a = enrolled(gw)
+    monkeypatch.setattr(relay, "audited_call_async", failing)
+    outbox_id = str(item(app_conn))
+    assert item_ids(closed(a)) == []  # fenced: no frame, and the socket closed
+    assert attempts(app_conn, outbox_id, a.node_id) is None
+
+
+def test_revoke_during_delivery(
+    ddb: Dsns, tmp_path: Path, app_conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R8-1 end to end, in both orders."""
+    # 1. The revocation commits first: record_sent is fenced, and nothing is written. The
+    #    re-check is slow here, so only the fenced delivery can close the socket.
+    with gateway(ddb, tmp_path, recheck_interval=60) as g:
+        a = enrolled(g)
+        nodes.revoke(app_conn, a.node_id)
+        outbox_id = str(item(app_conn))
+        assert item_ids(closed(a)) == []
+        assert attempts(app_conn, outbox_id, a.node_id) is None
+
+    # 2. record_sent takes its locks first: the revocation waits for it, the frame is written
+    #    after its commit, then the re-check closes the socket within one interval.
+    with gateway(ddb, tmp_path, recheck_interval=0.2) as g:
+        b = enrolled(g)
+        holding = threading.Event()
+        release = threading.Event()
+        real = relay.audited_call_async
+
+        async def slow(conn: Any, sql: Any, params: Any) -> Any:
+            if "record_sent" not in sql:
+                return await real(conn, sql, params)
+            async with conn.transaction():
+                cur = await conn.execute(sql, params)
+                row = await cur.fetchone()
+                holding.set()
+                await asyncio.to_thread(release.wait, 10)
+            return tuple(row)
+
+        monkeypatch.setattr(relay, "audited_call_async", slow)
+        outbox_id = str(item(app_conn))
+        assert holding.wait(5)
+        revoker = InThread(ddb.app, lambda c: nodes.revoke(c, b.node_id))
+        revoker.wait_until_blocked(ddb.superuser)
+        release.set()
+        frames = closed(b)
+        revoker.join()
+        assert item_ids(frames) == [outbox_id]
+        assert attempts(app_conn, outbox_id, b.node_id) == 1
+
+
+def test_old_socket_is_fenced(gw: Gw, app_conn: Conn, ddb: Dsns) -> None:
+    """A connection superseded elsewhere (another gateway process): this process still has
+    the old socket. Its delivery is fenced, and so is everything it sends."""
+    a = enrolled(gw)
+    with psycopg.connect(ddb.gateway, autocommit=True) as other:
+        other.execute("SELECT gw.open_connection(%s)", (a.node_id,))
+    outbox_id = str(item(app_conn))
+    assert item_ids(closed(a)) == []  # no outbox.item on the old socket
+    assert attempts(app_conn, outbox_id, a.node_id) is None
+
+    a2 = reborn(gw, a)
+    a2.auto_received = False
+    a2.hello()
+    assert item_ids(a2.sync()) == [outbox_id]
+    with psycopg.connect(ddb.gateway, autocommit=True) as other:
+        other.execute("SELECT gw.open_connection(%s)", (a.node_id,))
+    message_id = a2.send("utterance", {"text": "show me the news", "screen_summary": None})
+    a2.ack(uuid.UUID(outbox_id))
+    a2.received(uuid.UUID(outbox_id))
+    closed(a2)
+    assert app_conn.execute(
+        "SELECT count(*) FROM conv.inbound WHERE id = %s", (message_id,)
+    ).fetchone() == (0,)
+    assert state(app_conn, outbox_id) == "DELIVERING"
+    row = app_conn.execute(
+        "SELECT received_at FROM comm.delivery WHERE outbox_id = %s", (outbox_id,)
+    ).fetchone()
+    assert row == (None,)
+
+
+# ------------------------------------------------------------------------------ P2-E13
+
+
+def _e13_trace_line(
+    run: int, ops: list[str], frames: dict[str, list[dict[str, Any]]], item_id: str
+) -> dict[str, Any]:
+    def symbolic(env: dict[str, Any]) -> dict[str, Any] | None:
+        if env["kind"] not in ("outbox.item", "outbox.cleared"):
+            return None
+        oid = env["payload"]["outbox_id"]
+        out = {"kind": env["kind"], "outbox_id": "this" if oid == item_id else "earlier"}
+        if env["kind"] == "outbox.cleared":
+            out["reason"] = env["payload"]["reason"]
+        return out
+
+    return {
+        "run": run,
+        "ops": ops,
+        "frames": {
+            name: [s for s in (symbolic(e) for e in envs) if s is not None]
+            for name, envs in frames.items()
+        },
+        "expect": "each outbox_id displayed at most once per node, never after outbox.cleared",
+    }
+
+
+def test_display_once_per_node_across_retry_and_reconnect(
+    ddb: Dsns, tmp_path: Path, app_conn: Conn
+) -> None:
+    """P2-E13 (node half): two nodes, 200 randomised runs of re-send sweep, reconnect, ack on
+    either node and supersede, with each node confirming receipt or not at random. For every
+    node and item: displayed at most once, never after its outbox.cleared. With
+    JARVIS_WRITE_TRACES=1 the runs are written to tests/fakes/traces/e13.jsonl (committed) for
+    Plan B to replay against the Rust node: per run the ops and, per node, the outbox frames it
+    received, with IDs made symbolic."""
+    rng = random.Random(13)  # noqa: S311  # a reproducible scenario, not crypto
+    trace: list[dict[str, Any]] = []
+    with gateway(ddb, tmp_path, tick_interval=3600) as g:  # the sweep runs only when called
+        fakes = {"A": enrolled(g), "B": enrolled(g)}
+        history: dict[str, list[FakeNode]] = {k: [v] for k, v in fakes.items()}
+        for run in range(200):
+            # A node that doesn't confirm receipt this run leaves items for the sweep to retry.
+            confirms = {name: rng.random() < 0.5 for name in fakes}
+            for name, fake in fakes.items():
+                fake.auto_received = confirms[name]
+            outbox_id = str(item(app_conn))
+            frames: dict[str, list[dict[str, Any]]] = {"A": [], "B": []}
+            ops = rng.choices(
+                ["sweep", "reconnect_A", "reconnect_B", "ack_A", "ack_B", "supersede", "wait"],
+                k=4,
+            )
+            for op in ops:
+                if op == "sweep":
+                    g.clock.advance(150)
+                    _sweep(g)
+                elif op.startswith("reconnect_"):
+                    name = op[-1]
+                    fakes[name].close()
+                    fakes[name] = reborn(g, fakes[name])
+                    fakes[name].auto_received = confirms[name]
+                    history[name].append(fakes[name])
+                    fakes[name].hello()
+                elif op.startswith("ack_"):
+                    fake = fakes[op[-1]]
+                    if outbox_id in fake.seen_outbox and outbox_id not in fake.cleared:
+                        fake.ack(uuid.UUID(outbox_id))
+                elif op == "supersede":
+                    app_conn.execute("SELECT comm.supersede(%s)", (outbox_id,))
+                for name, fake in fakes.items():
+                    frames[name] += fake.drain(0.005)
+            for name, fake in fakes.items():
+                frames[name] += fake.sync() + fake.drain(0.02)
+            trace.append(_e13_trace_line(run, ops, frames, outbox_id))
+        for name, instances in history.items():
+            displays: Counter[str] = Counter()
+            log: list[tuple[str, str]] = []
+            for fake in instances:
+                displays += fake.displays
+                log += fake.log
+            assert displays and max(displays.values()) == 1, name
+            gone: set[str] = set()
+            for what, oid in log:
+                if what == "cleared":
+                    gone.add(oid)
+                else:
+                    assert oid not in gone, (name, oid)
+    if os.environ.get("JARVIS_WRITE_TRACES") == "1":
+        TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TRACE_PATH.write_text("".join(json.dumps(line, sort_keys=True) + "\n" for line in trace))
+
+
+# ------------------------------------------------------------------------------ welcome, heartbeat
+
+
+def test_welcome_summary_order(gw: Gw, app_conn: Conn) -> None:
+    """P2-E07 end to end: `welcome` carries the open session and the §8.3 summary, mapped
+    onto the message schema's groups (controller ruling G2)."""
+    guest = person(app_conn)
+    a = enrolled(gw, guest)
+    a.close()
+    session = session_of(app_conn, guest)
+    u1 = item(
+        app_conn, who=guest, priority=Priority.URGENT, kind="approval.requested", group_key="ap-1"
+    )
+    t1 = item(app_conn, who=guest, kind="budget.80", group_key="budget")
+    d1 = item(app_conn, who=guest, priority=Priority.DIGEST, kind="brain.down", group_key="brain")
+    t2 = item(app_conn, who=guest, kind="budget.100", group_key="budget")
+    u2 = item(
+        app_conn, who=guest, priority=Priority.URGENT, kind="approval.expiring", group_key="ap-2"
+    )
+    t3 = item(app_conn, who=guest, kind="turn.indeterminate", group_key="turn")
+    d2 = item(app_conn, who=guest, priority=Priority.DIGEST, kind="brain.back", group_key="brain")
+    item(app_conn, who=guest, priority=Priority.SILENT, kind="action.readonly_ok", group_key="x")
+    b = reborn(gw, a)
+    welcome = b.hello()
+    Welcome.model_validate(welcome)  # the schema's shape, nothing extra
+    assert welcome["session_id"] == str(session)
+    assert welcome["summary"] == [
+        {"priority": "URGENT", "group_key": "ap-1", "outbox_ids": [str(u1)],
+         "line": "Approval waiting for your decision"},
+        {"priority": "URGENT", "group_key": "ap-2", "outbox_ids": [str(u2)],
+         "line": "Approval expires in 2 minutes"},
+        {"priority": "TODAY", "group_key": "budget", "outbox_ids": [str(t1), str(t2)],
+         "line": "Claude budget 80% used this month (2)"},
+        {"priority": "TODAY", "group_key": "turn", "outbox_ids": [str(t3)],
+         "line": "A request ended without a clear outcome"},
+        {"priority": "DIGEST", "group_key": "brain", "outbox_ids": [str(d1), str(d2)],
+         "line": "Claude is available again (2)"},
+    ]  # fmt: skip
+
+
+def test_welcome_without_open_session(gw: Gw, app_conn: Conn) -> None:
+    guest = person(app_conn)
+    a = enrolled(gw, guest)
+    a.close()
+    assert reborn(gw, a).hello() == {"session_id": None, "summary": []}
+
+
+def test_three_missed_heartbeats_close_connection(gw: Gw, app_conn: Conn) -> None:
+    a = enrolled(gw)
+    a.answer_pings = False
+    for _ in range(3):
+        gw.clock.advance(30)
+        assert collect(a, lambda e: any(x["kind"] == "ping" for x in e))
+    _wait_for(lambda: close_reason(app_conn, a.node_id) == [None])  # still open
+    gw.clock.advance(30)
+    closed(a)
+    assert _wait_for(lambda: close_reason(app_conn, a.node_id) == ["heartbeat"])
+    row = app_conn.execute(
+        "SELECT closed_at IS NOT NULL FROM gw.node_connection WHERE node_id = %s", (a.node_id,)
+    ).fetchone()
+    assert row == (True,)
+
+
+def test_answered_heartbeats_keep_connection(gw: Gw, app_conn: Conn) -> None:
+    a = enrolled(gw)
+    for _ in range(5):
+        gw.clock.advance(30)
+        collect(a, lambda e: any(x["kind"] == "ping" for x in e))  # answered with pong
+    a.sync()
+    assert close_reason(app_conn, a.node_id) == [None]

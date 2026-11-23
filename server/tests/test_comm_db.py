@@ -59,6 +59,7 @@ CONN_FUNCTIONS = {
     "comm.record_received(bigint,uuid)",
     "comm.acknowledge(bigint,uuid)",
     "conv.record_chunk_received(bigint,uuid,integer)",
+    "conv.record_resume_out_of_range(bigint,uuid,numeric)",  # R12-8 (Task 7)
 }
 
 SENT = "SELECT comm.record_sent(%s, %s)"
@@ -1076,8 +1077,10 @@ def test_chunk_cursor_only_moves_forward(gateway: Conn, app: Conn) -> None:
         "SELECT node_id, acked_seq FROM conv.stream_cursor WHERE reply_id = %s", (reply,)
     ).fetchall()
     assert rows == [(node_id, 5)]
-    with pytest.raises(psycopg.errors.InvalidParameterValue):
-        gateway.execute(CHUNK, (conn_id, reply, 6))  # no such chunk
+    since = _seq(app)
+    # A chunk that doesn't exist: a harmless, non-audited no-op (R12-8), cursor unchanged.
+    assert gateway.execute(CHUNK, (conn_id, reply, 6)).fetchone() == (False, None)
+    assert _audit(app, since) == []
     with pytest.raises(psycopg.errors.InvalidParameterValue):
         gateway.execute(CHUNK, (conn_id, reply, 0))
     with pytest.raises(psycopg.errors.InsufficientPrivilege):
@@ -1190,6 +1193,9 @@ def test_gateway_cannot_write_conv_message_or_ledger(gateway: Conn) -> None:
         "INSERT INTO comm.event (kind, subject_type, subject_id) VALUES ('x', 'x', 'x')",
         "SELECT * FROM conv.message",
         "SELECT * FROM conv.session",
+        "SELECT started_at FROM conv.session",  # R12-9: only id, person_id, closed_at
+        "SELECT last_activity_at FROM conv.session",
+        "UPDATE conv.session SET closed_at = now()",
         "SELECT * FROM conv.inbound",
         "SELECT * FROM comm.event",
     ):
@@ -1237,6 +1243,7 @@ GATEWAY_NODE_COLUMNS = {
     f"SELECT gw.node.{c}"
     for c in ("id", "person_id", "kind", "public_key", "tailscale_identity", "revoked_at")
 }
+GATEWAY_SESSION_COLUMNS = {f"SELECT conv.session.{c}" for c in ("id", "person_id", "closed_at")}
 GATEWAY_EXECUTE = {
     "gw.enrol_node(text,bytea,text)",
     "gw.open_connection(uuid,bigint)",
@@ -1268,7 +1275,7 @@ def test_gateway_has_no_memory_function_or_table(gateway: Conn, owner: Conn) -> 
                     (name, GATEWAY_ROLE, p),
                 ).fetchall()
                 granted |= {f"{p} {name}.{c}" for (c,) in columns}
-    assert granted == GATEWAY_TABLES | GATEWAY_NODE_COLUMNS
+    assert granted == GATEWAY_TABLES | GATEWAY_NODE_COLUMNS | GATEWAY_SESSION_COLUMNS
     functions = owner.execute(
         "SELECT p.oid::regprocedure::text FROM pg_proc p"
         " JOIN pg_namespace n ON n.oid = p.pronamespace"
@@ -1524,3 +1531,195 @@ def test_0009_downgrade_restores_skew_stub() -> None:
                 )
                 == stub_acl
             )
+
+
+# --- node.resume_out_of_range (R12-5, R12-8) --------------------------------------------------
+
+RESUME = "SELECT conv.record_resume_out_of_range(%s, %s, %s::numeric)"
+RESUME_FN = "conv.record_resume_out_of_range(bigint,uuid,numeric)"
+
+
+def _resume_events(conn: Conn, node_id: uuid.UUID) -> list[tuple[Any, ...]]:
+    return conn.execute(
+        "SELECT subject_type, subject_id, person_id, details FROM comm.event"
+        " WHERE kind = 'node.resume_out_of_range' AND subject_id = %s ORDER BY occurred_at, id",
+        (str(node_id),),
+    ).fetchall()
+
+
+def _resume_event(node_id: uuid.UUID, reply: uuid.UUID, reason: str) -> tuple[Any, ...]:
+    return (
+        "node",
+        str(node_id),
+        MANJ,
+        {"node_id": str(node_id), "reply_id": str(reply), "reason": reason},
+    )
+
+
+def test_resume_unknown_and_foreign_reply_indistinguishable(gateway: Conn, app: Conn) -> None:
+    """A nonexistent reply and another person's reply both record `unknown_reply`, with the
+    same shape: details exactly node_id, reply_id, reason; last_seq never stored."""
+    person_b = _person(app)
+    node_id, conn_id = _connected(app, gateway)
+    foreign = uuid.uuid4()
+    _chunks(app, foreign, 3, person_b)
+    nowhere = uuid.uuid4()
+    since = _seq(app)
+    assert _one(gateway, RESUME, (conn_id, foreign, 2)) is True
+    assert _one(gateway, RESUME, (conn_id, nowhere, 2)) is True
+    assert _resume_events(app, node_id) == [
+        _resume_event(node_id, foreign, "unknown_reply"),
+        _resume_event(node_id, nowhere, "unknown_reply"),
+    ]
+    assert _audit(app, since) == []  # an event, never an audit row or a tally entry
+    assert _one(app, "SELECT count(*) FROM comm.outbox WHERE person_id = %s", (person_b,)) == 0
+
+
+def test_resume_beyond_max_and_within_range(gateway: Conn, app: Conn) -> None:
+    node_id, conn_id = _connected(app, gateway)
+    reply = uuid.uuid4()
+    _chunks(app, reply, 3)
+    for last_seq in (-5, 0, 2, 3):  # within the stored range, or below it: nothing written
+        assert _one(gateway, RESUME, (conn_id, reply, last_seq)) is False
+    assert _resume_events(app, node_id) == []
+    assert _one(gateway, RESUME, (conn_id, reply, 4)) is True
+    assert _resume_events(app, node_id) == [_resume_event(node_id, reply, "beyond_max")]
+    jobs = _one(app, "SELECT count(*) FROM ops.job WHERE kind = 'system.event'", ())
+    assert jobs == 0  # no notification path
+
+
+def test_resume_last_seq_must_be_a_finite_integer(gateway: Conn, app: Conn) -> None:
+    node_id, conn_id = _connected(app, gateway)
+    reply = uuid.uuid4()
+    _chunks(app, reply, 1)
+    for bad in (None, "NaN", "Infinity", "-Infinity", "1.5", "-0.25"):
+        with pytest.raises(psycopg.errors.InvalidParameterValue):
+            gateway.execute(RESUME, (conn_id, reply, bad))
+    with pytest.raises(psycopg.errors.InvalidParameterValue):
+        gateway.execute(RESUME, (conn_id, None, 1))
+    assert _resume_events(app, node_id) == []
+    # Any integer magnitude: a Python int beyond 64 bits passes through psycopg as numeric.
+    assert _one(gateway, RESUME, (conn_id, reply, 2**70)) is True
+    assert _one(gateway, RESUME, (conn_id, uuid.uuid4(), -(2**70))) is True
+    assert _one(gateway, RESUME, (conn_id, reply, "2.000")) is False  # integral, suppressed
+    assert [e[3]["reason"] for e in _resume_events(app, node_id)] == [
+        "beyond_max",
+        "unknown_reply",
+    ]
+
+
+def test_resume_event_suppressed_in_rolling_window(gateway: Conn, app: Conn) -> None:
+    node_id, conn_id = _connected(app, gateway)
+    reply = uuid.uuid4()
+    _chunks(app, reply, 2)
+    assert _one(gateway, RESUME, (conn_id, reply, 9)) is True
+    assert _one(gateway, RESUME, (conn_id, reply, 10)) is False  # same key: suppressed
+    other = uuid.uuid4()  # the same reply ID under the other reason is a separate key
+    assert _one(gateway, RESUME, (conn_id, other, 1)) is True
+    _chunks(app, other, 1)  # now the node's own reply: beyond_max is a new key
+    assert _one(gateway, RESUME, (conn_id, other, 5)) is True
+    assert _one(gateway, RESUME, (conn_id, other, 6)) is False
+    assert len(_resume_events(app, node_id)) == 3
+    # Rolling, not aligned: an earlier event 14 minutes ago suppresses, 16 minutes ago doesn't.
+    for minutes, expected in ((14, False), (16, True)):
+        node2, conn2 = _connected(app, gateway)
+        late = uuid.uuid4()
+        app.execute(
+            "INSERT INTO comm.event (kind, subject_type, subject_id, person_id, details,"
+            " occurred_at) VALUES ('node.resume_out_of_range', 'node', %s, %s, %s,"
+            " now() - make_interval(mins => %s))",
+            (
+                str(node2),
+                MANJ,
+                Jsonb({"node_id": str(node2), "reply_id": str(late), "reason": "unknown_reply"}),
+                minutes,
+            ),
+        )
+        assert _one(gateway, RESUME, (conn2, late, 1)) is expected, minutes
+    # Another node's events are another key.
+    _, conn3 = _connected(app, gateway)
+    assert _one(gateway, RESUME, (conn3, reply, 9)) is True
+
+
+def test_resume_event_suppression_is_concurrency_safe(dsns: Dsns, gateway: Conn, app: Conn) -> None:
+    """Two simultaneous calls for one key: the second waits on the first's key lock, then
+    sees its committed event and writes nothing."""
+    node_id, conn_id = _connected(app, gateway)
+    reply = uuid.uuid4()
+    release = threading.Event()
+
+    def first(c: Conn) -> Any:
+        with c.transaction():
+            result = _one(c, RESUME, (conn_id, reply, 1))
+            release.wait(10)
+        return result
+
+    t1 = InThread(dsns.gateway, first)
+    deadline = time.monotonic() + 10
+    # t1's event is invisible until it commits; wait until t1 holds the key lock instead.
+    while not _one(
+        app,
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND pid = %s",
+        (t1.pid,),
+    ):
+        assert time.monotonic() < deadline, "t1 never took the key lock"
+        time.sleep(0.01)
+    t2 = InThread(dsns.gateway, lambda c: _one(c, RESUME, (conn_id, reply, 1)))
+    assert t2.wait_until_blocked(dsns.superuser) == "advisory"
+    release.set()
+    assert (t1.join(), t2.join()) == (True, False)
+    assert _resume_events(app, node_id) == [_resume_event(node_id, reply, "unknown_reply")]
+
+    # And without an ordering, from many threads at once: still exactly one event.
+    key = uuid.uuid4()
+    results: list[Any] = []
+    barrier = threading.Barrier(6)
+
+    def racer() -> None:
+        with psycopg.connect(dsns.gateway, autocommit=True) as c:
+            barrier.wait(10)
+            results.append(_one(c, RESUME, (conn_id, key, 1)))
+
+    run_all([racer] * 6)
+    assert sorted(results) == [False] * 5 + [True]
+
+
+def test_resume_event_fenced(gateway: Conn, app: Conn) -> None:
+    node_id = _node(app, gateway)
+    old = _open(gateway, node_id)
+    _open(gateway, node_id)  # supersedes old
+    _fenced(lambda: gateway.execute(RESUME, (old, uuid.uuid4(), 1)))
+    nodes.revoke(app, node_id)
+    _fenced(lambda: gateway.execute(RESUME, (10**12, uuid.uuid4(), 1)))
+    assert _resume_events(app, node_id) == []
+
+
+def test_resume_function_executable_by_gateway_only(dsns: Dsns, app: Conn, owner: Conn) -> None:
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        app.execute(RESUME, (1, uuid.uuid4(), 1))
+    acl = owner.execute(
+        "SELECT a.grantee, a.privilege_type FROM pg_proc p, aclexplode(p.proacl) a"
+        " WHERE p.oid = %s::regprocedure AND a.grantee <> p.proowner",
+        (RESUME_FN,),
+    ).fetchall()
+    assert [r[1] for r in acl] == ["EXECUTE"] and 0 not in {r[0] for r in acl}  # not PUBLIC
+    unrelated = f"jarvis_test_unrelated_{secrets.token_hex(4)}"
+    with psycopg.connect(dsns.superuser, autocommit=True) as su:
+        su.execute(f'CREATE ROLE "{unrelated}" NOLOGIN'.encode())
+        try:
+            for role, expected in (
+                (unrelated, False),
+                ("jarvis_app", False),
+                ("public", False),
+                (GATEWAY_ROLE, True),
+            ):
+                assert (
+                    _one(su, "SELECT has_function_privilege(%s, %s, 'EXECUTE')", (role, RESUME_FN))
+                    is expected
+                ), role
+            config = _one(
+                su, "SELECT proconfig FROM pg_proc WHERE oid = %s::regprocedure", (RESUME_FN,)
+            )
+            assert config == ["search_path=pg_catalog, pg_temp"]
+        finally:
+            su.execute(f'DROP ROLE "{unrelated}"'.encode())

@@ -40,6 +40,11 @@ class ConnectRefused(Refused):
     """gw.open_connection refused: unknown_node or revoked."""
 
 
+class OutboxRefused(Refused):
+    """comm.record_received or comm.acknowledge refused: unknown_item (unknown, or another
+    person's item; R9-5)."""
+
+
 class ConsumeRefused(Refused):
     """ledger.consume_approval refused: unknown_approval, not_approved, expired or
     already_consumed."""

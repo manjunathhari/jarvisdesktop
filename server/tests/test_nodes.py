@@ -68,6 +68,8 @@ GATEWAY_FUNCTIONS = GATEWAY_GW_FUNCTIONS | {
     "comm.record_received(bigint,uuid)",
     "comm.acknowledge(bigint,uuid)",
     "conv.record_chunk_received(bigint,uuid,integer)",
+    # Task 7 (R12-8): in conv, so gw keeps exactly six.
+    "conv.record_resume_out_of_range(bigint,uuid,numeric)",
 }
 
 

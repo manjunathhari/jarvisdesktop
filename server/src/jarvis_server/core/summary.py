@@ -13,6 +13,7 @@ expired items are left out. The order is §8.3's:
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from typing import Any
 from uuid import UUID
 
@@ -37,7 +38,7 @@ LINE: dict[str, str] = {
 GENERIC_LINE = "A notification is waiting"
 DIGEST_LINE = "{label} ({count})"
 
-_QUERY = """
+QUERY = """
 SELECT id, priority, kind, group_key FROM comm.outbox
 WHERE person_id = %s
   AND state IN ('PENDING', 'DELIVERING', 'DELIVERED')
@@ -60,8 +61,14 @@ def _grouped(rows: list[tuple[UUID, str, str]]) -> dict[str, list[tuple[UUID, st
 
 def reconnect_summary(conn: psycopg.Connection[Any], person_id: UUID) -> list[dict[str, Any]]:
     """The person's open outbox items as summary entries, in §8.3 order."""
+    return build_summary(conn.execute(QUERY, (person_id,)).fetchall())
+
+
+def build_summary(rows: Iterable[Sequence[Any]]) -> list[dict[str, Any]]:
+    """Summary entries from `QUERY`'s rows (`id, priority, kind, group_key`, in its order).
+    Pure, so the async gateway runs the same query and builds the same entries."""
     by_priority: dict[str, list[tuple[UUID, str, str]]] = {"URGENT": [], "TODAY": [], "DIGEST": []}
-    for outbox_id, priority, kind, group_key in conn.execute(_QUERY, (person_id,)).fetchall():
+    for outbox_id, priority, kind, group_key in rows:
         by_priority[priority].append((UUID(str(outbox_id)), kind, group_key))
 
     entries: list[dict[str, Any]] = [

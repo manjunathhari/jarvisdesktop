@@ -5,8 +5,10 @@
   conv.stream_chunk, conv.stream_cursor and conv.session_ticket.
 - Schema comm: comm.event (append-only, codes and IDs only), comm.outbox and comm.delivery.
 - jarvis_gateway may SELECT conv.stream_chunk, conv.stream_cursor, comm.outbox and
-  comm.delivery, and EXECUTE conv.record_inbound, comm.record_sent, comm.record_received,
-  comm.acknowledge and conv.record_chunk_received. Each takes a connection ID, never a node ID,
+  comm.delivery, and the columns id, person_id and closed_at of conv.session (R12-9), and
+  EXECUTE conv.record_inbound, comm.record_sent, comm.record_received, comm.acknowledge,
+  conv.record_chunk_received and conv.record_resume_out_of_range (R12-8, event
+  node.resume_out_of_range). Each takes a connection ID, never a node ID,
   and calls gw.current_node(p_conn_id) first, in the same transaction; it takes no other lock
   on gw.node or gw.node_connection itself, and never calls the heartbeat (R8-1).
 - jarvis_app writes conversations and events, creates outbox items (always PENDING), and
@@ -18,9 +20,10 @@
 - Refused requests write the REJECTED audit row and return a reason code (R7-1): an unknown
   inbound kind (unknown_kind); a message_id already recorded by another node (id_conflict,
   R9-4); an outbox item unknown or of another person (unknown_item, R9-5); a stream chunk of
-  another person's session (other_person, R9-1). Each connection function acts only on records
-  of the fenced node's person. A fenced connection raises JF001. A
-  malformed call raises invalid_parameter_value.
+  another person's session (other_person, R9-1); an acknowledgement of a chunk that doesn't
+  exist (or was pruned) is a non-audited no-op (R12-8). Each connection function acts only on
+  records of the fenced node's person. A fenced connection raises JF001. A malformed call
+  raises invalid_parameter_value.
 - audit.event: entity types 'inbound', 'outbox' and 'stream'; actions INBOUND, SEND, RECEIVE,
   ACK, SUPERSEDE, EXPIRE and CHUNK_RECEIVE. Rows carry codes and IDs only.
 - gw.record_clock_skew, 0008's internal stub, becomes the recorder of event node.clock_skew
@@ -248,6 +251,9 @@ GRANT SELECT, DELETE ON comm.delivery TO jarvis_app;
 -- The gateway (§4.1): reads only; every change goes through the functions below.
 GRANT SELECT ON conv.stream_chunk, conv.stream_cursor, comm.outbox, comm.delivery
     TO jarvis_gateway;
+-- R12-9: which person a session belongs to, and whether it is open. IDs only: started_at and
+-- last_activity_at stay denied, so SELECT * still fails.
+GRANT SELECT (id, person_id, closed_at) ON conv.session TO jarvis_gateway;
 """
 
 FUNCTIONS = r"""
@@ -457,7 +463,8 @@ $$;
 
 -- Gateway: the node has every chunk of the reply up to p_seq. The cursor only moves forward.
 -- A chunk of another person's session is refused, (false, 'other_person'), and no cursor row
--- is created or changed (R9-1). A chunk that doesn't exist is a malformed call here.
+-- is created or changed (R9-1). A chunk that doesn't exist, or was pruned after 24 h, is a
+-- harmless non-audited no-op, (false, NULL) (R12-8): a late acknowledgement is not an error.
 CREATE FUNCTION conv.record_chunk_received(p_conn_id bigint, p_reply_id uuid, p_seq integer)
 RETURNS TABLE (recorded boolean, refusal text)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
@@ -476,8 +483,8 @@ BEGIN
         JOIN conv.session s ON s.id = k.session_id
         WHERE k.reply_id = p_reply_id AND k.seq = p_seq;
     IF v_owner IS NULL THEN
-        RAISE EXCEPTION 'malformed record_chunk_received call: no such chunk'
-            USING ERRCODE = 'invalid_parameter_value';
+        RETURN QUERY SELECT false, NULL::text;
+        RETURN;
     END IF;
     SELECT n.person_id INTO v_person FROM gw.node n WHERE n.id = v_node;  -- no lock of its own
     IF v_owner <> v_person THEN
@@ -492,6 +499,62 @@ BEGIN
         ON CONFLICT (reply_id, node_id) DO UPDATE
         SET acked_seq = greatest(c.acked_seq, EXCLUDED.acked_seq);
     RETURN QUERY SELECT true, NULL::text;
+END;
+$$;
+
+-- Gateway (R12-5, R12-8): a node's `resume` entry that the gateway ignored. The only event the
+-- gateway can cause, and the caller supplies no event content: the database decides the reason.
+-- A reply with no chunk in the node's person's sessions (nonexistent and foreign alike) is
+-- 'unknown_reply'; the person's own reply with p_last_seq above its highest stored seq is
+-- 'beyond_max'; anything else writes nothing and returns false. p_last_seq is numeric, any
+-- integer; NULL, NaN, +-Infinity and fractions are malformed, and it is never stored. At most one
+-- event per (node, reply, reason) in a rolling 15 minutes: a transaction-scoped advisory lock on
+-- the key serialises the check and the insert, so two concurrent calls never write two. A
+-- suppressed call returns false. No refusal tally, no outbox item, no job, no NOTIFY.
+CREATE FUNCTION conv.record_resume_out_of_range(
+    p_conn_id bigint, p_reply_id uuid, p_last_seq numeric
+) RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_node uuid;
+    v_person uuid;
+    v_max integer;
+    v_reason text;
+BEGIN
+    v_node := gw.current_node(p_conn_id);  -- the fence, first (R8-1)
+    IF p_reply_id IS NULL OR p_last_seq IS NULL
+       OR p_last_seq IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)
+       OR p_last_seq <> trunc(p_last_seq) THEN
+        RAISE EXCEPTION 'malformed record_resume_out_of_range call'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    SELECT n.person_id INTO v_person FROM gw.node n WHERE n.id = v_node;  -- no lock of its own
+    SELECT max(k.seq) INTO v_max FROM conv.stream_chunk k
+        JOIN conv.session s ON s.id = k.session_id
+        WHERE k.reply_id = p_reply_id AND s.person_id = v_person;
+    IF v_max IS NULL THEN
+        v_reason := 'unknown_reply';
+    ELSIF p_last_seq > v_max THEN
+        v_reason := 'beyond_max';
+    ELSE
+        RETURN false;
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        'node.resume_out_of_range/' || v_node::text || '/' || p_reply_id::text || '/' || v_reason,
+        0));
+    IF EXISTS (SELECT 1 FROM comm.event e
+               WHERE e.kind = 'node.resume_out_of_range' AND e.subject_type = 'node'
+                 AND e.subject_id = v_node::text
+                 AND e.details->>'reply_id' = p_reply_id::text
+                 AND e.details->>'reason' = v_reason
+                 AND e.occurred_at > now() - interval '15 minutes') THEN
+        RETURN false;
+    END IF;
+    INSERT INTO comm.event (kind, subject_type, subject_id, person_id, details)
+        VALUES ('node.resume_out_of_range', 'node', v_node::text, v_person,
+                jsonb_build_object('node_id', v_node::text, 'reply_id', p_reply_id::text,
+                                   'reason', v_reason));
+    RETURN true;
 END;
 $$;
 
@@ -573,6 +636,7 @@ REVOKE ALL ON FUNCTION comm.record_sent(bigint, uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION comm.record_received(bigint, uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION comm.acknowledge(bigint, uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION conv.record_chunk_received(bigint, uuid, integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION conv.record_resume_out_of_range(bigint, uuid, numeric) FROM PUBLIC;
 REVOKE ALL ON FUNCTION comm.supersede(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION comm.supersede_for_create(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION comm.expire(uuid) FROM PUBLIC;
@@ -582,6 +646,8 @@ GRANT EXECUTE ON FUNCTION comm.record_sent(bigint, uuid) TO jarvis_gateway;
 GRANT EXECUTE ON FUNCTION comm.record_received(bigint, uuid) TO jarvis_gateway;
 GRANT EXECUTE ON FUNCTION comm.acknowledge(bigint, uuid) TO jarvis_gateway;
 GRANT EXECUTE ON FUNCTION conv.record_chunk_received(bigint, uuid, integer) TO jarvis_gateway;
+GRANT EXECUTE ON FUNCTION conv.record_resume_out_of_range(bigint, uuid, numeric)
+    TO jarvis_gateway;
 GRANT EXECUTE ON FUNCTION comm.supersede(uuid) TO jarvis_app;
 GRANT EXECUTE ON FUNCTION comm.supersede_for_create(uuid) TO jarvis_app;
 GRANT EXECUTE ON FUNCTION comm.expire(uuid) TO jarvis_app;
@@ -657,6 +723,7 @@ def downgrade() -> None:
     DROP FUNCTION comm.expire(uuid);
     DROP FUNCTION comm.supersede_for_create(uuid);
     DROP FUNCTION comm.supersede(uuid);
+    DROP FUNCTION conv.record_resume_out_of_range(bigint, uuid, numeric);
     DROP FUNCTION conv.record_chunk_received(bigint, uuid, integer);
     DROP FUNCTION comm.acknowledge(bigint, uuid);
     DROP FUNCTION comm.record_received(bigint, uuid);

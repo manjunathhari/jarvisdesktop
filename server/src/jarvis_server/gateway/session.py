@@ -1,4 +1,5 @@
-"""One node connection: handshake, inbound recording and the revocation re-check (§6.1, §7.1).
+"""One node connection: handshake, inbound recording, delivery and the revocation re-check
+(§6.1, §6.2, §7.1, §8.2).
 
 **Handshake.** After `whois` (an unknown peer is refused `unknown_peer`), the gateway sends a
 signed `challenge` before reading anything, then checks the node's single reply: first message
@@ -20,9 +21,15 @@ envelope gets `error malformed`; neither carries a `seq` the gateway counts. An 
 another node, with a bad `node-msg` signature or a `seq` that isn't the previous + 1 closes the
 connection through `gw.close_connection(conn_id, code)`, which writes its DISCONNECT row.
 `utterance`, `approval.decision` and `action.receipt` go to `conv.record_inbound`; `ping` to
-`gw.touch_connection` and `pong`; `received` and `ack` are accepted and dropped until Task 7.
-Any other database error on an established connection sends `error server_error` and closes
-through `gw.close_connection(conn_id, 'server_error')`.
+`gw.touch_connection` and `pong`; `received` and `ack` to `comm.record_received`,
+`comm.acknowledge` or `conv.record_chunk_received` (a refusal is sent back as `error`); `pong`
+answers the gateway's heartbeat. Any other database error on an established connection sends
+`error server_error` and closes through `gw.close_connection(conn_id, 'server_error')`.
+
+**Delivery** (`relay`): `welcome` carries the open session and the reconnect summary. Then the
+connection registers with the process's `Relay`, which stops an older connection of the same
+node (`superseded`), and gets its pending items and unacknowledged chunks. The relay can stop
+the connection (`stop`): fenced, superseded, a database failure or three missed heartbeats.
 
 **Fencing.** Every connection-scoped database call relies on the database fence: SQLSTATE
 `JF001` closes the socket. A re-check every `recheck_interval` seconds (60 in service) calls
@@ -56,12 +63,16 @@ from jarvis_server import signing
 from jarvis_server.contracts import (
     MESSAGE_MODELS,
     NIL_UUID,
+    Ack,
     Enrol,
     Hello,
     MessageKind,
     NodeEnvelope,
+    Received,
+    ResumePosition,
 )
 from jarvis_server.dbcall import FENCED_SQLSTATE, audited_call_async
+from jarvis_server.gateway import relay
 from jarvis_server.gateway.keys import GatewayKeys, node_key_id
 from jarvis_server.gateway.tailscale import WhoIs, is_tailnet_address
 
@@ -99,6 +110,7 @@ class GatewayContext:
     clock: Callable[[], datetime]
     recheck_interval: float
     bind_check: bool
+    relay: relay.Relay
 
 
 class HandshakeRefused(Exception):
@@ -176,6 +188,12 @@ class Session:
         self.identity: str | None = None
         self.node_id: UUID | None = None
         self.conn_id: int | None = None
+        self.person_id: UUID | None = None
+        self.link: relay.NodeLink | None = None
+        self._resume: tuple[ResumePosition, ...] = ()
+        self._stopped = asyncio.Event()
+        self._stop_reason: str | None = None
+        self._socket_reason = ""
         self._node_public: bytes = b""
         self._node_key_id = ""
         self._out_seq = 0
@@ -189,27 +207,56 @@ class Session:
         try:
             if not await self._handshake():
                 return
-            serve = asyncio.create_task(self._serve())
-            recheck = asyncio.create_task(self._recheck())
-            done, pending = await asyncio.wait(
-                {serve, recheck}, return_when=asyncio.FIRST_COMPLETED
+            assert self.node_id is not None and self.person_id is not None
+            assert self.conn_id is not None
+            self.link = relay.NodeLink(
+                self.ctx.relay,
+                self,
+                node_id=self.node_id,
+                person_id=self.person_id,
+                conn_id=self.conn_id,
+                connected_at=self.ctx.clock(),
             )
-            for task in pending:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-            for task in done:
-                task.result()
+            self.ctx.relay.register(self.link)
+            try:
+                await self.link.on_connect(self._resume)
+                await self._established()
+            finally:
+                self.ctx.relay.unregister(self.link)
         finally:
-            await self._close_socket(CLOSE_REFUSED)
+            await self._close_socket(CLOSE_REFUSED, self._socket_reason)
 
-    async def _close_socket(self, code: int) -> None:
+    async def _established(self) -> None:
+        tasks = {
+            asyncio.create_task(self._serve()),
+            asyncio.create_task(self._recheck()),
+            asyncio.create_task(self._stopped.wait()),
+        }
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        for task in done:
+            task.result()
+        if self._stopped.is_set() and self._stop_reason is not None:
+            await self._db_close(self._stop_reason)
+
+    def stop(self, db_reason: str | None, socket_reason: str = "") -> None:
+        """End this connection (called by the relay): `db_reason` goes to gw.close_connection,
+        None when the database already closed or fenced it."""
+        if not self._stopped.is_set():
+            self._stop_reason = db_reason
+            self._socket_reason = socket_reason
+            self._stopped.set()
+
+    async def _close_socket(self, code: int, reason: str = "") -> None:
         if (
             self.ws.application_state == WebSocketState.CONNECTED
             and self.ws.client_state == WebSocketState.CONNECTED
         ):
             with contextlib.suppress(RuntimeError):
-                await self.ws.close(code)
+                await self.ws.close(code, reason or None)
 
     async def send(self, kind: MessageKind, payload: dict[str, Any]) -> None:
         """Sign and send one envelope with the next gateway `seq` (R6-8). Gateway messages
@@ -292,6 +339,7 @@ class Session:
         skew_ms = max(-SKEW_CLAMP_MS, min(SKEW_CLAMP_MS, skew_ms))
         skew_arg = skew_ms if abs(skew_ms) > SKEW_TOLERANCE_MS else None
         if isinstance(reply, Hello):
+            self._resume = reply.resume
             await self._path_a(raw, env, skew_arg)
         else:
             await self._path_b(raw, reply, skew_arg)
@@ -344,13 +392,15 @@ class Session:
             raise HandshakeRefused("malformed")
         async with self.ctx.pool.connection() as conn:
             cur = await conn.execute(
-                "SELECT public_key, tailscale_identity, revoked_at FROM gw.node WHERE id = %s",
+                "SELECT public_key, tailscale_identity, revoked_at, person_id FROM gw.node"
+                " WHERE id = %s",
                 (node_id,),
             )
             row = await cur.fetchone()
         if row is None:
             raise HandshakeRefused("unknown_node")  # a claimed ID is never stored
         public_key, identity, revoked_at = bytes(row[0]), row[1], row[2]
+        self.person_id = UUID(str(row[3]))
         if not signing.verify_envelope(
             signing.Purpose.NODE_MSG, public_key, node_key_id(public_key), raw
         ):
@@ -361,7 +411,7 @@ class Session:
             raise HandshakeRefused("identity_mismatch", node_id)
         self._check_key_state(node_id)
         await self._open(node_id, public_key, skew)
-        await self.send(MessageKind.WELCOME, {"session_id": None, "summary": []})
+        await self.send(MessageKind.WELCOME, await relay.welcome(self.ctx.pool, self.person_id))
 
     def _check_key_state(self, node_id: UUID) -> None:
         """The node's `key_state` decision point (§6.1 step 6, R6-6).
@@ -391,13 +441,17 @@ class Session:
         if refusal is not None:
             raise HandshakeRefused(str(refusal), audited=True)
         node_id = UUID(str(node_id))
+        async with self.ctx.pool.connection() as conn:
+            cur = await conn.execute("SELECT person_id FROM gw.node WHERE id = %s", (node_id,))
+            row = await cur.fetchone()
+        assert row is not None  # nodes are never deleted
+        self.person_id = UUID(str(row[0]))
         await self._open(node_id, public_key, skew)
         core_key_id, core_public = self.ctx.keys.current_core_key
         await self.send(
             MessageKind.WELCOME,
             {
-                "session_id": None,
-                "summary": [],
+                **await relay.welcome(self.ctx.pool, self.person_id),
                 "enrolment": {
                     "node_id": str(node_id),
                     "core_key_id": core_key_id,
@@ -486,7 +540,24 @@ class Session:
         elif kind is MessageKind.PING:
             await self._db("SELECT gw.touch_connection(%s)", (self.conn_id,))
             await self.send(MessageKind.PONG, {})
-        # received / ack: accepted and dropped until Task 7 wires them to comm.*; pong: nothing.
+        elif kind is MessageKind.PONG:
+            assert self.link is not None
+            self.link.on_pong()
+        else:  # received / ack
+            await self._confirm(kind, payload)
+
+    async def _confirm(self, kind: MessageKind, payload: dict[str, Any]) -> None:
+        assert self.link is not None
+        model = Ack if kind is MessageKind.ACK else Received
+        ref = _payload(model, payload).root
+        try:
+            refusal = await self.link.on_confirm(kind, ref)
+        except psycopg.Error as e:
+            if _fenced(e):
+                raise Fenced from None
+            raise
+        if refusal is not None:
+            await self._error(refusal, "the message was refused")
 
     async def _record_inbound(self, message_id: UUID, kind: MessageKind, payload: Any) -> None:
         try:

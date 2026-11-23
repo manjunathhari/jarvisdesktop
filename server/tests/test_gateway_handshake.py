@@ -81,8 +81,8 @@ def _empty_refusal_tally(gdb: Dsns) -> Iterator[None]:
 
 
 class FakeClock:
-    def __init__(self) -> None:
-        self.now = datetime(2026, 11, 23, 10, 0, tzinfo=UTC)
+    def __init__(self, start: datetime | None = None) -> None:
+        self.now = start or datetime(2026, 11, 23, 10, 0, tzinfo=UTC)
 
     def __call__(self) -> datetime:
         return self.now
@@ -103,6 +103,7 @@ class Gw:
     core_key: Ed25519PrivateKey
     tmp: Path
     nodes_made: list[FakeNode] = field(default_factory=list)
+    app: Any = None
 
     @property
     def gw_key_id(self) -> str:
@@ -202,8 +203,10 @@ def running_gateway(
     bind_check: bool = False,
     recheck_interval: float = 0.1,
     dsn: str | None = None,
+    clock: FakeClock | None = None,
+    tick_interval: float = 0.05,
 ) -> Iterator[Gw]:
-    clock = FakeClock()
+    clock = clock or FakeClock()
     whois = FakeWhoIs()
     gw_key = gw_key or Ed25519PrivateKey.generate()
     core_key = core_key or Ed25519PrivateKey.generate()
@@ -219,9 +222,10 @@ def running_gateway(
         bind_check=bind_check,
         clock=clock,
         recheck_interval=recheck_interval,
+        tick_interval=tick_interval,
     )
     with TestClient(PeerFromHeader(app)) as client:
-        gw = Gw(dsns, client, clock, whois, gw_key, core_key, tmp)
+        gw = Gw(dsns, client, clock, whois, gw_key, core_key, tmp, app=app)
         try:
             yield gw
         finally:
@@ -933,12 +937,15 @@ def test_malformed_and_unknown_kind_get_error(gw_client: Gw) -> None:
     assert _wait_for(lambda: _inbound(gw_client.dsns, ok))
 
 
-def test_received_and_ack_accepted_until_task_7(gw_client: Gw) -> None:
+def test_received_and_ack_of_unknown_item_refused_and_open(gw_client: Gw) -> None:
+    """Task 7 wires `received` and `ack` to comm.*: an unknown item is refused
+    (`unknown_item`, audited by the function) and the connection stays open."""
     a = gw_client.enrolled()
     a.received(uuid.uuid4())
     a.ack(uuid.uuid4())
     a.send("ping", {})
-    assert a.recv()["kind"] == "pong"  # no error and still open
+    kinds = [(e["kind"], e["payload"].get("code")) for e in (a.recv(), a.recv(), a.recv())]
+    assert kinds == [("error", "unknown_item"), ("error", "unknown_item"), ("pong", None)]
 
 
 def test_ping_touches_connection(gw_client: Gw, app_conn: Conn) -> None:
@@ -954,6 +961,10 @@ def test_ping_touches_connection(gw_client: Gw, app_conn: Conn) -> None:
 
 def test_node_close_closes_connection_row(gw_client: Gw, app_conn: Conn) -> None:
     a = gw_client.enrolled()
+    # Past the connect-time delivery first: TestClient cancels the app as soon as the client
+    # closes, which a real server doesn't, so a close mid-delivery would test TestClient.
+    a.send("ping", {})
+    assert a.recv()["kind"] == "pong"
     a.close()
 
     def closed() -> Any:

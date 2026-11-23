@@ -15,6 +15,13 @@ Its pins, node ID and seen-list live in a JSON file (``state_path``), reloaded b
 envelope) carries no ``seq`` the gateway could count, so building one with ``envelope()`` and
 sending it with ``send_raw()`` doesn't move the node's counter.
 
+Delivery (Task 7): it sends ``received`` automatically when an outbox item arrives
+(``auto_received``) and for every reply chunk (``ack_chunks``), answers the gateway's ``ping``
+with ``pong`` (``answer_pings``), shows a ``(reply_id, seq)`` at most once, and never shows an
+item it has seen or that ``outbox.cleared`` removed; the cleared list lives in the state file
+too. ``log`` records each display and each clear in order, for the P2-E13 invariants.
+``sync()`` is a barrier: a ``ping`` whose ``pong`` follows everything the gateway sent first.
+
 Also here: ``FakeWhoIs`` (dict-backed ``whois``) and ``PeerFromHeader``, a test-only ASGI
 wrapper that sets the connection's peer address from a request header, because Starlette's
 TestClient has one fixed client address. The gateway itself never reads that header.
@@ -121,7 +128,12 @@ class FakeNode:
         self.pinned_gateway: dict[str, bytes] = {}
         self.trusted_core: dict[str, bytes] = {}
         self.seen_outbox: set[str] = set()
+        self.cleared: set[str] = set()
         self.last_shown: dict[str, int] = {}
+        self.auto_received = True
+        self.ack_chunks = True
+        self.answer_pings = True
+        self.log: list[tuple[str, str]] = []
         self.node_id = node_id
         self._load()
         if node_id is not None:
@@ -153,6 +165,7 @@ class FakeNode:
         self.pinned_gateway = {k: bytes.fromhex(v) for k, v in state["gateway_keys"].items()}
         self.trusted_core = {k: bytes.fromhex(v) for k, v in state["core_keys"].items()}
         self.seen_outbox = set(state["seen_outbox"])
+        self.cleared = set(state.get("cleared", []))
         self.last_shown = dict(state["shown"])
 
     def _save(self) -> None:
@@ -163,6 +176,7 @@ class FakeNode:
                     "gateway_keys": {k: v.hex() for k, v in self.pinned_gateway.items()},
                     "core_keys": {k: v.hex() for k, v in self.trusted_core.items()},
                     "seen_outbox": sorted(self.seen_outbox),
+                    "cleared": sorted(self.cleared),
                     "shown": self.last_shown,
                 }
             )
@@ -226,15 +240,16 @@ class FakeNode:
         clock_skew_ms: int | None = None,
         sent_at: datetime | None = None,
         node_id: UUID | None = None,
+        resume: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """``hello`` (path A); returns the ``welcome`` payload."""
+        """``hello`` (path A); returns the ``welcome`` payload. ``resume`` defaults to the
+        last shown ``seq`` of every reply in the state file."""
         if not self.connected:
             self.connect()
         assert self.challenge is not None
-        payload: dict[str, Any] = {
-            "nonce": nonce or self.challenge["nonce"],
-            "resume": [{"reply_id": r, "last_seq": s} for r, s in sorted(self.last_shown.items())],
-        }
+        if resume is None:
+            resume = [{"reply_id": r, "last_seq": s} for r, s in sorted(self.last_shown.items())]
+        payload: dict[str, Any] = {"nonce": nonce or self.challenge["nonce"], "resume": resume}
         if clock_skew_ms is not None:
             payload["clock_skew_ms"] = clock_skew_ms
         self.send("hello", payload, sent_at=sent_at, node_id=node_id)
@@ -356,10 +371,34 @@ class FakeNode:
         return dict(json.loads(message["text"]))
 
     def recv(self, timeout: float = 2.0) -> dict[str, Any]:
-        """The next gateway message, after every node-side check."""
+        """The next gateway message, after every node-side check. A gateway ``ping`` is
+        answered with ``pong`` when ``answer_pings`` is set."""
         env = self._receive(timeout)
         self.inject(env)
+        if env["kind"] == "ping" and self.answer_pings:
+            self.send("pong", {})
         return env
+
+    def drain(self, timeout: float = 0.005) -> list[dict[str, Any]]:
+        """Every message already sent, until none arrives within ``timeout``."""
+        out: list[dict[str, Any]] = []
+        while True:
+            try:
+                out.append(self.recv(timeout))
+            except TimeoutError:
+                return out
+
+    def sync(self, timeout: float = 5.0) -> list[dict[str, Any]]:
+        """Send ``ping`` and return what the gateway sent before its ``pong``. The gateway
+        handles one connection's messages in order, so the ``pong`` follows everything that
+        connection's earlier messages (and its connect-time delivery) caused."""
+        self.send("ping", {})
+        out: list[dict[str, Any]] = []
+        while True:
+            env = self.recv(timeout)
+            if env["kind"] == "pong":
+                return out
+            out.append(env)
 
     def inject(self, env: dict[str, Any]) -> None:
         """Process one gateway envelope exactly as if it had arrived on the connection."""
@@ -398,10 +437,17 @@ class FakeNode:
                     except AuthzInvalid:
                         raise Rejected("bad_signature") from None
                 outbox_id = payload["outbox_id"]
-                if outbox_id not in self.seen_outbox:
+                if outbox_id not in self.seen_outbox and outbox_id not in self.cleared:
                     self.seen_outbox.add(outbox_id)
                     self.displays[outbox_id] += 1
+                    self.log.append(("display", outbox_id))
                     self._save()
+                if self.auto_received and self.ws is not None:
+                    self.send("received", {"outbox_id": outbox_id})
+            elif kind == "outbox.cleared":
+                self.cleared.add(payload["outbox_id"])
+                self.log.append(("cleared", payload["outbox_id"]))
+                self._save()
             elif kind == "reply.chunk":
                 self._chunk(payload)
         except Rejected as e:
@@ -419,4 +465,5 @@ class FakeNode:
             self.last_shown[reply_id] = seq
             self.shown_chunks[reply_id].append(seq)
             self._save()
-        self.send("received", {"reply_id": reply_id, "seq": seq})
+        if self.ack_chunks and self.ws is not None:
+            self.send("received", {"reply_id": reply_id, "seq": seq})

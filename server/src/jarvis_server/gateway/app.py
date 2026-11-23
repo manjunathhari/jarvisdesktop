@@ -29,6 +29,7 @@ from psycopg_pool import AsyncConnectionPool
 from jarvis_server import config
 from jarvis_server.bootstrap import GATEWAY_ROLE
 from jarvis_server.gateway.keys import GatewayKeys, load_keys
+from jarvis_server.gateway.relay import TICK_S, Relay
 from jarvis_server.gateway.session import GatewayContext, Session
 from jarvis_server.gateway.tailscale import LocalApiWhoIs, WhoIs, is_tailnet_address, tailnet_ipv4
 
@@ -63,10 +64,12 @@ def create_app(
     bind_check: bool = True,
     clock: Callable[[], datetime] = _utcnow,
     recheck_interval: float = RECHECK_INTERVAL_S,
+    tick_interval: float = TICK_S,
 ) -> FastAPI:
     """The gateway app. `bind_check` refuses a connection that arrived on a local address that
-    isn't a Tailscale address (recorded `unknown_peer`); `clock` and `recheck_interval` are
-    injectable for tests."""
+    isn't a Tailscale address (recorded `unknown_peer`); `clock`, `recheck_interval` and the
+    relay's `tick_interval` (how often, in real seconds, it checks the clock for heartbeats
+    and the re-send sweep) are injectable for tests."""
     keys = GatewayKeys(gw_key=gw_key, gw_key_id=gw_key_id, core_public_keys=dict(core_public_keys))
 
     @asynccontextmanager
@@ -77,15 +80,21 @@ def create_app(
         await pool.open(wait=True)
         try:
             await _check_role(pool)
-            app.state.gateway = GatewayContext(
-                pool=pool,
-                whois=whois,
-                keys=keys,
-                clock=clock,
-                recheck_interval=recheck_interval,
-                bind_check=bind_check,
-            )
-            yield
+            relay = Relay(pool=pool, dsn=dsn, clock=clock, tick_interval=tick_interval)
+            await relay.start()
+            try:
+                app.state.gateway = GatewayContext(
+                    pool=pool,
+                    whois=whois,
+                    keys=keys,
+                    clock=clock,
+                    recheck_interval=recheck_interval,
+                    bind_check=bind_check,
+                    relay=relay,
+                )
+                yield
+            finally:
+                await relay.stop()
         finally:
             await pool.close()
 
