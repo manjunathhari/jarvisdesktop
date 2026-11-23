@@ -14,6 +14,9 @@ import psycopg
 
 # The household seeded by migration 0006 (D6 "me only": one household).
 HOUSEHOLD_ID = UUID("00000000-0000-4000-8000-000000000001")
+# The household owner, seeded by migration 0006 (MANJ_ID). Budget warnings go to this person
+# alone (R12-16).
+OWNER_PERSON_ID = UUID("00000000-0000-4000-8000-000000000002")
 
 SECRETS_DIR = Path(os.environ.get("JARVIS_SECRETS_DIR", "/run/secrets"))
 

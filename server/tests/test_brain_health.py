@@ -8,6 +8,7 @@ rows block the 0009 downgrade. People are fictional.
 from __future__ import annotations
 
 import json
+import secrets
 import subprocess
 import sys
 import uuid
@@ -18,7 +19,7 @@ from typing import Any
 import psycopg
 import pytest
 
-from jarvis_server import comm, jobs
+from jarvis_server import comm, jobs, nodes
 from jarvis_server.brain import (
     BrainCallFailed,
     BrainEvent,
@@ -30,6 +31,7 @@ from jarvis_server.brain import (
     health,
 )
 from jarvis_server.core import dispatch, rules
+from jarvis_server.signing import fingerprint
 
 from .conftest import Dsns, fresh_database
 
@@ -37,6 +39,8 @@ Conn = psycopg.Connection[Any]
 
 HOUSEHOLD = uuid.UUID("00000000-0000-4000-8000-000000000001")
 MODEL = "claude-opus-5-5"
+CFP = fingerprint(bytes(range(32)))
+GFP = fingerprint(bytes(range(32, 64)))
 
 
 @pytest.fixture(scope="module")
@@ -238,3 +242,78 @@ def test_probe_unexpected_exception_is_send_phase(app: Conn) -> None:  # §10.1 
     assert health.is_down(app) is True
     status = app.execute("SELECT status FROM ops.job WHERE id = %s", (job_id,)).fetchone()
     assert status == ("DONE",)
+
+
+def _new_person(owner: Conn) -> uuid.UUID:
+    pid = uuid.uuid4()
+    owner.execute(
+        "INSERT INTO ledger.person (id, display_name, organization_id, source_ref)"
+        " VALUES (%s, 'Ravi Fictional', %s, 'test')",
+        (pid, HOUSEHOLD),
+    )
+    return pid
+
+
+def _acknowledge(app: Conn, gateway: Conn, person: uuid.UUID, item: uuid.UUID) -> None:
+    """Deliver and acknowledge `item` through a node of `person`, as the gateway does."""
+    code = nodes.create_enrolment(
+        app, person_id=person, kind="DESKTOP", name="pc", core_fp=CFP, gw_fp=GFP
+    )
+    token, _, _ = nodes.parse_enrolment_code(code)
+    node_id = nodes.enrol(
+        gateway,
+        token=token,
+        public_key=secrets.token_bytes(32),
+        tailscale_identity=f"ts:pc-{secrets.token_hex(4)}",
+    )
+    row = gateway.execute("SELECT conn_id FROM gw.open_connection(%s)", (node_id,)).fetchone()
+    assert row is not None
+    assert gateway.execute("SELECT comm.record_sent(%s, %s)", (row[0], item)).fetchone() == (True,)
+    acked = gateway.execute("SELECT comm.acknowledge(%s, %s)", (row[0], item)).fetchone()
+    assert acked == ("ACKNOWLEDGED",)
+
+
+def _down_item(app: Conn, person: uuid.UUID) -> uuid.UUID:
+    event = comm.record_event(app, "brain.down", subject_type="brain", subject_id="brain",
+                              person_id=person, details={})  # fmt: skip
+    [item] = rules.notify(app, "brain.down", person_id=person, event_id=event, context={})
+    return item
+
+
+def _back_items(app: Conn, person: uuid.UUID) -> list[tuple[str, uuid.UUID | None]]:
+    rows = app.execute(
+        "SELECT priority, supersedes_id FROM comm.outbox WHERE person_id = %s"
+        " AND kind = 'brain.back'",
+        (person,),
+    ).fetchall()
+    return [(str(r[0]), r[1]) for r in rows]
+
+
+def test_back_reaches_everyone_told_it_was_down(
+    app: Conn, owner: Conn, gateway: Conn
+) -> None:  # R12-17
+    seen, unseen, never = _new_person(owner), _new_person(owner), _new_person(owner)
+    _down(app)
+    seen_item, unseen_item = _down_item(app, seen), _down_item(app, unseen)
+    _acknowledge(app, gateway, seen, seen_item)
+    brain = FakeBrain([Speech("ok")], usage=(30, 2))
+    health.set_probe_brain(lambda: (brain, MODEL))
+    _run_probe(app)
+    assert health.is_down(app) is False
+    # Both people told it was down hear it is back; the acknowledged item is left as it is,
+    # the open one is superseded. The person never told it was down hears nothing.
+    assert _back_items(app, seen) == [("DIGEST", None)]
+    assert _back_items(app, unseen) == [("DIGEST", unseen_item)]
+    assert _back_items(app, never) == []
+    states = dict(
+        app.execute(
+            "SELECT id, state FROM comm.outbox WHERE id = ANY(%s)", ([seen_item, unseen_item],)
+        ).fetchall()
+    )
+    assert states == {seen_item: "ACKNOWLEDGED", unseen_item: "SUPERSEDED"}
+    # The next outage tells only whoever is sent its "down" item.
+    _down(app)
+    _down_item(app, unseen)
+    _run_probe(app)
+    assert len(_back_items(app, unseen)) == 2
+    assert len(_back_items(app, seen)) == 1  # its earlier outage was already answered

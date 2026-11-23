@@ -6,11 +6,11 @@ missing), so concurrent jobs count every failure and report each transition once
 
 `brain.probe` (scheduled every 2 minutes while the brain is DOWN) does nothing while the brain
 is up. While it is DOWN it sends a minimal request, reserved like any other call (turn_id is
-null) on its own committed connection (R12-13): success settles it, marks the brain back and
-sends CLAUDE_BACK (`brain.back`, which supersedes each person's open "Claude down" item); a
-CONNECT failure releases the reservation, a SEND failure (or any exception the brain raises
-that is not a placed `BrainCallFailed`) lapses it at full value, and either counts as a
-failure. Re-queueing the turns
+null) on its own committed connection (R12-13). Success settles it, marks the brain back and
+sends CLAUDE_BACK (`brain.back`) to everyone who was sent the current "Claude down" item,
+superseding that item where it is still open (R12-17). A CONNECT failure releases the
+reservation; a SEND failure (or any exception the brain raises that is not a placed
+`BrainCallFailed`) lapses it at full value; either counts as a failure. Re-queueing the turns
 held while the brain was down is the conversation turn's job (Task 10), not the probe's.
 
 The probe gets its brain from `set_probe_brain`, set by the process that wires the brain up;
@@ -50,11 +50,6 @@ PROBE_REQUEST = BrainRequest(
 )
 
 _DOWN_KINDS = ("brain.down", "brain.down.with_held")
-_OPEN = (
-    comm.OutboxState.PENDING.value,
-    comm.OutboxState.DELIVERING.value,
-    comm.OutboxState.DELIVERED.value,
-)
 
 
 class MeteredBrain(Brain, Protocol):
@@ -122,13 +117,25 @@ def is_down(conn: psycopg.Connection[Any]) -> bool:
     return row is not None and bool(row[0].get("down", False))
 
 
+# People sent a "Claude down" item since their last "Claude back": everyone told about the
+# current outage, whatever has happened to that item since (acknowledged included).
+_TOLD_DOWN = """
+SELECT d.person_id FROM comm.outbox d
+WHERE d.kind = ANY(%s)
+GROUP BY d.person_id
+HAVING max(d.created_at) > coalesce(
+    (SELECT max(b.created_at) FROM comm.outbox b
+     WHERE b.person_id = d.person_id AND b.kind = 'brain.back'),
+    '-infinity')
+ORDER BY d.person_id
+"""
+
+
 def _announce_back(conn: psycopg.Connection[Any]) -> None:
-    """CLAUDE_BACK for every person with an open "Claude down" item (§8.1)."""
-    people = conn.execute(
-        "SELECT DISTINCT person_id FROM comm.outbox WHERE kind = ANY(%s) AND state = ANY(%s)"
-        " ORDER BY person_id",
-        (list(_DOWN_KINDS), list(_OPEN)),
-    ).fetchall()
+    """CLAUDE_BACK for every person who was sent the current "Claude down" item, including
+    those who have acknowledged it, and for no one else (§8.1, R12-17). `rules.notify`
+    supersedes the person's down item if it is still open."""
+    people = conn.execute(_TOLD_DOWN, (list(_DOWN_KINDS),)).fetchall()
     for (person,) in people:
         person_id = UUID(str(person))
         event_id = comm.record_event(

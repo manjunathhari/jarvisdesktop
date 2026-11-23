@@ -20,8 +20,8 @@ are always read under the lock that guards them.
   so the sweep and a late job together notify exactly once.
 - 80% and 100% of the monthly cap: one `budget.80` / `budget.100` event and notification per
   month; a refusal by today's ceiling alone: one `budget.daily` per IST day (R12-14). Decided
-  under the budget row lock and sent to the person of the turn being reserved. A probe has no
-  turn and no person, so it never sends them; the next turn does.
+  under the budget row lock and always sent to the household owner
+  (`config.OWNER_PERSON_ID`), whoever's turn or probe crossed the line (R12-16).
 - Budget steps of a job that calls the brain commit on their own connection
   (`committing_connection`, R12-13), never in the job's transaction.
 """
@@ -42,7 +42,7 @@ import psycopg
 from psycopg import errors
 from psycopg.pq import TransactionStatus
 
-from jarvis_server import comm, jobs
+from jarvis_server import comm, config, jobs
 from jarvis_server.core import dispatch, rules
 
 log = logging.getLogger("jarvis.brain.budget")
@@ -225,9 +225,11 @@ def _indeterminate(
     return True
 
 
-def _threshold(conn: psycopg.Connection[Any], kind: str, subject: str, person_id: UUID) -> None:
+def _threshold(conn: psycopg.Connection[Any], kind: str, subject: str) -> None:
     """One `budget.80` / `budget.100` event and notification per month (subject `YYYY-MM`),
-    one `budget.daily` per IST day (subject `YYYY-MM-DD`). Needs the month lock."""
+    one `budget.daily` per IST day (subject `YYYY-MM-DD`), always to the household owner and
+    to no one else (R12-16). Needs the month lock."""
+    owner = config.OWNER_PERSON_ID
     seen = conn.execute(
         "SELECT 1 FROM comm.event WHERE kind = %s AND subject_type = 'budget'"
         " AND subject_id = %s LIMIT 1",
@@ -236,9 +238,9 @@ def _threshold(conn: psycopg.Connection[Any], kind: str, subject: str, person_id
     if seen is not None:
         return
     event_id = comm.record_event(
-        conn, kind, subject_type="budget", subject_id=subject, person_id=person_id, details={}
+        conn, kind, subject_type="budget", subject_id=subject, person_id=owner, details={}
     )
-    rules.notify(conn, kind, person_id=person_id, event_id=event_id, context={})
+    rules.notify(conn, kind, person_id=owner, event_id=event_id, context={})
 
 
 # --- the interface -----------------------------------------------------------------------------
@@ -330,14 +332,13 @@ def reserve(
                 return Owner.OWNED_ELSEWHERE, None
             new_id = UUID(str(inserted[0]))
             used += reserve_paise
-        if person_id is not None:
-            this_month = month.strftime("%Y-%m")
-            if used * 100 >= row.cap_inr * WARN_PERCENT:
-                _threshold(conn, "budget.80", this_month, person_id)
-            if over_cap or used >= row.cap_inr:
-                _threshold(conn, "budget.100", this_month, person_id)
-            elif over_day:  # refused by today's ceiling alone (R12-14)
-                _threshold(conn, "budget.daily", today.isoformat(), person_id)
+        this_month = month.strftime("%Y-%m")
+        if used * 100 >= row.cap_inr * WARN_PERCENT:
+            _threshold(conn, "budget.80", this_month)
+        if over_cap or used >= row.cap_inr:
+            _threshold(conn, "budget.100", this_month)
+        elif over_day:  # refused by today's ceiling alone (R12-14)
+            _threshold(conn, "budget.daily", today.isoformat())
         if new_id is None:
             return Owner.NO_BUDGET, None
         return Owner.RESERVED, new_id

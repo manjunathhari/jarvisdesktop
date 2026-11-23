@@ -19,7 +19,7 @@ from typing import Any
 import psycopg
 import pytest
 
-from jarvis_server import jobs
+from jarvis_server import config, jobs
 from jarvis_server.brain import budget, prices
 from jarvis_server.brain.budget import BudgetRow, Owner
 from jarvis_server.core import dispatch
@@ -32,6 +32,8 @@ Turns = Callable[[], uuid.UUID]
 
 HOUSEHOLD = uuid.UUID("00000000-0000-4000-8000-000000000001")
 IST_OFFSET = timedelta(hours=5, minutes=30)
+OWNER = config.OWNER_PERSON_ID  # the seeded household owner (R12-16)
+BUDGET_KINDS = ("budget.80", "budget.100", "budget.daily")
 
 
 @pytest.fixture(scope="module")
@@ -144,6 +146,26 @@ def _items(app: Conn, person: uuid.UUID, kind: str) -> list[tuple[str, str]]:
     rows = app.execute(
         "SELECT priority, state FROM comm.outbox WHERE person_id = %s AND kind = %s",
         (person, kind),
+    ).fetchall()
+    return [(str(r[0]), str(r[1])) for r in rows]
+
+
+def _owner_items(app: Conn, kind: str, subject: str) -> list[tuple[str, str]]:
+    """The owner's items of `kind` for one budget period (event subject `YYYY-MM` or a day)."""
+    rows = app.execute(
+        "SELECT o.priority, o.state FROM comm.outbox o JOIN comm.event e ON e.id = o.event_id"
+        " WHERE o.person_id = %s AND o.kind = %s AND e.subject_id = %s",
+        (OWNER, kind, subject),
+    ).fetchall()
+    return [(str(r[0]), str(r[1])) for r in rows]
+
+
+def _daily_items(app: Conn, month: date) -> list[tuple[str, str]]:
+    """Every `budget.daily` item, for anyone, about a day of `month`."""
+    rows = app.execute(
+        "SELECT o.priority, o.state FROM comm.outbox o JOIN comm.event e ON e.id = o.event_id"
+        " WHERE o.kind = 'budget.daily' AND e.subject_id LIKE %s",
+        (month.strftime("%Y-%m-") + "%",),
     ).fetchall()
     return [(str(r[0]), str(r[1])) for r in rows]
 
@@ -561,7 +583,7 @@ def test_sweep_job_kind(app: Conn) -> None:
 
 def test_80_and_100_percent(
     app: Conn, person: uuid.UUID, new_turn: Turns, monkeypatch: pytest.MonkeyPatch
-) -> None:
+) -> None:  # P2-B2; R12-16: the turns are a second person's, the warnings the owner's
     month = _month()
     _budget(app, month, 10_000, monkeypatch)
     now = _utc(_next(month) - timedelta(days=1))  # the last day: no ceiling below the cap
@@ -571,23 +593,27 @@ def test_80_and_100_percent(
         return _reserve(app, new_turn(), now, paise=paise)[0]
 
     assert ask(7_999) is Owner.RESERVED  # 79.99%: nothing
-    assert _items(app, person, "budget.80") == []
+    assert _owner_items(app, "budget.80", subject) == []
     assert ask(1) is Owner.RESERVED  # exactly 80%
-    assert _items(app, person, "budget.80") == [("TODAY", "PENDING")]
+    assert _owner_items(app, "budget.80", subject) == [("TODAY", "PENDING")]
     assert ask(1_000) is Owner.RESERVED  # 90%: no second warning this month
     assert _events(app, "budget.80", subject) == 1
-    assert _items(app, person, "budget.100") == []
+    assert _owner_items(app, "budget.100", subject) == []
     assert ask(1_001) is Owner.NO_BUDGET  # would pass the cap: refused, calls stopped
-    assert _items(app, person, "budget.100") == [("URGENT", "PENDING")]
+    assert _owner_items(app, "budget.100", subject) == [("URGENT", "PENDING")]
     assert ask(1_000) is Owner.RESERVED  # exactly 100% still fits
     assert ask(1) is Owner.NO_BUDGET
     assert _events(app, "budget.100", subject) == 1  # once a month
     assert _events(app, "budget.80", subject) == 1
+    assert _owner_items(app, "budget.80", subject) == [("TODAY", "PENDING")]
+    assert _owner_items(app, "budget.100", subject) == [("URGENT", "PENDING")]
     assert _totals(app, month) == (10_000, 0, 10_000)
-    assert _items(app, person, "budget.daily") == []  # the cap refused, not today's ceiling
+    assert _daily_items(app, month) == []  # the cap refused, not today's ceiling
+    for kind in BUDGET_KINDS:  # the person whose turns crossed the lines is not told
+        assert _items(app, person, kind) == []
 
 
-# --- budget.daily (R12-14) and a raised cap (R12-15) -------------------------------------------
+# --- budget.daily (R12-14), to the owner (R12-16), and a raised cap (R12-15) -------------------
 
 
 def test_budget_daily_once_per_day(
@@ -596,17 +622,21 @@ def test_budget_daily_once_per_day(
     month = _month()
     _budget(app, month, 3000, monkeypatch)
     now = _utc(_next(month) - timedelta(days=10))  # ceiling 300 today, 333 tomorrow
-    assert _reserve(app, new_turn(), now, paise=400)[0] is Owner.NO_BUDGET
-    assert _items(app, person, "budget.daily") == [("URGENT", "PENDING")]
-    assert _reserve(app, new_turn(), now + timedelta(hours=1), paise=400)[0] is Owner.NO_BUDGET
-    assert _events(app, "budget.daily", (now + IST_OFFSET).date().isoformat()) == 1  # once today
-    assert _reserve(app, new_turn(), now + timedelta(days=1), paise=400)[0] is Owner.NO_BUDGET
+    today = (now + IST_OFFSET).date().isoformat()
     tomorrow = (now + timedelta(days=1) + IST_OFFSET).date().isoformat()
+    assert _reserve(app, new_turn(), now, paise=400)[0] is Owner.NO_BUDGET
+    assert _owner_items(app, "budget.daily", today) == [("URGENT", "PENDING")]
+    assert _reserve(app, new_turn(), now + timedelta(hours=1), paise=400)[0] is Owner.NO_BUDGET
+    assert _reserve(app, None, now, paise=400)[0] is Owner.NO_BUDGET  # a probe, same day
+    assert _events(app, "budget.daily", today) == 1  # once today
+    assert _owner_items(app, "budget.daily", today) == [("URGENT", "PENDING")]
+    assert _reserve(app, new_turn(), now + timedelta(days=1), paise=400)[0] is Owner.NO_BUDGET
     assert _events(app, "budget.daily", tomorrow) == 1  # a new IST day: one more
-    assert len(_items(app, person, "budget.daily")) == 2
-    assert _items(app, person, "budget.100") == []
-    assert _reserve(app, None, now, paise=400)[0] is Owner.NO_BUDGET  # a probe tells no one
-    assert len(_items(app, person, "budget.daily")) == 2
+    assert _owner_items(app, "budget.daily", tomorrow) == [("URGENT", "PENDING")]
+    assert len(_daily_items(app, month)) == 2
+    assert _owner_items(app, "budget.100", month.strftime("%Y-%m")) == []
+    for kind in BUDGET_KINDS:
+        assert _items(app, person, kind) == []
 
 
 def test_monthly_cap_refusal_is_budget_100_not_daily(
@@ -616,8 +646,10 @@ def test_monthly_cap_refusal_is_budget_100_not_daily(
     _budget(app, month, 3000, monkeypatch)
     now = _utc(_next(month) - timedelta(days=1))  # the last day: both limits refuse 3001
     assert _reserve(app, new_turn(), now, paise=3001)[0] is Owner.NO_BUDGET
-    assert _items(app, person, "budget.100") == [("URGENT", "PENDING")]
-    assert _items(app, person, "budget.daily") == []
+    assert _owner_items(app, "budget.100", month.strftime("%Y-%m")) == [("URGENT", "PENDING")]
+    assert _daily_items(app, month) == []
+    for kind in BUDGET_KINDS:
+        assert _items(app, person, kind) == []
 
 
 def test_raised_cap_applies_to_the_current_month(app: Conn) -> None:
@@ -744,3 +776,9 @@ def test_sweep_job_and_late_reserve_do_not_deadlock(
     assert len(_items(app, person, "turn.indeterminate")) == 2  # one per turn
     status = app.execute("SELECT status FROM ops.job WHERE id = %s", (sweep_id,)).fetchone()
     assert status == ("DONE",)
+
+
+def test_owner_is_the_seeded_person(app: Conn) -> None:  # R12-16
+    assert str(OWNER) == "00000000-0000-4000-8000-000000000002"  # migration 0006 MANJ_ID
+    row = app.execute("SELECT organization_id FROM ledger.person WHERE id = %s", (OWNER,))
+    assert row.fetchone() == (config.HOUSEHOLD_ID,)
