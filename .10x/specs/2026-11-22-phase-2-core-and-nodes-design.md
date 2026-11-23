@@ -1,6 +1,6 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** **Revision 12, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, **revision 12**. Revision 12 adds R12-1 to R12-8 (§20), from Manj's ruling of 23 Nov on the gateway audit gap: a sixth gateway function, `gw.refuse_handshake`; a bounded refusal tally against audit flooding; the gateway-computed clock skew, recorded by `gw.open_connection`; and a restricted Task 7 record for the resume event.
+**Status:** **Revision 12, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, **revision 12**. Revision 12 adds R12-1 to R12-9 (§20), from Manj's ruling of 23 Nov on the gateway audit gap: a sixth gateway function, `gw.refuse_handshake`; a bounded refusal tally against audit flooding; the gateway-computed clock skew, recorded by `gw.open_connection`; and a restricted Task 7 record for the resume event.
 
 **Approval history:**
 - **Revision 4:** approved by Manj on 2026-11-22.
@@ -110,11 +110,12 @@ A new role, **`jarvis_gateway`**, gets only what the gateway needs. Everything n
 | Object | Grant |
 |---|---|
 | `gw.node` | SELECT (columns `id`, `person_id`, `kind`, `public_key`, `tailscale_identity`, `revoked_at`) |
+| `conv.session` | SELECT (columns `id`, `person_id`, `closed_at` only; R12-9) |
 | `conv.stream_chunk` | SELECT |
 | `conv.stream_cursor` | SELECT (changed only through `conv.record_chunk_received`) |
 | `comm.outbox` | SELECT |
 | `comm.delivery` | SELECT |
-| everything in `ledger`, `audit`, `ops` (other than the functions below), `conv.message`, `conv.session`, `gw.enrolment`, memory | **nothing** |
+| everything in `ledger`, `audit`, `ops` (other than the functions below), `conv.message`, the other `conv.session` columns (`started_at`, `last_activity_at`), `gw.enrolment`, memory | **nothing** |
 
 The gateway changes state **only** through these functions, and holds EXECUTE on nothing else:
 
@@ -1049,3 +1050,4 @@ Architecture direction approved; implementation approval pending these changes. 
 | R12-6 | **Envelope signing `key_id`** (owner, 23 Nov, on Task 6's NEEDS_CONTEXT): a node signs `node-msg` envelopes under `fingerprint(node public key)`; the gateway signs `gw-transport` envelopes under the `key_id` its `challenge` announced. Nothing new on the wire. | §7.1 |
 | R12-7 | **Gateway's copy of the core public key** (owner, 23 Nov): the gateway reads it from a non-secret file `core_signing_key.pub` (raw 32-byte public key) in the secrets directory, alongside `gateway_signing_key.pub`, with `core_key_id = fingerprint(public)`. The gateway never reads `core_signing_key`. Task 14 supplies the file in deployment, and Task 12 replaces this source with `gw.trusted_key`. | §7.1 |
 | R12-8 | **`conv.record_resume_out_of_range(p_conn_id bigint, p_reply_id uuid, p_last_seq numeric) RETURNS boolean`** (owner, 23 Nov, with the Task 7 brief): SECURITY DEFINER with a fixed search path, owned by `jarvis_owner`, executable only by `jarvis_gateway`. It calls `gw.current_node(p_conn_id)` first; node and person come from the connection. The database decides the reason: a reply that is not in the node's person's sessions, or does not exist, is `unknown_reply` (foreign and nonexistent are indistinguishable); the person's own reply with `p_last_seq` above the highest stored chunk `seq` is `beyond_max`; otherwise nothing is written and it returns false. `p_last_seq` is `numeric` so it is no narrower than the protocol's "any integer"; NULL, non-finite or non-integral values are refused (`invalid_parameter_value`). It writes one fixed `comm.event` `node.resume_out_of_range` (subject the node, person the node's person) with details exactly `node_id`, `reply_id`, `reason`; `last_seq` is never stored, and the caller supplies no event content. It does not use the refusal tally. Suppression: at most one event per (node, reply_id, reason) in a rolling 15-minute window, concurrency-safe (two simultaneous calls never write two events); `unknown_reply` and `beyond_max` are separate keys. The gateway considers only the first 64 `resume` entries of a `hello`, in order, and ignores the rest. No notification rule and no generic event-to-notification path. It lives in `conv`, so the `gw` schema keeps exactly six gateway functions (R12-2). It is added to migration 0009 in place; 0011 stays Task 12's. In the same task, `conv.record_chunk_received` returns `(false, NULL)` with no audit row for a nonexistent or pruned chunk, keeping the foreign-person refusal. | §4.1, §6.2 step 6 |
+| R12-9 | **The gateway reads session ownership** (owner, 23 Nov, on Task 7's NEEDS_CONTEXT): `GRANT SELECT (id, person_id, closed_at) ON conv.session TO jarvis_gateway`, in migration 0009 in place. IDs and a timestamp only, with no conversation content and no new function, so `gw` keeps six functions. It is used for the live relay (a reply's session → person → that person's connected nodes), for reconnect candidate replies (R9-1) and for `welcome.session_id`. `started_at` and `last_activity_at` stay denied, and tests pin the exact columns. | §4.1 |
