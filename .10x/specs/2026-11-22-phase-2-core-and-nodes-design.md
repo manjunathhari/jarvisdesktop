@@ -1,6 +1,6 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** **Revision 11b, awaiting Manj's review** (Revision 11 was approved on 23 Nov; 11b amends R11-3 only: the grouping-key fallback and the signed card's raw form). Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, **revision 11b**. Revision 11 adds R11-1 to R11-3 (§20), from the Task 5 review: audited refusals inside a job transaction, the rule that an audit row always survives, and typed optional notification inputs.
+**Status:** **Revision 12, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, **revision 12**. Revision 12 adds R12-1 to R12-5 (§20), from Manj's ruling of 23 Nov on the gateway audit gap: a sixth gateway function, `gw.refuse_handshake`; a bounded refusal tally against audit flooding; the gateway-computed clock skew, recorded by `gw.open_connection`; and a restricted Task 7 record for the resume event.
 
 **Approval history:**
 - **Revision 4:** approved by Manj on 2026-11-22.
@@ -10,6 +10,8 @@
 - **Revision 8** (R8-1, R8-2): approved by Manj with plan revision 8b on 2026-11-22.
 - **Revision 9** (R9-1 to R9-6): approved by Manj with plan revision 9 on 2026-11-22.
 - **Revision 10** (R10-1, R10-2): approved by Manj with plan revision 10 on 2026-11-22.
+- **Revision 11** (R11-1 to R11-3): approved by Manj on 2026-11-23.
+- **Revision 11b** (R11-3 amended) and **R11-4**: approved by Manj with plan revisions 11b2 and 11b3 on 2026-11-23.
 
 Authorises the implementation plan, not code. ADR-011 to 014 remain Proposed.
 **Date:** 2026-11-22
@@ -119,13 +121,14 @@ The gateway changes state **only** through these functions, and holds EXECUTE on
 | Function | Does |
 |---|---|
 | `gw.enrol_node(token, public_key, tailscale_identity)` | One-time node registration (§7.2) |
-| `gw.open_connection(node_id)` / `gw.close_connection(conn_id, reason)` | Connection rows; opening fences any older connection of the node |
+| `gw.open_connection(node_id, clock_skew_ms)` / `gw.close_connection(conn_id, reason)` | Connection rows; opening fences any older connection of the node. `clock_skew_ms` is optional and computed by the gateway; above the 30 s tolerance it is recorded as event `node.clock_skew` in the same transaction (§6.1 step 4, R12-4) |
+| `gw.refuse_handshake(code, tailscale_identity, node_id)` | Records a handshake the gateway refused, as a `CONNECT_REFUSED` audit row through the refusal tally. Creates no connection and changes no node (Handshake refusals, below; R12-1 to R12-3) |
 | `gw.touch_connection(conn_id)` | Heartbeat: `gw.node.last_seen_at` and `gw.node_connection.last_ping_at` |
 | `gw.current_node(conn_id)` | The node of an open, non-revoked connection, or the fenced-connection error. Called first by every Task 3 and Task 7 function that works on an established connection (the `conv` and `comm` functions below), and by the gateway's 60 s revocation re-check. **Not** called by the `gw` functions themselves (R8-1) |
 | `conv.record_inbound(conn_id, message_id, kind, payload)` | Writes `conv.inbound` (person filled from the node row inside the function) and enqueues the matching fixed job kind |
 | `comm.record_sent(conn_id, outbox_id)` / `comm.record_received(conn_id, outbox_id)` / `comm.acknowledge(conn_id, outbox_id)` / `conv.record_chunk_received(conn_id, reply_id, seq)` | Delivery and stream-cursor transitions (§8.2, §6.2) |
 
-The five functions in the `gw` schema are the gateway's whole node and connection surface. Which ones go through `gw.current_node` (R8-1):
+The six functions in the `gw` schema are the gateway's whole node and connection surface (R12-2; R7-3 listed five). Which ones go through `gw.current_node` (R8-1):
 
 | Function | Calls `current_node`? | Instead |
 |---|---|---|
@@ -133,10 +136,11 @@ The five functions in the `gw` schema are the gateway's whole node and connectio
 | `gw.open_connection` | No | Opens and supersedes under its own locks (node `FOR UPDATE`, then the old connection `FOR UPDATE`) |
 | `gw.close_connection` | No | Its own locks (node `FOR SHARE`, then this connection `FOR UPDATE`). It checks the connection while holding them. An already closed connection is a no-op that returns without a second `DISCONNECT`; revocation doesn't prevent closing |
 | `gw.touch_connection` | No | Its own locks (node `FOR NO KEY UPDATE`, then this connection `FOR NO KEY UPDATE`), and it re-checks both fence conditions in its own `UPDATE … WHERE`. Calling `current_node` first would take share locks it then has to upgrade, which is the deadlock its stronger lock avoids |
+| `gw.refuse_handshake` | No | Runs when no connection exists. It takes no node or connection lock; its only locks are the refusal tally's (R12-3) |
 | `gw.current_node` | — | It is the fence |
 | every `conv` and `comm` function that takes a connection ID (Tasks 3 and 7) | **Yes, first**, in the same transaction | It takes no other lock on `gw.node` or `gw.node_connection` itself |
 
-All of these take the connection ID, except `gw.enrol_node` and `gw.open_connection`, which runs before the connection exists. All keep the one lock order: node row first, then connection rows.
+All of these take the connection ID, except `gw.enrol_node`, `gw.open_connection` and `gw.refuse_handshake`, which run before the connection exists. All keep the one lock order: node row first, then connection rows.
 
 **Rules for every SECURITY DEFINER function** (gateway-facing and core-facing alike):
 - `SET search_path = pg_catalog, pg_temp`, and every object reference is schema-qualified.
@@ -150,6 +154,7 @@ All of these take the connection ID, except `gw.enrol_node` and `gw.open_connect
   | **A fenced connection** (§7.1, R7-5): the connection is closed, superseded or its node revoked | raises the dedicated error `connection_fenced` (SQLSTATE `JF001`), distinct from ordinary permission denial | No row of its own: the operation that caused the fencing is in the permanent audit trail. That's `CONNECT` with the superseded connection, `DISCONNECT`, or `REVOKE` plus `DISCONNECT` (R8-2) |
   | **A malformed call** (a missing or invalid argument: a programming error) | raises `invalid_parameter_value` | No |
 
+  Refusal audit rows from `gw.enrol_node` and `gw.refuse_handshake` go through the refusal tally (R12-3): the refusal is always returned, and the audit row is written or counted under the tally's bound.
 - **The caller commits before it raises (R7-1).** The Python wrapper for an audited function runs the call in **its own transaction**, which it commits, and only then raises the matching application exception (for example `EnrolmentRefused(reason)`). It must never call an audited function inside a transaction it might roll back, because the refusal's audit row would disappear with it. The shared helper refuses to run unless the connection is idle, with no transaction open. Tests go through this Python boundary: after the exception, a **separate** connection must still see the audit row.
 - No second call writes an audit row afterwards: the function records the refusal atomically with its decision.
 - **Inside a job (R11-1).** A job handler runs in dispatch's one job transaction (ADR-013), so the commit-before-raise rule takes this form:
@@ -207,6 +212,43 @@ All of these take the connection ID, except `gw.enrol_node` and `gw.open_connect
 
 Each is written in the same transaction as the change it records. A connection row left open by a gateway restart is closed, with its `DISCONNECT` (reason `superseded`), when the node next connects.
 
+**Handshake refusals (R12-1).** A failed authentication attempt is a security event, so it goes in the permanent audit trail even though no connection exists. Each refused handshake is recorded once, by whichever side made the decision:
+
+| Codes | Decided by | Recorded by | Audit action |
+|---|---|---|---|
+| `not_first`, `bad_seq`, `bad_nonce`, `challenge_expired`, `bad_signature`, `identity_mismatch`, `revoked`, `unknown_node`, `reenrol_required`, `malformed`, `unknown_peer` | the gateway (§6.1 steps 1 and 6, R6-6) | `gw.refuse_handshake` | `CONNECT_REFUSED` |
+| `bad_token`, `key_in_use`, `identity_in_use` | `gw.enrol_node` | `gw.enrol_node` itself (unchanged) | `ENROL`, REJECTED |
+| `unknown_node`, `revoked`, when found under `gw.open_connection`'s lock (a revocation racing the handshake) | `gw.open_connection` | `gw.open_connection` itself (unchanged) | `CONNECT_REFUSED` |
+
+Four gateway codes are new in R12-1:
+- **`unknown_node`:** `hello` names a node ID that isn't registered;
+- **`reenrol_required`:** a STALE node, closed with 4409 (R6-6);
+- **`malformed`:** the first node message fails the envelope or payload schema, or `hello` carries the nil UUID;
+- **`unknown_peer`:** `whois` returns no identity (§6.1 step 1).
+
+**`gw.refuse_handshake(code, tailscale_identity, node_id) RETURNS text`:**
+- **`code`** must be one of the eleven gateway codes above. Any other value, including the three `gw.enrol_node` codes, is a malformed call.
+- **`tailscale_identity`** is optional (absent only for `unknown_peer`), 1 to 200 characters, and is always this connection's `whois` identity, never message content.
+- **`node_id`** is optional. When given, it must be a registered node (nodes are never deleted), or the call is malformed. The gateway passes it only for a node whose row it has read: `bad_signature` on path A, `revoked`, `identity_mismatch`, `reenrol_required`. A node ID claimed in a message but not registered is never passed or stored, so `unknown_node` has no `node_id`.
+- **Nothing else:** it accepts no details, free text or event content.
+- **No side effects:** it creates no connection, changes no node, and takes no node or connection lock.
+- **Malformed arguments** raise `invalid_parameter_value` and write nothing (R7-1).
+- **The result:** `'recorded'` when it wrote an audit row, `'counted'` when the tally absorbed the refusal (R12-3).
+- **The audit row:** entity `node`; `entity_id` the node ID, or the nil UUID; action `CONNECT_REFUSED`; outcome REJECTED; reason the code; details only `node_id` and `tailscale_identity` (each when present) and `suppressed` (R12-3).
+
+The gateway calls it through `audited_call_async`, in its own committed transaction, before it closes the socket.
+
+**Audit-flood protection (R12-3).** Tailnet reachability doesn't stop a compromised or noisy device from retrying without end. Refusal audit rows from `gw.refuse_handshake` and from `gw.enrol_node`'s refusals are therefore bounded by a tally:
+- **The key** of a refusal is (action, code, `tailscale_identity`, `node_id`, `enrolment_id`), with absent values compared as equal. Every part is a server-side identifier: the connection's `whois` identity, a registered node, an enrolment the token matched. Varying message content can't create new keys; random tokens all share "no enrolment".
+- **Per key:** the first refusal in each 15-minute window, aligned to UTC quarter-hours, writes its audit row. Later refusals with that key in the same window are counted instead.
+- **Global ceiling:** at most 30 refusal audit rows per window across all keys. Past that, every refusal in that window is counted instead.
+- **Counts are kept:** `gw.refusal_tally` holds one mutable row per key, with the number of refusals counted since that key's last audit row and the time of the latest. The key's next audit row carries that number as details `suppressed` (a decimal string, `"0"` when none) and resets it. A number not yet carried stays visible in the tally row.
+- **Bound:** at most 30 refusal rows per 15 minutes (2,880 a day), whatever the attempt rate. Distinct events stay distinct: each new key gets its own row in its first window under the ceiling, and every refusal is counted.
+- **The refusal itself is unchanged:** `gw.enrol_node` still returns its structured refusal, and the gateway still closes the socket with 4401 or 4409. Only the audit row is counted rather than written.
+- **Locks:** the window row (`gw.refusal_window`, a single row) `FOR UPDATE`, then the key's tally row. They are taken after any enrolment lock, and never together with a node or connection lock.
+- **Grants:** `jarvis_gateway` has no grant on either table; `jarvis_app` may SELECT both. Both are kept indefinitely: there is one row per key, and the key space is bounded by real identities, nodes and enrolments.
+- **Not tallied:** `gw.open_connection`'s own refusals stay one row per event, because reaching it needs a valid signature by a registered key.
+
 Its password is a new secret file, `pg_gateway_password`. Privilege tests: P2-S1 and P2-S6 (§14).
 
 ### 4.2 Network
@@ -242,6 +284,8 @@ Three new schemas keep the boundaries visible: `gw` (nodes), `conv` (conversatio
 |---|---|
 | `gw.node` | `id`, `person_id` → `ledger.person`, `kind` (DESKTOP, PHONE), `name`, `public_key` (Ed25519), `tailscale_identity`, `registered_at`, `revoked_at`, `last_seen_at` |
 | `gw.node_connection` | `id`, `node_id`, `opened_at`, `last_ping_at`, `closed_at`, `close_reason` |
+| `gw.refusal_tally` | the refusal key (`action`, `code`, `tailscale_identity`, `node_id`, `enrolment_id`; unique, `NULLS NOT DISTINCT`), `suppressed`, `last_at`, `last_audited_window` (R12-3) |
+| `gw.refusal_window` | a single row: `window_start`, `audited` (refusal audit rows written in this window; R12-3) |
 | `gw.enrolment` | `id`, `token_hash`, `person_id`, `kind`, `name`, `expires_at`, `used_at`, `node_id` (§7.2). Rows are created only through the audited core function `gw.create_enrolment(…)` (R7-2); no role inserts them directly, and the gateway has no grant on this table. |
 
 A revoked node (`revoked_at` set) is refused at the handshake, and its open connection is closed within one sweep (P2-E10). `gw.node_connection` rows are kept for 90 days (§5.7). The permanent record of every open, supersede and close is the `CONNECT` / `DISCONNECT` audit (R8-2).
@@ -337,7 +381,7 @@ Core only.
 
 ### 6.1 A node connects
 
-1. **Open:** the WebSocket opens on `jarvis-gw`'s tailnet address. The gateway reads the peer's Tailscale identity from the sidecar's local API (`whois`). An unknown peer is closed.
+1. **Open:** the WebSocket opens on `jarvis-gw`'s tailnet address. The gateway reads the peer's Tailscale identity from the sidecar's local API (`whois`). An unknown peer is closed with 4401 and recorded as `unknown_peer` (R12-1).
 2. **Challenge (R6-1):** immediately after accepting the WebSocket, and before reading anything from the node, the gateway sends `challenge`, signed `gw-transport`.
    - **The nonce:** 32 bytes from the operating system's cryptographic random source, base64url (43 characters). It is new for every connection and held only in that connection's memory, so it dies with the connection or a gateway restart. A nonce is never derived from, or reused across, anything else.
    - **The payload:** `nonce`, `issued_at` (gateway clock, RFC 3339 with offset), `expires_at` (= `issued_at` + 30 s), and the gateway's current `key_id` and `public_key`.
@@ -347,9 +391,15 @@ Core only.
    - the `gw-transport` signature must verify with that key.
 
    Anything else (a missing, malformed or unverifiable challenge, or any other message first) → the node closes the connection and sends nothing.
-4. **Clock skew is advisory only.** The node computes `skew = issued_at − its own clock`. If `|skew|` > 30 s, the node puts `clock_skew_ms` in `hello`, shows "This device's clock is off", and the gateway records event `node.clock_skew` (codes only). The server's time never replaces the node's own clock for validity checks, and never substitutes for nonce or signature checks.
+4. **Clock skew is advisory only (R12-4).** The **gateway** computes it: `skew_ms` = the signed envelope `sent_at` of the node's `hello` or `enrol`, minus the gateway's clock when that message arrived (positive means the node's clock is ahead). The gateway clamps it to ±10^12 ms. If `|skew_ms|` > 30 000 (the 30 s tolerance), it passes the value to `gw.open_connection`, which records the event in the same transaction as opening the connection:
+   - **The event:** `comm.event` kind `node.clock_skew`, `subject_type` `node`, `subject_id` the node ID, `person_id` from the node row, details exactly `node_id` and `skew_ms` (a decimal string such as `"-45210"`), as R9-2 requires. It creates no outbox item and enqueues no job.
+   - **The threshold is enforced in SQL too:** `|skew_ms|` ≤ 30 000 records nothing, and `|skew_ms|` > 10^12 is a malformed call.
+   - **The gateway gets no general event-writing permission.**
+   - **The node's side:** it still compares `issued_at` with its own clock and may show "This device's clock is off". The `clock_skew_ms` it puts in `hello` is display information only; the server never records or trusts it.
+
+   Neither side's time replaces the other's for validity checks, and skew never substitutes for nonce or signature checks.
 5. **The node replies** with `hello` (`nonce`, `resume`, optional `clock_skew_ms`), signed `node-msg` with its key. A new device sends `enrol` instead (token, public key, `nonce`), signed with its new key (§7.2).
-6. **The gateway checks the reply** (R6-7 splits this into two paths). Any failure closes the connection with code 4401 and writes an audit row with the failing check as a code (`bad_signature`, `bad_nonce`, `challenge_expired`, `not_first`, `bad_seq`, `identity_mismatch`, `revoked`, `bad_token`, `key_in_use`).
+6. **The gateway checks the reply** (R6-7 splits this into two paths). Any failure closes the connection with code 4401 and is recorded once in the audit trail with the failing check as a code: through `gw.refuse_handshake`, or by `gw.enrol_node` itself for its own refusals (§4.1, Handshake refusals; R12-1). A STALE node's 4409 is recorded the same way, as `reenrol_required`.
 
    **Checks common to both paths:**
    - it is the **first** node message on this connection, with `seq` = 1 (R6-8);
@@ -389,7 +439,7 @@ Core only.
    - `memory.retrieve_context(person, utterance, viewer=person)`;
    - the tool menu: the desktop modules (news, live TV, screen actions) plus `pc.delete_test_file`. `pc.list_test_folder` is called by core itself (§9.3), not offered to Claude.
 5. Core calls the router (§10). As speech arrives, core writes `conv.stream_chunk` rows (`seq` 1, 2, …) and NOTIFYs `jarvis_stream` with only the `reply_id`.
-6. The gateway, woken by NOTIFY, reads the new chunks from its last `seq` and sends them to every connected node in the session. **NOTIFY is only a wake-up; the chunks are the durable stream.** If either process restarts mid-reply, the gateway resumes from the node's durable acknowledged cursor (`conv.stream_cursor`). A `resume` position the node reports is used only when it is within the stored range; otherwise the cursor is used (P2-E03; R5-2). The replies to resume are chosen only from the reconnecting node's own person's sessions; cursor rows record progress and are never used to pick replies (R9-1).
+6. The gateway, woken by NOTIFY, reads the new chunks from its last `seq` and sends them to every connected node in the session. **NOTIFY is only a wake-up; the chunks are the durable stream.** If either process restarts mid-reply, the gateway resumes from the node's durable acknowledged cursor (`conv.stream_cursor`). A `resume` position the node reports is used only when it is within the stored range; otherwise the cursor is used (P2-E03; R5-2). The `node.resume_out_of_range` event is recorded through a restricted, fenced function added in Task 7, never through a general event-writing permission (R12-5). The replies to resume are chosen only from the reconnecting node's own person's sessions; cursor rows record progress and are never used to pick replies (R9-1).
 7. When the reply is complete, core writes the final chunk (`final = true`) and the JARVIS `conv.message`.
 8. **Tool calls go to policy (§9), never straight to a node.** A READ_ONLY module call, such as "show the news", is part of the live reply: core writes it as a `conv.stream_chunk` of type ACTION with a core-signed `authz` (§7.1) and `valid_until` = now + 2 minutes, and the gateway sends it as `node.action` to the node that spoke. The gateway, the node and core each enforce `valid_until` (§9.4); a node that reconnects later never replays it. It does **not** go in the outbox. An IRREVERSIBLE call becomes an approval, which does go in the outbox (§9.3), and the action it leads to is sent only after approval.
 9. The node acknowledges what it rendered. The audit trail records the turn as codes only.
@@ -835,6 +885,7 @@ Flow tests:
 | P2-S5 | From inside the gateway container, every outbound connection except Postgres and tailnet replies fails; compose contains no `ports:` |
 | P2-S6 | Enrolment privileges: token reuse, expired token and two concurrent uses of one token (one wins); the gateway can't insert into `gw.node` directly, change a node's key or identity, or read `gw.enrolment`; every SECURITY DEFINER function has a fixed `search_path` (checked from `pg_proc`) |
 | P2-S7 | Core can reach `api.anthropic.com` through the proxy and nothing else |
+| P2-S8 | Handshake refusals: each is audited once with codes and IDs only; 500 refused handshakes from one device in one window write one audit row, and that key's next row carries `suppressed` = 499; the global ceiling holds across many keys; the gateway can execute exactly six functions (R12-1 to R12-3) |
 
 Tests use fake nodes (a Python WebSocket client), and P2-B tests use a fake brain. One live check on the desktop runs P2-A1 by hand. Every test that can run in CI does (Postgres 17, as now). init's smoke check gains rows for the E- and S-tests that need no node.
 
@@ -989,3 +1040,8 @@ Architecture direction approved; implementation approval pending these changes. 
   - `group_key` is the caller's key, otherwise the rule's per-kind default; never a placeholder, and the column stays NOT NULL;
   - `authz` is the raw `{object, key_id, sig}` dictionary passed through unchanged, untrusted until the node verifies it. That is sufficient because signatures cover `JCS(object)` (§7.1). | §8.1 |
 | R11-4 | **`comm.supersede_for_create`** (owner, 23 Nov): for `create_outbox` only, a supersede that checks the target under its own `FOR UPDATE` lock. It returns `'applied'` (audited) or `'skipped'` (non-audited, target already terminal). This closes the check-then-act race the Task 5 follow-up review reproduced. A direct `comm.supersede` on a terminal item still returns `'terminal'` with its audit row (R9-3). | §4.1 |
+| R12-1 | **`gw.refuse_handshake`** (owner, 23 Nov): records a refused handshake as `CONNECT_REFUSED`, accepting only the eleven fixed gateway codes, an optional `whois` identity and an optional registered node ID. No details or event content, no connection, no node change. Codes decided by `gw.enrol_node` or `gw.open_connection` stay recorded by those functions, so nothing is audited twice. New codes: `unknown_node`, `reenrol_required`, `malformed`, `unknown_peer`. | §4.1, §6.1 |
+| R12-2 | **The gateway's `gw` surface is six functions**, replacing R7-3's five: `gw.refuse_handshake` is added | §4.1 |
+| R12-3 | **Audit-flood protection:** a refusal tally keyed on server-side identifiers. One audit row per key per 15-minute window, at most 30 per window overall; every other refusal is counted, and the count is carried in the key's next audit row as `suppressed` | §4.1, §5.1 |
+| R12-4 | **Clock skew computed by the gateway:** from the signed `hello` or `enrol` `sent_at` against the gateway's clock. `gw.open_connection(node_id, clock_skew_ms)` records `node.clock_skew` (details `node_id`, `skew_ms`) in the same transaction, only above 30 s. The node's own `clock_skew_ms` is display-only. | §4.1, §6.1 step 4 |
+| R12-5 | **`node.resume_out_of_range` stays in Task 7**, recorded through a similarly restricted, fenced function; no general gateway event-writing function | §6.2 step 6 |

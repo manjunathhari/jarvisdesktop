@@ -8,9 +8,9 @@
 
 **Tech Stack:** Python 3.12, uv, psycopg 3 (sync in core, async in the gateway), Alembic, FastAPI and uvicorn, `rfc8785`, `cryptography` (Ed25519), `httpx` (Claude), pytest, ruff, mypy; Postgres 17; Docker Compose; `tailscale/tailscale` sidecar.
 
-**Plan revision:** 11b3 (23 Nov 2026: adds the Task 3 SQL follow-up, `comm.supersede_for_create`, spec R11-4). Revision 11b (23 Nov 2026: Task 3 and Task 5 follow the amended R11-3, with the grouping-key fallback to the rule's per-kind default and the raw `authz` dictionary). Revision 11 (corrected 23 Nov 2026 after Manj's review: the no-brain test checks loaded modules in a subprocess, and the `create_outbox` terminal-supersede skip moves to the Task 5 follow-up). Revision 11 adds the in-job audited-refusal rule and `audited_call_in_job` (Task 11), the 'audit rows always survive' rule with `create_outbox`'s non-audited skip, and typed `NotifyContext` (Task 5 interface). Spec R11-1 to R11-3. Revision 10 makes `ledger.consume_approval` an audited structured refusal and states the trigger is a backstop (spec R10-1, R10-2). That changes Task 4 and the Task 11 caller rule. Revision 9 applies Manj's rulings on the Task 3 review (spec R9-1 to R9-6): stream-cursor isolation by session (Tasks 3, 7, 10 and 11), strict event details, `supersede` / `expire` outcomes, `id_conflict`, `unknown_item`, the `stream_cursor` grant, the stricter Task 2 mixed-load test, and two Task 7 notes. Revision 8 (corrected after Manj's review: the exact set of functions that do and don't call `current_node` is now explicit). Revision 8 applies Manj's rulings on the Task 2 review (spec R8-1, R8-2): strict fencing with one lock order and race tests in both orders (Tasks 2, 3 and 7), CONNECT / DISCONNECT audit, and five smaller points in Task 2. Revision 7 (corrected after Manj's review: Task 2 Step 3 now returns structured refusals instead of raising). Revision 7 applies Manj's rulings on Task 2 (spec R7-1 to R7-6): audited refusals return a structured result and the caller commits before raising, audited enrolment creation, the five-function `gw` surface, `last_ping_at`, the `JF001` fencing error and the 0008 rollback rule. They change Tasks 2 and 3. Revision 6 (corrected after Manj's review: Task 6's enrolment test ends with `welcome` and makes no second `hello`, and Task 12's key-source statements now separate enrolment from ordinary welcomes and rotation). Revision 6 adds Manj's handshake corrections (spec R6-6 to R6-8): the enrolment key-pinning `welcome` block, separate `hello` and `enrol` validation paths, per-sender `seq`, and stale-node refusal after the challenge. They change Task 1, Task 6 and Task 12's tests. Revision 5 applied Manj's Task 1 rulings (spec Revision 6): the `challenge` kind and nonce handshake, key-announcement expiry, gateway/core key separation cases and the timestamp rule. They change Task 1 (contracts and shared cases) and Task 6 (handshake tests). Revision 4 fixed the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
+**Plan revision:** 12 (23 Nov 2026: Manj's ruling on the gateway audit gap, spec R12-1 to R12-5. It adds the Task 2 SQL follow-up: `gw.refuse_handshake`, the refusal tally, the clock-skew argument on `gw.open_connection`, and six-function permission tests. Task 6 records handshake refusals and computes the skew; Task 7 keeps the resume event under a restricted, fenced function). Revision 11b3 (23 Nov 2026: adds the Task 3 SQL follow-up, `comm.supersede_for_create`, spec R11-4). Revision 11b (23 Nov 2026: Task 3 and Task 5 follow the amended R11-3, with the grouping-key fallback to the rule's per-kind default and the raw `authz` dictionary). Revision 11 (corrected 23 Nov 2026 after Manj's review: the no-brain test checks loaded modules in a subprocess, and the `create_outbox` terminal-supersede skip moves to the Task 5 follow-up). Revision 11 adds the in-job audited-refusal rule and `audited_call_in_job` (Task 11), the 'audit rows always survive' rule with `create_outbox`'s non-audited skip, and typed `NotifyContext` (Task 5 interface). Spec R11-1 to R11-3. Revision 10 makes `ledger.consume_approval` an audited structured refusal and states the trigger is a backstop (spec R10-1, R10-2). That changes Task 4 and the Task 11 caller rule. Revision 9 applies Manj's rulings on the Task 3 review (spec R9-1 to R9-6): stream-cursor isolation by session (Tasks 3, 7, 10 and 11), strict event details, `supersede` / `expire` outcomes, `id_conflict`, `unknown_item`, the `stream_cursor` grant, the stricter Task 2 mixed-load test, and two Task 7 notes. Revision 8 (corrected after Manj's review: the exact set of functions that do and don't call `current_node` is now explicit). Revision 8 applies Manj's rulings on the Task 2 review (spec R8-1, R8-2): strict fencing with one lock order and race tests in both orders (Tasks 2, 3 and 7), CONNECT / DISCONNECT audit, and five smaller points in Task 2. Revision 7 (corrected after Manj's review: Task 2 Step 3 now returns structured refusals instead of raising). Revision 7 applies Manj's rulings on Task 2 (spec R7-1 to R7-6): audited refusals return a structured result and the caller commits before raising, audited enrolment creation, the five-function `gw` surface, `last_ping_at`, the `JF001` fencing error and the 0008 rollback rule. They change Tasks 2 and 3. Revision 6 (corrected after Manj's review: Task 6's enrolment test ends with `welcome` and makes no second `hello`, and Task 12's key-source statements now separate enrolment from ordinary welcomes and rotation). Revision 6 adds Manj's handshake corrections (spec R6-6 to R6-8): the enrolment key-pinning `welcome` block, separate `hello` and `enrol` validation paths, per-sender `seq`, and stale-node refusal after the challenge. They change Task 1, Task 6 and Task 12's tests. Revision 5 applied Manj's Task 1 rulings (spec Revision 6): the `challenge` kind and nonce handshake, key-announcement expiry, gateway/core key separation cases and the timestamp rule. They change Task 1 (contracts and shared cases) and Task 6 (handshake tests). Revision 4 fixed the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
 
-**Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, **Revision 11b** (R11-1 to R11-3, with R11-3 amended in 11b, on top of the approved Revisions 4 to 10). Implementers work from Revision 11b only. Section references (§) below point there. Read it alongside this plan.
+**Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, **Revision 12** (R12-1 to R12-5, on top of the approved Revisions 4 to 11b and R11-4). Implementers work from Revision 12 only. Section references (§) below point there. Read it alongside this plan.
 
 **Out of this plan (separate plans):**
 - **Plan B:** the Rust desktop node (spec §13).
@@ -47,6 +47,9 @@ Only then change the contract. The plan and the spec are updated in the same com
   | Approval re-surface | 2 min before expiry |
   | Live action validity | 2 min |
   | Node clock tolerance | 30 s |
+  | Clock-skew record | only when \|skew\| > 30 000 ms; the gateway clamps to ±10^12 ms |
+  | Refusal audit window | 15 min, aligned to UTC quarter-hours; one audit row per refusal key per window |
+  | Refusal audit ceiling | 30 refusal audit rows per window, all keys together |
   | Heartbeat | 30 s; 3 missed = offline |
   | Re-send sweep | every 60 s, for items whose last send is > 2 min old |
   | Revocation re-check | every 60 s |
@@ -245,7 +248,7 @@ git commit -m "Phase 2: final node envelope, message contracts, JCS signing and 
   - unique on `gw.node.public_key`, and a partial unique on `tailscale_identity WHERE revoked_at IS NULL`;
   - `gw.create_enrolment(p_token_hash bytea, p_person_id uuid, p_kind text, p_name text) RETURNS uuid` (EXECUTE for `jarvis_app` only; `expires_at` = now() + 15 min set inside the function, never by the caller; writes an `ENROL_CREATE` audit row; spec R7-2);
   - `gw.enrol_node(p_token text, p_public_key bytea, p_tailscale_identity text) RETURNS TABLE (node_id uuid, refusal text)`: success → `(new id, NULL)`; refusal → `(NULL, 'bad_token' | 'key_in_use' | 'identity_in_use')`, with a REJECTED audit row in the same transaction. It never raises for a refusal (spec R7-1);
-  - `gw.open_connection(p_node_id uuid) RETURNS TABLE (conn_id bigint, refusal text)`: refusal `'unknown_node' | 'revoked'` (audited `CONNECT_REFUSED`); otherwise, in one transaction it closes any open connection of that node (`closed_at = now()`, reason `superseded`) and opens the new one. At most one open connection per node, enforced by a partial unique index `UNIQUE (node_id) WHERE closed_at IS NULL`;
+  - `gw.open_connection(p_node_id uuid, p_clock_skew_ms bigint DEFAULT NULL) RETURNS TABLE (conn_id bigint, refusal text)` (the skew argument added by the Task 2 SQL follow-up, spec R12-4): refusal `'unknown_node' | 'revoked'` (audited `CONNECT_REFUSED`, one row per event, not tallied); otherwise, in one transaction it closes any open connection of that node (`closed_at = now()`, reason `superseded`) and opens the new one. At most one open connection per node, enforced by a partial unique index `UNIQUE (node_id) WHERE closed_at IS NULL`;
   - `gw.close_connection(p_conn_id bigint, p_reason text) RETURNS boolean`: does **not** call `current_node`. Its own locks are node `FOR SHARE`, then the connection `FOR UPDATE`, and it checks the connection while holding them. It returns true and writes `DISCONNECT` when it closes; it returns false, with no second `DISCONNECT`, if the connection was already closed. Revocation doesn't prevent closing;
   - `gw.current_node(p_conn_id bigint) RETURNS uuid`: the fence, called first by every `conv` and `comm` function that takes a connection ID (Tasks 3 and 7). The four `gw` connection functions (`enrol_node`, `open_connection`, `close_connection`, `touch_connection`) do **not** call it (spec §4.1, R8-1). It returns the node only if the connection is open and the node is not revoked. Otherwise it raises `RAISE EXCEPTION 'connection_fenced' USING ERRCODE = 'JF001'` (spec R7-5), with no audit row of its own. The gateway also calls it directly for its 60 s revocation re-check;
   - `gw.touch_connection(p_conn_id bigint) RETURNS void`: the heartbeat. It does **not** call `current_node`. It takes node `FOR NO KEY UPDATE`, then the connection `FOR NO KEY UPDATE`, then updates `gw.node.last_seen_at` and `gw.node_connection.last_ping_at`, each `UPDATE … WHERE` repeating `revoked_at IS NULL` and `closed_at IS NULL`. If the connection is superseded, closed or revoked, it raises `connection_fenced` (`JF001`), so it can't update anything;
@@ -268,7 +271,8 @@ git commit -m "Phase 2: final node envelope, message contracts, JCS signing and 
     | `revoke_node` | `FOR UPDATE` | `FOR UPDATE` (all open connections) |
 
     Always node row first, then connection rows. `touch_connection` also repeats `closed_at IS NULL` and `revoked_at IS NULL` in both of its `UPDATE … WHERE` clauses, and raises `JF001` if either matches no row;
-  - **gateway EXECUTE:** exactly these five: `gw.enrol_node`, `gw.open_connection`, `gw.close_connection`, `gw.touch_connection`, `gw.current_node` (spec R7-3);
+  - `gw.refuse_handshake(p_code text, p_tailscale_identity text DEFAULT NULL, p_node_id uuid DEFAULT NULL) RETURNS text` (gateway EXECUTE; added by the Task 2 SQL follow-up, spec R12-1): see that follow-up;
+  - **gateway EXECUTE:** exactly these six: `gw.enrol_node`, `gw.open_connection`, `gw.close_connection`, `gw.touch_connection`, `gw.current_node`, `gw.refuse_handshake` (spec R12-2, replacing R7-3's five);
   - **rollback:** `downgrade()` refuses, with a clear error and the schema left intact, if any `audit.event` row has `entity_type = 'node'`, or any `gw.node` or `gw.enrolment` row exists. Otherwise it removes everything 0008 added, including grants; the cluster-wide role stays (spec R7-6).
 - Produces (Python), in `jarvis_server.dbcall` (spec R7-1):
   - `class Refused(Exception)` with `reason: str`, plus subclasses `EnrolmentRefused`, `RevokeRefused` and `ConnectRefused`
@@ -305,7 +309,7 @@ def test_create_enrolment_is_audited(app, owner):        # ENROL_CREATE audit ro
 def test_app_cannot_insert_enrolment_directly(app):      # INSERT INTO gw.enrolment → InsufficientPrivilege (only via the function)
 def test_revoke_returns_explicit_result(app):            # first → applied; second → RevokeRefused('already_revoked'), audited
 def test_fenced_error_code_is_jf001(gateway):            # current_node on a closed connection → SQLSTATE JF001, not 42501
-def test_gateway_execute_surface_is_exactly_five(owner): # has_function_privilege over pg_proc: only the five gw functions
+def test_gateway_execute_surface_is_exactly_six(owner):  # has_function_privilege over pg_proc: only the six gw functions (R12-2)
 def test_concurrent_use_of_one_token_one_wins(...):      # two threads, two connections; exactly one node row
 def test_enrol_never_updates_existing_node(...):         # reuse PUB1 with a new token → EnrolmentRefused('key_in_use'), audited;
                                                          #   that new token is still unused; node 1 unchanged
@@ -671,6 +675,60 @@ def test_direct_supersede_of_terminal_still_audited(app):    # comm.supersede on
 def test_supersede_for_create_grants(gateway, app):          # gateway can't execute it; app can; fixed search_path; no PUBLIC
 ```
 
+**Task 2 SQL follow-up (owner-authorised, 23 Nov; spec R12-1 to R12-4).** One bounded round, after this plan revision is approved and before Task 6. It edits migrations 0008 and 0009 in place (unmerged and undeployed) and doesn't reopen Task 2 or Task 3 generally.
+- **Files:** `server/migrations/versions/0008_gateway_nodes.py`, `server/migrations/versions/0009_conv_comm.py`, `server/tests/test_nodes.py`, `server/tests/test_comm_db.py`. If an existing test changes meaning, the report says which and why.
+- **0008, the tally (spec R12-3):**
+  - `gw.refusal_tally (action text, code text, tailscale_identity text, node_id uuid, enrolment_id uuid, suppressed bigint NOT NULL DEFAULT 0, last_at timestamptz, last_audited_window timestamptz)`, with `UNIQUE NULLS NOT DISTINCT (action, code, tailscale_identity, node_id, enrolment_id)`;
+  - `gw.refusal_window (id smallint PRIMARY KEY CHECK (id = 1), window_start timestamptz NOT NULL, audited int NOT NULL)`, seeded with one row;
+  - `jarvis_app` SELECT on both; no grant to `jarvis_gateway`;
+  - internal `gw.tally_refusal(p_action text, p_code text, p_tailscale_identity text, p_node_id uuid, p_enrolment_id uuid, p_entity_id uuid, p_details jsonb) RETURNS text`: SECURITY INVOKER, fixed `search_path`, owned by `jarvis_owner`, no EXECUTE for anyone (it runs inside the owner's SECURITY DEFINER callers). Window = `date_bin('15 minutes', now(), '2000-01-01 00:00+00')`. It locks the window row `FOR UPDATE` (resetting it for a new window), then upserts the key's tally row. If the key's `last_audited_window` < this window and `audited` < 30, it writes the audit row with details `p_details` plus `suppressed` (the key's count as a decimal string), resets `suppressed` to 0, sets `last_audited_window`, increments `audited` and returns `'recorded'`; otherwise it increments `suppressed` and returns `'counted'`. `last_at` = now() either way.
+- **0008, `gw.refuse_handshake(p_code text, p_tailscale_identity text DEFAULT NULL, p_node_id uuid DEFAULT NULL) RETURNS text`** (SECURITY DEFINER, gateway EXECUTE only; spec R12-1):
+  - `p_code` in exactly `not_first`, `bad_seq`, `bad_nonce`, `challenge_expired`, `bad_signature`, `identity_mismatch`, `revoked`, `unknown_node`, `reenrol_required`, `malformed`, `unknown_peer`; anything else (including `bad_token`, `key_in_use`, `identity_in_use`, NULL and `''`) → `invalid_parameter_value`;
+  - `p_tailscale_identity` NULL or 1 to 200 characters; `p_node_id` NULL or an existing `gw.node.id` (read without a lock); else `invalid_parameter_value`, with nothing written;
+  - calls `gw.tally_refusal('CONNECT_REFUSED', p_code, p_tailscale_identity, p_node_id, NULL, coalesce(p_node_id, nil UUID), details)` with details only `node_id` and `tailscale_identity`, each when present; returns its result;
+  - writes no `gw.node_connection` row, updates no `gw.node` row, and takes no node or connection lock.
+- **0008, `gw.enrol_node`:** its REJECTED audit row goes through `gw.tally_refusal('ENROL', v_refusal, p_tailscale_identity, NULL, v_enrolment, …)`. Its return value is unchanged: every refusal still returns `(NULL, reason)`.
+- **0008, `gw.open_connection(p_node_id uuid, p_clock_skew_ms bigint DEFAULT NULL)`:** `|p_clock_skew_ms|` > 10^12 → `invalid_parameter_value`, before any lock. After the `CONNECT` row, when `|p_clock_skew_ms|` > 30 000, it calls internal `gw.record_clock_skew(p_node_id uuid, p_skew_ms bigint) RETURNS void` (SECURITY INVOKER, no EXECUTE for anyone). In 0008 that function is a stub that writes nothing, because `comm` doesn't exist yet. The old one-argument signature is dropped, and grants are on the new one.
+- **0009:** `CREATE OR REPLACE gw.record_clock_skew` (same signature, so ownership and grants stay) to insert `comm.event` kind `node.clock_skew`, `subject_type` `node`, `subject_id` the node ID, `person_id` from `gw.node`, details `{"node_id": "<uuid>", "skew_ms": "<decimal>"}`. No outbox item, no job, no NOTIFY. 0009's `downgrade()` restores the stub.
+- **Rollback:** 0008's `downgrade()` also drops the two tables and three new functions; its existing refusal guard still covers `CONNECT_REFUSED` rows. 0009's down and up leave `gw.record_clock_skew` as a stub and then a recorder again.
+- **Tests:**
+
+```python
+def test_gateway_execute_surface_is_exactly_six(owner):     # replaces …_exactly_five: the six gw functions, nothing else in any
+                                                             #   schema; gw.tally_refusal and gw.record_clock_skew executable by nobody
+def test_refuse_handshake_records_each_code(gateway, owner): # each of the eleven codes → 'recorded'; one CONNECT_REFUSED row, REJECTED,
+                                                             #   reason = code; details keys ⊆ {node_id, tailscale_identity,
+                                                             #   suppressed}; suppressed "0"; no connection row; node row unchanged
+def test_refuse_handshake_rejects_other_codes(gateway, owner):  # bad_token, key_in_use, identity_in_use, 'bogus', NULL, '' →
+                                                             #   invalid_parameter_value; no audit or tally row
+def test_refuse_handshake_argument_checks(gateway, owner):   # unregistered node_id; identity '' or 201 characters →
+                                                             #   invalid_parameter_value; nothing written
+def test_refuse_handshake_takes_no_node_lock(dsns):          # another session holds the node FOR UPDATE (revoke_node, transaction
+                                                             #   open) → refuse_handshake for that node returns under lock_timeout 1 s
+def test_refusal_tally_one_row_per_key_per_window(gateway, owner):  # 500 calls, one key → 1 row, 499 'counted', tally suppressed
+                                                             #   499; owner moves last_audited_window and window_start back 15 min
+                                                             #   → next call 'recorded' with suppressed "499"; tally reset to 0
+def test_refusal_tally_keys_are_distinct(gateway, owner):    # different code, identity or node → separate rows in one window
+def test_refusal_global_ceiling(gateway, owner):             # 40 distinct keys in one window → 30 rows, 10 'counted'; next window
+                                                             #   each counted key's row carries suppressed "1"
+def test_refusal_tally_concurrent(dsns):                     # two sessions × 50 calls, one key → exactly 1 row, suppressed 99;
+                                                             #   two sessions × 40 distinct keys → never more than 30 rows
+def test_enrol_refusals_tallied(gateway, owner):             # 5 random bad tokens from one identity → each returns (NULL,'bad_token');
+                                                             #   one ENROL REJECTED row; tally suppressed 4
+def test_gateway_cannot_touch_tally_or_events(gateway):      # SELECT/INSERT gw.refusal_tally, gw.refusal_window, INSERT comm.event
+                                                             #   → insufficient_privilege
+def test_open_connection_records_clock_skew(gateway, app):   # skew 45210 and -45210 → CONNECT row and one node.clock_skew event,
+                                                             #   details exactly {node_id, skew_ms: "45210"/"-45210"}, person from
+                                                             #   the node row; 30000, -30000 and NULL → no event; no outbox, no job
+def test_open_connection_skew_is_atomic(dsns):              # in an explicit transaction rolled back → neither connection, CONNECT
+                                                             #   nor event remains
+def test_open_connection_skew_bounds(gateway):               # 10^12 + 1 → invalid_parameter_value; no connection or audit row
+def test_0008_down_and_up_with_tally(...):                   # empty → down/up clean, tables and functions gone then back; a
+                                                             #   CONNECT_REFUSED row → downgrade refuses
+def test_0009_downgrade_restores_skew_stub(...):             # 0009 down: open_connection with skew 45210 works, writes no event;
+                                                             #   0009 up: records again
+```
+
 ---
 
 ### Task 6: Gateway, part 1 — handshake, enrolment, inbound, fake node
@@ -682,7 +740,9 @@ def test_supersede_for_create_grants(gateway, app):          # gateway can't exe
 - Test: `server/tests/test_gateway_handshake.py`
 
 **Interfaces:**
-- Consumes: `signing.*` (Task 1); `gw.*` functions (Task 2); `conv.record_inbound` (Task 3)
+- Consumes: `signing.*` (Task 1); `gw.*` functions (Task 2 and its SQL follow-up: `gw.refuse_handshake`, `gw.open_connection(node_id, clock_skew_ms)`); `conv.record_inbound` (Task 3)
+- **Handshake refusals (spec R12-1):** every handshake the gateway refuses (§6.1 steps 1 and 6, and 4409) calls `gw.refuse_handshake` through `audited_call_async`, committed before the socket closes, with this connection's `whois` identity and, only when the node row was read, its node ID. Refusals that `gw.enrol_node` or `gw.open_connection` return are already audited by them, so the gateway doesn't call `refuse_handshake` for those.
+- **Clock skew (spec R12-4):** the gateway computes `skew_ms` = the signed envelope `sent_at` of `hello` or `enrol` − its clock at receipt (injectable clock), clamps it to ±10^12, and passes it to `gw.open_connection` only when `|skew_ms|` > 30 000. It ignores the node's `clock_skew_ms`.
 - Produces:
   - `class WhoIs(Protocol): async def identity(self, peer_ip: str) -> str | None`; `class LocalApiWhoIs(WhoIs)` (Tailscale local API over the shared socket at `JARVIS_TS_SOCKET`); `class FakeWhoIs(WhoIs)` (dict-backed, tests only)
   - `create_app(*, dsn: str, whois: WhoIs, gw_key: Ed25519PrivateKey, gw_key_id: str, core_public_keys: Mapping[str, bytes], bind_check: bool = True) -> FastAPI`. The WebSocket route is `/v1/node`.
@@ -720,7 +780,16 @@ def test_second_hello_on_same_connection_refused(...):       # nonce consumed: a
 def test_failed_first_reply_consumes_nonce(...):             # bad-signature hello, then a correct one on the same socket → closed
 def test_message_before_hello_refused(...):                  # utterance as first message → closed 4401, audit not_first
 def test_nil_node_id_only_for_challenge_and_enrol(...):      # nil UUID on utterance → error/closed
-def test_clock_skew_recorded_not_trusted(...):               # hello with clock_skew_ms 120000 → event node.clock_skew; handshake proceeds
+def test_clock_skew_computed_by_gateway(...):               # hello with signed sent_at 120 s ahead of the injected clock → one event
+                                                             #   node.clock_skew, skew_ms "120000"; handshake proceeds. hello with
+                                                             #   accurate sent_at but clock_skew_ms 120000 → no event (R12-4)
+def test_each_handshake_refusal_audited_once(...):          # one representative per gateway code → exactly one CONNECT_REFUSED row
+                                                             #   with that code, visible from a separate connection after the close;
+                                                             #   enrol with a bad token → one ENROL REJECTED row, no CONNECT_REFUSED
+def test_stale_node_refusal_recorded(...):                  # STALE node → 4409, CONNECT_REFUSED reenrol_required with node_id
+def test_unregistered_node_id_never_stored(...):            # hello naming an unknown UUID → 4401; row unknown_node without node_id
+def test_repeated_refusals_bounded(...):                    # 100 bad-signature hellos from one peer in one window → 1 audit row;
+                                                             #   every socket still closed with 4401
 def test_node_refuses_challenge_from_unpinned_key(...):      # FakeNode with pinned key K1; gateway signs with K2 → node closes, sends nothing
 def test_enrol_ends_with_welcome(gw_client, enrolment_code):  # challenge → FakeNode.enrol (pins the gateway key by the code's
                                                              #   gateway fingerprint) → welcome with an enrolment block; NO second
@@ -732,7 +801,8 @@ def test_enrol_ends_with_welcome(gw_client, enrolment_code):  # challenge → Fa
 def test_reconnect_after_enrolment_uses_hello(...):          # a new connection by the enrolled FakeNode → challenge → hello (path A)
                                                              #   → welcome with no enrolment block
 def test_enrol_refuses_keys_not_matching_fingerprints(...):  # gateway configured with a different core key → node refuses
-def test_unknown_tailscale_peer_closed(...):                 # FakeWhoIs returns None → close code 4401 (P2-S3)
+def test_unknown_tailscale_peer_closed(...):                 # FakeWhoIs returns None → close code 4401 (P2-S3); CONNECT_REFUSED
+                                                             #   unknown_peer with no identity and no node_id
 def test_tailscale_identity_mismatch_closed(...):            # registered "ts:pc", whois "ts:other" → closed, audit CONNECT_REFUSED
 def test_bad_signature_closes(...):                          # tampered payload → closed (P2-S3)
 def test_replayed_seq_closes(...):                           # seq repeated → closed (P2-S3)
@@ -794,7 +864,7 @@ git commit -am "Phase 2: gateway handshake, enrolment, inbound recording; fake n
       | `last_seq` > `max_seq_in_db(reply_id)` | **entry ignored** → `acked_seq + 1`; event `node.resume_out_of_range` |
       | unknown `reply_id`, or a reply outside the node's sessions | **entry ignored**; nothing sent for it; event `node.resume_out_of_range` |
 
-      Events hold codes and IDs only. There is no clamping to the maximum, so a node's own state can never make the gateway skip a chunk that exists.
+      Events hold codes and IDs only. **Recording `node.resume_out_of_range` (spec R12-5):** this task adds a restricted, fenced database function for it. It calls `gw.current_node` first, writes only that fixed event kind with only identifiers in its details, and accepts no caller-supplied event content. There is no general gateway event-writing function. Its exact signature, and whether it goes through the refusal tally, come to Manj with the Task 7 brief. There is no clamping to the maximum, so a node's own state can never make the gateway skip a chunk that exists.
     - The node drops any `(reply_id, seq)` it has already shown, so a chunk sent twice is shown once.
     - ACTION chunks go only to `target_node_id`, and only while `now() <= valid_until`.
     - An in-memory "last sent" value may exist to avoid busy re-sends, but it is only an optimisation. Correctness depends on the cursor alone.
