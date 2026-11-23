@@ -91,6 +91,7 @@ def _in(minutes: float) -> datetime:
         ("brain.back", Priority.DIGEST),
         ("budget.80", Priority.TODAY),
         ("budget.100", Priority.URGENT),
+        ("budget.daily", Priority.URGENT),  # R12-14
         ("turn.cap_expired", Priority.TODAY),
         ("turn.indeterminate", Priority.TODAY),
         ("turn.completed_after_hold", Priority.TODAY),  # controller ruling 1
@@ -112,7 +113,8 @@ def test_rule_priority(app: Conn, person: uuid.UUID, event: str, expected: Prior
 def test_event_kinds_are_exactly_the_shared_interface() -> None:
     assert set(rules.EVENT_KINDS) == {
         "approval.requested", "approval.expiring", "approval.expired", "brain.down",
-        "brain.down.with_held", "brain.back", "budget.80", "budget.100", "turn.cap_expired",
+        "brain.down.with_held", "brain.back", "budget.80", "budget.100", "budget.daily",
+        "turn.cap_expired",
         "turn.indeterminate", "turn.completed_after_hold", "action.readonly_ok",
         "brain.config_error",
     }  # fmt: skip

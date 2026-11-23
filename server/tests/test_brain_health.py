@@ -12,13 +12,23 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Iterator
+from datetime import timedelta
 from typing import Any
 
 import psycopg
 import pytest
 
 from jarvis_server import comm, jobs
-from jarvis_server.brain import BrainCallFailed, CallPhase, FakeBrain, Speech, health
+from jarvis_server.brain import (
+    BrainCallFailed,
+    BrainEvent,
+    BrainRequest,
+    CallPhase,
+    FakeBrain,
+    Speech,
+    budget,
+    health,
+)
 from jarvis_server.core import dispatch, rules
 
 from .conftest import Dsns, fresh_database
@@ -165,3 +175,66 @@ def test_core_registers_both_job_kinds() -> None:
         [sys.executable, "-I", "-c", probe], check=True, capture_output=True, text=True
     )
     assert json.loads(out.stdout) == ["brain.probe", "brain.reservation_sweep"]
+
+
+class Crash(BaseException):
+    """Stands in for the process dying mid-call: no `except Exception` catches it."""
+
+
+class RaisingBrain:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.usage: tuple[int, int] | None = None
+        self.calls = 0
+
+    def think(self, req: BrainRequest) -> Iterator[BrainEvent]:
+        self.calls += 1
+        raise self.error
+        yield Speech("never")  # a generator, like a real brain
+
+
+def test_crash_during_probe_call_leaves_a_committed_reservation(app: Conn) -> None:  # R12-13
+    _down(app)
+    brain = RaisingBrain(Crash())
+    health.set_probe_brain(lambda: (brain, MODEL))
+    with pytest.raises(Crash):
+        job_id = jobs.enqueue(app, "brain.probe")
+        app.execute(
+            "UPDATE ops.job SET status = 'RUNNING', attempts = 1, locked_by = 'test',"
+            " locked_until = now() + interval '5 minutes' WHERE id = %s",
+            (job_id,),
+        )
+        dispatch.handle(app, jobs.Job(id=job_id, kind="brain.probe", payload={}, attempts=1,
+                                      max_attempts=2))  # fmt: skip
+    assert brain.calls == 1
+    # The job's transaction rolled back, but the reservation was committed before the call.
+    [(rid, state, reserved, lease)] = app.execute(
+        "SELECT id, state, reserved_inr, lease_until FROM ops.brain_reservation WHERE job_id = %s",
+        (job_id,),
+    ).fetchall()
+    assert state == "ACTIVE" and reserved > 0
+    month = app.execute("SELECT month FROM ops.brain_reservation WHERE id = %s", (rid,)).fetchone()
+    assert month is not None
+    settled_before = app.execute(
+        "SELECT settled_inr FROM ops.brain_budget WHERE month = %s", (month[0],)
+    ).fetchone()
+    assert settled_before is not None
+    # The sweep later lapses it at its full value.
+    assert budget.lapse_expired(app, lease + timedelta(seconds=1)) == 1
+    assert _probe_reservations(app, job_id) == [("LAPSED", None)]
+    settled_after = app.execute(
+        "SELECT settled_inr FROM ops.brain_budget WHERE month = %s", (month[0],)
+    ).fetchone()
+    assert settled_after == (settled_before[0] + reserved,)
+
+
+def test_probe_unexpected_exception_is_send_phase(app: Conn) -> None:  # §10.1 step 4
+    _down(app)
+    brain = RaisingBrain(RuntimeError("unplaced"))
+    health.set_probe_brain(lambda: (brain, MODEL))
+    job_id = _run_probe(app)  # the job completes: the failure is handled, not raised
+    assert brain.calls == 1
+    assert _probe_reservations(app, job_id) == [("LAPSED", None)]
+    assert health.is_down(app) is True
+    status = app.execute("SELECT status FROM ops.job WHERE id = %s", (job_id,)).fetchone()
+    assert status == ("DONE",)

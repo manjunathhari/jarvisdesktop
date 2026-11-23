@@ -19,14 +19,19 @@ are always read under the lock that guards them.
 - The indeterminate path runs only while `conv.inbound.outcome` is empty, under the turn lock,
   so the sweep and a late job together notify exactly once.
 - 80% and 100% of the monthly cap: one `budget.80` / `budget.100` event and notification per
-  month, decided under the budget row lock and sent to the person of the turn being reserved.
-  A probe has no turn and no person, so it never sends them; the next turn does.
+  month; a refusal by today's ceiling alone: one `budget.daily` per IST day (R12-14). Decided
+  under the budget row lock and sent to the person of the turn being reserved. A probe has no
+  turn and no person, so it never sends them; the next turn does.
+- Budget steps of a job that calls the brain commit on their own connection
+  (`committing_connection`, R12-13), never in the job's transaction.
 """
 
 from __future__ import annotations
 
 import calendar
+import contextlib
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from enum import StrEnum
@@ -35,6 +40,7 @@ from uuid import UUID
 
 import psycopg
 from psycopg import errors
+from psycopg.pq import TransactionStatus
 
 from jarvis_server import comm, jobs
 from jarvis_server.core import dispatch, rules
@@ -43,7 +49,10 @@ log = logging.getLogger("jarvis.brain.budget")
 
 IST = timezone(timedelta(hours=5, minutes=30), "IST")  # Asia/Kolkata
 
-MONTHLY_CAP_PAISE = 500_000  # Rs 5,000 (§10.1; raised only by changing this and redeploying)
+# Rs 5,000 (§10.1). Changed only here, then redeployed. A raise applies to the current month
+# at the next reservation; a lower value never lowers the current month (R12-15).
+MONTHLY_CAP_PAISE = 500_000
+STEP_LOCK_TIMEOUT = "30s"  # a budget step on its own connection never waits for ever
 WARN_PERCENT = 80
 
 _LIVE = ("ACTIVE", "SETTLED", "LAPSED")
@@ -101,6 +110,39 @@ def daily_ceiling(budget_row: BudgetRow, now_ist: datetime) -> int:
     return max(0, (budget_row.cap_inr - spent_before_today) // days_left)
 
 
+@contextlib.contextmanager
+def committing_connection(conn: psycopg.Connection[Any]) -> Iterator[psycopg.Connection[Any]]:
+    """A connection whose budget steps commit on their own (R12-13).
+
+    `conn` itself when it is an idle autocommit connection (each step is then a real
+    transaction); otherwise, inside a job transaction, a short sibling connection to the same
+    database as the same role, closed afterwards. A job that calls the brain runs `reserve`
+    through this before the call and `settle` / `release` / `lapse` through it after, so the
+    reservation is committed before any request byte is sent, and the turn and budget locks
+    are held only for those short transactions, never during the call:
+
+        with budget.committing_connection(conn) as c:
+            owner, rid = budget.reserve(c, ...)
+        ... call the brain ...
+        with budget.committing_connection(conn) as c:
+            budget.settle(c, rid, ...)
+
+    The caller's own transaction must not hold the turn row or a budget row when it does this:
+    the sibling would wait on its own job. `STEP_LOCK_TIMEOUT` turns such a mistake into an
+    error instead of a hang.
+    """
+    if conn.autocommit and conn.info.transaction_status == TransactionStatus.IDLE:
+        yield conn
+        return
+    password = conn.info.password
+    conninfo = conn.info.dsn
+    if password:
+        conninfo = psycopg.conninfo.make_conninfo(conninfo, password=password)
+    with psycopg.connect(conninfo, autocommit=True) as own:
+        own.execute("SELECT set_config('lock_timeout', %s, false)", (STEP_LOCK_TIMEOUT,))
+        yield own
+
+
 # --- locked reads and writes (callers hold the locks named) ------------------------------------
 
 
@@ -112,7 +154,8 @@ def _lock_turn(conn: psycopg.Connection[Any], turn_id: UUID) -> tuple[UUID, str 
 
 
 def _lock_budget(conn: psycopg.Connection[Any], month: date, today: date) -> BudgetRow:
-    """Lock the month's row (created with the configured cap if missing) and read it."""
+    """Lock the month's row (created with the configured cap if missing), raise its cap to the
+    configured one if that is higher (R12-15), and read it."""
     conn.execute(
         "INSERT INTO ops.brain_budget (month, cap_inr) VALUES (%s, %s) ON CONFLICT DO NOTHING",
         (month, MONTHLY_CAP_PAISE),
@@ -123,13 +166,17 @@ def _lock_budget(conn: psycopg.Connection[Any], month: date, today: date) -> Bud
         (month,),
     ).fetchone()
     assert row is not None
+    cap = int(row[0])
+    if cap < MONTHLY_CAP_PAISE:
+        cap = MONTHLY_CAP_PAISE
+        conn.execute("UPDATE ops.brain_budget SET cap_inr = %s WHERE month = %s", (cap, month))
     spent = conn.execute(
         "SELECT coalesce(sum(CASE state WHEN 'SETTLED' THEN actual_inr ELSE reserved_inr END), 0)"
         " FROM ops.brain_reservation WHERE month = %s AND day = %s AND state = ANY(%s)",
         (month, today, list(_LIVE)),
     ).fetchone()
     assert spent is not None
-    return BudgetRow(month, int(row[0]), int(row[1]), int(row[2]), int(spent[0]))
+    return BudgetRow(month, cap, int(row[1]), int(row[2]), int(spent[0]))
 
 
 def _lock_month(conn: psycopg.Connection[Any], month: date) -> None:
@@ -178,9 +225,9 @@ def _indeterminate(
     return True
 
 
-def _threshold(conn: psycopg.Connection[Any], kind: str, month: date, person_id: UUID) -> None:
-    """One `budget.80` / `budget.100` event and notification per month. Needs the month lock."""
-    subject = month.strftime("%Y-%m")
+def _threshold(conn: psycopg.Connection[Any], kind: str, subject: str, person_id: UUID) -> None:
+    """One `budget.80` / `budget.100` event and notification per month (subject `YYYY-MM`),
+    one `budget.daily` per IST day (subject `YYYY-MM-DD`). Needs the month lock."""
     seen = conn.execute(
         "SELECT 1 FROM comm.event WHERE kind = %s AND subject_type = 'budget'"
         " AND subject_id = %s LIMIT 1",
@@ -229,24 +276,35 @@ def reserve(
                 (turn_id, list(_LIVE)),
             ).fetchone()
             if existing is not None:
-                rid, r_month, state, r_lease = existing
+                rid, r_month, first_state, r_lease = existing
                 rid = UUID(str(rid))
-                expired = state == "ACTIVE" and r_lease < now
-                # This month's row, and the reservation's own month if it is to be lapsed,
-                # in ascending month order.
-                for m in sorted({month, r_month} if expired else {month}):
+                expired = r_lease < now  # the lease never changes
+                # This month's row, and the reservation's own month if it may be lapsed, in
+                # ascending month order.
+                lapsable = first_state == "ACTIVE" and expired
+                for m in sorted({month, r_month} if lapsable else {month}):
                     if m == month:
                         _lock_budget(conn, m, today)
                     else:
                         _lock_month(conn, m)
+                # Re-read under the reservation's row lock: settle and release take no turn
+                # lock, so the owner may have finished while this call waited for the budget.
+                locked = conn.execute(
+                    "SELECT state FROM ops.brain_reservation WHERE id = %s FOR UPDATE", (rid,)
+                ).fetchone()
+                assert locked is not None
+                state = locked[0]
                 if state == "SETTLED":
                     return Owner.ANSWERED, rid
-                if state == "ACTIVE" and not expired:
-                    return Owner.OWNED_ELSEWHERE, rid
-                if expired:
-                    _lapse_locked(conn, rid)
-                _indeterminate(conn, turn_id, person_id, rid)
-                return Owner.INDETERMINATE, rid
+                if state == "LAPSED":  # lapsed earlier, with its indeterminate path
+                    return Owner.INDETERMINATE, rid
+                if state == "ACTIVE":
+                    if not expired:
+                        return Owner.OWNED_ELSEWHERE, rid
+                    if _lapse_locked(conn, rid):
+                        _indeterminate(conn, turn_id, person_id, rid)
+                    return Owner.INDETERMINATE, rid
+                # RELEASED while this call waited: the turn is free, reserve afresh below.
 
         row = _lock_budget(conn, month, today)
         used = row.settled_inr + row.reserved_inr
@@ -273,10 +331,13 @@ def reserve(
             new_id = UUID(str(inserted[0]))
             used += reserve_paise
         if person_id is not None:
+            this_month = month.strftime("%Y-%m")
             if used * 100 >= row.cap_inr * WARN_PERCENT:
-                _threshold(conn, "budget.80", month, person_id)
+                _threshold(conn, "budget.80", this_month, person_id)
             if over_cap or used >= row.cap_inr:
-                _threshold(conn, "budget.100", month, person_id)
+                _threshold(conn, "budget.100", this_month, person_id)
+            elif over_day:  # refused by today's ceiling alone (R12-14)
+                _threshold(conn, "budget.daily", today.isoformat(), person_id)
         if new_id is None:
             return Owner.NO_BUDGET, None
         return Owner.RESERVED, new_id
@@ -368,14 +429,17 @@ def lapse(conn: psycopg.Connection[Any], reservation_id: UUID) -> bool:
 
 
 def lapse_expired(conn: psycopg.Connection[Any], now: datetime) -> int:
-    """The sweep (§10.1 step 5): lapse every ACTIVE reservation past its lease, one
-    transaction each. Returns how many this call lapsed."""
+    """The sweep (§10.1 step 5): lapse every ACTIVE reservation past its lease, each in its own
+    committed transaction (through `committing_connection`), so no lock outlives one lapse and
+    the order turn, then budget holds even when the sweep runs inside a job transaction.
+    Returns how many this call lapsed."""
     expired = conn.execute(
         "SELECT id FROM ops.brain_reservation WHERE state = 'ACTIVE' AND lease_until < %s"
         " ORDER BY lease_until, id",
         (_aware(now, "now"),),
     ).fetchall()
-    return sum(1 for (rid,) in expired if lapse(conn, UUID(str(rid))))
+    with committing_connection(conn) as own:
+        return sum(1 for (rid,) in expired if lapse(own, UUID(str(rid))))
 
 
 @dispatch.register("brain.reservation_sweep")

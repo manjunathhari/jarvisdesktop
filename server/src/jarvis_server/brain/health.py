@@ -6,9 +6,11 @@ missing), so concurrent jobs count every failure and report each transition once
 
 `brain.probe` (scheduled every 2 minutes while the brain is DOWN) does nothing while the brain
 is up. While it is DOWN it sends a minimal request, reserved like any other call (turn_id is
-null): success settles it, marks the brain back and sends CLAUDE_BACK (`brain.back`, which
-supersedes each person's open "Claude down" item); a CONNECT failure releases the reservation,
-a SEND failure lapses it at full value, and either counts as a failure. Re-queueing the turns
+null) on its own committed connection (R12-13): success settles it, marks the brain back and
+sends CLAUDE_BACK (`brain.back`, which supersedes each person's open "Claude down" item); a
+CONNECT failure releases the reservation, a SEND failure (or any exception the brain raises
+that is not a placed `BrainCallFailed`) lapses it at full value, and either counts as a
+failure. Re-queueing the turns
 held while the brain was down is the conversation turn's job (Task 10), not the probe's.
 
 The probe gets its brain from `set_probe_brain`, set by the process that wires the brain up;
@@ -138,7 +140,12 @@ def _announce_back(conn: psycopg.Connection[Any]) -> None:
 
 def probe(conn: psycopg.Connection[Any], brain: MeteredBrain, model: str, *, job_id: int) -> bool:
     """One probe call for job `job_id` (claimed: its lease is the reservation's lease).
-    True when the brain has just come back."""
+    True when the brain has just come back.
+
+    The reservation and its settle / release / lapse each commit on their own connection
+    (R12-13), so a crash during the call leaves a committed ACTIVE reservation for the sweep
+    to lapse at full value, and no budget or turn lock is held during the call.
+    """
     row = conn.execute(
         "SELECT now(), locked_until FROM ops.job WHERE id = %s", (job_id,)
     ).fetchone()
@@ -146,31 +153,41 @@ def probe(conn: psycopg.Connection[Any], brain: MeteredBrain, model: str, *, job
         raise ValueError(f"probe job {job_id} holds no lease")
     now, lease_until = row
     ceiling = prices.cost_paise(model, count_input_tokens(PROBE_REQUEST), PROBE_MAX_TOKENS)
-    owner, reservation = budget.reserve(
-        conn, job_id=job_id, turn_id=None, reserve_paise=ceiling, lease_until=lease_until, now=now
-    )
+    with budget.committing_connection(conn) as own:
+        owner, reservation = budget.reserve(
+            own, job_id=job_id, turn_id=None, reserve_paise=ceiling, lease_until=lease_until,
+            now=now,
+        )  # fmt: skip
     if owner is not budget.Owner.RESERVED or reservation is None:
         log.info("probe job %s: no budget for a probe (%s)", job_id, owner)
         return False
+    phase: CallPhase | None = None
     try:
         for _ in brain.think(PROBE_REQUEST):
             pass
     except BrainCallFailed as failure:
-        if failure.phase is CallPhase.CONNECT:
-            budget.release(conn, reservation)
-        else:
-            budget.lapse(conn, reservation)
-        record_failure(conn)
-        log.info("probe job %s: brain still down (%s)", job_id, failure.phase)
-        return False
+        phase = failure.phase
+    except Exception as exc:  # unplaceable: the send phase (fail closed, §10.1 step 4)
+        phase = CallPhase.SEND
+        log.warning("probe job %s: unexpected %s from the brain", job_id, type(exc).__name__)
     usage = brain.usage
-    if usage is None:  # a completed stream with no usage cannot be metered: fail closed
-        budget.lapse(conn, reservation)
+    if phase is None and usage is None:  # a completed stream with no usage: fail closed
+        phase = CallPhase.SEND
+    with budget.committing_connection(conn) as own:
+        if phase is CallPhase.CONNECT:
+            budget.release(own, reservation)
+        elif phase is CallPhase.SEND:
+            budget.lapse(own, reservation)
+        else:
+            assert usage is not None
+            budget.settle(
+                own, reservation, actual_paise=prices.cost_paise(model, *usage), usage=usage,
+                model=model,
+            )  # fmt: skip
+    if phase is not None:
         record_failure(conn)
+        log.info("probe job %s: brain still down (%s)", job_id, phase)
         return False
-    budget.settle(
-        conn, reservation, actual_paise=prices.cost_paise(model, *usage), usage=usage, model=model
-    )
     back = record_success(conn)
     if back:
         _announce_back(conn)

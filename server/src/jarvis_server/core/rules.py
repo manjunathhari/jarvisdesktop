@@ -80,6 +80,9 @@ RULES: dict[str, Rule] = {
     "budget.100": Rule(
         Priority.URGENT, "budget", "Claude budget used up this month; Claude calls stopped"
     ),
+    "budget.daily": Rule(  # R12-14
+        Priority.URGENT, "budget", "Today's Claude budget is used up; Claude calls resume tomorrow."
+    ),
     "turn.cap_expired": Rule(
         Priority.TODAY, "turn", "A held request expired before the budget allowed it"
     ),

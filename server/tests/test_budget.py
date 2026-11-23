@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import secrets
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime, timedelta
@@ -106,8 +107,14 @@ def _job(app: Conn) -> int:
     return jobs.enqueue(app, "conv.turn")
 
 
-def _budget(app: Conn, month: date, cap: int) -> None:
+def _budget(
+    app: Conn, month: date, cap: int, monkeypatch: pytest.MonkeyPatch | None = None
+) -> None:
+    """The month's row with `cap`; with `monkeypatch`, `cap` is also the configured cap, so
+    reserve does not raise it (R12-15)."""
     app.execute("INSERT INTO ops.brain_budget (month, cap_inr) VALUES (%s, %s)", (month, cap))
+    if monkeypatch is not None:
+        monkeypatch.setattr(budget, "MONTHLY_CAP_PAISE", cap)
 
 
 def _totals(app: Conn, month: date) -> tuple[int, int, int]:
@@ -198,9 +205,9 @@ def test_last_day_ceiling_is_whole_remainder() -> None:  # [Review Focus 1]
     assert budget.daily_ceiling(over, last) == 0  # never negative
 
 
-def test_daily_ceiling(app: Conn) -> None:
+def test_daily_ceiling(app: Conn, monkeypatch: pytest.MonkeyPatch) -> None:
     month = _month()
-    _budget(app, month, 3000)
+    _budget(app, month, 3000, monkeypatch)
     now = _utc(_next(month) - timedelta(days=10))  # 10 days left including today
     assert _reserve(app, None, now, paise=301) == (Owner.NO_BUDGET, None)
     got, rid = _reserve(app, None, now, paise=300)
@@ -244,10 +251,10 @@ def test_price_table_and_rounding() -> None:
 
 
 def test_twenty_concurrent_reservations_three_fit(
-    dsns: Dsns, app: Conn, person: uuid.UUID, new_turn: Turns
+    dsns: Dsns, app: Conn, new_turn: Turns, monkeypatch: pytest.MonkeyPatch
 ) -> None:  # P2-B3
     month = _month()
-    _budget(app, month, 3000)
+    _budget(app, month, 3000, monkeypatch)
     now = _utc(_next(month) - timedelta(days=1))  # the last day: the ceiling is the remainder
     turns = [new_turn() for _ in range(20)]
     job_ids = [_job(app) for _ in range(20)]
@@ -552,9 +559,11 @@ def test_sweep_job_kind(app: Conn) -> None:
 # --- 80% and 100% (P2-B2) ----------------------------------------------------------------------
 
 
-def test_80_and_100_percent(app: Conn, person: uuid.UUID, new_turn: Turns) -> None:
+def test_80_and_100_percent(
+    app: Conn, person: uuid.UUID, new_turn: Turns, monkeypatch: pytest.MonkeyPatch
+) -> None:
     month = _month()
-    _budget(app, month, 10_000)
+    _budget(app, month, 10_000, monkeypatch)
     now = _utc(_next(month) - timedelta(days=1))  # the last day: no ceiling below the cap
     subject = month.strftime("%Y-%m")
 
@@ -575,3 +584,163 @@ def test_80_and_100_percent(app: Conn, person: uuid.UUID, new_turn: Turns) -> No
     assert _events(app, "budget.100", subject) == 1  # once a month
     assert _events(app, "budget.80", subject) == 1
     assert _totals(app, month) == (10_000, 0, 10_000)
+    assert _items(app, person, "budget.daily") == []  # the cap refused, not today's ceiling
+
+
+# --- budget.daily (R12-14) and a raised cap (R12-15) -------------------------------------------
+
+
+def test_budget_daily_once_per_day(
+    app: Conn, person: uuid.UUID, new_turn: Turns, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    month = _month()
+    _budget(app, month, 3000, monkeypatch)
+    now = _utc(_next(month) - timedelta(days=10))  # ceiling 300 today, 333 tomorrow
+    assert _reserve(app, new_turn(), now, paise=400)[0] is Owner.NO_BUDGET
+    assert _items(app, person, "budget.daily") == [("URGENT", "PENDING")]
+    assert _reserve(app, new_turn(), now + timedelta(hours=1), paise=400)[0] is Owner.NO_BUDGET
+    assert _events(app, "budget.daily", (now + IST_OFFSET).date().isoformat()) == 1  # once today
+    assert _reserve(app, new_turn(), now + timedelta(days=1), paise=400)[0] is Owner.NO_BUDGET
+    tomorrow = (now + timedelta(days=1) + IST_OFFSET).date().isoformat()
+    assert _events(app, "budget.daily", tomorrow) == 1  # a new IST day: one more
+    assert len(_items(app, person, "budget.daily")) == 2
+    assert _items(app, person, "budget.100") == []
+    assert _reserve(app, None, now, paise=400)[0] is Owner.NO_BUDGET  # a probe tells no one
+    assert len(_items(app, person, "budget.daily")) == 2
+
+
+def test_monthly_cap_refusal_is_budget_100_not_daily(
+    app: Conn, person: uuid.UUID, new_turn: Turns, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    month = _month()
+    _budget(app, month, 3000, monkeypatch)
+    now = _utc(_next(month) - timedelta(days=1))  # the last day: both limits refuse 3001
+    assert _reserve(app, new_turn(), now, paise=3001)[0] is Owner.NO_BUDGET
+    assert _items(app, person, "budget.100") == [("URGENT", "PENDING")]
+    assert _items(app, person, "budget.daily") == []
+
+
+def test_raised_cap_applies_to_the_current_month(app: Conn) -> None:
+    month = _month()
+    _budget(app, month, 1000)  # created under an older, lower cap
+    now = _utc(_next(month) - timedelta(days=1))
+    assert _reserve(app, None, now, paise=2000)[0] is Owner.RESERVED  # fits the raised cap
+    assert _totals(app, month) == (budget.MONTHLY_CAP_PAISE, 0, 2000)
+
+
+def test_lower_configured_cap_never_lowers_the_month(app: Conn) -> None:
+    month = _month()
+    _budget(app, month, budget.MONTHLY_CAP_PAISE + 100_000)
+    now = _utc(_next(month) - timedelta(days=1))
+    assert _reserve(app, None, now, paise=550_000)[0] is Owner.RESERVED
+    assert _totals(app, month) == (budget.MONTHLY_CAP_PAISE + 100_000, 0, 550_000)
+
+
+# --- review fixes: the late owner and the sweep job (I1, I2) -----------------------------------
+
+
+@pytest.mark.parametrize("owner_step", ["settle", "release"])
+def test_owner_finishing_while_second_job_waits(
+    dsns: Dsns, app: Conn, person: uuid.UUID, new_turn: Turns, owner_step: str
+) -> None:
+    """The owner's settle (or release) is queued on the budget row ahead of a second job whose
+    unlocked read saw ACTIVE past its lease. The second job acts on the state it reads under
+    the lock: an answered turn stays answered, a released one is reserved afresh."""
+    month = _month()
+    _budget(app, month, budget.MONTHLY_CAP_PAISE)
+    t0 = _utc(month)
+    later = t0 + timedelta(minutes=10)
+    turn = new_turn()
+    _, rid = _reserve(app, turn, t0)
+    assert rid is not None
+    job = _job(app)
+
+    def finish(c: Conn) -> None:
+        if owner_step == "settle":
+            budget.settle(c, rid, actual_paise=50, usage=(10, 2), model="claude-opus-5-5")
+        else:
+            budget.release(c, rid)
+
+    with psycopg.connect(dsns.app) as holder:
+        holder.execute("SELECT 1 FROM ops.brain_budget WHERE month = %s FOR UPDATE", (month,))
+        owner_job = InThread(dsns.app, finish)
+        owner_job.wait_until_blocked(dsns.superuser)
+        second = InThread(
+            dsns.app,
+            lambda c: budget.reserve(
+                c, job_id=job, turn_id=turn, reserve_paise=1000,
+                lease_until=later + timedelta(minutes=5), now=later,
+            ),
+        )  # fmt: skip
+        second.wait_until_blocked(dsns.superuser)
+        holder.rollback()
+    owner_job.join()
+    got, got_id = second.join()
+    assert _outcome(app, turn) is None
+    assert _items(app, person, "turn.indeterminate") == []
+    if owner_step == "settle":
+        assert (got, got_id) == (Owner.ANSWERED, rid)
+        assert _state(app, rid) == ("SETTLED", 50)
+        assert _totals(app, month) == (budget.MONTHLY_CAP_PAISE, 50, 0)
+    else:
+        assert got is Owner.RESERVED and got_id is not None and got_id != rid
+        assert _state(app, rid) == ("RELEASED", None)
+        assert _state(app, got_id) == ("ACTIVE", None)
+        assert _totals(app, month) == (budget.MONTHLY_CAP_PAISE, 0, 1000)
+
+
+def _lock_waiters(dsns: Dsns, at_least: int) -> None:
+    """Wait (bounded) until `at_least` backends of the test database wait on a lock."""
+    with psycopg.connect(dsns.superuser, autocommit=True) as su:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            row = su.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = %s"
+                " AND wait_event_type = 'Lock'",
+                (dsns.database,),
+            ).fetchone()
+            if row is not None and row[0] >= at_least:
+                return
+            time.sleep(0.01)
+    raise AssertionError("no backend waited on a lock")
+
+
+def test_sweep_job_and_late_reserve_do_not_deadlock(
+    dsns: Dsns, app: Conn, person: uuid.UUID, new_turn: Turns
+) -> None:
+    """Two expired reservations in one month, swept by the job (inside dispatch's transaction)
+    while a late job holds the second turn and then reserves it. Each lapse commits on its
+    own, so the sweep never holds the month while it waits for a turn (turn, then budget)."""
+    start = datetime.now(UTC) - timedelta(hours=1)
+    first_turn, second_turn = new_turn(), new_turn()
+    _, first = _reserve(app, first_turn, start)
+    _, second = _reserve(app, second_turn, start + timedelta(seconds=1))
+    assert first is not None and second is not None
+    month, _ = budget.ist_month_day(start)
+    before = _totals(app, month)
+    sweep_id = jobs.enqueue(app, "brain.reservation_sweep")
+    late_job = _job(app)
+    with psycopg.connect(dsns.app) as late:
+        late.execute("SELECT 1 FROM conv.inbound WHERE id = %s FOR UPDATE", (second_turn,))
+        sweep = InThread(
+            dsns.app,
+            lambda c: dispatch.handle(c, jobs.Job(id=sweep_id, kind="brain.reservation_sweep",
+                                                  payload={}, attempts=1, max_attempts=2)),
+        )  # fmt: skip
+        _lock_waiters(dsns, 1)  # the sweep lapsed the first and now waits for the second turn
+        late.execute("SET LOCAL lock_timeout = '10s'")
+        now = datetime.now(UTC)
+        got = budget.reserve(
+            late, job_id=late_job, turn_id=second_turn, reserve_paise=1000,
+            lease_until=now + timedelta(minutes=5), now=now,
+        )  # fmt: skip
+        late.commit()
+    sweep.join()
+    assert got == (Owner.INDETERMINATE, second)
+    assert _state(app, first) == ("LAPSED", None)
+    assert _state(app, second) == ("LAPSED", None)
+    assert _totals(app, month) == (before[0], before[1] + 2000, before[2] - 2000)
+    assert _outcome(app, first_turn) == _outcome(app, second_turn) == "INDETERMINATE"
+    assert len(_items(app, person, "turn.indeterminate")) == 2  # one per turn
+    status = app.execute("SELECT status FROM ops.job WHERE id = %s", (sweep_id,)).fetchone()
+    assert status == ("DONE",)

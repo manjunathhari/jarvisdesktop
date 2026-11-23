@@ -29,6 +29,7 @@ LINE: dict[str, str] = {
     "brain.back": "Claude is available again",
     "budget.80": "Claude budget 80% used this month",
     "budget.100": "Claude budget used up this month",
+    "budget.daily": "Claude budget used up for today",
     "turn.cap_expired": "A held request expired",
     "turn.indeterminate": "A request ended without a clear outcome",
     "turn.completed_after_hold": "A held request has been answered",
