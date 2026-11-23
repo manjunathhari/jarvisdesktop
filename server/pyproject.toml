@@ -21,6 +21,7 @@ dev = [
     "mypy>=1.13",
     "types-jsonschema",
     "rfc3339-validator>=0.1.4",
+    "httpx2>=2.16.2",
 ]
 
 [project.scripts]
