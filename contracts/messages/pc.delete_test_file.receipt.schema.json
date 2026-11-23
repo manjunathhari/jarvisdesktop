@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/pc.delete_test_file.receipt.schema.json",
+  "title": "`action.receipt` of an approved `pc.delete_test_file`",
+  "description": "node → gateway: the outcome for one `execution_key` (§9.4). Evidence: the file ID and the SHA-256 read before recycling (null when no file was found), the time it was recycled (null unless RECYCLED), and for REFUSED or ERROR the failing check.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "execution_key",
+    "result",
+    "evidence"
+  ],
+  "properties": {
+    "execution_key": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "result": {
+      "enum": [
+        "RECYCLED",
+        "MISMATCH",
+        "NOT_FOUND",
+        "REFUSED",
+        "ERROR"
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file_id",
+        "before_sha256",
+        "recycled_at"
+      ],
+      "properties": {
+        "file_id": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{16}:[0-9a-f]{32}$",
+              "description": "Windows file ID: the 64-bit volume serial number and the 128-bit file ID from `GetFileInformationByHandleEx(FileIdInfo)`, lower-case hex, joined by `:`."
+            }
+          ]
+        },
+        "before_sha256": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$",
+              "description": "SHA-256, lower-case hex."
+            }
+          ]
+        },
+        "recycled_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "check": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.]{0,63}$"
+        }
+      }
+    }
+  }
+}

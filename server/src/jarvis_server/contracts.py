@@ -10,7 +10,15 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, RootModel, model_validator
+from pydantic import (
+    AfterValidator,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+    model_validator,
+)
 
 
 class Visibility(StrEnum):
@@ -83,6 +91,7 @@ class AuditAction(StrEnum):
     CHUNK_RECEIVE = "CHUNK_RECEIVE"
     CONSUME = "CONSUME"
     DECIDE = "DECIDE"
+    RECEIPT = "RECEIPT"
 
 
 class AuditOutcome(StrEnum):
@@ -519,6 +528,64 @@ class ActionReceipt(RootModel[ApprovedActionReceipt | LiveActionReceipt]):
     pass
 
 
+# --- the desktop's test-folder actions (spec §9.3, §9.4; R12-25) --------------------------------
+
+DEVICE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+     *(f"LPT{i}" for i in range(1, 10))}
+)  # fmt: skip
+
+
+def _plain_file_name(name: str) -> str:
+    if name.split(".", 1)[0].upper() in DEVICE_NAMES:
+        raise ValueError("a device name is not a file name")
+    return name
+
+
+FileName = Annotated[
+    str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"), AfterValidator(_plain_file_name)
+]
+Sha256Hex = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+WindowsFileId = Annotated[str, Field(pattern=r"^[0-9a-f]{16}:[0-9a-f]{32}$")]
+
+
+class FolderFile(_Contract):
+    """One file of the test folder: `pc.delete_test_file`'s args, and one listing entry."""
+
+    name: FileName
+    size: Annotated[int, Field(ge=0, strict=True)]
+    sha256: Sha256Hex
+    file_id: WindowsFileId
+
+
+class ListTestFolderArgs(_Contract):
+    """`pc.list_test_folder` takes no arguments."""
+
+
+class ListingEvidence(_Contract):
+    files: Annotated[list[FolderFile], Field(max_length=1000)]
+
+
+class ListingReceipt(_Contract):
+    reply_id: UUID
+    seq: Seq
+    result: Literal["OK", "REFUSED", "ERROR"]
+    evidence: ListingEvidence
+
+
+class DeleteEvidence(_Contract):
+    file_id: WindowsFileId | None
+    before_sha256: Sha256Hex | None
+    recycled_at: AwareDatetime | None
+    check: Code | None = None
+
+
+class DeleteReceipt(_Contract):
+    execution_key: UUID
+    result: Literal["RECYCLED", "MISMATCH", "NOT_FOUND", "REFUSED", "ERROR"]
+    evidence: DeleteEvidence
+
+
 class KeyRole(StrEnum):
     CORE = "core"
     GATEWAY = "gateway"
@@ -574,4 +641,13 @@ MESSAGE_MODELS: dict[str, type[BaseModel]] = {
     "pong": Pong,
     "error": Error,
     "authz": Authz,
+}
+
+# Schemas in contracts/messages that are not message kinds: the test-folder actions' args and
+# receipts (R12-25), validated by core, not by the gateway.
+DESKTOP_MODELS: dict[str, type[BaseModel]] = {
+    "pc.list_test_folder.args": ListTestFolderArgs,
+    "pc.delete_test_file.args": FolderFile,
+    "pc.list_test_folder.receipt": ListingReceipt,
+    "pc.delete_test_file.receipt": DeleteReceipt,
 }

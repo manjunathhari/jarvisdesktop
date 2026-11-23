@@ -7,6 +7,7 @@ test_turn does; everything core does goes through the real code on a `jarvis_app
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 import uuid
 from collections.abc import Callable
@@ -19,6 +20,8 @@ from psycopg.types.json import Jsonb
 from jarvis_server import jobs
 from jarvis_server.core import approvals, dispatch
 
+from ..schema_registry import CONTRACTS, validator
+
 Conn = psycopg.Connection[Any]
 HOUSEHOLD = uuid.UUID("00000000-0000-4000-8000-000000000001")
 
@@ -26,14 +29,44 @@ A_TXT = {
     "name": "a.txt",
     "size": 12,
     "sha256": hashlib.sha256(b"fictional a").hexdigest(),
-    "file_id": "0x1c2d3e4f:0000000000000000000000000000a001",
+    "file_id": "00000000a1b2c3d4:0000000000000000000000000000a001",
 }
 B_TXT = {
     "name": "b.txt",
     "size": 7,
     "sha256": hashlib.sha256(b"fictional b").hexdigest(),
-    "file_id": "0x1c2d3e4f:0000000000000000000000000000b002",
+    "file_id": "00000000a1b2c3d4:0000000000000000000000000000b002",
 }
+
+
+def conform(name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """`payload`, after checking it against `contracts/messages/<name>.schema.json` (R12-25)."""
+    schema = json.loads((CONTRACTS / "messages" / f"{name}.schema.json").read_text())
+    validator(schema).validate(payload)
+    return payload
+
+
+def listing_receipt(
+    reply_id: Any, seq: int, files: list[dict[str, Any]], result: str = "OK"
+) -> dict[str, Any]:
+    """A `pc.list_test_folder` receipt, in the contract's shape."""
+    return conform(
+        "pc.list_test_folder.receipt",
+        {"reply_id": str(reply_id), "seq": seq, "result": result, "evidence": {"files": files}},
+    )
+
+
+def delete_receipt(
+    key: str, result: str = "RECYCLED", *, file_id: str | None = A_TXT["file_id"],
+    before_sha256: str | None = A_TXT["sha256"], recycled_at: str | None = "now",
+) -> dict[str, Any]:  # fmt: skip
+    """A `pc.delete_test_file` receipt, in the contract's shape."""
+    when = datetime.now().astimezone().isoformat() if recycled_at == "now" else recycled_at
+    return conform(
+        "pc.delete_test_file.receipt",
+        {"execution_key": key, "result": result,
+         "evidence": {"file_id": file_id, "before_sha256": before_sha256, "recycled_at": when}},
+    )  # fmt: skip
 
 
 def new_person(owner: Conn, name: str = "Asha Fictional") -> uuid.UUID:
@@ -151,8 +184,7 @@ def planting_listing(
         assert row is not None
         inbound(
             owner, node, person, "action.receipt",
-            {"reply_id": str(row[0]), "seq": row[1], "result": result,
-             "evidence": {"files": files}},
+            listing_receipt(row[0], row[1], files if result == "OK" else [], result),
             received_at=received_at,
         )  # fmt: skip
         planted.append(True)
@@ -229,6 +261,16 @@ def task_state(app: Conn, approval_id: uuid.UUID) -> str:
     ).fetchone()
     assert row is not None
     return str(row[0])
+
+
+def receipt_audit(conn: Conn, inbound_id: uuid.UUID) -> list[tuple[Any, ...]]:
+    """(outcome, reason, details) of the RECEIPT audit rows about one inbound receipt."""
+    rows = conn.execute(
+        "SELECT outcome::text, reason, details FROM audit.event WHERE entity_type = 'inbound'"
+        " AND entity_id = %s AND action = 'RECEIPT' ORDER BY seq",
+        (inbound_id,),
+    ).fetchall()
+    return [tuple(r) for r in rows]
 
 
 def audit(conn: Conn, entity_id: uuid.UUID) -> list[tuple[Any, ...]]:

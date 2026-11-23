@@ -556,7 +556,7 @@ def _propose(c: psycopg.Connection[Any], turn: _Inbound, stream: _Stream, call: 
         stream.say(NO_LISTING_TEXT)
         return
     if approval is None:
-        stream.say(NOT_LISTED_TEXT.format(name=name if actions.NAME.fullmatch(name) else "it"))
+        stream.say(NOT_LISTED_TEXT.format(name=name if actions.valid_file_name(name) else "it"))
     else:
         stream.say(APPROVAL_TEXT)
 

@@ -26,7 +26,7 @@
 - ops.brain_budget, ops.brain_reservation and ops.brain_usage (§5.6): tables only, amounts in
   paise. At most one live (ACTIVE, SETTLED or LAPSED) reservation per turn. The reserve, settle
   and lapse logic (§10.1) comes in a later task.
-- audit.event: entity type 'approval'; actions CONSUME and DECIDE. Rows carry codes and IDs
+- audit.event: entity type 'approval'; actions CONSUME, DECIDE and RECEIPT. Rows carry codes and IDs
   only.
 - Approval audit (R12-21): an AFTER INSERT trigger writes the CREATE row; an AFTER UPDATE OF
   decision trigger writes DECIDE APPLIED (APPROVED, DENIED, EXPIRED); and
@@ -34,6 +34,9 @@
   core refused under §9.3 step 6 and changes nothing else. Its codes are fixed, in check order:
   unknown_approval, bad_card_sig, other_person, node_revoked, not_pending, expired. Any other
   code is a malformed call. EXECUTE for jarvis_app only.
+- Receipt audit (R12-24): ledger.refuse_receipt(ref, node_id, code) writes the RECEIPT REJECTED
+  row of a receipt core rejected (§9.4), or of a verification listing that never came, and
+  changes nothing else. Fixed codes (listed with the function); EXECUTE for jarvis_app only.
 - All of it is for the core (jarvis_app); the gateway has no grant on any 0010 object, and
   PUBLIC has no EXECUTE on either function, the trigger function included.
 - An APPROVED or DENIED approval records both decided_at and decided_by_node_id (CHECK
@@ -271,6 +274,41 @@ END;
 $$;
 REVOKE ALL ON FUNCTION ledger.refuse_decision(uuid, uuid, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION ledger.refuse_decision(uuid, uuid, text) TO jarvis_app;
+
+-- R12-24, §9.4: a receipt core rejected. Writes one RECEIPT REJECTED row with the code as its
+-- reason and changes nothing else. The codes are fixed:
+--   about one receipt (p_ref is its conv.inbound ID; entity 'inbound'):
+--     unknown_key      no issued action has this execution key, or not for this node
+--     reused_key       the key's one receipt was already accepted
+--     unknown_action   a live receipt for no ACTION chunk of this node and person
+--     late             received after the action's signed valid_until
+--     malformed        evidence not in the shape of its contract (R12-25)
+--     not_recycled     a delete receipt whose result is not RECYCLED
+--     file_mismatch    the receipt's file ID or SHA-256 differs from the approved file
+--     listing_failed   the verification listing's result is not OK, or it is malformed
+--     still_listed     the verification listing still has the approved file ID
+--   about an issued action whose verification listing never came (p_ref is the approval ID;
+--   entity 'approval'):
+--     listing_missing
+-- Any other code, or a NULL argument, is a malformed call.
+CREATE FUNCTION ledger.refuse_receipt(p_ref uuid, p_node_id uuid, p_code text) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    IF p_ref IS NULL OR p_node_id IS NULL OR p_code IS NULL
+       OR p_code NOT IN ('unknown_key', 'reused_key', 'unknown_action', 'late', 'malformed',
+                         'not_recycled', 'file_mismatch', 'listing_failed', 'still_listed',
+                         'listing_missing') THEN
+        RAISE EXCEPTION 'malformed refuse_receipt call' USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    PERFORM audit.append('AGENT', 'core',
+                         CASE WHEN p_code = 'listing_missing' THEN 'approval' ELSE 'inbound' END,
+                         p_ref, 'RECEIPT', NULL, NULL, 'REJECTED', p_code, NULL,
+                         jsonb_build_object('node_id', p_node_id));
+    RETURN p_code;
+END;
+$$;
+REVOKE ALL ON FUNCTION ledger.refuse_receipt(uuid, uuid, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION ledger.refuse_receipt(uuid, uuid, text) TO jarvis_app;
 """
 
 BUDGET = r"""
@@ -325,7 +363,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ops.brain_reservation TO jarvis_app;
 GRANT SELECT, INSERT, DELETE ON ops.brain_usage TO jarvis_app;
 """
 
-NEW_ACTIONS = ("CONSUME", "DECIDE")
+NEW_ACTIONS = ("CONSUME", "DECIDE", "RECEIPT")
 ACTIONS_0009 = (
     "CREATE",
     "TRANSITION",
@@ -386,6 +424,7 @@ def downgrade() -> None:
     DROP TABLE ops.brain_usage;
     DROP TABLE ops.brain_reservation;
     DROP TABLE ops.brain_budget;
+    DROP FUNCTION ledger.refuse_receipt(uuid, uuid, text);
     DROP FUNCTION ledger.refuse_decision(uuid, uuid, text);
     DROP FUNCTION ledger.consume_approval(uuid);
     DROP TABLE ledger.approval;

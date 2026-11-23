@@ -11,39 +11,43 @@ one past `valid_until` (+30 s); core refuses a receipt that arrived after it.
 `memory.written` outbox item for history. Nothing in Claude's arguments sets `by`, the viewer
 or the subject.
 
-**Receipts (job `action.receipt`).** One per inbound message, which gets an outcome once:
+**Receipts (job `action.receipt`).** One per inbound message, which gets an outcome once.
+Shapes are the shared contracts (R12-25): `pc.list_test_folder.receipt` and
+`pc.delete_test_file.receipt`.
 - a live receipt (`reply_id` + `seq`) is accepted only from the chunk's target node, for an
   ACTION chunk of that node's person, received no later than its `valid_until`. A listing that
   verifies a delete goes on to the verification below; a module or screen action gets a SILENT
   `action.readonly_ok`; a listing `approvals.propose_delete` waits for needs nothing more.
 - an approved action's receipt (`execution_key`): one per key, through the `ledger.action` row
-  issued with the action (`status` ISSUED, locked here). RECYCLED with the approved file ID and
-  hash -> RECEIVED, an unverified `ledger.outcome`, and a fresh `pc.list_test_folder` to the
-  same node. Anything else -> the task is FAILED and Jarvis says so.
-- the fresh listing's receipt verifies at source: the file ID is absent -> the outcome is
-  verified, the task COMPLETED and Jarvis says it is done; otherwise the task is FAILED. It is
-  never marked done without that listing (v2 §13.3).
+  issued with the action (`status` ISSUED, locked here), and only from the requesting node. It
+  ends the `action.approved` item. RECYCLED with the approved file ID and SHA-256 -> RECEIVED,
+  an unverified `ledger.outcome`, a fresh `pc.list_test_folder` to the same node, and
+  `action.verify_timeout` at the listing timeout (10 s).
+- the fresh listing verifies at source: only an `OK` listing without the file ID closes the
+  task (outcome verified, COMPLETED, "Done"). A non-OK or malformed listing, the file still
+  listed, a late listing, or none by the timeout: FAILED, and Jarvis says so (v2 §13.3).
 
-A refused receipt sets the inbound's outcome REFUSED and records event
-`action.receipt_refused` (codes only). Task transitions inside the job are audited calls, made
-through `dbcall.audited_call_in_job` (R11-1); a refused transition is kept and the handler
-stops.
+Every rejected receipt is audited (R12-24): `ledger.refuse_receipt` with a fixed code, through
+`dbcall.audited_call_in_job`, as the handler's last write (R11-1). Task transitions are audited
+calls too, and come before the action and outcome writes: a refused transition is kept and
+nothing else is written.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, cast
+from typing import Any, LiteralString, cast
 from uuid import UUID
 
 import psycopg
 from psycopg.types.json import Jsonb
+from pydantic import ValidationError
 
-from jarvis_server import comm, jobs, signing
+from jarvis_server import comm, contracts, jobs, signing
 from jarvis_server.contracts import MemoryCategory, MemoryTag
 from jarvis_server.core import dispatch, identity, keys, rules
 from jarvis_server.dbcall import audited_call_in_job
@@ -52,13 +56,18 @@ from jarvis_server.memory.engine import MemoryEngine
 log = logging.getLogger("jarvis.core.actions")
 
 LIVE_VALIDITY = timedelta(minutes=2)
+LISTING_TIMEOUT = timedelta(seconds=10)  # the fixed listing timeout, for the fresh listing too
 LISTING = "pc.list_test_folder"
 DELETE = "pc.delete_test_file"
+LISTING_OK = "OK"
 CORE = ("AGENT", "core")
 
-_SHA256 = re.compile(r"[0-9a-f]{64}")
-_FILE_ID = re.compile(r"[A-Za-z0-9:_-]{1,100}")
-NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")  # §9.4 path safety, server side too
+# ledger.refuse_receipt's fixed codes (R12-24), and those that mean "not verified".
+RECEIPT_REFUSALS = (
+    "unknown_key", "reused_key", "unknown_action", "late", "malformed", "not_recycled",
+    "file_mismatch", "listing_failed", "still_listed", "listing_missing",
+)  # fmt: skip
+VERIFY_FAILURES = frozenset({"late", "listing_failed", "still_listed", "listing_missing"})
 
 
 # --- signing -----------------------------------------------------------------------------------
@@ -156,25 +165,27 @@ def speak(conn: psycopg.Connection[Any], session_id: UUID, text: str) -> UUID:
     return reply_id
 
 
-def parse_listing(evidence: Any) -> dict[str, dict[str, Any]] | None:
-    """A listing's files by name, `{name, size, sha256, file_id}` each; None if malformed."""
-    files = evidence.get("files") if isinstance(evidence, dict) else None
-    if not isinstance(files, list):
+def valid_file_name(name: str) -> bool:
+    """§9.4 path safety, server side too: a plain name, never a path, stream or device."""
+    try:
+        contracts.FolderFile.model_validate(
+            {"name": name, "size": 0, "sha256": "0" * 64, "file_id": "0" * 16 + ":" + "0" * 32}
+        )
+    except ValidationError:
+        return False
+    return True
+
+
+def parse_listing(payload: Any) -> dict[str, dict[str, Any]] | None:
+    """The files, by name, of an `OK` listing receipt (contract `pc.list_test_folder.receipt`,
+    R12-25); None for any other result or a payload not in that shape."""
+    try:
+        receipt = contracts.ListingReceipt.model_validate(payload)
+    except ValidationError:
         return None
-    out: dict[str, dict[str, Any]] = {}
-    for f in files:
-        if not isinstance(f, dict) or set(f) != {"name", "size", "sha256", "file_id"}:
-            return None
-        name, size, sha, file_id = f["name"], f["size"], f["sha256"], f["file_id"]
-        if not (
-            isinstance(name, str) and NAME.fullmatch(name)
-            and isinstance(size, int) and not isinstance(size, bool) and size >= 0
-            and isinstance(sha, str) and _SHA256.fullmatch(sha)
-            and isinstance(file_id, str) and _FILE_ID.fullmatch(file_id)
-        ):  # fmt: skip
-            return None
-        out[name] = {"name": name, "size": size, "sha256": sha, "file_id": file_id}
-    return out
+    if receipt.result != LISTING_OK:
+        return None
+    return {f.name: f.model_dump() for f in receipt.evidence.files}
 
 
 # --- memory.write ------------------------------------------------------------------------------
@@ -219,15 +230,20 @@ def _set_outcome(conn: psycopg.Connection[Any], inbound_id: UUID, outcome: str) 
     )
 
 
-def _refuse_receipt(
-    conn: psycopg.Connection[Any], inbound_id: UUID, person_id: UUID, reason: str
+def refuse_receipt(
+    conn: psycopg.Connection[Any],
+    *,
+    ref: UUID,
+    node_id: UUID,
+    code: str,
+    inbound_id: UUID | None,
 ) -> None:
-    comm.record_event(
-        conn, "action.receipt_refused", subject_type="inbound", subject_id=str(inbound_id),
-        person_id=person_id, details={"reason": reason},
-    )  # fmt: skip
-    _set_outcome(conn, inbound_id, "REFUSED")
-    log.info("receipt %s refused: %s", inbound_id, reason)
+    """A rejected receipt (R12-24): the inbound's REFUSED outcome, then, last, the audited
+    `ledger.refuse_receipt` row in the job's transaction (R11-1). The caller returns next."""
+    if inbound_id is not None:
+        _set_outcome(conn, inbound_id, "REFUSED")
+    audited_call_in_job(conn, "SELECT ledger.refuse_receipt(%s, %s, %s)", (ref, node_id, code))
+    log.info("receipt for %s refused: %s", ref, code)
 
 
 def transition_in_job(
@@ -260,6 +276,89 @@ def db_now(conn: psycopg.Connection[Any]) -> datetime:
     return cast(datetime, row[0])
 
 
+def end_items(conn: psycopg.Connection[Any], approval_id: UUID, kinds: Sequence[str]) -> None:
+    """Supersede the approval's open outbox items of `kinds`. One that ended meanwhile is
+    answered 'terminal' with its own audit row, which commits with the job."""
+    rows = conn.execute(
+        "SELECT o.id FROM comm.outbox o JOIN comm.event e ON e.id = o.event_id"
+        " WHERE e.subject_type = 'approval' AND e.subject_id = %s AND o.kind = ANY(%s)"
+        " AND o.state IN ('PENDING', 'DELIVERING', 'DELIVERED')"
+        " ORDER BY o.created_at, o.id",
+        (str(approval_id), list(kinds)),
+    ).fetchall()
+    for (outbox_id,) in rows:
+        audited_call_in_job(conn, "SELECT comm.supersede(%s)", (outbox_id,))
+
+
+@dataclass(frozen=True)
+class _Issued:
+    """An issued approved action: its `ledger.action` row (locked) and approval."""
+
+    action_id: UUID
+    task_id: UUID
+    status: str
+    approval_id: UUID
+    node_id: UUID
+    person_id: UUID
+    args: dict[str, Any]
+
+
+_ISSUED = """
+SELECT a.id, a.task_id, a.status, p.id, p.requesting_node_id, p.requested_from_person_id,
+       p.action_args
+FROM ledger.action a JOIN ledger.approval p ON p.execution_key::text = a.idempotency_key
+WHERE {where} FOR UPDATE OF a
+"""
+
+
+def _issued(conn: psycopg.Connection[Any], where: LiteralString, value: str) -> _Issued | None:
+    row = conn.execute(_ISSUED.format(where=where), (value,)).fetchone()
+    if row is None:
+        return None
+    return _Issued(
+        UUID(str(row[0])), UUID(str(row[1])), str(row[2]), UUID(str(row[3])),
+        UUID(str(row[4])), UUID(str(row[5])), row[6],
+    )  # fmt: skip
+
+
+def _fail(
+    conn: psycopg.Connection[Any],
+    issued: _Issued,
+    *,
+    code: str,
+    ref: UUID,
+    inbound_id: UUID | None,
+    evidence: dict[str, Any],
+) -> None:
+    """§9.4 "If any check fails, the task is FAILED and Jarvis says so". The transition comes
+    first: refused, it is kept and nothing else is written. Then the action and its outcome
+    (never verified), the spoken result, and last the audited receipt refusal."""
+    if not transition_in_job(conn, issued.task_id, "FAILED", code):
+        return
+    conn.execute("UPDATE ledger.action SET status = 'FAILED' WHERE id = %s", (issued.action_id,))
+    updated = conn.execute(
+        "UPDATE ledger.outcome SET evidence = evidence || %s WHERE action_id = %s",
+        (Jsonb({"check": code}), issued.action_id),
+    )
+    if updated.rowcount == 0:
+        conn.execute(
+            "INSERT INTO ledger.outcome (action_id, verified, evidence, source_ref)"
+            " VALUES (%s, false, %s, %s)",
+            (issued.action_id, Jsonb({**evidence, "check": code}),
+             f"approval:{issued.approval_id}"),
+        )  # fmt: skip
+    session_id = ticket_session(conn, issued.task_id)
+    if session_id is not None:
+        name = issued.args.get("name", "the file")
+        text = (
+            f"I couldn't confirm that {name} was deleted."
+            if code in VERIFY_FAILURES
+            else f"I didn't delete {name}: the file had changed or couldn't be recycled."
+        )
+        speak(conn, session_id, text)
+    refuse_receipt(conn, ref=ref, node_id=issued.node_id, code=code, inbound_id=inbound_id)
+
+
 @dispatch.register("action.receipt")
 def on_receipt(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     """Handler of `action.receipt`, payload `{inbound_id}`."""
@@ -277,7 +376,7 @@ def on_receipt(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     if kind != "action.receipt":
         raise ValueError(f"inbound {inbound_id} is a {kind}, not an action.receipt")
     if "execution_key" in payload:
-        _approved_receipt(conn, inbound_id, node_id, person_id, payload)
+        _approved_receipt(conn, inbound_id, node_id, payload)
     else:
         _live_receipt(conn, inbound_id, node_id, person_id, payload, received_at)
 
@@ -292,31 +391,36 @@ def _live_receipt(
 ) -> None:
     reply_id = UUID(str(payload["reply_id"]))
     chunk = conn.execute(
-        "SELECT k.authz, k.valid_until, k.target_node_id, s.person_id, k.session_id"
+        "SELECT k.authz, k.valid_until, k.target_node_id, s.person_id"
         " FROM conv.stream_chunk k JOIN conv.session s ON s.id = k.session_id"
         " WHERE k.reply_id = %s AND k.seq = %s AND k.type = 'ACTION'",
         (reply_id, payload["seq"]),
     ).fetchone()
     if chunk is None or chunk[2] != node_id or chunk[3] != person_id:
-        _refuse_receipt(conn, inbound_id, person_id, "unknown_action")
+        refuse_receipt(conn, ref=inbound_id, node_id=node_id, code="unknown_action",
+                       inbound_id=inbound_id)  # fmt: skip
         return
     action_kind = str(chunk[0]["object"]["action_kind"])
-    verifying = None
-    if action_kind == LISTING:
-        verifying = conn.execute(
-            "SELECT o.id, o.action_id, o.evidence FROM ledger.outcome o"
-            " WHERE o.evidence->>'listing_reply_id' = %s AND NOT o.verified FOR UPDATE",
-            (str(reply_id),),
-        ).fetchone()
-    if received_at > chunk[1]:  # C3, core side: past its signed valid_until
-        _refuse_receipt(conn, inbound_id, person_id, "expired")
-        if verifying is not None:
-            _verify(conn, verifying, None, UUID(str(chunk[4])))
+    issued = None
+    if action_kind == LISTING:  # the fresh listing after a delete?
+        issued = _issued(
+            conn,
+            "a.id = (SELECT o.action_id FROM ledger.outcome o"
+            " WHERE o.evidence->>'listing_reply_id' = %s)",
+            str(reply_id),
+        )
+    late = received_at > chunk[1]  # C3, core side: past its signed valid_until
+    if issued is not None and issued.status == "RECEIVED":
+        if late:
+            _fail(conn, issued, code="late", ref=inbound_id, inbound_id=inbound_id, evidence={})
+        else:
+            _verify(conn, issued, payload, inbound_id)
+        return
+    if late:
+        refuse_receipt(conn, ref=inbound_id, node_id=node_id, code="late", inbound_id=inbound_id)
         return
     _set_outcome(conn, inbound_id, "ANSWERED")
-    if verifying is not None:
-        _verify(conn, verifying, parse_listing(payload.get("evidence")), UUID(str(chunk[4])))
-    elif action_kind != LISTING:
+    if action_kind != LISTING:
         event_id = comm.record_event(
             conn, "action.readonly_ok", subject_type="stream", subject_id=str(reply_id),
             person_id=person_id, details={"result": str(payload["result"])},
@@ -326,106 +430,114 @@ def _live_receipt(
 
 
 def _approved_receipt(
-    conn: psycopg.Connection[Any],
-    inbound_id: UUID,
-    node_id: UUID,
-    person_id: UUID,
-    payload: dict[str, Any],
+    conn: psycopg.Connection[Any], inbound_id: UUID, node_id: UUID, payload: dict[str, Any]
 ) -> None:
     key = str(UUID(str(payload["execution_key"])))
-    row = conn.execute(
-        "SELECT a.id, a.task_id, a.status, p.id, p.requesting_node_id, p.action_args"
-        " FROM ledger.action a JOIN ledger.approval p ON p.execution_key::text = a.idempotency_key"
-        " WHERE a.idempotency_key = %s FOR UPDATE OF a",
-        (key,),
-    ).fetchone()
-    if row is None or row[4] != node_id:
-        _refuse_receipt(conn, inbound_id, person_id, "unknown_key")
+    issued = _issued(conn, "a.idempotency_key = %s", key)
+    if issued is None or issued.node_id != node_id:
+        refuse_receipt(conn, ref=inbound_id, node_id=node_id, code="unknown_key",
+                       inbound_id=inbound_id)  # fmt: skip
         return
-    action_id, task_id, status, approval_id, args = (
-        UUID(str(row[0])), UUID(str(row[1])), row[2], UUID(str(row[3])), row[5],
-    )  # fmt: skip
-    if status != "ISSUED":  # one receipt per key
-        _refuse_receipt(conn, inbound_id, person_id, "duplicate_receipt")
+    if issued.status != "ISSUED":  # one receipt per key
+        refuse_receipt(conn, ref=inbound_id, node_id=node_id, code="reused_key",
+                       inbound_id=inbound_id)  # fmt: skip
         return
-    result = str(payload["result"])
-    evidence = payload.get("evidence") or {}
-    matches = (
-        result == "RECYCLED"
-        and evidence.get("file_id") == args.get("file_id")
-        and evidence.get("sha256") == args.get("sha256")
-    )
-    session_id = ticket_session(conn, task_id)
-    _set_outcome(conn, inbound_id, "ANSWERED")
-    if not matches:
-        conn.execute("UPDATE ledger.action SET status = 'FAILED' WHERE id = %s", (action_id,))
-        conn.execute(
-            "INSERT INTO ledger.outcome (action_id, verified, evidence, source_ref)"
-            " VALUES (%s, false, %s, %s)",
-            (action_id, Jsonb({"result": result, "check": "receipt"}), f"approval:{approval_id}"),
-        )
-        if not transition_in_job(conn, task_id, "FAILED", f"receipt_{result.lower()}"):
-            return
-        if session_id is not None:
-            speak(conn, session_id, f"I didn't delete {args.get('name')}: the file had changed "
-                  "or couldn't be recycled.")  # fmt: skip
+    end_items(conn, issued.approval_id, ("action.approved",))  # answered: never re-sent
+    try:
+        receipt = contracts.DeleteReceipt.model_validate(payload)
+    except ValidationError:
+        _fail(conn, issued, code="malformed", ref=inbound_id, inbound_id=inbound_id,
+              evidence={"result": str(payload.get("result"))})  # fmt: skip
+        return
+    evidence = {"result": receipt.result, "file_id": receipt.evidence.file_id,
+                "before_sha256": receipt.evidence.before_sha256}  # fmt: skip
+    if receipt.result != "RECYCLED":
+        _fail(conn, issued, code="not_recycled", ref=inbound_id, inbound_id=inbound_id,
+              evidence=evidence)  # fmt: skip
+        return
+    if (receipt.evidence.file_id, receipt.evidence.before_sha256) != (
+        issued.args.get("file_id"), issued.args.get("sha256"),
+    ):  # fmt: skip
+        _fail(conn, issued, code="file_mismatch", ref=inbound_id, inbound_id=inbound_id,
+              evidence=evidence)  # fmt: skip
+        return
+    session_id = ticket_session(conn, issued.task_id)
+    if session_id is None:  # nowhere to list: it can't be verified, so it is never done
+        _set_outcome(conn, inbound_id, "ANSWERED")  # the receipt itself was right
+        _fail(conn, issued, code="listing_missing", ref=issued.approval_id,
+              inbound_id=None, evidence=evidence)  # fmt: skip
         return
     listing_reply = uuid.uuid4()
-    conn.execute("UPDATE ledger.action SET status = 'RECEIVED' WHERE id = %s", (action_id,))
+    conn.execute("UPDATE ledger.action SET status = 'RECEIVED' WHERE id = %s", (issued.action_id,))
     conn.execute(
         "INSERT INTO ledger.outcome (action_id, verified, evidence, source_ref)"
         " VALUES (%s, false, %s, %s)",
-        (
-            action_id,
-            Jsonb({"result": result, "file_id": args["file_id"], "sha256": args["sha256"],
-                   "listing_reply_id": str(listing_reply)}),
-            f"approval:{approval_id}",
-        ),
+        (issued.action_id, Jsonb({**evidence, "listing_reply_id": str(listing_reply)}),
+         f"approval:{issued.approval_id}"),
     )  # fmt: skip
-    if session_id is None:  # no session to list in: it can't be verified, so never done
-        conn.execute("UPDATE ledger.action SET status = 'FAILED' WHERE id = %s", (action_id,))
-        transition_in_job(conn, task_id, "FAILED", "unverifiable")
-        return
     issue_live(
         conn, reply_id=listing_reply, session_id=session_id, target_node_id=node_id,
-        person_id=person_id, action_kind=LISTING, args={}, now=db_now(conn),
+        person_id=issued.person_id, action_kind=LISTING, args={}, now=db_now(conn),
     )  # fmt: skip
+    jobs.enqueue(conn, "action.verify_timeout", {"action_id": str(issued.action_id)},
+                 delay=LISTING_TIMEOUT)  # fmt: skip
+    _set_outcome(conn, inbound_id, "ANSWERED")
 
 
 def _verify(
-    conn: psycopg.Connection[Any],
-    outcome: Sequence[Any],
-    listing: dict[str, dict[str, Any]] | None,
-    session_id: UUID,
+    conn: psycopg.Connection[Any], issued: _Issued, payload: dict[str, Any], inbound_id: UUID
 ) -> None:
-    """The fresh listing after RECYCLED: the file ID must be gone (§9.4)."""
-    outcome_id, action_id, evidence = UUID(str(outcome[0])), UUID(str(outcome[1])), outcome[2]
-    row = conn.execute(
-        "SELECT task_id, status FROM ledger.action WHERE id = %s FOR UPDATE", (action_id,)
-    ).fetchone()
-    assert row is not None
-    task_id, status = UUID(str(row[0])), row[1]
-    if status != "RECEIVED":
+    """The fresh listing after RECYCLED: an `OK` listing without the approved file ID is the
+    only thing that closes the task (§9.4)."""
+    listing = parse_listing(payload)
+    file_id = issued.args.get("file_id")
+    if listing is None:
+        _fail(conn, issued, code="listing_failed", ref=inbound_id, inbound_id=inbound_id,
+              evidence={})  # fmt: skip
         return
-    gone = listing is not None and all(
-        f["file_id"] != evidence["file_id"] for f in listing.values()
-    )
-    name = conn.execute(
-        "SELECT action_args->>'name' FROM ledger.approval WHERE execution_key::text ="
-        " (SELECT idempotency_key FROM ledger.action WHERE id = %s)",
-        (action_id,),
-    ).fetchone()
-    file_name = "the file" if name is None else str(name[0])
-    if not gone:
-        conn.execute("UPDATE ledger.action SET status = 'FAILED' WHERE id = %s", (action_id,))
-        if transition_in_job(conn, task_id, "FAILED", "not_verified"):
-            speak(conn, session_id, f"I couldn't confirm that {file_name} was deleted.")
+    if any(f["file_id"] == file_id for f in listing.values()):
+        _fail(conn, issued, code="still_listed", ref=inbound_id, inbound_id=inbound_id,
+              evidence={})  # fmt: skip
         return
+    if not transition_in_job(conn, issued.task_id, "COMPLETED", "verified"):
+        return  # kept; nothing is marked verified beside a task that didn't move
     conn.execute(
         "UPDATE ledger.outcome SET verified = true, verified_at = now(),"
-        " evidence = evidence || %s WHERE id = %s",
-        (Jsonb({"verified_by": "fresh_listing"}), outcome_id),
+        " evidence = evidence || %s WHERE action_id = %s",
+        (Jsonb({"verified_by": "fresh_listing"}), issued.action_id),
     )
-    conn.execute("UPDATE ledger.action SET status = 'VERIFIED' WHERE id = %s", (action_id,))
-    if transition_in_job(conn, task_id, "COMPLETED", "verified"):
-        speak(conn, session_id, f"Done: {file_name} is in the Recycle Bin.")
+    conn.execute("UPDATE ledger.action SET status = 'VERIFIED' WHERE id = %s", (issued.action_id,))
+    _set_outcome(conn, inbound_id, "ANSWERED")
+    session_id = ticket_session(conn, issued.task_id)
+    if session_id is not None:
+        speak(conn, session_id, f"Done: {issued.args.get('name')} is in the Recycle Bin.")
+
+
+@dispatch.register("action.verify_timeout")
+def on_verify_timeout(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
+    """The fresh listing's 10 s (the listing timeout): if it hasn't verified the action by now,
+    the action is not verified, so the task is FAILED and Jarvis says so (§9.4)."""
+    issued = _issued(conn, "a.id = %s", str(UUID(job.payload["action_id"])))
+    if issued is None or issued.status != "RECEIVED":
+        return  # verified or failed already
+    _fail(conn, issued, code="listing_missing", ref=issued.approval_id, inbound_id=None,
+          evidence={})  # fmt: skip
+
+
+@dispatch.register("outbox.expire")
+def on_outbox_expire(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
+    """Expire one outbox item once it is past its `expires_at` (§5.4); payload `{outbox_id}`.
+    An item already ended is left as it is; one run early is re-queued for its expiry.
+    `comm.expire` locks the item itself; one that ends in between is answered 'terminal' with
+    its own audit row, which commits with the job."""
+    outbox_id = UUID(job.payload["outbox_id"])
+    row = conn.execute(
+        "SELECT state, expires_at <= now(), expires_at - now() FROM comm.outbox WHERE id = %s",
+        (outbox_id,),
+    ).fetchone()
+    if row is None or row[0] not in ("PENDING", "DELIVERING", "DELIVERED") or row[1] is None:
+        return
+    if not row[1]:
+        jobs.enqueue(conn, "outbox.expire", dict(job.payload), delay=row[2])
+        return
+    audited_call_in_job(conn, "SELECT comm.expire(%s)", (outbox_id,))

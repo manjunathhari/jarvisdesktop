@@ -15,7 +15,14 @@ from .schema_registry import CONTRACTS, validator
 
 MESSAGES = CONTRACTS / "messages"
 EXAMPLES = CONTRACTS / "examples" / "messages"
-NAMES = sorted(c.MESSAGE_MODELS)
+MODELS: dict[str, Any] = {**c.MESSAGE_MODELS, **c.DESKTOP_MODELS}
+NAMES = sorted(MODELS)
+DESKTOP = [
+    "pc.list_test_folder.args",
+    "pc.delete_test_file.args",
+    "pc.list_test_folder.receipt",
+    "pc.delete_test_file.receipt",
+]
 
 KINDS = [
     "challenge",
@@ -48,7 +55,8 @@ def _example(name: str, kind: str) -> Any:
 
 def test_every_message_schema_has_a_model() -> None:
     on_disk = {p.name.removesuffix(".schema.json") for p in MESSAGES.glob("*.schema.json")}
-    assert on_disk == set(NAMES) == {*KINDS, "authz"}
+    assert on_disk == set(NAMES) == {*KINDS, "authz", *DESKTOP}
+    assert not set(c.DESKTOP_MODELS) & set(c.MESSAGE_MODELS)  # never a message kind
     assert c.MESSAGE_MODELS["authz"] is c.Authz
 
 
@@ -67,7 +75,7 @@ def test_schema_is_valid_draft_2020_12(name: str) -> None:
 def test_valid_example_passes_schema_and_model(name: str) -> None:
     example = _example(name, "valid")
     validator(_schema(name)).validate(example)
-    c.MESSAGE_MODELS[name].model_validate(example)
+    MODELS[name].model_validate(example)
 
 
 @pytest.mark.parametrize("name", NAMES)
@@ -75,16 +83,16 @@ def test_invalid_example_fails_schema_and_model(name: str) -> None:
     example = _example(name, "invalid")
     assert not validator(_schema(name)).is_valid(example)
     with pytest.raises(ValidationError):
-        c.MESSAGE_MODELS[name].model_validate(example)
+        MODELS[name].model_validate(example)
 
 
 @pytest.mark.parametrize("name", [n for n in NAMES if "properties" in _schema(n)])
 def test_model_fields_match_schema_properties(name: str) -> None:
     schema = _schema(name)
-    model = c.MESSAGE_MODELS[name]
+    model = MODELS[name]
     assert set(model.model_fields) == set(schema["properties"])
     required = {n for n, f in model.model_fields.items() if f.is_required()}
-    assert required == set(schema["required"])
+    assert required == set(schema.get("required", []))
 
 
 def test_authz_object_fields_are_exactly_the_spec_list() -> None:
@@ -276,3 +284,54 @@ def test_nonce_is_43_char_base64url(name: str) -> None:
     assert not validator(_schema(name)).is_valid(short)
     with pytest.raises(ValidationError):
         c.MESSAGE_MODELS[name].model_validate(short)
+
+
+# --- the test-folder shapes (R12-25): schema and model agree case by case -----------------------
+
+_FILE = {
+    "name": "a.txt",
+    "size": 12,
+    "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "file_id": "00000000a1b2c3d4:0000000000000000000000000000a001",
+}
+
+
+@pytest.mark.parametrize(
+    ("change", "ok"),
+    [
+        ({}, True),
+        ({"name": "Report-2026.final.txt"}, True),
+        ({"name": "../a.txt"}, False),
+        ({"name": "a:b"}, False),
+        ({"name": ".hidden"}, False),
+        ({"name": "nul"}, False),
+        ({"name": "Com1.log"}, False),
+        ({"name": "console.txt"}, True),
+        ({"size": -1}, False),
+        ({"size": "12"}, False),
+        ({"sha256": "9F86" + _FILE["sha256"][4:]}, False),
+        ({"file_id": "0x0000000000001a2b"}, False),
+    ],
+)
+def test_folder_file_schema_and_model_agree(change: dict[str, Any], ok: bool) -> None:
+    payload = {**_FILE, **change}
+    assert validator(_schema("pc.delete_test_file.args")).is_valid(payload) is ok
+    if ok:
+        c.FolderFile.model_validate(payload)
+    else:
+        with pytest.raises(ValidationError):
+            c.FolderFile.model_validate(payload)
+
+
+def test_delete_receipt_without_a_file_found() -> None:
+    payload = {
+        "execution_key": "e1d2c3b4-a5f6-4e7d-8c9b-0a1f2e3d4c5b",
+        "result": "NOT_FOUND",
+        "evidence": {"file_id": None, "before_sha256": None, "recycled_at": None},
+    }
+    validator(_schema("pc.delete_test_file.receipt")).validate(payload)
+    c.DeleteReceipt.model_validate(payload)
+    # each also passes the generic `action.receipt` the gateway checks
+    validator(_schema("action.receipt")).validate(payload)
+    for name in ("pc.list_test_folder.receipt", "pc.delete_test_file.receipt"):
+        validator(_schema("action.receipt")).validate(_example(name, "valid"))

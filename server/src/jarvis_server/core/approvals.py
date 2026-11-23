@@ -29,7 +29,8 @@ On success: the decision (audited by its trigger), the open card superseded, and
 the task to READY, `ledger.consume_approval` (a refusal is kept the same way: the handler
 returns), IN_PROGRESS, the `ledger.action` row keyed by the execution key (one receipt per key),
 and the signed `node.action` as an URGENT `action.approved` item targeted at the requesting node
-only (R12-23), valid until the earlier of now + 2 min and the approval's expiry. DENIED cancels
+only (R12-23), valid until the earlier of now + 2 min and the approval's expiry; an
+`outbox.expire` job ends the item then, if its receipt hasn't already. DENIED cancels
 the task. Every audited call in a handler goes through `audited_call_in_job`; no refusal is
 ever turned into an exception.
 
@@ -63,9 +64,8 @@ log = logging.getLogger("jarvis.core.approvals")
 
 APPROVAL_EXPIRY = timedelta(minutes=10)
 RESURFACE_BEFORE = timedelta(minutes=2)
-LISTING_TIMEOUT = 10.0  # seconds
+LISTING_TIMEOUT = actions.LISTING_TIMEOUT.total_seconds()
 POLL_INTERVAL = 0.05  # seconds
-LISTING_OK = "OK"
 CORE_ACTOR = Actor(ActorKind.AGENT, "core")
 ATLAS = Atlas()
 
@@ -131,8 +131,8 @@ def _await_listing(
         ).fetchone()  # fmt: skip
         if row is not None:
             payload, in_time = row
-            listing = actions.parse_listing(payload.get("evidence"))
-            if not in_time or payload.get("result") != LISTING_OK or listing is None:
+            listing = actions.parse_listing(payload)  # OK, in the contract's shape, or None
+            if not in_time or listing is None:
                 raise ListingUnavailable("late or unusable listing")
             return listing
         if _clock() >= deadline:
@@ -154,7 +154,7 @@ def propose_delete(
     must be an idle autocommit connection (the turn's committing connection)."""
     if not conn.autocommit or conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
         raise ValueError("propose_delete waits; it needs an idle autocommit connection")
-    if not actions.NAME.fullmatch(name):
+    if not actions.valid_file_name(name):
         return None  # never a path, a stream or a device name (§9.4)
     reply_id = uuid.uuid4()
     seq = actions.issue_live(
@@ -224,6 +224,9 @@ def propose_delete(
 
 
 def _open_cards(conn: psycopg.Connection[Any], approval_id: UUID) -> list[UUID]:
+    """The approval's open cards. (`jarvis_app` can't lock outbox rows; if one ends meanwhile,
+    `comm.supersede` / `comm.expire` answers 'terminal' with its own audit row, which commits
+    with the job: it is that item's state, not a refusal of the handler's request.)"""
     rows = conn.execute(
         "SELECT o.id FROM comm.outbox o JOIN comm.event e ON e.id = o.event_id"
         " WHERE e.subject_type = 'approval' AND e.subject_id = %s AND o.kind = ANY(%s)"
@@ -394,11 +397,13 @@ def on_decision(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
         conn, "action.approved", subject_type="approval", subject_id=str(approval_id),
         person_id=person_id, details={"task_id": str(task_id)},
     )  # fmt: skip
-    rules.notify(
+    [item] = rules.notify(
         conn, "action.approved", person_id=person_id, event_id=event_id,
         context={"authz": authz, "target_node_id": requesting_node, "expires_at": valid_until,
                  "text": f"Deleting {args.get('name')}", "group_key": f"action:{approval_id}"},
     )  # fmt: skip
+    # The item ends at its valid_until (outbox.expire), or when its receipt is handled.
+    jobs.enqueue(conn, "outbox.expire", {"outbox_id": str(item)}, delay=valid_until - db_now)
     _answered(conn, inbound_id)
     log.info("approval %s: action issued (expires %s)", approval_id, expires_at)
 

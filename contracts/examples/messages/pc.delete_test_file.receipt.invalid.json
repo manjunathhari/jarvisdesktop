@@ -1,0 +1,9 @@
+{
+  "execution_key": "e1d2c3b4-a5f6-4e7d-8c9b-0a1f2e3d4c5b",
+  "result": "DELETED",
+  "evidence": {
+    "file_id": "00000000a1b2c3d4:0000000000000000000000000000a001",
+    "before_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "recycled_at": "2026-11-22T10:03:00Z"
+  }
+}

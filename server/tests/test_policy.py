@@ -19,7 +19,7 @@ from jarvis_server.atlas import ApprovedPlan, Atlas
 from jarvis_server.bootstrap import APP_ROLE
 from jarvis_server.brain import Speech, ToolCall, budget, health
 from jarvis_server.contracts import ActorKind, EntityType, MemoryCategory, MemoryTag
-from jarvis_server.core import dispatch, keys, turn
+from jarvis_server.core import actions, dispatch, keys, turn
 from jarvis_server.dbcall import NotInJob, audited_call_in_job
 from jarvis_server.memory import checks
 from jarvis_server.memory.engine import SYSTEM, MemoryEngine
@@ -415,3 +415,43 @@ def test_outbox_target_must_be_the_persons_node(
         comm.create_outbox(app, **kw, target_node_id=other_node)
     with pytest.raises(psycopg.errors.CheckViolation):  # never re-addressed afterwards
         owner.execute("UPDATE comm.outbox SET target_node_id = NULL WHERE id = %s", (ok,))
+
+
+def test_refuse_receipt_codes_privileges_and_entities(
+    app: Conn, owner: Conn, gateway: Conn, node: uuid.UUID
+) -> None:
+    """R12-24: the fixed receipt codes, one REJECTED row each and nothing else; definer,
+    EXECUTE for jarvis_app only."""
+    codes = ("unknown_key", "reused_key", "unknown_action", "late", "malformed", "not_recycled",
+             "file_mismatch", "listing_failed", "still_listed", "listing_missing")  # fmt: skip
+    assert codes == actions.RECEIPT_REFUSALS
+    for code in codes:
+        ref = uuid.uuid4()
+        assert _one_row(app, "SELECT ledger.refuse_receipt(%s, %s, %s)", (ref, node, code)) == (
+            code,
+        )
+        rows = app.execute(
+            "SELECT entity_type, action::text, outcome::text, reason, details FROM audit.event"
+            " WHERE entity_id = %s",
+            (ref,),
+        ).fetchall()
+        entity = "approval" if code == "listing_missing" else "inbound"
+        assert rows == [(entity, "RECEIPT", "REJECTED", code, {"node_id": str(node)})]
+    for bad in ("expired", "duplicate_receipt", "anything", None):
+        with pytest.raises(psycopg.errors.InvalidParameterValue):
+            app.execute("SELECT ledger.refuse_receipt(%s, %s, %s)", (uuid.uuid4(), node, bad))
+    with pytest.raises(psycopg.errors.InvalidParameterValue):
+        app.execute("SELECT ledger.refuse_receipt(NULL, %s, 'late')", (node,))
+    row = owner.execute(
+        "SELECT p.prosecdef, pg_get_userbyid(p.proowner), p.proconfig,"
+        " (SELECT array_agg(pg_get_userbyid(a.grantee)::text ORDER BY 1)"
+        "  FROM aclexplode(p.proacl) a"
+        "  WHERE a.privilege_type = 'EXECUTE' AND a.grantee <> p.proowner),"
+        " has_function_privilege('public', p.oid, 'EXECUTE')"
+        " FROM pg_proc p WHERE p.oid = 'ledger.refuse_receipt(uuid, uuid, text)'::regprocedure"
+    ).fetchone()
+    assert row == (True, "jarvis_owner", ["search_path=pg_catalog, pg_temp"], [APP_ROLE], False)
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        gateway.execute(
+            "SELECT ledger.refuse_receipt(gen_random_uuid(), gen_random_uuid(), 'late')"
+        )

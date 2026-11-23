@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/pc.list_test_folder.receipt.schema.json",
+  "title": "`action.receipt` of a live `pc.list_test_folder`",
+  "description": "node → gateway: the test folder's files (§9.3 step 2, §9.4). Only `OK` is a listing core uses; `REFUSED` or `ERROR` (folder unusable) carries no files.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "reply_id",
+    "seq",
+    "result",
+    "evidence"
+  ],
+  "properties": {
+    "reply_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "result": {
+      "enum": [
+        "OK",
+        "REFUSED",
+        "ERROR"
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "files"
+      ],
+      "properties": {
+        "files": {
+          "type": "array",
+          "maxItems": 1000,
+          "items": {
+            "$ref": "pc.delete_test_file.args.schema.json"
+          }
+        }
+      }
+    }
+  }
+}

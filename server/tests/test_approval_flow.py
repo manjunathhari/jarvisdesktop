@@ -25,7 +25,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from starlette.websockets import WebSocketDisconnect
 
-from jarvis_server import jobs, nodes, policy, signing
+from jarvis_server import comm, jobs, nodes, policy, signing
 from jarvis_server.brain import Speech, ToolCall, budget, health
 from jarvis_server.contracts import EntityType
 from jarvis_server.core import actions, approvals, dispatch, keys, turn
@@ -189,11 +189,7 @@ def test_live_action_receipt_after_valid_until_refused(
     assert receipt is not None
     flow.run(app, "action.receipt", {"inbound_id": str(receipt[0])})
     assert flow.outcome_of(app, receipt[0]) == "REFUSED"
-    event = app.execute(
-        "SELECT details FROM comm.event WHERE kind = 'action.receipt_refused' AND subject_id = %s",
-        (str(receipt[0]),),
-    ).fetchone()
-    assert event == ({"reason": "expired"},)
+    assert flow.receipt_audit(app, receipt[0]) == [("REJECTED", "late", {"node_id": str(node)})]
 
 
 def test_live_receipt_from_another_node_refused(
@@ -213,6 +209,7 @@ def test_live_receipt_from_another_node_refused(
     )
     flow.run(app, "action.receipt", {"inbound_id": str(receipt)})
     assert flow.outcome_of(app, receipt) == "REFUSED"
+    assert flow.receipt_audit(app, receipt)[0][:2] == ("REJECTED", "unknown_action")
     ok = flow.inbound(
         owner,
         node,
@@ -547,15 +544,18 @@ def _approve(app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID,
 
 def _receipt(owner: Conn, node: uuid.UUID, person: uuid.UUID, key: str, result: str = "RECYCLED",
              **evidence: Any) -> uuid.UUID:  # fmt: skip
-    ev = {"file_id": A_TXT["file_id"], "sha256": A_TXT["sha256"],
-          "recycled_at": datetime.now(UTC).isoformat(), **evidence}  # fmt: skip
-    return flow.inbound(
-        owner,
-        node,
-        person,
-        "action.receipt",
-        {"execution_key": key, "result": result, "evidence": ev},
-    )
+    """A delete receipt, in the contract's shape (R12-25)."""
+    return flow.inbound(owner, node, person, "action.receipt",
+                        flow.delete_receipt(key, result, **evidence))  # fmt: skip
+
+
+def _listing(owner: Conn, node: uuid.UUID, person: uuid.UUID, reply: uuid.UUID, seq: int,
+             files: list[dict[str, Any]], result: str = "OK",
+             received_at: datetime | None = None) -> uuid.UUID:  # fmt: skip
+    """A listing receipt, in the contract's shape (R12-25)."""
+    return flow.inbound(owner, node, person, "action.receipt",
+                        flow.listing_receipt(reply, seq, files, result),
+                        received_at=received_at)  # fmt: skip
 
 
 def _verification_listing(app: Conn, node: uuid.UUID) -> tuple[uuid.UUID, int]:
@@ -568,6 +568,28 @@ def _verification_listing(app: Conn, node: uuid.UUID) -> tuple[uuid.UUID, int]:
     return uuid.UUID(str(row[0])), int(row[1])
 
 
+def _action(app: Conn, key: str) -> tuple[Any, ...]:
+    """(action status, bool_or(verified), count of outcomes) of an issued key."""
+    row = app.execute(
+        "SELECT a.status, bool_or(o.verified), count(o.id) FROM ledger.action a"
+        " LEFT JOIN ledger.outcome o ON o.action_id = a.id WHERE a.idempotency_key = %s"
+        " GROUP BY a.status",
+        (key,),
+    ).fetchone()
+    assert row is not None
+    return tuple(row)
+
+
+def _last_speech(app: Conn, session: uuid.UUID) -> str:
+    row = app.execute(
+        "SELECT text FROM conv.stream_chunk WHERE session_id = %s AND type = 'SPEECH'"
+        " ORDER BY created_at DESC LIMIT 1",
+        (session,),
+    ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
 def test_receipt_then_fresh_listing_completes(
     app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
     proposed: uuid.UUID,
@@ -577,9 +599,7 @@ def test_receipt_then_fresh_listing_completes(
     flow.run(app, "action.receipt", {"inbound_id": str(receipt)})
     assert flow.task_state(app, proposed) == "IN_PROGRESS"  # not done before the listing
     reply, seq = _verification_listing(app, node)
-    listing = flow.inbound(owner, node, person, "action.receipt",
-                           {"reply_id": str(reply), "seq": seq, "result": "OK",
-                            "evidence": {"files": [B_TXT]}})  # fmt: skip
+    listing = _listing(owner, node, person, reply, seq, [B_TXT])
     flow.run(app, "action.receipt", {"inbound_id": str(listing)})
     assert flow.task_state(app, proposed) == "COMPLETED"
     outcome = app.execute(
@@ -588,12 +608,11 @@ def test_receipt_then_fresh_listing_completes(
         (key,),
     ).fetchone()
     assert outcome == (True, True, "VERIFIED")
-    spoken = app.execute(
-        "SELECT text FROM conv.stream_chunk WHERE session_id = %s AND type = 'SPEECH'"
-        " ORDER BY created_at DESC LIMIT 1",
-        (session,),
-    ).fetchone()
-    assert spoken == ("Done: a.txt is in the Recycle Bin.",)
+    assert _last_speech(app, session) == "Done: a.txt is in the Recycle Bin."
+    assert flow.receipt_audit(app, receipt) == [] and flow.receipt_audit(app, listing) == []
+    # Minor 2: the receipt ended the action's item, so it is never re-sent.
+    [item] = _issued(app, person)
+    assert item["state"] == "SUPERSEDED"
 
 
 def test_one_receipt_per_key(
@@ -605,6 +624,7 @@ def test_one_receipt_per_key(
     again = _receipt(owner, node, person, key)
     flow.run(app, "action.receipt", {"inbound_id": str(again)})
     assert flow.outcome_of(app, again) == "REFUSED"
+    assert flow.receipt_audit(app, again) == [("REJECTED", "reused_key", {"node_id": str(node)})]
     listings = app.execute(
         "SELECT count(*) FROM conv.stream_chunk WHERE target_node_id = %s AND type = 'ACTION'"
         " AND authz->'object'->>'action_kind' = 'pc.list_test_folder'",
@@ -615,43 +635,184 @@ def test_one_receipt_per_key(
     other = _receipt(owner, stranger, person, key)
     flow.run(app, "action.receipt", {"inbound_id": str(other)})
     assert flow.outcome_of(app, other) == "REFUSED"  # only the requesting node's receipt counts
+    assert flow.receipt_audit(app, other) == [
+        ("REJECTED", "unknown_key", {"node_id": str(stranger)})
+    ]
+    unknown = _receipt(owner, node, person, str(uuid.uuid4()))
+    flow.run(app, "action.receipt", {"inbound_id": str(unknown)})
+    assert flow.receipt_audit(app, unknown)[0][:2] == ("REJECTED", "unknown_key")
 
 
-@pytest.mark.parametrize("variant", ["file_id", "sha256", "result", "still_listed", "listing_late"])
+@pytest.mark.parametrize(
+    ("variant", "code"),
+    [
+        ("file_id", "file_mismatch"),
+        ("sha256", "file_mismatch"),
+        ("result", "not_recycled"),
+        ("malformed", "malformed"),
+        ("still_listed", "still_listed"),
+        ("listing_late", "late"),
+        ("listing_error", "listing_failed"),
+        ("listing_error_partial", "listing_failed"),
+        ("listing_malformed", "listing_failed"),
+    ],
+)
 def test_receipt_mismatch_fails_task(
-    variant: str, app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID,
-    proposed: uuid.UUID,
+    variant: str, code: str, dsns: Dsns, app: Conn, owner: Conn, person: uuid.UUID,
+    node: uuid.UUID, session: uuid.UUID, proposed: uuid.UUID,
 ) -> None:  # fmt: skip
-    """P2-A6: a receipt with a different file ID or hash, a non-RECYCLED result, or a fresh
-    listing that still has the file (or comes too late): the task is FAILED, never COMPLETED."""
+    """P2-A6 and I1: a receipt with a different file ID or hash, a non-RECYCLED result, evidence
+    off the contract, or a fresh listing that still has the file, comes too late, is not OK
+    (even with an empty or partial file list) or is malformed: the task is FAILED, never
+    COMPLETED or verified, Jarvis says so, and the rejection is audited with its code (R12-24)."""
     key = _approve(app, owner, person, node, proposed)
-    extra: dict[str, Any] = {}
-    result = "RECYCLED"
     if variant == "file_id":
-        extra = {"file_id": B_TXT["file_id"]}
+        receipt = _receipt(owner, node, person, key, file_id=B_TXT["file_id"])
     elif variant == "sha256":
-        extra = {"sha256": B_TXT["sha256"]}
+        receipt = _receipt(owner, node, person, key, before_sha256=B_TXT["sha256"])
     elif variant == "result":
-        result = "MISMATCH"
-    receipt = _receipt(owner, node, person, key, result, **extra)
+        receipt = _receipt(owner, node, person, key, "MISMATCH", recycled_at=None)
+    elif variant == "malformed":
+        receipt = flow.inbound(owner, node, person, "action.receipt",
+                               {"execution_key": key, "result": "RECYCLED",
+                                "evidence": {"file_id": A_TXT["file_id"],
+                                             "sha256": A_TXT["sha256"]}})  # fmt: skip
+    else:
+        receipt = _receipt(owner, node, person, key)
     flow.run(app, "action.receipt", {"inbound_id": str(receipt)})
-    if variant in ("still_listed", "listing_late"):
+    refused = receipt
+    if variant.startswith("listing") or variant == "still_listed":
+        assert flow.receipt_audit(app, receipt) == []
         reply, seq = _verification_listing(app, node)
         late = flow.db_now(app) + timedelta(minutes=3) if variant == "listing_late" else None
-        listing = flow.inbound(owner, node, person, "action.receipt",
-                               {"reply_id": str(reply), "seq": seq, "result": "OK",
-                                "evidence": {"files": [A_TXT, B_TXT]}},
-                               received_at=late)  # fmt: skip
-        flow.run(app, "action.receipt", {"inbound_id": str(listing)})
+        if variant == "listing_error":
+            refused = _listing(owner, node, person, reply, seq, [], "ERROR")
+        elif variant == "listing_error_partial":
+            refused = _listing(owner, node, person, reply, seq, [B_TXT], "REFUSED")
+        elif variant == "listing_malformed":
+            refused = flow.inbound(owner, node, person, "action.receipt",
+                                   {"reply_id": str(reply), "seq": seq, "result": "OK",
+                                    "evidence": {}})  # fmt: skip
+        else:
+            files = [A_TXT, B_TXT] if variant == "still_listed" else [B_TXT]
+            refused = _listing(owner, node, person, reply, seq, files, received_at=late)
+        flow.run(app, "action.receipt", {"inbound_id": str(refused)})
     assert flow.task_state(app, proposed) == "FAILED"
     task_id = flow.approval_row(app, proposed)["task_id"]
     assert "COMPLETED" not in [e.to_state for e in audit_trail(app, EntityType.TASK, task_id)]
-    verified = app.execute(
-        "SELECT bool_or(o.verified) FROM ledger.outcome o JOIN ledger.action a"
-        " ON a.id = o.action_id WHERE a.idempotency_key = %s",
-        (key,),
+    assert _action(app, key)[:2] == ("FAILED", False)
+    assert flow.outcome_of(app, refused) == "REFUSED"
+    with psycopg.connect(dsns.app, autocommit=True) as other:
+        assert flow.receipt_audit(other, refused) == [("REJECTED", code, {"node_id": str(node)})]
+    assert "a.txt" in _last_speech(app, session) and "Done" not in _last_speech(app, session)
+
+
+def test_verification_listing_that_never_comes_fails_the_task(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    proposed: uuid.UUID,
+) -> None:  # fmt: skip
+    """I2: the fresh listing's timeout (10 s) is a job, scheduled with it. No receipt by then:
+    FAILED, spoken, audited `listing_missing` against the approval."""
+    key = _approve(app, owner, person, node, proposed)
+    flow.run(app, "action.receipt", {"inbound_id": str(_receipt(owner, node, person, key))})
+    row = app.execute(
+        "SELECT payload, round(extract(epoch FROM run_at - now())) FROM ops.job"
+        " WHERE kind = 'action.verify_timeout' AND status = 'QUEUED' ORDER BY id DESC LIMIT 1"
     ).fetchone()
-    assert verified == (False,)
+    assert row is not None and 0 <= row[1] <= 10
+    flow.run(app, "action.verify_timeout", dict(row[0]))  # the clock reaches its run_at
+    assert flow.task_state(app, proposed) == "FAILED"
+    assert _action(app, key)[:2] == ("FAILED", False)
+    assert flow.audit(app, proposed)[-1] == ("RECEIPT", "REJECTED", "listing_missing", None, None)
+    assert _last_speech(app, session) == "I couldn't confirm that a.txt was deleted."
+    # the listing arriving after that changes nothing
+    reply, seq = _verification_listing(app, node)
+    after = _listing(owner, node, person, reply, seq, [B_TXT])
+    flow.run(app, "action.receipt", {"inbound_id": str(after)})
+    assert flow.task_state(app, proposed) == "FAILED"
+    assert _action(app, key)[:2] == ("FAILED", False)
+
+
+def test_verify_timeout_after_the_listing_does_nothing(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, proposed: uuid.UUID
+) -> None:
+    key = _approve(app, owner, person, node, proposed)
+    flow.run(app, "action.receipt", {"inbound_id": str(_receipt(owner, node, person, key))})
+    reply, seq = _verification_listing(app, node)
+    flow.run(app, "action.receipt",
+             {"inbound_id": str(_listing(owner, node, person, reply, seq, [B_TXT]))})  # fmt: skip
+    action_id = app.execute(
+        "SELECT id FROM ledger.action WHERE idempotency_key = %s", (key,)
+    ).fetchone()
+    assert action_id is not None
+    since = int(app.execute("SELECT max(seq) FROM audit.event").fetchone()[0])  # type: ignore[index]
+    flow.run(app, "action.verify_timeout", {"action_id": str(action_id[0])})
+    assert flow.task_state(app, proposed) == "COMPLETED"
+    assert _action(app, key)[:2] == ("VERIFIED", True)
+    assert app.execute("SELECT count(*) FROM audit.event WHERE seq > %s", (since,)).fetchone() == (
+        0,
+    )
+
+
+def test_refused_transition_writes_no_outcome(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    proposed: uuid.UUID,
+) -> None:  # fmt: skip
+    """Minor 3: the transition comes first. Here the task was cancelled meanwhile, so COMPLETED
+    is refused (and audited): the outcome is not marked verified, the action stays RECEIVED,
+    and nothing is said."""
+    key = _approve(app, owner, person, node, proposed)
+    flow.run(app, "action.receipt", {"inbound_id": str(_receipt(owner, node, person, key))})
+    task_id = flow.approval_row(app, proposed)["task_id"]
+    app.execute("SELECT ledger.transition('task', %s, 'CANCELLED', 'AGENT', 'test', 'test')",
+                (task_id,))  # fmt: skip
+    speech = "SELECT count(*) FROM conv.stream_chunk WHERE session_id = %s AND type = 'SPEECH'"
+    spoken = app.execute(speech, (session,)).fetchone()
+    reply, seq = _verification_listing(app, node)
+    flow.run(app, "action.receipt",
+             {"inbound_id": str(_listing(owner, node, person, reply, seq, [B_TXT]))})  # fmt: skip
+    assert flow.task_state(app, proposed) == "CANCELLED"
+    assert _action(app, key) == ("RECEIVED", False, 1)
+    trail = [(e.to_state, e.outcome) for e in audit_trail(app, EntityType.TASK, task_id)]
+    assert trail[-1] == ("COMPLETED", "REJECTED")
+    assert app.execute(speech, (session,)).fetchone() == spoken  # nothing said
+
+
+def test_approved_item_expires_at_valid_until(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, proposed: uuid.UUID
+) -> None:
+    """Minor 2: an `outbox.expire` job is scheduled at the action's valid_until; run early it
+    re-queues itself, at its time it expires the item (audited), and an item already ended is
+    left alone."""
+    _approve(app, owner, person, node, proposed)
+    [item] = _issued(app, person)
+    row = app.execute(
+        "SELECT id, payload, run_at FROM ops.job WHERE kind = 'outbox.expire'"
+        " AND payload->>'outbox_id' = %s",
+        (str(item["id"]),),
+    ).fetchone()
+    assert row is not None and abs((row[2] - item["expires_at"]).total_seconds()) < 1
+    flow.run(app, "outbox.expire", dict(row[1]))  # early: re-queued, the item still open
+    assert _issued(app, person)[0]["state"] == "PENDING"
+    requeued = app.execute(
+        "SELECT count(*) FROM ops.job WHERE kind = 'outbox.expire' AND status = 'QUEUED'"
+        " AND payload->>'outbox_id' = %s",
+        (str(item["id"]),),
+    ).fetchone()
+    assert requeued == (2,)
+    expired = flow.db_now(app) - timedelta(minutes=11)  # an item whose valid_until has passed
+    event = comm.record_event(app, "test.notice", subject_type="test", subject_id="t-exp",
+                              person_id=person, details={})  # fmt: skip
+    old = comm.create_outbox(app, person_id=person, event_id=event, priority=comm.Priority.URGENT,
+                             kind="action.approved", body={"text": "x"}, group_key="t",
+                             expires_at=expired, target_node_id=node)  # fmt: skip
+    flow.run(app, "outbox.expire", {"outbox_id": str(old)})
+    assert app.execute("SELECT state FROM comm.outbox WHERE id = %s", (old,)).fetchone() == (
+        "EXPIRED",
+    )
+    assert flow.audit(app, old)[-1] == ("EXPIRE", "APPLIED", "expired", "PENDING", "EXPIRED")
+    flow.run(app, "outbox.expire", {"outbox_id": str(old)})  # ended already: nothing more
+    assert len(flow.audit(app, old)) == 1
 
 
 # --- P2-A1 end to end, over the real gateway -----------------------------------------------
@@ -736,9 +897,9 @@ def test_delete_flow_end_to_end(
     got = _until(desk, lambda e: bool(_actions(e)))
     [listing] = [e["payload"]["authz"]["object"] for e in _actions(got)]
     assert listing["action_kind"] == "pc.list_test_folder"
+    flow.conform("pc.list_test_folder.args", listing["args"])  # what core emits (R12-25)
     assert listing["target_node_id"] == str(desk.node_id) and desk.actions[-1] == listing
-    desk.send("action.receipt", {"reply_id": listing["reply_id"], "seq": 1, "result": "OK",
-                                 "evidence": {"files": [A_TXT, B_TXT]}})  # fmt: skip
+    desk.listing_receipt(listing["reply_id"], 1, [A_TXT, B_TXT])
     # 2. the URGENT card, signed by the core key, on both devices
     got += _until(desk, lambda e: bool(_outbox(e, "approval.requested")))
     [card] = _outbox(got, "approval.requested")
@@ -762,16 +923,18 @@ def test_delete_flow_end_to_end(
     action = item["authz"]["object"]
     assert action["kind"] == "node.action" and action["execution_key"] is not None
     assert action["target_node_id"] == str(desk.node_id) and action["args"] == A_TXT
+    flow.conform("pc.delete_test_file.args", action["args"])
+    flow.conform("pc.delete_test_file.args", card_obj["args"])
     assert datetime.fromisoformat(action["valid_until"]) <= gw.clock() + timedelta(
         minutes=2, seconds=5
     )
     assert desk.actions[-1] == action  # passed the §7.1 node rules
     assert _outbox(other.sync() + other.drain(0.3), "action.approved") == []
     # 4. RECYCLED with the approved file ID and hash -> a fresh listing
-    desk.send("action.receipt", {"execution_key": action["execution_key"], "result": "RECYCLED",
-                                 "evidence": {"file_id": A_TXT["file_id"],
-                                              "sha256": A_TXT["sha256"],
-                                              "recycled_at": gw.clock().isoformat()}})  # fmt: skip
+    desk.delete_receipt(action["execution_key"], "RECYCLED", {
+        "file_id": A_TXT["file_id"], "before_sha256": A_TXT["sha256"],
+        "recycled_at": gw.clock().isoformat(),
+    })  # fmt: skip
     desk.sync()
     assert flow.run_queued(app, "action.receipt") is not None  # the listing's, from step 1
     assert flow.run_queued(app, "action.receipt") is not None  # the delete's
@@ -780,8 +943,7 @@ def test_delete_flow_end_to_end(
     assert (
         fresh["action_kind"] == "pc.list_test_folder" and fresh["reply_id"] != listing["reply_id"]
     )
-    desk.send("action.receipt", {"reply_id": fresh["reply_id"], "seq": 1, "result": "OK",
-                                 "evidence": {"files": [B_TXT]}})  # fmt: skip
+    desk.listing_receipt(fresh["reply_id"], 1, [B_TXT])
     desk.sync()
     assert flow.run_queued(app, "action.receipt") is not None
     # 5. COMPLETED, verified, spoken
@@ -897,3 +1059,28 @@ def test_gateway_refuses_to_send_expired_action(app: Conn, gw: Gw, core_key: Any
     sent = [e["payload"]["authz"]["object"]["reply_id"] for e in _actions(got)]
     assert sent == [str(fresh)]
     assert desk.rejected == []
+
+
+def test_gateway_never_offers_an_expired_approved_item(app: Conn, gw: Gw) -> None:
+    """Minor 2, gateway side: an `action.approved` item past its `expires_at` (the action's
+    valid_until) is never written to the socket, on connect or by the sweep."""
+    desk = gw.enrolled()
+    desk.sync()
+    assert desk.node_id is not None
+    desk.auto_received = False
+    event = comm.record_event(app, "test.notice", subject_type="test", subject_id="t-gw-exp",
+                              person_id=MANJ, details={})  # fmt: skip
+    kw: dict[str, Any] = {"person_id": MANJ, "event_id": event, "priority": comm.Priority.URGENT,
+                          "kind": "action.approved", "body": {"text": "Deleting"},
+                          "group_key": "t", "target_node_id": desk.node_id}  # fmt: skip
+    stale = comm.create_outbox(app, **kw, expires_at=gw.clock() - timedelta(seconds=1))
+    live = comm.create_outbox(app, **kw, expires_at=gw.clock() + timedelta(minutes=2))
+    got = _until(
+        desk, lambda e: str(live) in [p["outbox_id"] for p in _outbox(e, "action.approved")]
+    )
+    gw.clock.advance(150)  # the live one is unconfirmed and now past its expiry too
+    gw.client.portal.call(lambda: gw.app.state.gateway.relay.sweep(wait=True))
+    got += desk.sync() + desk.drain(0.2)
+    sent = [p["outbox_id"] for p in _outbox(got, "action.approved")]
+    assert sent == [str(live)]  # once, before its expiry; the stale one never
+    assert str(stale) not in sent

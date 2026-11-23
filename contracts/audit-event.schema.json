@@ -80,7 +80,8 @@
         "EXPIRE",
         "CHUNK_RECEIVE",
         "CONSUME",
-        "DECIDE"
+        "DECIDE",
+        "RECEIPT"
       ]
     },
     "from_state": {

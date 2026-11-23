@@ -62,6 +62,7 @@ from jarvis_server.signing import (
     verify_envelope,
 )
 
+from ..schema_registry import CONTRACTS, validator
 from .node_rules import (
     Rejected,
     SeqChecker,
@@ -101,6 +102,13 @@ class PeerFromHeader:
             if peer is not None:
                 scope["client"] = (peer.decode(), 50000)
         await self.app(scope, receive, send)
+
+
+def _conform(name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Check a payload the fake desktop sends against its shared contract (R12-25)."""
+    schema = json.loads((CONTRACTS / "messages" / f"{name}.schema.json").read_text())
+    validator(schema).validate(payload)
+    return payload
 
 
 def b64(raw: bytes) -> str:
@@ -350,6 +358,21 @@ class FakeNode:
     def send_raw(self, text: str) -> None:
         self.last_sent = text
         self.ws.send_text(text)
+
+    def listing_receipt(
+        self, reply_id: str, seq: int, files: list[dict[str, Any]], result: str = "OK"
+    ) -> UUID:
+        """The desktop's answer to a live ``pc.list_test_folder``, in the contract's shape."""
+        return self.send("action.receipt", _conform("pc.list_test_folder.receipt", {
+            "reply_id": reply_id, "seq": seq, "result": result, "evidence": {"files": files},
+        }))  # fmt: skip
+
+    def delete_receipt(self, execution_key: str, result: str, evidence: dict[str, Any]) -> UUID:
+        """The desktop's receipt for an approved ``pc.delete_test_file``, in the contract's
+        shape."""
+        return self.send("action.receipt", _conform("pc.delete_test_file.receipt", {
+            "execution_key": execution_key, "result": result, "evidence": evidence,
+        }))  # fmt: skip
 
     def received(self, outbox_id: UUID) -> UUID:
         return self.send("received", {"outbox_id": str(outbox_id)})
