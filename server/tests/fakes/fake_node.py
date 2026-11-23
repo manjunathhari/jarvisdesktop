@@ -1,0 +1,422 @@
+"""A fake node for gateway tests: a WebSocket client that follows the node-side rules.
+
+It signs every envelope it sends as ``node-msg`` under ``fingerprint(its public key)`` (R12-6),
+with its own per-connection ``seq``. It checks everything the gateway sends: the gateway's
+``seq`` (``SeqChecker``), the ``gw-transport`` signature under the key the connection's
+challenge announced, and the node rules in ``node_rules`` (challenge, enrolment welcome,
+``node.action``, ``keyset``). It never accepts a key from the gateway alone: the gateway key is
+pinned only through the enrolment code's gateway fingerprint, and the core key only through
+``welcome.enrolment`` matching the code's core fingerprint (§6.1, §7.2). Until then every
+core-authorised item (``node.action``, an approval card, ``keyset``, anything shown) is
+refused and recorded in ``rejected``.
+
+Its pins, node ID and seen-list live in a JSON file (``state_path``), reloaded by a new
+``FakeNode`` on the same path. A frame the gateway can't parse (too large, not JSON, not an
+envelope) carries no ``seq`` the gateway could count, so building one with ``envelope()`` and
+sending it with ``send_raw()`` doesn't move the node's counter.
+
+Also here: ``FakeWhoIs`` (dict-backed ``whois``) and ``PeerFromHeader``, a test-only ASGI
+wrapper that sets the connection's peer address from a request header, because Starlette's
+TestClient has one fixed client address. The gateway itself never reads that header.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import uuid
+from collections import Counter, defaultdict
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+import anyio
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from starlette.testclient import TestClient
+from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.websockets import WebSocketDisconnect
+
+from jarvis_server.contracts import NIL_UUID
+from jarvis_server.nodes import parse_enrolment_code
+from jarvis_server.signing import (
+    AuthzInvalid,
+    Purpose,
+    b64url_decode,
+    check_authz,
+    fingerprint,
+    public_bytes,
+    sign_envelope,
+    verify_envelope,
+)
+
+from .node_rules import (
+    Rejected,
+    SeqChecker,
+    check_challenge,
+    check_enrolment_welcome,
+    check_keyset,
+    check_node_action,
+)
+
+PEER_HEADER = "x-test-peer-ip"
+# Refused until the core key is pinned (§6.1 step 7): anything core-authorised or shown.
+CORE_CONTENT = frozenset({"node.action", "keyset", "outbox.item", "reply.chunk"})
+ROUTE = "/v1/node"
+
+
+class FakeWhoIs:
+    """``whois`` from a dict: peer IP → Tailscale identity. Unknown peers give None."""
+
+    def __init__(self, table: dict[str, str] | None = None) -> None:
+        self.table: dict[str, str] = dict(table or {})
+
+    async def identity(self, peer_ip: str) -> str | None:
+        return self.table.get(peer_ip)
+
+
+class PeerFromHeader:
+    """Test-only ASGI wrapper: a WebSocket's ``client`` address comes from ``x-test-peer-ip``."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "websocket":
+            headers = [(k, v) for k, v in scope["headers"] if k != PEER_HEADER.encode()]
+            peer = dict(scope["headers"]).get(PEER_HEADER.encode())
+            scope = {**scope, "headers": headers}
+            if peer is not None:
+                scope["client"] = (peer.decode(), 50000)
+        await self.app(scope, receive, send)
+
+
+def b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _iso(t: datetime) -> str:
+    return t.isoformat()
+
+
+class FakeNode:
+    def __init__(
+        self,
+        client: TestClient,
+        *,
+        key: Ed25519PrivateKey,
+        node_id: UUID | None,
+        peer_ip: str,
+        state_path: Path,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self.client = client
+        self.key = key
+        self.public = public_bytes(key)
+        self.key_id = fingerprint(self.public)
+        self.peer_ip = peer_ip
+        self.state_path = state_path
+        self.clock = clock or (lambda: datetime.now(UTC))
+        self.pinned_gateway: dict[str, bytes] = {}
+        self.trusted_core: dict[str, bytes] = {}
+        self.seen_outbox: set[str] = set()
+        self.last_shown: dict[str, int] = {}
+        self.node_id = node_id
+        self._load()
+        if node_id is not None:
+            self.node_id = node_id
+        self.rejected: list[tuple[str, str]] = []
+        self.displays: Counter[str] = Counter()
+        self.shown_chunks: dict[str, list[int]] = defaultdict(list)
+        self.actions: list[dict[str, Any]] = []
+        self.received_envelopes: list[dict[str, Any]] = []
+        self.discarded = False
+        self.challenge: dict[str, Any] | None = None
+        self.last_sent: str | None = None
+        self._ctx: Any = None
+        self.ws: Any = None
+        self._seq = 0
+        self._peer_seq = SeqChecker()
+        self._gw_key_id: str | None = None
+        self._gw_public: bytes | None = None
+        self._authorised = False
+
+    # ------------------------------------------------------------------ state file
+
+    def _load(self) -> None:
+        if not self.state_path.exists():
+            return
+        state = json.loads(self.state_path.read_text())
+        if state.get("node_id"):
+            self.node_id = UUID(state["node_id"])
+        self.pinned_gateway = {k: bytes.fromhex(v) for k, v in state["gateway_keys"].items()}
+        self.trusted_core = {k: bytes.fromhex(v) for k, v in state["core_keys"].items()}
+        self.seen_outbox = set(state["seen_outbox"])
+        self.last_shown = dict(state["shown"])
+
+    def _save(self) -> None:
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "node_id": str(self.node_id) if self.node_id else None,
+                    "gateway_keys": {k: v.hex() for k, v in self.pinned_gateway.items()},
+                    "core_keys": {k: v.hex() for k, v in self.trusted_core.items()},
+                    "seen_outbox": sorted(self.seen_outbox),
+                    "shown": self.last_shown,
+                }
+            )
+        )
+
+    # ------------------------------------------------------------------ connection
+
+    @property
+    def connected(self) -> bool:
+        return self.ws is not None
+
+    @property
+    def next_gateway_seq(self) -> int:
+        """The ``seq`` the next gateway message must carry (for tests that inject frames)."""
+        return self._peer_seq._next
+
+    def connect(self, *, enrol_gateway_fingerprint: str | None = None) -> dict[str, Any]:
+        """Open a connection and check the challenge (§6.1 step 3); return its payload.
+
+        An enrolling device passes the gateway fingerprint from its code and has no pinned key;
+        an enrolled one checks against its pinned gateway keys. On a bad challenge the node
+        closes and sends nothing.
+        """
+        self._ctx = self.client.websocket_connect(ROUTE, headers={PEER_HEADER: self.peer_ip})
+        self.ws = self._ctx.__enter__()
+        self._seq = 0
+        self._peer_seq = SeqChecker()
+        self._authorised = False
+        env = self._receive(2.0)
+        try:
+            payload = check_challenge(
+                env,
+                pinned_gateway=None if enrol_gateway_fingerprint else self.pinned_gateway,
+                enrol_fingerprint=enrol_gateway_fingerprint,
+            )
+            self._peer_seq.expect(env["seq"])
+        except Rejected as e:
+            self._refuse("challenge", e.reason)
+        self._gw_key_id = payload["key_id"]
+        self._gw_public = b64url_decode(payload["public_key"], 32)
+        self.challenge = payload
+        return payload
+
+    def close(self) -> None:
+        if self._ctx is not None:
+            ctx, self._ctx, self.ws = self._ctx, None, None
+            ctx.__exit__(None, None, None)
+
+    def _refuse(self, what: str, reason: str) -> Any:
+        """Record a rejection, close the connection without replying, and raise."""
+        self.rejected.append((what, reason))
+        self.close()
+        raise Rejected(reason)
+
+    # ------------------------------------------------------------------ handshake
+
+    def hello(
+        self,
+        *,
+        nonce: str | None = None,
+        clock_skew_ms: int | None = None,
+        sent_at: datetime | None = None,
+        node_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        """``hello`` (path A); returns the ``welcome`` payload."""
+        if not self.connected:
+            self.connect()
+        assert self.challenge is not None
+        payload: dict[str, Any] = {
+            "nonce": nonce or self.challenge["nonce"],
+            "resume": [{"reply_id": r, "last_seq": s} for r, s in sorted(self.last_shown.items())],
+        }
+        if clock_skew_ms is not None:
+            payload["clock_skew_ms"] = clock_skew_ms
+        self.send("hello", payload, sent_at=sent_at, node_id=node_id)
+        env = self.recv()
+        if env["kind"] != "welcome":
+            raise AssertionError(f"expected welcome, got {env['kind']}")
+        self._authorised = bool(self.trusted_core)
+        return dict(env["payload"])
+
+    def enrol(self, code: str, *, sent_at: datetime | None = None) -> UUID:
+        """Enrol with a code (§7.2): pin the gateway key by the code's gateway fingerprint,
+        send ``enrol``, then pin the core key only if ``welcome.enrolment`` matches the code's
+        core fingerprint. On a mismatch, discard the keys, store nothing and close."""
+        token, core_fp, gw_fp = parse_enrolment_code(code)
+        if not self.connected:
+            self.connect(enrol_gateway_fingerprint=gw_fp)
+        assert self.challenge is not None
+        self.send(
+            "enrol",
+            {"token": token, "public_key": b64(self.public), "nonce": self.challenge["nonce"]},
+            sent_at=sent_at,
+            node_id=NIL_UUID,
+        )
+        env = self.recv()
+        while env["kind"] != "welcome":
+            env = self.recv()
+        try:
+            node_id, core_key_id, core_public = check_enrolment_welcome(
+                env["payload"], core_fingerprint=core_fp
+            )
+            if UUID(env["node_id"]) != node_id:
+                raise Rejected("node_id_mismatch")
+        except Rejected as e:
+            self.discarded = True
+            self.pinned_gateway, self.trusted_core, self.node_id = {}, {}, None
+            self._refuse("welcome", e.reason)
+        assert self._gw_key_id is not None and self._gw_public is not None
+        self.pinned_gateway = {self._gw_key_id: self._gw_public}
+        self.trusted_core = {core_key_id: core_public}
+        self.node_id = node_id
+        self._authorised = True
+        self._save()
+        return node_id
+
+    # ------------------------------------------------------------------ sending
+
+    def envelope(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        seq: int | None = None,
+        sent_at: datetime | None = None,
+        node_id: UUID | None = None,
+        message_id: UUID | None = None,
+    ) -> dict[str, Any]:
+        """A signed envelope with the next ``seq``, without consuming it."""
+        env = {
+            "version": 1,
+            "message_id": str(message_id or uuid.uuid4()),
+            "node_id": str(node_id or self.node_id or NIL_UUID),
+            "seq": self._seq + 1 if seq is None else seq,
+            "sent_at": _iso(sent_at or self.clock()),
+            "kind": kind,
+            "payload": payload,
+        }
+        return sign_envelope(Purpose.NODE_MSG, self.key, self.key_id, env)
+
+    def send(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        seq: int | None = None,
+        sent_at: datetime | None = None,
+        node_id: UUID | None = None,
+        message_id: UUID | None = None,
+        mutate: Callable[[dict[str, Any]], None] | None = None,
+    ) -> UUID:
+        """Sign and send one message; ``mutate`` changes the envelope after signing."""
+        if self.discarded:
+            raise RuntimeError("this device discarded its keys")
+        env = self.envelope(
+            kind, payload, seq=seq, sent_at=sent_at, node_id=node_id, message_id=message_id
+        )
+        if seq is None:
+            self._seq += 1
+        if mutate is not None:
+            mutate(env)
+        self.send_raw(json.dumps(env))
+        return UUID(env["message_id"])
+
+    def send_raw(self, text: str) -> None:
+        self.last_sent = text
+        self.ws.send_text(text)
+
+    def received(self, outbox_id: UUID) -> UUID:
+        return self.send("received", {"outbox_id": str(outbox_id)})
+
+    def ack(self, outbox_id: UUID) -> UUID:
+        return self.send("ack", {"outbox_id": str(outbox_id)})
+
+    # ------------------------------------------------------------------ receiving
+
+    def _receive(self, timeout: float) -> dict[str, Any]:
+        """The next frame as JSON; WebSocketDisconnect if the gateway closed; TimeoutError."""
+        ws = self.ws
+        if ws is None:
+            raise RuntimeError("not connected")
+
+        async def _next() -> Any:
+            with anyio.fail_after(timeout):
+                return await ws._send_rx.receive()
+
+        message = ws.portal.call(_next)
+        if message["type"] == "websocket.close":
+            self.close()
+            raise WebSocketDisconnect(code=message.get("code", 1000))
+        return dict(json.loads(message["text"]))
+
+    def recv(self, timeout: float = 2.0) -> dict[str, Any]:
+        """The next gateway message, after every node-side check."""
+        env = self._receive(timeout)
+        self.inject(env)
+        return env
+
+    def inject(self, env: dict[str, Any]) -> None:
+        """Process one gateway envelope exactly as if it had arrived on the connection."""
+        try:
+            self._peer_seq.expect(env.get("seq"))  # type: ignore[arg-type]
+        except Rejected as e:
+            self._refuse(str(env.get("kind")), e.reason)
+        assert self._gw_key_id is not None and self._gw_public is not None
+        if not verify_envelope(Purpose.GW_TRANSPORT, self._gw_public, self._gw_key_id, env):
+            self._refuse(str(env.get("kind")), "bad_signature")
+        self.received_envelopes.append(env)
+        kind, payload = env["kind"], env["payload"]
+        if kind in CORE_CONTENT and not self._authorised:
+            self.rejected.append((kind, "unauthorised"))
+            return
+        try:
+            if kind == "node.action":
+                assert self.node_id is not None
+                check_node_action(
+                    payload["authz"], trusted=self.trusted_core, me=self.node_id, now=self.clock()
+                )
+                self.actions.append(dict(payload["authz"]["object"]))
+            elif kind == "keyset":
+                obj = check_keyset(
+                    payload, payload["authz"], trusted=self.trusted_core, now=self.clock()
+                )
+                raw = b64url_decode(obj["args"]["public_key"], 32)
+                assert raw is not None  # check_keyset validated it
+                target = self.trusted_core if obj["args"]["role"] == "core" else self.pinned_gateway
+                target[obj["args"]["key_id"]] = raw
+                self._save()
+            elif kind == "outbox.item":
+                if payload.get("authz") is not None:
+                    try:
+                        check_authz(payload["authz"], self.trusted_core)
+                    except AuthzInvalid:
+                        raise Rejected("bad_signature") from None
+                outbox_id = payload["outbox_id"]
+                if outbox_id not in self.seen_outbox:
+                    self.seen_outbox.add(outbox_id)
+                    self.displays[outbox_id] += 1
+                    self._save()
+            elif kind == "reply.chunk":
+                self._chunk(payload)
+        except Rejected as e:
+            self.rejected.append((kind, e.reason))
+
+    def _chunk(self, payload: dict[str, Any]) -> None:
+        reply_id, seq = payload["reply_id"], payload["seq"]
+        if payload["type"] == "ACTION":
+            assert self.node_id is not None
+            check_node_action(
+                payload["authz"], trusted=self.trusted_core, me=self.node_id, now=self.clock()
+            )
+            self.actions.append(dict(payload["authz"]["object"]))
+        if seq > self.last_shown.get(reply_id, 0):
+            self.last_shown[reply_id] = seq
+            self.shown_chunks[reply_id].append(seq)
+            self._save()
+        self.send("received", {"reply_id": reply_id, "seq": seq})

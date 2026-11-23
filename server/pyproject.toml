@@ -11,6 +11,8 @@ dependencies = [
     "pydantic>=2.9",
     "rfc8785>=0.1.4",
     "cryptography>=50.0.2",
+    "fastapi>=0.165.0",
+    "uvicorn[standard]>=0.54.0",
 ]
 
 [dependency-groups]
@@ -27,6 +29,7 @@ dev = [
 [project.scripts]
 jarvis-core = "jarvis_server.core_main:main"
 jarvis-scheduler = "jarvis_server.scheduler_main:main"
+jarvis-gateway = "jarvis_server.gateway.app:main"
 
 [build-system]
 requires = ["hatchling"]
