@@ -90,22 +90,21 @@ def create_outbox(
 ) -> UUID:
     """Create a PENDING outbox item; supersede `supersedes_id` in the same transaction.
 
-    NOTIFYs `jarvis_outbox` with the new id (and comm.supersede with the old one), delivered
-    when the transaction commits. Superseding an item that has already ended (acknowledged,
-    expired or superseded) is a **non-audited no-op** (R11-2): the audited comm.supersede is not
-    called, no audit row is written, the old item is untouched, and the new item is still
-    created. A live target goes through comm.supersede as before.
+    NOTIFYs `jarvis_outbox` with the new id (and the supersede with the old one), delivered
+    when the transaction commits. The supersede goes through comm.supersede_for_create, which
+    checks the target under its own FOR UPDATE lock (R11-4): a live target is superseded with
+    its audit row ('applied'); one that has already ended (acknowledged, expired or
+    superseded), even concurrently, is a **non-audited no-op** ('skipped', R11-2). The old item
+    is then untouched and the new item is still created.
     """
     _check_code("kind", kind)
     with conn.transaction():
-        supersede_live = False
         if supersedes_id is not None:
             row = conn.execute(
-                "SELECT person_id, state FROM comm.outbox WHERE id = %s", (supersedes_id,)
+                "SELECT person_id FROM comm.outbox WHERE id = %s", (supersedes_id,)
             ).fetchone()
             if row is None or row[0] != person_id:
                 raise ValueError("an item can only supersede an item of the same person")
-            supersede_live = row[1] not in TERMINAL_STATES
         row = conn.execute(
             "INSERT INTO comm.outbox (person_id, event_id, priority, kind, body, authz,"
             " group_key, supersedes_id, expires_at)"
@@ -124,11 +123,11 @@ def create_outbox(
         ).fetchone()
         assert row is not None
         outbox_id = UUID(str(row[0]))
-        if supersede_live:
-            # 'applied'; or 'terminal' (audited) only if the item ended after the read above,
-            # which the app role cannot lock against. The new item stands either way.
-            outcome = conn.execute("SELECT comm.supersede(%s)", (supersedes_id,)).fetchone()
-            if outcome is None or outcome[0] not in ("applied", "terminal"):
-                raise RuntimeError(f"comm.supersede returned {outcome!r}")
+        if supersedes_id is not None:
+            outcome = conn.execute(
+                "SELECT comm.supersede_for_create(%s)", (supersedes_id,)
+            ).fetchone()
+            if outcome is None or outcome[0] not in ("applied", "skipped"):
+                raise RuntimeError(f"comm.supersede_for_create returned {outcome!r}")
         conn.execute("SELECT pg_notify('jarvis_outbox', %s)", (str(outbox_id),))
     return outbox_id

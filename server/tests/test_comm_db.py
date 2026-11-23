@@ -606,6 +606,155 @@ def test_create_outbox_skips_terminal_supersede_unaudited(
     ]
 
 
+# --- comm.supersede_for_create (R11-4): the check happens in SQL, under the row lock ----------
+
+SUPERSEDE_FOR_CREATE = "SELECT comm.supersede_for_create(%s)"
+
+
+class _RollBack(Exception):
+    """Raised inside session A's transaction so that it rolls back."""
+
+
+@pytest.mark.parametrize("via", ["create_outbox", "direct"])
+def test_supersede_for_create_race_writes_no_refusal(
+    dsns: Dsns, app: Conn, tracked_functions: None, via: str
+) -> None:
+    """The reviewer's race: B expires the target while A is inside create_outbox (or the SQL
+    call itself). A waits on the row lock, gets 'skipped', then rolls back. No REJECTED or
+    terminal audit row exists anywhere: only B's EXPIRE row."""
+    target = _item(app)
+    since = _seq(app)
+    seen_in_a: dict[str, Any] = {}
+
+    def session_a(c: Conn) -> None:
+        with c.transaction():
+            if via == "create_outbox":
+                new = _item(c, supersedes_id=target)
+                seen_in_a["new"] = new
+                calls = c.execute(  # the audited comm.supersede was never reached
+                    "SELECT coalesce(sum(calls), 0) FROM pg_stat_xact_user_functions"
+                    " WHERE schemaname = 'comm' AND funcname = 'supersede'"
+                ).fetchone()
+                seen_in_a["supersede_calls"] = None if calls is None else int(calls[0])
+            else:
+                seen_in_a["outcome"] = _one(c, SUPERSEDE_FOR_CREATE, (target,))
+            seen_in_a["audit"] = _audit(c, since)  # inside A's transaction, before rollback
+            seen_in_a["state"] = _state(c, target)
+            raise _RollBack
+
+    with psycopg.connect(dsns.app) as b:  # session B: expire, transaction held open
+        assert _one(b, "SELECT comm.expire(%s)", (target,)) == "applied"
+        a = InThread(dsns.app, session_a)
+        assert a.wait_until_blocked(dsns.superuser) in ROW_LOCK_WAITS
+        b.commit()
+    with pytest.raises(_RollBack):
+        a.join()
+
+    expire_only = [("outbox", target, "EXPIRE", "PENDING", "EXPIRED", "APPLIED", "expired", {})]
+    assert seen_in_a["audit"] == expire_only
+    if via == "create_outbox":
+        assert seen_in_a["supersede_calls"] == 0
+        assert (
+            _one(app, "SELECT count(*) FROM comm.outbox WHERE id = %s", (seen_in_a["new"],)) == 0
+        )  # A's new item rolled back with it
+    else:
+        assert seen_in_a["outcome"] == "skipped"
+    assert seen_in_a["state"] == "EXPIRED"
+    with psycopg.connect(dsns.app, autocommit=True) as other:  # after A's rollback
+        assert _audit(other, since) == expire_only
+        rejected = _one(
+            other,
+            "SELECT count(*) FROM audit.event WHERE seq > %s"
+            " AND (outcome = 'REJECTED' OR reason = 'terminal')",
+            (since,),
+        )
+        assert rejected == 0
+    assert _state(app, target) == "EXPIRED"
+
+
+def test_supersede_for_create_skipped_is_unaudited(app: Conn, gateway: Conn) -> None:
+    _, conn_id = _connected(app, gateway)
+    targets = {"EXPIRED": _item(app), "SUPERSEDED": _item(app), "ACKNOWLEDGED": _item(app)}
+    assert _one(app, "SELECT comm.expire(%s)", (targets["EXPIRED"],)) == "applied"
+    assert _one(app, "SELECT comm.supersede(%s)", (targets["SUPERSEDED"],)) == "applied"
+    assert _one(gateway, ACK, (conn_id, targets["ACKNOWLEDGED"])) == "ACKNOWLEDGED"
+    for state, target in targets.items():
+        before = app.execute(
+            "SELECT state, state_changed_at FROM comm.outbox WHERE id = %s", (target,)
+        ).fetchone()
+        since = _seq(app)
+        assert _one(app, SUPERSEDE_FOR_CREATE, (target,)) == "skipped", state
+        assert _seq(app) == since, state  # no audit row of any kind
+        after = app.execute(
+            "SELECT state, state_changed_at FROM comm.outbox WHERE id = %s", (target,)
+        ).fetchone()
+        assert after == before and after is not None and after[0] == state
+
+
+def test_supersede_for_create_applied_is_audited(app: Conn, dsns: Dsns) -> None:
+    live = _item(app)
+    since = _seq(app)
+    with psycopg.connect(dsns.app, autocommit=True) as listener:
+        listener.execute("LISTEN jarvis_outbox")
+        with app.transaction():
+            assert _one(app, SUPERSEDE_FOR_CREATE, (live,)) == "applied"
+            assert _state(app, live) == "SUPERSEDED"
+            in_txn = _audit(app, since)  # the audit row is written in the same transaction
+        got = [n.payload for n in listener.notifies(timeout=5, stop_after=1)]
+    row = ("outbox", live, "SUPERSEDE", "PENDING", "SUPERSEDED", "APPLIED", "superseded", {})
+    assert in_txn == [row]
+    assert _audit(app, since) == [row]
+    assert got == [str(live)]
+    with pytest.raises(psycopg.errors.InvalidParameterValue):
+        app.execute(SUPERSEDE_FOR_CREATE, (uuid.uuid4(),))
+    with pytest.raises(psycopg.errors.InvalidParameterValue):
+        app.execute(SUPERSEDE_FOR_CREATE, (None,))
+
+
+def test_direct_supersede_of_terminal_still_audited(app: Conn) -> None:
+    item = _item(app)
+    assert _one(app, "SELECT comm.expire(%s)", (item,)) == "applied"
+    since = _seq(app)
+    assert _one(app, "SELECT comm.supersede(%s)", (item,)) == "terminal"
+    assert _audit(app, since) == [
+        ("outbox", item, "SUPERSEDE", "EXPIRED", None, "REJECTED", "terminal", {}),
+    ]
+    assert _state(app, item) == "EXPIRED"
+
+
+def test_supersede_for_create_grants(gateway: Conn, app: Conn, owner: Conn) -> None:
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        gateway.execute(SUPERSEDE_FOR_CREATE, (uuid.uuid4(),))
+    with pytest.raises(psycopg.errors.InvalidParameterValue):  # app may execute it
+        app.execute(SUPERSEDE_FOR_CREATE, (uuid.uuid4(),))
+    row = owner.execute(
+        "SELECT p.prosecdef, p.proconfig, pg_get_userbyid(p.proowner),"
+        " (SELECT array_agg(pg_get_userbyid(a.grantee)::text ORDER BY 1)"
+        "  FROM aclexplode(p.proacl) a"
+        "  WHERE a.privilege_type = 'EXECUTE' AND a.grantee <> p.proowner),"
+        " EXISTS (SELECT 1 FROM aclexplode(p.proacl) a WHERE a.grantee = 0),"
+        " p.prorettype::regtype::text"
+        " FROM pg_proc p WHERE p.oid = 'comm.supersede_for_create(uuid)'::regprocedure"
+    ).fetchone()
+    assert row == (
+        True,
+        ["search_path=pg_catalog, pg_temp"],
+        "jarvis_owner",
+        ["jarvis_app"],
+        False,
+        "text",
+    )
+    for role in (GATEWAY_ROLE, "public"):
+        assert (
+            _one(
+                owner,
+                "SELECT has_function_privilege(%s, 'comm.supersede_for_create(uuid)', 'EXECUTE')",
+                (role,),
+            )
+            is False
+        )
+
+
 def test_supersede_and_expire_report_outcome(app: Conn) -> None:
     item = _item(app)
     other = _item(app)

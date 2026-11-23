@@ -10,9 +10,11 @@
   and calls gw.current_node(p_conn_id) first, in the same transaction; it takes no other lock
   on gw.node or gw.node_connection itself, and never calls the heartbeat (R8-1).
 - jarvis_app writes conversations and events, creates outbox items (always PENDING), and
-  EXECUTEs comm.supersede and comm.expire. Outbox state changes only through these functions:
-  each locks the item FOR UPDATE, moves its state forward only and writes one audit row per
-  call. A trigger refuses any other change, for every role.
+  EXECUTEs comm.supersede, comm.supersede_for_create (create_outbox only, R11-4) and
+  comm.expire. Outbox state changes only through these functions: each locks the item FOR
+  UPDATE and moves its state forward only. Every call writes one audit row, except a 'skipped'
+  comm.supersede_for_create, which is a non-audited no-op (R11-2). A trigger refuses any other
+  change, for every role.
 - Refused requests write the REJECTED audit row and return a reason code (R7-1): an unknown
   inbound kind (unknown_kind); a message_id already recorded by another node (id_conflict,
   R9-4); an outbox item unknown or of another person (unknown_item, R9-5); a stream chunk of
@@ -500,6 +502,30 @@ BEGIN
 END;
 $$;
 
+-- Core, for comm.create_outbox only (R11-4): the target's state is checked here, under this
+-- function's own FOR UPDATE lock, never by an application-side read. An item that is already
+-- terminal is a non-audited no-op, 'skipped' (R11-2): nothing is written, so nothing can be
+-- lost if the caller's transaction rolls back. A live item is superseded by comm.supersede
+-- itself, in the same transaction ('applied', with its audit row and NOTIFY). Its terminal
+-- branch can't run from here: this transaction holds the row lock, so the state can't change
+-- in between.
+CREATE FUNCTION comm.supersede_for_create(p_outbox_id uuid) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_state text;
+BEGIN
+    SELECT o.state INTO v_state FROM comm.outbox o WHERE o.id = p_outbox_id FOR UPDATE;
+    IF v_state IS NULL THEN
+        RAISE EXCEPTION 'malformed supersede_for_create call'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF v_state IN ('ACKNOWLEDGED', 'SUPERSEDED', 'EXPIRED') THEN
+        RETURN 'skipped';
+    END IF;
+    RETURN comm.supersede(p_outbox_id);
+END;
+$$;
+
 CREATE FUNCTION comm.expire(p_outbox_id uuid) RETURNS text
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
@@ -529,6 +555,7 @@ REVOKE ALL ON FUNCTION comm.record_received(bigint, uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION comm.acknowledge(bigint, uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION conv.record_chunk_received(bigint, uuid, integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION comm.supersede(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION comm.supersede_for_create(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION comm.expire(uuid) FROM PUBLIC;
 
 GRANT EXECUTE ON FUNCTION conv.record_inbound(bigint, uuid, text, jsonb) TO jarvis_gateway;
@@ -537,6 +564,7 @@ GRANT EXECUTE ON FUNCTION comm.record_received(bigint, uuid) TO jarvis_gateway;
 GRANT EXECUTE ON FUNCTION comm.acknowledge(bigint, uuid) TO jarvis_gateway;
 GRANT EXECUTE ON FUNCTION conv.record_chunk_received(bigint, uuid, integer) TO jarvis_gateway;
 GRANT EXECUTE ON FUNCTION comm.supersede(uuid) TO jarvis_app;
+GRANT EXECUTE ON FUNCTION comm.supersede_for_create(uuid) TO jarvis_app;
 GRANT EXECUTE ON FUNCTION comm.expire(uuid) TO jarvis_app;
 """
 
@@ -598,6 +626,7 @@ def downgrade() -> None:
     """)
     op.execute(f"""
     DROP FUNCTION comm.expire(uuid);
+    DROP FUNCTION comm.supersede_for_create(uuid);
     DROP FUNCTION comm.supersede(uuid);
     DROP FUNCTION conv.record_chunk_received(bigint, uuid, integer);
     DROP FUNCTION comm.acknowledge(bigint, uuid);
