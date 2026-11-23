@@ -118,7 +118,10 @@ FUNCTIONS = """
 -- Internal (R12-3): the refusal tally. SECURITY INVOKER, called only inside the owner's
 -- SECURITY DEFINER functions (gw.enrol_node, gw.refuse_handshake); nobody may EXECUTE it.
 -- Locks: the window row FOR UPDATE, then the key's tally row; never a node or connection lock.
--- The window lock serialises every caller, so the decision below can't race.
+-- The window lock serialises every caller, so the decision below can't race. now() is the
+-- caller's transaction start, so a caller can reach the lock after another has already moved
+-- the row to a later window: the row never moves back, and the effective window is the later
+-- of the two, for the ceiling and for the key's last audited window alike.
 CREATE FUNCTION gw.tally_refusal(
     p_action text, p_code text, p_tailscale_identity text, p_node_id uuid,
     p_enrolment_id uuid, p_entity_id uuid, p_details jsonb
@@ -134,9 +137,11 @@ DECLARE
 BEGIN
     SELECT w.window_start, w.audited INTO v_start, v_audited
         FROM gw.refusal_window w WHERE w.id = 1 FOR UPDATE;
-    IF v_start IS DISTINCT FROM v_window THEN  -- a new window
+    IF v_start < v_window THEN  -- a new window
         UPDATE gw.refusal_window w SET window_start = v_window, audited = 0 WHERE w.id = 1;
         v_audited := 0;
+    ELSE  -- this window, or a later one already opened by a caller whose transaction is newer
+        v_window := v_start;
     END IF;
     -- The key's row, found or created through the NULLS NOT DISTINCT constraint. Its ctid
     -- addresses the row version this statement wrote, which only this transaction can change.
@@ -434,6 +439,7 @@ BEGIN
                          'reenrol_required', 'malformed', 'unknown_peer')
        OR (p_tailscale_identity IS NOT NULL
            AND length(p_tailscale_identity) NOT BETWEEN 1 AND 200)
+       OR (p_code = 'unknown_node' AND p_node_id IS NOT NULL)  -- never a claimed node ID
        OR (p_node_id IS NOT NULL
            AND NOT EXISTS (SELECT 1 FROM gw.node n WHERE n.id = p_node_id)) THEN
         RAISE EXCEPTION 'malformed refuse_handshake call'

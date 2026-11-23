@@ -1178,9 +1178,11 @@ def test_refuse_handshake_rejects_other_codes(app: Conn, gateway: Conn, owner: C
 
 
 def test_refuse_handshake_argument_checks(app: Conn, gateway: Conn, owner: Conn) -> None:
+    registered = _node(app, gateway)
     since = _seq(app)
     for code, ts, node in (
         ("unknown_node", _ts(), uuid.uuid4()),  # an unregistered node is never stored
+        ("unknown_node", _ts(), registered),  # unknown_node never carries a node ID (R12-1)
         ("malformed", "", None),
         ("malformed", "x" * 201, None),
     ):
@@ -1218,6 +1220,36 @@ def test_refusal_tally_one_row_per_key_per_window(app: Conn, gateway: Conn, owne
     rows = _audit_rows(app, since)
     assert len(rows) == 1 and rows[0][4]["suppressed"] == "499"
     assert _tally(app, "CONNECT_REFUSED", "bad_signature", ts, node_id) == 0
+
+
+def test_refusal_window_never_moves_back(app: Conn, gateway: Conn, owner: Conn) -> None:
+    """A caller whose transaction began in an earlier quarter-hour than the row's window must
+    not reset the ceiling (review I-1): the later window stays in force."""
+    _avoid_window_edge(owner)
+    owner.execute(
+        "UPDATE gw.refusal_window SET audited = 30, window_start ="
+        " date_bin('15 minutes', now(), '2000-01-01 00:00+00') + interval '15 minutes'"
+    )
+    before = owner.execute("SELECT window_start, audited FROM gw.refusal_window").fetchone()
+    assert before is not None
+    since = _seq(app)
+    assert _refuse(gateway, "malformed", _ts()) == "counted"
+    assert owner.execute("SELECT window_start, audited FROM gw.refusal_window").fetchone() == before
+    assert _audit_rows(app, since) == []
+    # Below the ceiling of that later window, a new key is recorded in that window.
+    owner.execute("UPDATE gw.refusal_window SET audited = 29")
+    ts = _ts()
+    assert _refuse(gateway, "malformed", ts) == "recorded"
+    assert owner.execute("SELECT window_start, audited FROM gw.refusal_window").fetchone() == (
+        before[0],
+        30,
+    )
+    row = app.execute(
+        f"SELECT last_audited_window FROM gw.refusal_tally WHERE {TALLY_KEY}",
+        ("CONNECT_REFUSED", "malformed", ts, None, None),
+    ).fetchone()
+    assert row == (before[0],)
+    assert len(_audit_rows(app, since)) == 1
 
 
 def test_refusal_tally_keys_are_distinct(app: Conn, gateway: Conn, owner: Conn) -> None:
