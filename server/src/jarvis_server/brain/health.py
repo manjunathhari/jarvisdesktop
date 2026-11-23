@@ -10,8 +10,9 @@ null) on its own committed connection (R12-13). Success settles it, marks the br
 sends CLAUDE_BACK (`brain.back`) to everyone who was sent the current "Claude down" item,
 superseding that item where it is still open (R12-17). A CONNECT failure releases the
 reservation; a SEND failure (or any exception the brain raises that is not a placed
-`BrainCallFailed`) lapses it at full value; either counts as a failure. Re-queueing the turns
-held while the brain was down is the conversation turn's job (Task 10), not the probe's.
+`BrainCallFailed`) lapses it at full value; either counts as a failure. When the brain comes
+back (from a probe or from a turn's own successful call), `came_back` runs the hooks registered
+with `on_back`: the conversation turn registers the re-run of held turns (Task 10, §10.2).
 
 The probe gets its brain from `set_probe_brain`, set by the process that wires the brain up;
 without one a probe job fails (`NoProbeBrain`) rather than pretending the brain is fine.
@@ -21,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import Any
 from uuid import UUID
 
 import psycopg
@@ -52,15 +53,14 @@ PROBE_REQUEST = BrainRequest(
 _DOWN_KINDS = ("brain.down", "brain.down.with_held")
 
 
-class MeteredBrain(Brain, Protocol):
-    """A brain that reports `(input_tokens, output_tokens)` after a completed call."""
-
-    usage: tuple[int, int] | None
-
+# Every `Brain` reports its usage (Task 8 carry-over a); the name is kept for callers.
+MeteredBrain = Brain
 
 ProbeBrain = Callable[[], tuple[MeteredBrain, str]]  # -> (brain, model name)
+BackHook = Callable[[psycopg.Connection[Any]], None]
 
 _probe_brain: ProbeBrain | None = None
+_back_hooks: list[BackHook] = []
 
 
 class NoProbeBrain(RuntimeError):
@@ -70,6 +70,12 @@ class NoProbeBrain(RuntimeError):
 def set_probe_brain(provider: ProbeBrain | None) -> None:
     global _probe_brain
     _probe_brain = provider
+
+
+def on_back(hook: BackHook) -> BackHook:
+    """Decorator: run `hook(conn)` in the transaction that reports the brain back."""
+    _back_hooks.append(hook)
+    return hook
 
 
 def _locked(conn: psycopg.Connection[Any]) -> tuple[bool, int]:
@@ -145,6 +151,13 @@ def _announce_back(conn: psycopg.Connection[Any]) -> None:
         rules.notify(conn, "brain.back", person_id=person_id, event_id=event_id, context={})
 
 
+def came_back(conn: psycopg.Connection[Any]) -> None:
+    """The brain has just come back: CLAUDE_BACK, then every `on_back` hook."""
+    _announce_back(conn)
+    for hook in _back_hooks:
+        hook(conn)
+
+
 def probe(conn: psycopg.Connection[Any], brain: MeteredBrain, model: str, *, job_id: int) -> bool:
     """One probe call for job `job_id` (claimed: its lease is the reservation's lease).
     True when the brain has just come back.
@@ -197,7 +210,7 @@ def probe(conn: psycopg.Connection[Any], brain: MeteredBrain, model: str, *, job
         return False
     back = record_success(conn)
     if back:
-        _announce_back(conn)
+        came_back(conn)
     return back
 
 

@@ -31,7 +31,7 @@ from jarvis_server import config, jobs, migrate, nodes, signing, smoke
 from jarvis_server.bootstrap import bootstrap
 from jarvis_server.brain import budget as _budget_jobs  # noqa: F401  registers job kinds
 from jarvis_server.brain import health as _health_jobs  # noqa: F401  registers job kinds
-from jarvis_server.core import dispatch
+from jarvis_server.core import dispatch, turn
 from jarvis_server.dbcall import Refused
 from jarvis_server.memory import checks as memory_checks
 from jarvis_server.memory import format as memory_format
@@ -107,6 +107,7 @@ def serve(poll_seconds: float = 2.0) -> None:
     with psycopg.connect(config.app_dsn(), autocommit=True) as conn:
         log.info("core started as %s", worker)
         memory = memory_service.open_engine(conn)  # refuses to start if memory does not load
+        turn.set_memory(memory)  # conv.turn reads memory as the authenticated person
 
         def _tick() -> None:
             nonlocal last_beat

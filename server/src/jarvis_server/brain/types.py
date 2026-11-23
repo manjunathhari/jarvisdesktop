@@ -79,4 +79,10 @@ class BrainCallFailed(Exception):
 
 
 class Brain(Protocol):
+    """A brain call streams events; after a completed stream `usage` is
+    `(input_tokens, output_tokens)` as the provider reported them, or None if it did not
+    complete (or reported none, which the caller treats as fail closed)."""
+
+    usage: tuple[int, int] | None
+
     def think(self, req: BrainRequest) -> Iterator[BrainEvent]: ...
