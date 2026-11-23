@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12, uv, psycopg 3 (sync in core, async in the gateway), Alembic, FastAPI and uvicorn, `rfc8785`, `cryptography` (Ed25519), `httpx` (Claude), pytest, ruff, mypy; Postgres 17; Docker Compose; `tailscale/tailscale` sidecar.
 
-**Plan revision:** 11 (22 Nov 2026). Revision 11 adds the in-job audited-refusal rule and `audited_call_in_job` (Task 11), the 'audit rows always survive' rule with `create_outbox`'s non-audited skip, and typed `NotifyContext` (Task 5 interface). Spec R11-1 to R11-3. Revision 10 makes `ledger.consume_approval` an audited structured refusal and states the trigger is a backstop (spec R10-1, R10-2). That changes Task 4 and the Task 11 caller rule. Revision 9 applies Manj's rulings on the Task 3 review (spec R9-1 to R9-6): stream-cursor isolation by session (Tasks 3, 7, 10 and 11), strict event details, `supersede` / `expire` outcomes, `id_conflict`, `unknown_item`, the `stream_cursor` grant, the stricter Task 2 mixed-load test, and two Task 7 notes. Revision 8 (corrected after Manj's review: the exact set of functions that do and don't call `current_node` is now explicit). Revision 8 applies Manj's rulings on the Task 2 review (spec R8-1, R8-2): strict fencing with one lock order and race tests in both orders (Tasks 2, 3 and 7), CONNECT / DISCONNECT audit, and five smaller points in Task 2. Revision 7 (corrected after Manj's review: Task 2 Step 3 now returns structured refusals instead of raising). Revision 7 applies Manj's rulings on Task 2 (spec R7-1 to R7-6): audited refusals return a structured result and the caller commits before raising, audited enrolment creation, the five-function `gw` surface, `last_ping_at`, the `JF001` fencing error and the 0008 rollback rule. They change Tasks 2 and 3. Revision 6 (corrected after Manj's review: Task 6's enrolment test ends with `welcome` and makes no second `hello`, and Task 12's key-source statements now separate enrolment from ordinary welcomes and rotation). Revision 6 adds Manj's handshake corrections (spec R6-6 to R6-8): the enrolment key-pinning `welcome` block, separate `hello` and `enrol` validation paths, per-sender `seq`, and stale-node refusal after the challenge. They change Task 1, Task 6 and Task 12's tests. Revision 5 applied Manj's Task 1 rulings (spec Revision 6): the `challenge` kind and nonce handshake, key-announcement expiry, gateway/core key separation cases and the timestamp rule. They change Task 1 (contracts and shared cases) and Task 6 (handshake tests). Revision 4 fixed the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
+**Plan revision:** 11 (corrected 23 Nov 2026 after Manj's review: the no-brain test checks loaded modules in a subprocess, and the `create_outbox` terminal-supersede skip moves to the Task 5 follow-up). Revision 11 adds the in-job audited-refusal rule and `audited_call_in_job` (Task 11), the 'audit rows always survive' rule with `create_outbox`'s non-audited skip, and typed `NotifyContext` (Task 5 interface). Spec R11-1 to R11-3. Revision 10 makes `ledger.consume_approval` an audited structured refusal and states the trigger is a backstop (spec R10-1, R10-2). That changes Task 4 and the Task 11 caller rule. Revision 9 applies Manj's rulings on the Task 3 review (spec R9-1 to R9-6): stream-cursor isolation by session (Tasks 3, 7, 10 and 11), strict event details, `supersede` / `expire` outcomes, `id_conflict`, `unknown_item`, the `stream_cursor` grant, the stricter Task 2 mixed-load test, and two Task 7 notes. Revision 8 (corrected after Manj's review: the exact set of functions that do and don't call `current_node` is now explicit). Revision 8 applies Manj's rulings on the Task 2 review (spec R8-1, R8-2): strict fencing with one lock order and race tests in both orders (Tasks 2, 3 and 7), CONNECT / DISCONNECT audit, and five smaller points in Task 2. Revision 7 (corrected after Manj's review: Task 2 Step 3 now returns structured refusals instead of raising). Revision 7 applies Manj's rulings on Task 2 (spec R7-1 to R7-6): audited refusals return a structured result and the caller commits before raising, audited enrolment creation, the five-function `gw` surface, `last_ping_at`, the `JF001` fencing error and the 0008 rollback rule. They change Tasks 2 and 3. Revision 6 (corrected after Manj's review: Task 6's enrolment test ends with `welcome` and makes no second `hello`, and Task 12's key-source statements now separate enrolment from ordinary welcomes and rotation). Revision 6 adds Manj's handshake corrections (spec R6-6 to R6-8): the enrolment key-pinning `welcome` block, separate `hello` and `enrol` validation paths, per-sender `seq`, and stale-node refusal after the challenge. They change Task 1, Task 6 and Task 12's tests. Revision 5 applied Manj's Task 1 rulings (spec Revision 6): the `challenge` kind and nonce handshake, key-announcement expiry, gateway/core key separation cases and the timestamp rule. They change Task 1 (contracts and shared cases) and Task 6 (handshake tests). Revision 4 fixed the `resume` rule in Task 7 (validate, then fall back to the acknowledged cursor; no clamping) and points to spec Revision 5. Revision 3 added the offline-node re-enrolment rule, heartbeat fencing, bounded `resume`, and three small corrections. Revision 2, after Manj's review, added: durable stream cursor, connection fencing, key rotation as Task 12, independent signing vectors, explicit S1/S4/S6 tests, init smoke limited to database-only rows, and the other additions in the review.
 
 **Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, **Revision 11** (R11-1 to R11-3, on top of the approved Revisions 4 to 10). Implementers work from Revision 11 only. Section references (§) below point there. Read it alongside this plan.
 
@@ -580,7 +580,7 @@ git commit -am "Phase 2: approvals with single consumption, brain budget tables 
   - `dispatch.register(kind: str) -> Callable[[Handler], Handler]` (decorator), `dispatch.handle(conn, job: jobs.Job) -> None` (an unknown kind raises `UnknownJob`)
   - `rules.notify(conn, event_kind: str, *, person_id: UUID, event_id: UUID, context: NotifyContext) -> list[UUID]`: applies the §8.1 table and returns the outbox ids
   - `class NotifyContext(TypedDict, total=False)` in `core/rules.py` (spec R11-3): `supersedes_id: UUID`, `expires_at: datetime` (aware), `group_key: str`, `text: str`, and `authz: contracts.Authz` (a dict of the signed object, carried untrusted). An absent `group_key` is stored as NULL, never as a placeholder string
-  - `summary.reconnect_summary(conn, person_id: UUID) -> list[dict[str, Any]]`: the §8.3 ordering, built from fixed templates with no brain import (enforced by a test that greps the module's imports)
+  - `summary.reconnect_summary(conn, person_id: UUID) -> list[dict[str, Any]]`: the §8.3 ordering, built from fixed templates, with no brain or model module loaded, directly or indirectly (enforced by a test that imports `core.summary` in a fresh subprocess and checks `sys.modules`)
   - job kind `system.event`, payload `{event_id, event_kind, person_id, context}` → `rules.notify`
 
 - [ ] **Step 1: Write the failing tests**
@@ -603,7 +603,9 @@ def test_brain_back_supersedes_down(app): ...
 def test_approval_requested_over_an_hour_is_today(app):      # expiry 2 h → TODAY (Phase 3 branch)
 def test_summary_order(app):                                 # mixed items → URGENT first one-by-one, TODAY grouped by
                                                              #   group_key, DIGEST one line per group, SILENT absent (P2-E07)
-def test_summary_needs_no_brain():                           # 'jarvis_server.brain' not imported by core.summary (P2-E08)
+def test_summary_needs_no_brain():                           # fresh subprocess: `import jarvis_server.core.summary`, then
+                                                             #   sys.modules contains no jarvis_server.brain*, anthropic, httpx,
+                                                             #   openai or requests module, including indirect imports (P2-E08)
 def test_server_initiated_event_creates_outbox_without_node(app):  # enqueue system.event; run dispatch; outbox row (P2-E01)
 def test_unknown_job_kind_fails_job(app): ...
 ```
@@ -624,6 +626,23 @@ Expected: all PASS
 
 ```bash
 git commit -am "Phase 2: core dispatch, deterministic notification rules, reconnect summary"
+```
+
+**Task 5 follow-up (owner-authorised, 23 Nov; spec R11-2, R11-3).** One bounded round:
+- **`NotifyContext`:** replace `rules.notify`'s `Mapping[str, Any]` context with the typed `NotifyContext` above. It has all five optional fields and their types; `expires_at` must be timezone-aware, or the call raises `ValueError` and writes nothing; and an absent `group_key` is stored as NULL, never the string `"None"`.
+- **The no-brain test:** the subprocess `sys.modules` version above.
+- **`comm.create_outbox`**, in Task 3's `comm.py`: when `supersedes_id` names an item that is already terminal, skip the supersede as a **non-audited no-op**. Create the new item normally, and don't call the audited `comm.supersede`. No refusal audit row is written. This doesn't reopen Task 3 generally.
+- **Tests:**
+
+```python
+def test_notify_context_types(app):                          # naive expires_at → ValueError, nothing written; each field accepted
+def test_absent_group_key_stays_null(app):                   # no group_key → comm.outbox.group_key IS NULL; two such items are not
+                                                             #   grouped together in reconnect_summary
+def test_authz_carried_untrusted(app):                       # an authz with a bad signature is carried unchanged into the item;
+                                                             #   rules/summary never verify or mark it trusted (no 'verified' field,
+                                                             #   no signature check); node_rules.check_node_action still rejects it
+def test_create_outbox_skips_terminal_supersede_unaudited(app):  # supersedes_id on a terminal item → new item created; no
+                                                             #   REJECTED audit row; old item unchanged; comm.supersede not called
 ```
 
 ---
@@ -1041,8 +1060,7 @@ git commit -am "Phase 2: conversation turn with sessions, memory retrieval, hold
       - approval creation writes a creation audit row;
       - expiry is checked under the approval row lock **before** the decision `UPDATE`, so the backstop trigger never raises inside a transaction holding a refusal;
       - no refusal is ever turned into a database exception;
-    - **`dbcall.audited_call_in_job`** is added in this task, together with the dispatch context variable that marks the job transaction;
-    - **`comm.create_outbox`**: when `supersedes_id` names an item that is already terminal, it skips the supersede as a **non-audited no-op** instead of calling the audited `comm.supersede` (spec R11-2). This is a change to Task 3's `comm.py`, made here.
+    - **`dbcall.audited_call_in_job`** is added in this task, together with the dispatch context variable that marks the job transaction. The `comm.create_outbox` terminal-supersede skip (spec R11-2) is **not** this task's: it was done in the Task 5 follow-up.
     - `action.receipt`: one receipt per key; the file ID and hash check; a fresh listing; then the outcome and close (§9.4);
     - `approval.expire` and `approval.expiring` (scheduled).
   - **`memory.write` from conversation (REVERSIBLE, §12):** `actions.memory_write(conn, engine, *, person_id, content: str, category: str, topics: Sequence[str]) -> str` writes a STATED entry with `by = memory_slug(person_id)` and `source = <inbound id>`, and creates a SILENT outbox item for history. Claude's arguments can never set `by`, `viewer` or the subject.
@@ -1081,8 +1099,6 @@ def test_audited_call_in_job_refuses_outside_job(app):    # called outside dispa
 def test_every_approval_refusal_follows_the_rule(...):    # each refusal path in the decision handler (wrong card_sig, other
                                                           #   person, revoked node, not pending, expired, not_approved,
                                                           #   already_consumed) → job DONE with the audit row kept
-def test_create_outbox_skips_terminal_supersede_unaudited(app):  # supersedes_id on a terminal item → new item created; no
-                                                          #   REJECTED audit row; the old item unchanged
 def test_memory_write_uses_authenticated_person(...):  # ToolCall(memory.write, args incl. by='daughter') → entry by 'manj', STATED
 def test_delete_proposal_links_ticket_to_session(...): # conv.session_ticket row exists
 def test_fake_node_rejects_action_for_another_node(...):   # P2-S4: core-signed action with target_node_id = node B, sent to A
