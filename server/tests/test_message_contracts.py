@@ -335,3 +335,25 @@ def test_delete_receipt_without_a_file_found() -> None:
     validator(_schema("action.receipt")).validate(payload)
     for name in ("pc.list_test_folder.receipt", "pc.delete_test_file.receipt"):
         validator(_schema("action.receipt")).validate(_example(name, "valid"))
+
+
+@pytest.mark.parametrize(
+    ("check", "ok"),
+    [("omitted", True), ("folder_reparse_point", True), (None, False), ("Bad", False)],
+)
+def test_delete_evidence_check_is_omitted_never_null(check: Any, ok: bool) -> None:
+    """Fix round 2 (C): model and schema agree that `check` is optional but never null."""
+    evidence: dict[str, Any] = {"file_id": None, "before_sha256": None, "recycled_at": None}
+    if check != "omitted":
+        evidence["check"] = check
+    payload = {
+        "execution_key": "e1d2c3b4-a5f6-4e7d-8c9b-0a1f2e3d4c5b",
+        "result": "REFUSED",
+        "evidence": evidence,
+    }
+    assert validator(_schema("pc.delete_test_file.receipt")).is_valid(payload) is ok
+    if ok:
+        c.DeleteReceipt.model_validate(payload)
+    else:
+        with pytest.raises(ValidationError):
+            c.DeleteReceipt.model_validate(payload)

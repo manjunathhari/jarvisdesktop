@@ -17,6 +17,7 @@ from pydantic import (
     ConfigDict,
     Field,
     RootModel,
+    field_validator,
     model_validator,
 )
 
@@ -577,7 +578,14 @@ class DeleteEvidence(_Contract):
     file_id: WindowsFileId | None
     before_sha256: Sha256Hex | None
     recycled_at: AwareDatetime | None
-    check: Code | None = None
+    check: Code | None = None  # omitted when there is none; never null, as in the schema
+
+    @field_validator("check", mode="before")
+    @classmethod
+    def _check_not_null(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("`check` is omitted when there is none, never null")
+        return value
 
 
 class DeleteReceipt(_Contract):

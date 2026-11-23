@@ -655,6 +655,8 @@ def test_one_receipt_per_key(
         ("listing_error", "listing_failed"),
         ("listing_error_partial", "listing_failed"),
         ("listing_malformed", "listing_failed"),
+        ("listing_duplicate_name", "listing_failed"),
+        ("listing_duplicate_id", "listing_failed"),
     ],
 )
 def test_receipt_mismatch_fails_task(
@@ -693,6 +695,11 @@ def test_receipt_mismatch_fails_task(
             refused = flow.inbound(owner, node, person, "action.receipt",
                                    {"reply_id": str(reply), "seq": seq, "result": "OK",
                                     "evidence": {}})  # fmt: skip
+        elif variant == "listing_duplicate_name":  # A's file ID hidden behind b.txt's name
+            refused = _listing(owner, node, person, reply, seq, [{**A_TXT, "name": "b.txt"}, B_TXT])
+        elif variant == "listing_duplicate_id":
+            refused = _listing(owner, node, person, reply, seq,
+                               [B_TXT, {**B_TXT, "name": "c.txt"}])  # fmt: skip
         else:
             files = [A_TXT, B_TXT] if variant == "still_listed" else [B_TXT]
             refused = _listing(owner, node, person, reply, seq, files, received_at=late)
@@ -705,6 +712,46 @@ def test_receipt_mismatch_fails_task(
     with psycopg.connect(dsns.app, autocommit=True) as other:
         assert flow.receipt_audit(other, refused) == [("REJECTED", code, {"node_id": str(node)})]
     assert "a.txt" in _last_speech(app, session) and "Done" not in _last_speech(app, session)
+
+
+def test_duplicate_names_in_the_proposal_listing_propose_nothing(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID
+) -> None:
+    """D: a listing that repeats a name (or a file ID) is malformed: fail closed."""
+    for files in ([{**B_TXT, "name": "a.txt"}, A_TXT], [A_TXT, {**A_TXT, "name": "c.txt"}]):
+        approvals.set_wait(None, flow.planting_listing(owner, node, person, files))
+        with pytest.raises(approvals.ListingUnavailable):
+            approvals.propose_delete(app, session_id=session, person_id=person, node_id=node,
+                                     name="a.txt", now=flow.db_now(app))  # fmt: skip
+    assert app.execute(
+        "SELECT count(*) FROM ledger.approval WHERE requesting_node_id = %s", (node,)
+    ).fetchone() == (0,)
+
+
+def test_replayed_receipt_refused_when_the_task_cannot_move(
+    dsns: Dsns, app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, proposed: uuid.UUID
+) -> None:
+    """A: the task was cancelled, so the mismatching receipt can't move it to FAILED (that
+    refusal is kept). The key's one receipt is still taken: the same receipt again is refused
+    `reused_key`, with its audit row."""
+    key = _approve(app, owner, person, node, proposed)
+    task_id = flow.approval_row(app, proposed)["task_id"]
+    app.execute("SELECT ledger.transition('task', %s, 'CANCELLED', 'AGENT', 'test', 'test')",
+                (task_id,))  # fmt: skip
+    first = _receipt(owner, node, person, key, file_id=B_TXT["file_id"])
+    flow.run(app, "action.receipt", {"inbound_id": str(first)})
+    assert flow.task_state(app, proposed) == "CANCELLED"
+    trail = [(e.to_state, e.outcome) for e in audit_trail(app, EntityType.TASK, task_id)]
+    assert trail[-1] == ("FAILED", "REJECTED")  # the kept refusal: nothing after it
+    assert flow.receipt_audit(app, first) == []
+    assert _action(app, key) == ("RECEIVED", None, 0)
+    again = _receipt(owner, node, person, key, file_id=B_TXT["file_id"])
+    job = flow.run(app, "action.receipt", {"inbound_id": str(again)})
+    assert flow.job_status(app, job) == "DONE" and flow.outcome_of(app, again) == "REFUSED"
+    with psycopg.connect(dsns.app, autocommit=True) as other:
+        assert flow.receipt_audit(other, again) == [
+            ("REJECTED", "reused_key", {"node_id": str(node)})
+        ]
 
 
 def test_verification_listing_that_never_comes_fails_the_task(

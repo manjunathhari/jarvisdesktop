@@ -178,14 +178,22 @@ def valid_file_name(name: str) -> bool:
 
 def parse_listing(payload: Any) -> dict[str, dict[str, Any]] | None:
     """The files, by name, of an `OK` listing receipt (contract `pc.list_test_folder.receipt`,
-    R12-25); None for any other result or a payload not in that shape."""
+    R12-25); None for any other result, a payload not in that shape, or a listing that repeats
+    a name or a file ID (JSON Schema can't express that uniqueness, so it is checked here)."""
     try:
         receipt = contracts.ListingReceipt.model_validate(payload)
     except ValidationError:
         return None
     if receipt.result != LISTING_OK:
         return None
-    return {f.name: f.model_dump() for f in receipt.evidence.files}
+    files = [f.model_dump() for f in receipt.evidence.files]
+    # A folder holds each name once and each file ID once. A listing that repeats either could
+    # hide the approved file behind another entry, so it is malformed: fail closed.
+    names = {f["name"] for f in files}
+    ids = {f["file_id"] for f in files}
+    if len(names) != len(files) or len(ids) != len(files):
+        return None
+    return {f["name"]: f for f in files}
 
 
 # --- memory.write ------------------------------------------------------------------------------
@@ -442,6 +450,9 @@ def _approved_receipt(
         refuse_receipt(conn, ref=inbound_id, node_id=node_id, code="reused_key",
                        inbound_id=inbound_id)  # fmt: skip
         return
+    # The key's one receipt is taken now, whatever happens to the task below: a replay of it
+    # is `reused_key` even if the task can't move (§9.4 "only for an issued key, once").
+    conn.execute("UPDATE ledger.action SET status = 'RECEIVED' WHERE id = %s", (issued.action_id,))
     end_items(conn, issued.approval_id, ("action.approved",))  # answered: never re-sent
     try:
         receipt = contracts.DeleteReceipt.model_validate(payload)
@@ -468,7 +479,6 @@ def _approved_receipt(
               inbound_id=None, evidence=evidence)  # fmt: skip
         return
     listing_reply = uuid.uuid4()
-    conn.execute("UPDATE ledger.action SET status = 'RECEIVED' WHERE id = %s", (issued.action_id,))
     conn.execute(
         "INSERT INTO ledger.outcome (action_id, verified, evidence, source_ref)"
         " VALUES (%s, false, %s, %s)",
