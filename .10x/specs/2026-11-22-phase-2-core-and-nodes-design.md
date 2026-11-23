@@ -1,6 +1,6 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** **Revision 11, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, revision 11. Revision 11 adds R11-1 to R11-3 (§20), from the Task 5 review: audited refusals inside a job transaction, the rule that an audit row always survives, and typed optional notification inputs.
+**Status:** **Revision 11b, awaiting Manj's review** (Revision 11 was approved on 23 Nov; 11b amends R11-3 only: the grouping-key fallback and the signed card's raw form). Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, revision 11. Revision 11 adds R11-1 to R11-3 (§20), from the Task 5 review: audited refusals inside a job transaction, the rule that an audit row always survives, and typed optional notification inputs.
 
 **Approval history:**
 - **Revision 4:** approved by Manj on 2026-11-22.
@@ -524,9 +524,9 @@ No job is involved, so enrolment works with core down.
 |---|---|---|
 | `supersedes_id` | UUID | The item this one supersedes |
 | `expires_at` | timestamp with offset | When the item expires, for example with its approval |
-| `group_key` | text | Groups related items in the reconnect summary (§8.3). When absent it stays absent (NULL), never a placeholder, so unrelated items are never grouped together |
+| `group_key` | text | Groups related items in the reconnect summary (§8.3). **The caller's grouping key, otherwise the rule's per-kind default; never a placeholder.** A non-empty key supplied by the caller takes precedence. An omitted key, or an explicit `None`, falls back to the rule's fixed default for that event kind, and is never stored as the text `"None"`. `comm.outbox.group_key` stays NOT NULL. Because each kind has its own default, related items, such as budget warnings, stay grouped, and unrelated kinds never share a group |
 | `text` | text | The reply text, for `turn.completed_after_hold` |
-| `authz` | the signed authorisation object (§7.1) | The core-signed approval card. It is carried as delivered. Delivery doesn't make it trusted: the node verifies it under §7.1, as for any authorisation |
+| `authz` | a raw dictionary with exactly the keys `object`, `key_id` and `sig` (§7.1) | The core-signed approval card, **passed through unchanged**. It is never parsed into a model and rebuilt before verification. Delivery doesn't make it trusted: the node verifies it under §7.1, as for any authorisation. Signatures cover `JCS(object)` (§7.1), not the original wire bytes, so the unchanged dictionary is enough to verify: re-serialising it canonically gives the same signed bytes |
 
 ### 8.2 Delivery to several nodes (exact rules)
 
@@ -985,4 +985,6 @@ Architecture direction approved; implementation approval pending these changes. 
 |---|---|---|
 | R11-1 | **Audited refusals inside a job:** the job transaction is the audited call's transaction, through `audited_call_in_job`. A kept refusal makes the handler return normally and stop, and dispatch commits it with the job. This applies to every approval refusal. | §4.1 |
 | R11-2 | **An audit row always survives:** there's no informational exception. An outcome that needs no record is a non-audited no-op. For example, `create_outbox` skips superseding an already terminal item without an audit row. | §4.1 |
-| R11-3 | **Typed optional notification inputs** (`NotifyContext`): `supersedes_id`, `expires_at`, `group_key` (NULL when absent), `text`, and `authz`, which stays untrusted until the node verifies it | §8.1 |
+| R11-3 | **Typed optional notification inputs** (`NotifyContext`): `supersedes_id`, `expires_at`, `group_key`, `text` and `authz`. **Amended in 11b (owner, 23 Nov):**
+  - `group_key` is the caller's key, otherwise the rule's per-kind default; never a placeholder, and the column stays NOT NULL;
+  - `authz` is the raw `{object, key_id, sig}` dictionary passed through unchanged, untrusted until the node verifies it. That is sufficient because signatures cover `JCS(object)` (§7.1). | §8.1 |
