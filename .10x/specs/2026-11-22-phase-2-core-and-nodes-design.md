@@ -1,6 +1,6 @@
 # JARVIS server — Phase 2 (Jarvis core and nodes) design
 
-**Status:** **Revision 12, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, **revision 12**. Revision 12 adds R12-1 to R12-5 (§20), from Manj's ruling of 23 Nov on the gateway audit gap: a sixth gateway function, `gw.refuse_handshake`; a bounded refusal tally against audit flooding; the gateway-computed clock skew, recorded by `gw.open_connection`; and a restricted Task 7 record for the resume event.
+**Status:** **Revision 12, awaiting Manj's review.** Matching plan: `.10x/plans/2026-11-22-phase-2-server.md`, **revision 12**. Revision 12 adds R12-1 to R12-7 (§20), from Manj's ruling of 23 Nov on the gateway audit gap: a sixth gateway function, `gw.refuse_handshake`; a bounded refusal tally against audit flooding; the gateway-computed clock skew, recorded by `gw.open_connection`; and a restricted Task 7 record for the resume event.
 
 **Approval history:**
 - **Revision 4:** approved by Manj on 2026-11-22.
@@ -469,6 +469,7 @@ Every message uses `contracts/node-envelope.schema.json`, made final in Phase 2.
 - **Serialisation:** RFC 8785, the JSON Canonicalization Scheme (JCS). Python uses the `rfc8785` package and Rust uses `serde_jcs`. Numbers in signed objects are integers only (amounts in paise, times as RFC 3339 strings), so JCS's number rules never come into play.
 - **Timestamps (R6-4).** Every timestamp in a protocol message or signed object is an RFC 3339 string **with an explicit offset**, such as `2026-11-22T10:02:00+05:30` or `…Z`. A timestamp without an offset is malformed and rejected. Database records, such as `ledger.approval`'s own columns, use Postgres `timestamptz` and are not wire formats. When a database value goes into a message or signed object (an approval card's `valid_until`, for example), it is written in this RFC 3339 form.
 - **Signed bytes:** `"jarvis-sig-v1\n" + purpose + "\n" + key_id + "\n" + JCS(object)`.
+- **Envelope `key_id` (R12-6).** Envelopes carry no `key_id` field; the signer's `key_id` is implied. A node signs every `node-msg` envelope under `key_id = fingerprint(its own public key)`, the 16-character fingerprint; the gateway computes it from `gw.node.public_key` (`hello`) or from the `enrol` payload's `public_key`. The gateway signs every `gw-transport` envelope on a connection under the `key_id` announced in that connection's `challenge`. `core-authz` signatures name their `key_id` in `authz`.
 - **Signature:** Ed25519 over those bytes, base64url without padding.
 - **Shared test vectors:** `contracts/signing-vectors/` holds objects, keys, purposes and expected signatures. The vectors are checked by both the Python and the Rust test suites in CI, so the two can't drift.
 
@@ -1045,3 +1046,5 @@ Architecture direction approved; implementation approval pending these changes. 
 | R12-3 | **Audit-flood protection:** a refusal tally keyed on server-side identifiers. One audit row per key per 15-minute window, at most 30 per window overall; every other refusal is counted, and the count is carried in the key's next audit row as `suppressed` | §4.1, §5.1 |
 | R12-4 | **Clock skew computed by the gateway:** from the signed `hello` or `enrol` `sent_at` against the gateway's clock. `gw.open_connection(node_id, clock_skew_ms)` records `node.clock_skew` (details `node_id`, `skew_ms`) in the same transaction, only above 30 s. The node's own `clock_skew_ms` is display-only. | §4.1, §6.1 step 4 |
 | R12-5 | **`node.resume_out_of_range` stays in Task 7**, recorded through a similarly restricted, fenced function; no general gateway event-writing function | §6.2 step 6 |
+| R12-6 | **Envelope signing `key_id`** (owner, 23 Nov, on Task 6's NEEDS_CONTEXT): a node signs `node-msg` envelopes under `fingerprint(node public key)`; the gateway signs `gw-transport` envelopes under the `key_id` its `challenge` announced. Nothing new on the wire. | §7.1 |
+| R12-7 | **Gateway's copy of the core public key** (owner, 23 Nov): the gateway reads it from a non-secret file `core_signing_key.pub` (raw 32-byte public key) in the secrets directory, alongside `gateway_signing_key.pub`, with `core_key_id = fingerprint(public)`. The gateway never reads `core_signing_key`. Task 14 supplies the file in deployment, and Task 12 replaces this source with `gw.trusted_key`. | §7.1 |

@@ -10,6 +10,10 @@ both check their code against these committed files. **Neither ever regenerates 
   JCS is RFC 8785 and `purpose` is `node-msg`, `gw-transport` or `core-authz`.
 - Signature: Ed25519 over those bytes, base64url without padding (86 characters).
 - An envelope's `sig` covers every other envelope field.
+- Envelopes carry no `key_id` field. A node signs `node-msg` envelopes under `key_id =
+  fingerprint(node public key)` (16 characters); the gateway signs `gw-transport` envelopes under the
+  `key_id` its connection's `challenge` announced (spec §7.1, R12-6). The vectors' `node-1` is only a
+  placeholder `key_id` for testing the byte layout.
 
 ## How they were made
 
