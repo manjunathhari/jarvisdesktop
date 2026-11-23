@@ -7,6 +7,10 @@ per node: a newer connection of the same node replaces and stops the older one, 
 `jarvis_outbox`, and runs a ticker for the heartbeat and the 60 s re-send sweep. Time comes from
 the injected clock (`now()`), never from sleeps.
 
+**Nothing shared waits on a socket (fix round 1, I-1).** Each link has its own queue and sender
+task; the listener, fan-out, ticker and sweep only enqueue. Every send is bounded by the send
+timeout; one that exceeds it closes that connection as `send_timeout`.
+
 **Every frame follows a fenced database call that succeeded (R8-1).** An outbox item is written
 only after `comm.record_sent` returned true in its own committed transaction; chunks, actions
 and `outbox.cleared` only after `gw.current_node`. `JF001` stops the connection without writing;
@@ -42,7 +46,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from datetime import datetime, timedelta
 from typing import Any, LiteralString, Protocol
 from uuid import UUID
@@ -67,6 +71,8 @@ RESUME_LIMIT = 64
 MAX_BODY = 4000
 SERVER_ERROR = "server_error"
 HEARTBEAT_REASON = "heartbeat"
+SEND_TIMEOUT = "send_timeout"
+SEND_TIMEOUT_S = 10.0  # real seconds one socket send may take (fix round 1, I-1)
 
 Pool = AsyncConnectionPool[psycopg.AsyncConnection[Any]]
 
@@ -156,8 +162,27 @@ class Endpoint(Protocol):
     def stop(self, db_reason: str | None, socket_reason: str = "") -> None: ...
 
 
+class SendTimeout(Exception):
+    """A socket send didn't finish within the send timeout: the peer stopped reading."""
+
+
+Work = Callable[[], Awaitable[None]]
+
+
 class _Stopped(Exception):
     """The connection was stopped while delivering; the delivery ends here."""
+
+
+def reap(task: asyncio.Task[Any]) -> None:
+    """Cancel `task` if it is still running, and retrieve its outcome when it ends, so no task
+    is left pending at shutdown and no exception goes unretrieved."""
+    task.cancel()
+    task.add_done_callback(_retrieve)
+
+
+def _retrieve(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 def _fenced(e: psycopg.Error) -> bool:
@@ -189,8 +214,14 @@ WHERE reply_id = %s AND seq >= %s ORDER BY seq
 
 
 class NodeLink:
-    """The relay's side of one established connection: its delivery lock (one delivery at a
-    time, in order), the in-memory stream mark and the heartbeat."""
+    """The relay's side of one established connection: its own outbound queue and sender task,
+    its delivery lock (one delivery at a time, in order), the in-memory stream mark and the
+    heartbeat.
+
+    **Nothing shared waits on this socket (fix round 1, I-1).** The listener, the fan-out, the
+    ticker and the sweep only enqueue work; this link's sender task runs it, each fenced call
+    immediately before its frame. A send that exceeds the send timeout stops the link, which
+    closes the connection as `send_timeout`, and never holds up another node."""
 
     def __init__(
         self,
@@ -213,10 +244,38 @@ class NodeLink:
         self._next_ping = connected_at + HEARTBEAT
         self._unanswered = 0
         self.stopped = False
+        self._queue: asyncio.Queue[Work] = asyncio.Queue()
+        self._sender = asyncio.create_task(self._send_loop())
+
+    async def _send_loop(self) -> None:
+        while True:
+            work = await self._queue.get()
+            try:
+                await self._guarded(work)
+            finally:
+                self._queue.task_done()
+
+    def _enqueue(self, work: Work) -> None:
+        if not self.stopped:
+            self._queue.put_nowait(work)
+
+    async def idle(self) -> None:
+        """Until everything queued so far has run (tests, and `Relay.sweep(wait=True)`)."""
+        await self._queue.join()
+
+    async def close(self) -> None:
+        """Stop the sender task and drop the queue; works while a send is blocked."""
+        self.stopped = True
+        reap(self._sender)
+        while not self._queue.empty():
+            self._queue.get_nowait()
+            self._queue.task_done()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._sender
 
     # ---------------------------------------------------------------- failures
 
-    async def _guarded(self, work: Callable[[], Any]) -> None:
+    async def _guarded(self, work: Work) -> None:
         """Run one relay-initiated delivery; a fence or database failure stops the link."""
         if self.stopped:
             return
@@ -226,6 +285,9 @@ class NodeLink:
                     await work()
         except _Stopped:
             pass
+        except SendTimeout:
+            log.info("connection %s: send timed out", self.conn_id)
+            self._stop(SEND_TIMEOUT)
         except psycopg.Error as e:
             if _fenced(e):
                 log.info("connection %s fenced during delivery", self.conn_id)
@@ -255,8 +317,8 @@ class NodeLink:
 
     # ---------------------------------------------------------------- outbox
 
-    async def offer(self, outbox_id: UUID | None = None) -> None:
-        """Send the open items this node hasn't been sent (one item, or all of them)."""
+    def _offer_work(self, outbox_id: UUID | None) -> Work:
+        """The open items this node hasn't been sent (one item, or all of them)."""
 
         async def work() -> None:
             rows = await self._query(
@@ -264,9 +326,12 @@ class NodeLink:
             )
             await self._deliver_items(rows)
 
-        await self._guarded(work)
+        return work
 
-    async def resend_due(self, now: datetime) -> None:
+    def offer(self, outbox_id: UUID | None = None) -> None:
+        self._enqueue(self._offer_work(outbox_id))
+
+    def resend_due(self, now: datetime) -> None:
         async def work() -> None:
             rows = await self._query(
                 _DUE,
@@ -274,7 +339,7 @@ class NodeLink:
             )
             await self._deliver_items(rows)
 
-        await self._guarded(work)
+        self._enqueue(work)
 
     async def _query(self, sql: LiteralString, params: dict[str, Any]) -> list[Any]:
         async with self.relay.pool.connection() as conn:
@@ -306,7 +371,7 @@ class NodeLink:
                 },
             )
 
-    async def clear(self, outbox_id: UUID, reason: str) -> None:
+    def clear(self, outbox_id: UUID, reason: str) -> None:
         """`outbox.cleared` if this node was sent the item and didn't acknowledge it here."""
 
         async def work() -> None:
@@ -325,17 +390,17 @@ class NodeLink:
                 MessageKind.OUTBOX_CLEARED, {"outbox_id": str(outbox_id), "reason": reason}
             )
 
-        await self._guarded(work)
+        self._enqueue(work)
 
     # ---------------------------------------------------------------- stream
 
-    async def relay_reply(self, reply_id: UUID) -> None:
+    def relay_reply(self, reply_id: UUID) -> None:
         """A live wake-up: the chunks after the cursor (and after what this link sent)."""
 
         async def work() -> None:
             await self._send_reply(reply_id, self._sent_upto.get(reply_id, 0), live=True)
 
-        await self._guarded(work)
+        self._enqueue(work)
 
     async def _send_reply(self, reply_id: UUID, after: int, *, live: bool) -> None:
         """Chunks with `seq > max(acked_seq, after)`; ACTION chunks only when `live`."""
@@ -371,10 +436,17 @@ class NodeLink:
             await self.endpoint.send(kind, payload)
 
     async def on_connect(self, resume: Sequence[ResumePosition]) -> None:
-        """After `welcome`: the items not yet sent to this node, then each candidate reply's
-        unacknowledged chunks (R9-1, R12-8)."""
-        await self.offer()
+        """After `welcome`, in the connection's own task: the items not yet sent to this node,
+        then each candidate reply's unacknowledged chunks (R9-1, R12-8)."""
+        await self._guarded(self._offer_work(None))
+        await self._guarded(self._resume_work(resume))
 
+    def resync(self) -> None:
+        """The same, queued: after the listener re-LISTENs (anything missed meanwhile)."""
+        self._enqueue(self._offer_work(None))
+        self._enqueue(self._resume_work(()))
+
+    def _resume_work(self, resume: Sequence[ResumePosition]) -> Work:
         async def work() -> None:
             async with self.relay.pool.connection() as conn:
                 cur = await conn.execute(
@@ -402,7 +474,7 @@ class NodeLink:
             for reply_id in candidates:
                 await self._send_reply(reply_id, positions.get(reply_id, 0), live=False)
 
-        await self._guarded(work)
+        return work
 
     # ---------------------------------------------------------------- from the node
 
@@ -431,8 +503,9 @@ class NodeLink:
     def on_pong(self) -> None:
         self._unanswered = 0
 
-    async def heartbeat(self, now: datetime) -> None:
-        """A `ping` every 30 s; three left unanswered close the connection (`heartbeat`)."""
+    def heartbeat(self, now: datetime) -> None:
+        """A `ping` every 30 s (queued); three left unanswered close the connection
+        (`heartbeat`). The decision never waits on the socket."""
         if self.stopped or now < self._next_ping:
             return
         if self._unanswered >= MISSED_HEARTBEATS:
@@ -441,8 +514,11 @@ class NodeLink:
             return
         self._unanswered += 1
         self._next_ping = now + HEARTBEAT
-        with contextlib.suppress(Exception):  # a closed socket: its receive loop closes it
+
+        async def ping() -> None:
             await self.endpoint.send(MessageKind.PING, {})
+
+        self._enqueue(ping)
 
 
 # ------------------------------------------------------------------ the process-wide relay
@@ -471,8 +547,11 @@ class Relay:
         await asyncio.wait_for(self._listening.wait(), 30)
 
     async def stop(self) -> None:
+        """Shutdown: the listener, the ticker and every link's sender task, all awaited."""
         for task in self._tasks:
-            task.cancel()
+            reap(task)
+        for link in list(self._links.values()):
+            await link.close()
         for task in self._tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
@@ -517,7 +596,7 @@ class Relay:
 
     async def _catch_up(self) -> None:
         for link in list(self._links.values()):
-            await link.on_connect(())
+            link.resync()
 
     async def _on_notify(self, channel: str, payload: str) -> None:
         try:
@@ -543,7 +622,7 @@ class Relay:
         if row is None:
             return
         for link in self._of(UUID(str(row[0]))):
-            await link.relay_reply(reply_id)
+            link.relay_reply(reply_id)
 
     async def _on_outbox(self, outbox_id: UUID) -> None:
         async with self.pool.connection() as conn:
@@ -556,9 +635,9 @@ class Relay:
         person_id, state = UUID(str(row[0])), str(row[1])
         for link in self._of(person_id):
             if state in ("PENDING", "DELIVERING", "DELIVERED"):
-                await link.offer(outbox_id)
+                link.offer(outbox_id)
             else:
-                await link.clear(outbox_id, state)
+                link.clear(outbox_id, state)
 
     # ---------------------------------------------------------------- the ticker
 
@@ -568,7 +647,7 @@ class Relay:
             try:
                 now = self.now()
                 for link in list(self._links.values()):
-                    await link.heartbeat(now)
+                    link.heartbeat(now)
                 if self._next_sweep is None:
                     self._next_sweep = now + RESEND_SWEEP
                 elif now >= self._next_sweep:
@@ -577,8 +656,12 @@ class Relay:
             except Exception:
                 log.warning("gateway ticker failed", exc_info=True)
 
-    async def sweep(self) -> None:
-        """Re-send, with the same ID, what a connected node hasn't confirmed (§8.2)."""
+    async def sweep(self, *, wait: bool = False) -> None:
+        """Re-send, with the same ID, what a connected node hasn't confirmed (§8.2): queued on
+        each link. `wait` (tests) returns once every link has run its queue."""
         now = self.now()
-        for link in list(self._links.values()):
-            await link.resend_due(now)
+        links = list(self._links.values())
+        for link in links:
+            link.resend_due(now)
+        if wait:
+            await asyncio.gather(*(link.idle() for link in links))

@@ -205,6 +205,7 @@ def running_gateway(
     dsn: str | None = None,
     clock: FakeClock | None = None,
     tick_interval: float = 0.05,
+    send_timeout: float = 10.0,
 ) -> Iterator[Gw]:
     clock = clock or FakeClock()
     whois = FakeWhoIs()
@@ -223,6 +224,7 @@ def running_gateway(
         clock=clock,
         recheck_interval=recheck_interval,
         tick_interval=tick_interval,
+        send_timeout=send_timeout,
     )
     with TestClient(PeerFromHeader(app)) as client:
         gw = Gw(dsns, client, clock, whois, gw_key, core_key, tmp, app=app)

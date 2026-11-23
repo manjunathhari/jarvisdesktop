@@ -31,6 +31,9 @@ connection registers with the process's `Relay`, which stops an older connection
 node (`superseded`), and gets its pending items and unacknowledged chunks. The relay can stop
 the connection (`stop`): fenced, superseded, a database failure or three missed heartbeats.
 
+**Sends are bounded** by `send_timeout` (10 s in service): a send that doesn't finish in time
+closes the connection through `gw.close_connection(conn_id, 'send_timeout')`.
+
 **Fencing.** Every connection-scoped database call relies on the database fence: SQLSTATE
 `JF001` closes the socket. A re-check every `recheck_interval` seconds (60 in service) calls
 `gw.current_node`, so a revoked or superseded connection is closed within one interval.
@@ -74,6 +77,7 @@ from jarvis_server.contracts import (
 from jarvis_server.dbcall import FENCED_SQLSTATE, audited_call_async
 from jarvis_server.gateway import relay
 from jarvis_server.gateway.keys import GatewayKeys, node_key_id
+from jarvis_server.gateway.relay import SEND_TIMEOUT_S
 from jarvis_server.gateway.tailscale import WhoIs, is_tailnet_address
 
 log = logging.getLogger(__name__)
@@ -111,6 +115,7 @@ class GatewayContext:
     recheck_interval: float
     bind_check: bool
     relay: relay.Relay
+    send_timeout: float = SEND_TIMEOUT_S
 
 
 class HandshakeRefused(Exception):
@@ -223,18 +228,24 @@ class Session:
                 await self._established()
             finally:
                 self.ctx.relay.unregister(self.link)
+                await self.link.close()
         finally:
             await self._close_socket(CLOSE_REFUSED, self._socket_reason)
 
     async def _established(self) -> None:
-        tasks = {
+        tasks = [
             asyncio.create_task(self._serve()),
             asyncio.create_task(self._recheck()),
             asyncio.create_task(self._stopped.wait()),
-        }
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        ]
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # Also when this connection itself is cancelled (shutdown): no task is left
+            # pending, and no task's exception goes unretrieved.
+            for task in tasks:
+                relay.reap(task)
         for task in pending:
-            task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         for task in done:
@@ -255,8 +266,9 @@ class Session:
             self.ws.application_state == WebSocketState.CONNECTED
             and self.ws.client_state == WebSocketState.CONNECTED
         ):
-            with contextlib.suppress(RuntimeError):
-                await self.ws.close(code, reason or None)
+            # Bounded like every send: a peer that stopped reading can't hold the close.
+            with contextlib.suppress(RuntimeError, TimeoutError):
+                await asyncio.wait_for(self.ws.close(code, reason or None), self.ctx.send_timeout)
 
     async def send(self, kind: MessageKind, payload: dict[str, Any]) -> None:
         """Sign and send one envelope with the next gateway `seq` (R6-8). Gateway messages
@@ -275,7 +287,15 @@ class Session:
             signed = signing.sign_envelope(
                 signing.Purpose.GW_TRANSPORT, self.ctx.keys.gw_key, self.ctx.keys.gw_key_id, env
             )
-            await self.ws.send_text(json.dumps(signed, ensure_ascii=False))
+            # Bounded: a peer that stops reading must not hold this connection (or the
+            # relay's sender for it) for minutes (fix round 1, I-1).
+            try:
+                await asyncio.wait_for(
+                    self.ws.send_text(json.dumps(signed, ensure_ascii=False)),
+                    self.ctx.send_timeout,
+                )
+            except TimeoutError:
+                raise relay.SendTimeout from None
 
     async def _error(self, code: str, detail: str) -> None:
         await self.send(MessageKind.ERROR, {"code": code, "detail": detail})
@@ -491,6 +511,10 @@ class Session:
             except Fenced:
                 log.info("connection %s fenced", self.conn_id)
                 return
+            except relay.SendTimeout:
+                log.info("connection %s: send timed out", self.conn_id)
+                await self._db_close(relay.SEND_TIMEOUT)
+                return
             except psycopg.Error as e:
                 # Any other database failure: its audited transaction rolled back, so nothing
                 # partial remains. Tell the node, then close through gw.close_connection.
@@ -586,7 +610,11 @@ class Session:
 
     async def _db_close(self, reason: str) -> None:
         """gw.close_connection: its DISCONNECT row records why (an already closed connection is
-        a no-op there)."""
+        a no-op there). Shielded: once started, it completes even if this connection's tasks
+        are cancelled (a shutdown), so the disconnect is still recorded."""
+        await asyncio.shield(self._db_close_now(reason))
+
+    async def _db_close_now(self, reason: str) -> None:
         try:
             async with self.ctx.pool.connection() as conn:
                 await audited_call_async(

@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import json
+import logging
 import os
 import random
 import secrets
@@ -29,7 +31,7 @@ from typing import Any
 import psycopg
 import pytest
 from psycopg.types.json import Jsonb
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from jarvis_server import comm, nodes
 from jarvis_server.comm import OutboxState, Priority
@@ -73,6 +75,7 @@ def gateway(
     recheck_interval: float = 0.1,
     tick_interval: float = 0.02,
     clock: FakeClock | None = None,
+    send_timeout: float = 10.0,
 ) -> Iterator[Gw]:
     """A gateway app; `keys_from` restarts with an earlier one's keys (and clock), as a new
     process would: nothing else carries over."""
@@ -83,6 +86,7 @@ def gateway(
         core_key=keys_from.core_key if keys_from else None,
         recheck_interval=recheck_interval,
         tick_interval=tick_interval,
+        send_timeout=send_timeout,
         clock=clock or (keys_from.clock if keys_from else FakeClock(datetime.now(UTC))),
     ) as gw:
         yield gw
@@ -103,7 +107,8 @@ def _relay(g: Gw) -> relay.Relay:
 
 def _sweep(g: Gw) -> None:
     """Run one re-send sweep to completion inside the app's event loop."""
-    g.client.portal.call(_relay(g).sweep)
+    r = _relay(g)
+    g.client.portal.call(lambda: r.sweep(wait=True))
 
 
 def reborn(g: Gw, fake: FakeNode, identity: str | None = None) -> FakeNode:
@@ -945,3 +950,209 @@ def test_answered_heartbeats_keep_connection(gw: Gw, app_conn: Conn) -> None:
         collect(a, lambda e: any(x["kind"] == "ping" for x in e))  # answered with pong
     a.sync()
     assert close_reason(app_conn, a.node_id) == [None]
+
+
+# ------------------------------------------------------------------------------ fix round 1
+
+
+@contextmanager
+def stuck_sends(monkeypatch: pytest.MonkeyPatch, fake: FakeNode) -> Iterator[threading.Event]:
+    """From when the returned event is set, every send to `fake`'s socket blocks forever, as
+    for a peer that stopped reading (its TCP window full). Other sockets are untouched."""
+    stuck = threading.Event()
+    real = WebSocket.send_text
+
+    async def send_text(self: WebSocket, data: str) -> None:
+        if stuck.is_set() and self.client is not None and self.client.host == fake.peer_ip:
+            await asyncio.Event().wait()  # never set
+        await real(self, data)
+
+    monkeypatch.setattr(WebSocket, "send_text", send_text)
+    yield stuck
+
+
+def _audit_reasons(dsns: Dsns, node: uuid.UUID | None, since: int) -> list[Any]:
+    with psycopg.connect(dsns.app, autocommit=True) as other:  # a separate connection
+        rows = other.execute(
+            "SELECT action::text, details->>'reason' FROM audit.event WHERE seq > %s"
+            " AND action::text = 'DISCONNECT' AND details->>'node_id' = %s ORDER BY seq",
+            (since, str(node)),
+        ).fetchall()
+    return [tuple(r) for r in rows]
+
+
+def test_stuck_socket_does_not_stall_other_nodes(
+    ddb: Dsns, tmp_path: Path, app_conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-1: a node whose sends block forever. Another node of the same person still gets a
+    live chunk and an outbox.item promptly, and its heartbeat and sweep keep running. Then the
+    stuck node is closed `send_timeout` on the injected timeout, with its DISCONNECT row and no
+    open connection row, checked from a separate connection."""
+    with gateway(ddb, tmp_path, send_timeout=3.0) as g:
+        stuck_node = enrolled(g)
+        healthy = enrolled(g)
+        healthy.auto_received = False  # leaves the item for the sweep to re-send
+        since = audit_seq(app_conn)
+        with stuck_sends(monkeypatch, stuck_node) as stuck:
+            stuck.set()
+            started = datetime.now(UTC)
+            reply = uuid.uuid4()
+            speech(app_conn, reply, [1])
+            outbox_id = str(item(app_conn))
+            collect(
+                healthy,
+                lambda e: chunk_seqs(e, reply) == [1] and outbox_id in item_ids(e),
+                timeout=1.5,
+            )
+            g.clock.advance(150)  # a heartbeat and a sweep fall due for both nodes
+            collect(
+                healthy,
+                lambda e: any(x["kind"] == "ping" for x in e) and outbox_id in item_ids(e),
+                timeout=1.5,
+            )
+            elapsed = (datetime.now(UTC) - started).total_seconds()
+            assert elapsed < 3.0, elapsed  # all of it before the stuck send timed out
+            assert close_reason(app_conn, stuck_node.node_id) == [None]  # still stuck, open
+            assert attempts(app_conn, outbox_id, healthy.node_id) == 2
+            assert healthy.displays[outbox_id] == 1
+
+            assert _wait_for(
+                lambda: close_reason(app_conn, stuck_node.node_id) == ["send_timeout"], 6
+            )
+        assert _audit_reasons(ddb, stuck_node.node_id, since) == [("DISCONNECT", "send_timeout")]
+        with psycopg.connect(ddb.app, autocommit=True) as other:
+            row = other.execute(
+                "SELECT count(*) FROM gw.node_connection WHERE node_id = %s AND closed_at IS NULL",
+                (stuck_node.node_id,),
+            ).fetchone()
+        assert row == (0,)
+        assert _wait_for(lambda: stuck_node.node_id not in _relay(g)._links)
+        assert close_reason(app_conn, healthy.node_id) == [None]
+        healthy.sync()  # still served
+
+
+def test_missed_heartbeats_close_while_send_blocked(
+    ddb: Dsns, tmp_path: Path, app_conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner requirement 1: missed-heartbeat detection, the close through gw.close_connection
+    and cancelling the link's queue and sender all work while its send is blocked (the send
+    timeout here is far longer than the test)."""
+    with gateway(ddb, tmp_path, send_timeout=600) as g:
+        a = enrolled(g)
+        with stuck_sends(monkeypatch, a) as stuck:
+            stuck.set()
+            link = _relay(g)._links[a.node_id]
+            for _ in range(4):
+                g.clock.advance(30)
+                _wait_for(lambda: False, 0.1)  # let the ticker see each step
+            assert _wait_for(lambda: close_reason(app_conn, a.node_id) == ["heartbeat"], 5)
+            assert _wait_for(lambda: link._sender.done(), 5)
+            assert a.node_id not in _relay(g)._links
+
+
+def test_close_connection_failure_after_send_timeout(
+    ddb: Dsns,
+    tmp_path: Path,
+    app_conn: Conn,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Owner requirement 3: recording the disconnect fails; it is logged, and the link still
+    stops and the socket still closes."""
+    from jarvis_server.gateway import session as gateway_session
+
+    real = gateway_session.audited_call_async
+
+    async def failing(conn: Any, sql: Any, params: Any) -> Any:
+        if "close_connection" in sql and params[1] == "send_timeout":
+            raise psycopg.errors.InternalError("injected")
+        return await real(conn, sql, params)
+
+    with gateway(ddb, tmp_path, send_timeout=0.5) as g:
+        a = enrolled(g)
+        link = _relay(g)._links[a.node_id]
+        monkeypatch.setattr(gateway_session, "audited_call_async", failing)
+        with stuck_sends(monkeypatch, a) as stuck:
+            stuck.set()
+            item(app_conn)
+            assert _wait_for(lambda: link._sender.done(), 5)
+            assert _wait_for(lambda: a.node_id not in _relay(g)._links, 5)
+        assert _wait_for(lambda: "could not close connection" in caplog.text, 5)
+        assert close_reason(app_conn, a.node_id) == [None]  # the row stays for the next connect
+        closed(a)  # the socket was closed regardless
+
+
+def test_confirmation_is_per_device(ddb: Dsns, tmp_path: Path, app_conn: Conn) -> None:
+    """Owner ruling: A confirmed, B didn't. Past the re-send interval B gets the same
+    outbox_id again and A doesn't; after both reconnect, the same per-device outcome. The
+    ticker is off so each pass is exactly the one this test runs."""
+    with gateway(ddb, tmp_path, tick_interval=3600) as gw:
+        _per_device(gw, app_conn)
+
+
+def _per_device(gw: Gw, app_conn: Conn) -> None:
+    a = enrolled(gw)
+    b = enrolled(gw)
+    b.auto_received = False
+    outbox_id = str(item(app_conn))
+    collect(a, lambda e: outbox_id in item_ids(e))
+    collect(b, lambda e: outbox_id in item_ids(e))
+    a.sync()
+    assert state(app_conn, outbox_id) == "DELIVERED"
+
+    def resent_once_more() -> tuple[list[str], list[str]]:
+        gw.clock.advance(150)
+        _sweep(gw)
+        got_b = item_ids(collect(b, lambda e: outbox_id in item_ids(e)))
+        got_a = item_ids(a.sync() + a.drain(0.2))
+        return got_a, got_b
+
+    assert resent_once_more() == ([], [outbox_id])
+    assert attempts(app_conn, outbox_id, a.node_id) == 1
+    assert attempts(app_conn, outbox_id, b.node_id) == 2
+
+    a.close()
+    b.close()
+    a = reborn(gw, a)
+    b = reborn(gw, b)
+    b.auto_received = False
+    a.hello()
+    b.hello()
+    # On connect only never-sent items go out; B's unconfirmed item stays eligible for the pass.
+    assert item_ids(a.sync()) == [] and item_ids(b.sync()) == []
+    assert resent_once_more() == ([], [outbox_id])
+    assert attempts(app_conn, outbox_id, a.node_id) == 1
+    assert attempts(app_conn, outbox_id, b.node_id) == 3
+    assert a.displays[outbox_id] == 0 and b.displays[outbox_id] == 0  # seen-lists hold
+
+
+def test_shutdown_leaves_no_pending_tasks(
+    ddb: Dsns,
+    tmp_path: Path,
+    app_conn: Conn,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Owner requirement 2: stopping the gateway with a healthy link, a link whose send is
+    blocked and queued work cancels every sender and task cleanly: nothing left pending, no
+    "Task was destroyed but it is pending" and no unretrieved task exception."""
+    caplog.set_level(logging.ERROR, logger="asyncio")
+    with gateway(ddb, tmp_path, send_timeout=600) as g:
+        healthy = enrolled(g)
+        blocked = enrolled(g)
+        links = [_relay(g)._links[f.node_id] for f in (healthy, blocked)]
+        with stuck_sends(monkeypatch, blocked) as stuck:
+            stuck.set()
+            item(app_conn)
+            item(app_conn)  # the second one waits in the blocked link's queue
+            collect(healthy, lambda e: len(item_ids(e)) >= 2)
+            relay_tasks = list(_relay(g)._tasks)
+    gc.collect()
+    assert all(link._sender.done() for link in links)
+    assert all(task.done() for task in relay_tasks)
+    bad = [
+        r.getMessage()
+        for r in caplog.records
+        if "destroyed but it is pending" in r.getMessage() or "never retrieved" in r.getMessage()
+    ]
+    assert bad == []

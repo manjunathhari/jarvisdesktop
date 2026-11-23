@@ -29,7 +29,7 @@ from psycopg_pool import AsyncConnectionPool
 from jarvis_server import config
 from jarvis_server.bootstrap import GATEWAY_ROLE
 from jarvis_server.gateway.keys import GatewayKeys, load_keys
-from jarvis_server.gateway.relay import TICK_S, Relay
+from jarvis_server.gateway.relay import SEND_TIMEOUT_S, TICK_S, Relay
 from jarvis_server.gateway.session import GatewayContext, Session
 from jarvis_server.gateway.tailscale import LocalApiWhoIs, WhoIs, is_tailnet_address, tailnet_ipv4
 
@@ -65,11 +65,13 @@ def create_app(
     clock: Callable[[], datetime] = _utcnow,
     recheck_interval: float = RECHECK_INTERVAL_S,
     tick_interval: float = TICK_S,
+    send_timeout: float = SEND_TIMEOUT_S,
 ) -> FastAPI:
     """The gateway app. `bind_check` refuses a connection that arrived on a local address that
     isn't a Tailscale address (recorded `unknown_peer`); `clock`, `recheck_interval` and the
     relay's `tick_interval` (how often, in real seconds, it checks the clock for heartbeats
-    and the re-send sweep) are injectable for tests."""
+    and the re-send sweep) and `send_timeout` (the bound on one socket send, in real seconds)
+    are injectable for tests."""
     keys = GatewayKeys(gw_key=gw_key, gw_key_id=gw_key_id, core_public_keys=dict(core_public_keys))
 
     @asynccontextmanager
@@ -91,6 +93,7 @@ def create_app(
                     recheck_interval=recheck_interval,
                     bind_check=bind_check,
                     relay=relay,
+                    send_timeout=send_timeout,
                 )
                 yield
             finally:
