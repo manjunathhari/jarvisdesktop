@@ -39,6 +39,11 @@ class OutboxState(StrEnum):
     EXPIRED = "EXPIRED"
 
 
+TERMINAL_STATES = frozenset(
+    {OutboxState.ACKNOWLEDGED.value, OutboxState.SUPERSEDED.value, OutboxState.EXPIRED.value}
+)
+
+
 def _check_code(what: str, value: str) -> None:
     if not _CODE.fullmatch(value):
         raise ValueError(f"{what} must be a code")
@@ -86,17 +91,21 @@ def create_outbox(
     """Create a PENDING outbox item; supersede `supersedes_id` in the same transaction.
 
     NOTIFYs `jarvis_outbox` with the new id (and comm.supersede with the old one), delivered
-    when the transaction commits. Superseding an item that has already ended is a recorded
-    no-op (comm.supersede returns 'terminal' and audits it); the new item is still created.
+    when the transaction commits. Superseding an item that has already ended (acknowledged,
+    expired or superseded) is a **non-audited no-op** (R11-2): the audited comm.supersede is not
+    called, no audit row is written, the old item is untouched, and the new item is still
+    created. A live target goes through comm.supersede as before.
     """
     _check_code("kind", kind)
     with conn.transaction():
+        supersede_live = False
         if supersedes_id is not None:
             row = conn.execute(
-                "SELECT person_id FROM comm.outbox WHERE id = %s", (supersedes_id,)
+                "SELECT person_id, state FROM comm.outbox WHERE id = %s", (supersedes_id,)
             ).fetchone()
             if row is None or row[0] != person_id:
                 raise ValueError("an item can only supersede an item of the same person")
+            supersede_live = row[1] not in TERMINAL_STATES
         row = conn.execute(
             "INSERT INTO comm.outbox (person_id, event_id, priority, kind, body, authz,"
             " group_key, supersedes_id, expires_at)"
@@ -115,9 +124,9 @@ def create_outbox(
         ).fetchone()
         assert row is not None
         outbox_id = UUID(str(row[0]))
-        if supersedes_id is not None:
-            # 'applied', or 'terminal' if it had already ended (acknowledged, expired or
-            # superseded): nothing to take back then, and the new item stands either way.
+        if supersede_live:
+            # 'applied'; or 'terminal' (audited) only if the item ended after the read above,
+            # which the app role cannot lock against. The new item stands either way.
             outcome = conn.execute("SELECT comm.supersede(%s)", (supersedes_id,)).fetchone()
             if outcome is None or outcome[0] not in ("applied", "terminal"):
                 raise RuntimeError(f"comm.supersede returned {outcome!r}")

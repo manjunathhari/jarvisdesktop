@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any
+from datetime import datetime
+from typing import Any, cast
 from uuid import UUID
 
 import psycopg
@@ -95,4 +96,18 @@ def _system_event(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
         raise ValueError(f"system.event: no event {event_id}")
     if row[0] != person_id:
         raise ValueError("system.event: the event belongs to another person")
-    rules.notify(conn, event_kind, person_id=person_id, event_id=event_id, context=context)
+    rules.notify(
+        conn, event_kind, person_id=person_id, event_id=event_id, context=_context(context)
+    )
+
+
+def _context(raw: dict[str, Any]) -> rules.NotifyContext:
+    """A job payload is JSON: turn its `supersedes_id` and `expires_at` strings back into a UUID
+    and a datetime. Every other value goes on as it is; `rules.notify` checks the whole context
+    (unknown keys, types, a naive `expires_at`, the authz shape)."""
+    context = dict(raw)
+    if isinstance(context.get("supersedes_id"), str):
+        context["supersedes_id"] = UUID(context["supersedes_id"])
+    if isinstance(context.get("expires_at"), str):
+        context["expires_at"] = datetime.fromisoformat(context["expires_at"])
+    return cast(rules.NotifyContext, context)

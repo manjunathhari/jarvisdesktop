@@ -3,25 +3,27 @@
 The event kinds below are a shared interface: later tasks emit exactly these strings, and an
 unknown kind is a programming error (`UnknownEvent`), not an audited refusal.
 
-`context` carries what the caller knows about the item (controller ruling 2):
-- `expires_at` (datetime or RFC 3339 string): the item expires then, e.g. an approval card
-  expires with its approval. Required for `approval.requested`, whose priority depends on it.
-- `supersedes_id` (UUID or string): the earlier item this one replaces, handed to
-  `comm.create_outbox`. The rules never look for an item to supersede on their own, with one
-  documented exception: `brain.back` supersedes the person's open "Claude down" item.
-- `group_key`: overrides the kind's default group.
-- `text`: the item's text, replacing the fixed one (the reply itself, for
-  `turn.completed_after_hold`).
-- `authz`: core's signed authorisation, for approval cards (§5.3, §7.1).
-- anything else: references (IDs and codes), stored under `body["refs"]`.
+The caller passes one typed `NotifyContext` (R11-3, 11b). Every field is optional:
+- `supersedes_id`: the earlier item this one replaces, handed to `comm.create_outbox`. The rules
+  never look for an item to supersede on their own, with one documented exception:
+  `brain.back` supersedes the person's open "Claude down" item (controller ruling 2).
+- `expires_at`: a timezone-aware datetime; the item expires then (an approval card expires
+  with its approval). Required for `approval.requested`, whose priority depends on it.
+- `group_key`: a non-empty key wins; omitted, `None` or empty falls back to the kind's fixed
+  default group, never a placeholder such as "None" (comm.outbox.group_key stays NOT NULL).
+- `text`: replaces the fixed text (the reply itself, for `turn.completed_after_hold`).
+- `authz`: the raw signed dict `{object, key_id, sig}`, checked for exactly that shape and
+  carried unchanged. It is never parsed into a model and rebuilt, and nothing here checks its
+  signature or marks it trusted: the node does that under §7.1.
+
+Any other key, or a value of the wrong type, raises `ValueError` before anything is written.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, TypedDict, cast
 from uuid import UUID
 
 import psycopg
@@ -32,6 +34,26 @@ from jarvis_server.comm import Priority
 
 class UnknownEvent(LookupError):
     """An event kind with no notification rule (a programming error)."""
+
+
+class AuthzDict(TypedDict):
+    """The raw core-signed authorisation, exactly as signed (§7.1)."""
+
+    object: dict[str, Any]
+    key_id: str
+    sig: str
+
+
+class NotifyContext(TypedDict, total=False):
+    supersedes_id: UUID
+    expires_at: datetime
+    group_key: str | None
+    text: str
+    authz: AuthzDict
+
+
+_CONTEXT_KEYS = frozenset(NotifyContext.__annotations__)
+_AUTHZ_KEYS = frozenset(AuthzDict.__annotations__)
 
 
 @dataclass(frozen=True)
@@ -64,14 +86,13 @@ RULES: dict[str, Rule] = {
     "turn.indeterminate": Rule(Priority.TODAY, "turn", "A request ended without a clear outcome"),
     "turn.completed_after_hold": Rule(Priority.TODAY, "turn", "A held request has been answered"),
     "action.readonly_ok": Rule(Priority.SILENT, "action", "Action completed"),
-    "brain.config_error": Rule(Priority.TODAY, "brain", "Claude configuration error"),
+    "brain.config_error": Rule(Priority.TODAY, "brain.config", "Claude configuration error"),
 }
 
 EVENT_KINDS: tuple[str, ...] = tuple(RULES)
 
 # brain.back supersedes the person's newest open item of these kinds (§8.1 "Claude back").
 _DOWN_KINDS = ("brain.down", "brain.down.with_held")
-_RESERVED = frozenset({"expires_at", "supersedes_id", "group_key", "text", "authz"})
 _OPEN = (
     comm.OutboxState.PENDING.value,
     comm.OutboxState.DELIVERING.value,
@@ -79,30 +100,40 @@ _OPEN = (
 )
 
 
-def _as_datetime(value: Any) -> datetime | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        moment = value
-    elif isinstance(value, str):
-        moment = datetime.fromisoformat(value)
-    else:
-        raise ValueError("expires_at must be a datetime or an RFC 3339 string")
-    if moment.tzinfo is None:
-        raise ValueError("expires_at must carry a time zone")
-    return moment
+def _checked(context: NotifyContext) -> NotifyContext:
+    """The context, its types checked at runtime (a TypedDict enforces nothing by itself)."""
+    if not isinstance(context, dict):
+        raise ValueError("context must be a NotifyContext dict")
+    extra = set(context) - _CONTEXT_KEYS
+    if extra:
+        raise ValueError(f"context has keys outside NotifyContext: {sorted(extra)}")
+    supersedes_id = context.get("supersedes_id")
+    if supersedes_id is not None and not isinstance(supersedes_id, UUID):
+        raise ValueError("context['supersedes_id'] must be a UUID")
+    expires_at = context.get("expires_at")
+    if expires_at is not None:
+        if not isinstance(expires_at, datetime):
+            raise ValueError("context['expires_at'] must be a datetime")
+        if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+            raise ValueError("context['expires_at'] must carry a time zone")
+    group_key = context.get("group_key")
+    if group_key is not None and not isinstance(group_key, str):
+        raise ValueError("context['group_key'] must be a string or None")
+    if "text" in context and (not isinstance(context["text"], str) or not context["text"]):
+        raise ValueError("context['text'] must be a non-empty string")
+    if "authz" in context:
+        _check_authz(context["authz"])
+    return context
 
 
-def _as_uuid(value: Any) -> UUID | None:
-    if value is None or isinstance(value, UUID):
-        return value
-    if isinstance(value, str):
-        return UUID(value)
-    raise ValueError("supersedes_id must be a UUID")
-
-
-def _ref(value: Any) -> Any:
-    return str(value) if isinstance(value, UUID | datetime) else value
+def _check_authz(authz: Any) -> None:
+    """Exactly {object: dict, key_id: str, sig: str}; the dict itself is passed on unchanged."""
+    if not isinstance(authz, dict) or set(authz) != _AUTHZ_KEYS:
+        raise ValueError("context['authz'] must be a dict with exactly object, key_id and sig")
+    if not isinstance(authz["object"], dict):
+        raise ValueError("context['authz']['object'] must be a dict")
+    if not isinstance(authz["key_id"], str) or not isinstance(authz["sig"], str):
+        raise ValueError("context['authz'] key_id and sig must be strings")
 
 
 def _priority(conn: psycopg.Connection[Any], kind: str, expires_at: datetime | None) -> Priority:
@@ -131,7 +162,7 @@ def notify(
     *,
     person_id: UUID,
     event_id: UUID,
-    context: Mapping[str, Any],
+    context: NotifyContext,
 ) -> list[UUID]:
     """Apply the §8.1 rule for `event_kind`; return the ids of the outbox items it created.
 
@@ -141,16 +172,12 @@ def notify(
     rule = RULES.get(event_kind)
     if rule is None:
         raise UnknownEvent(f"no notification rule for event kind {event_kind!r}")
-    expires_at = _as_datetime(context.get("expires_at"))
-    supersedes_id = _as_uuid(context.get("supersedes_id"))
-    text = context.get("text", rule.text)
-    if not isinstance(text, str) or not text:
-        raise ValueError("context['text'] must be a non-empty string")
+    context = _checked(context)
+    expires_at = context.get("expires_at")
+    supersedes_id = context.get("supersedes_id")
+    group_key = context.get("group_key") or rule.group_key  # None or "" -> the kind's default
     authz = context.get("authz")
-    refs = {k: _ref(v) for k, v in context.items() if k not in _RESERVED}
-    body: dict[str, Any] = {"event": event_kind, "text": text}
-    if refs:
-        body["refs"] = refs
+    body: dict[str, Any] = {"event": event_kind, "text": context.get("text", rule.text)}
 
     with conn.transaction():
         # Serialise notifications of one event, then return what an earlier run created.
@@ -171,9 +198,9 @@ def notify(
             priority=priority,
             kind=event_kind,
             body=body,
-            group_key=str(context.get("group_key", rule.group_key)),
+            group_key=group_key,
             expires_at=expires_at,
             supersedes_id=supersedes_id,
-            authz=authz,
+            authz=None if authz is None else cast("dict[str, Any]", authz),  # unchanged
         )
     return [outbox_id]

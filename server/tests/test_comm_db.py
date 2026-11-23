@@ -540,6 +540,72 @@ def test_superseded_and_expired_remain_readable(app: Conn, dsns: Dsns) -> None:
     assert all(r[3] == {"text": "A fictional notice"} for r in rows)
 
 
+def _supersede_calls(dsns: Dsns, fn: Callable[[Conn], Any]) -> int:
+    """How many times `fn` called comm.supersede, from the backend's own function statistics
+    (track_functions on for this test database only, in a fresh app connection)."""
+    with psycopg.connect(dsns.app, autocommit=True) as conn:
+        assert _one(conn, "SHOW track_functions", ()) == "pl"
+        with conn.transaction():
+            fn(conn)
+            calls = conn.execute(
+                "SELECT coalesce(sum(calls), 0) FROM pg_stat_xact_user_functions"
+                " WHERE schemaname = 'comm' AND funcname = 'supersede'"
+            ).fetchone()
+    assert calls is not None
+    return int(calls[0])
+
+
+@pytest.fixture
+def tracked_functions(dsns: Dsns) -> Iterator[None]:
+    with psycopg.connect(dsns.superuser, autocommit=True) as su:
+        su.execute(f"ALTER DATABASE {dsns.database} SET track_functions = 'pl'")
+        try:
+            yield
+        finally:
+            su.execute(f"ALTER DATABASE {dsns.database} RESET track_functions")
+
+
+def test_create_outbox_skips_terminal_supersede_unaudited(
+    app: Conn, dsns: Dsns, tracked_functions: None
+) -> None:
+    """R11-2: superseding an item that has already ended is a non-audited no-op inside
+    create_outbox. The new item is created, the old one is untouched, comm.supersede is not
+    called and no REJECTED audit row is written. A live target still goes through it."""
+    for terminal in ("EXPIRED", "SUPERSEDED"):
+        old = _item(app)
+        if terminal == "EXPIRED":
+            assert _one(app, "SELECT comm.expire(%s)", (old,)) == "applied"
+        else:
+            _item(app, supersedes_id=old)
+        before = app.execute(
+            "SELECT state, state_changed_at FROM comm.outbox WHERE id = %s", (old,)
+        ).fetchone()
+        since = _seq(app)
+        created: list[uuid.UUID] = []
+
+        def supersede_ended(c: Conn, old: uuid.UUID = old, out: list[uuid.UUID] = created) -> None:
+            out.append(_item(c, supersedes_id=old))
+
+        calls = _supersede_calls(dsns, supersede_ended)
+        assert calls == 0
+        assert _audit(app, since) == []
+        after = app.execute(
+            "SELECT state, state_changed_at FROM comm.outbox WHERE id = %s", (old,)
+        ).fetchone()
+        assert after == before and after is not None and after[0] == terminal
+        [new] = created
+        assert _state(app, new) == "PENDING"
+        assert _one(app, "SELECT supersedes_id FROM comm.outbox WHERE id = %s", (new,)) == old
+
+    live = _item(app)
+    since = _seq(app)
+    assert _supersede_calls(dsns, lambda c: _item(c, supersedes_id=live)) == 1
+    assert _state(app, live) == "SUPERSEDED"
+    assert [r[2:6] for r in _audit(app, since)] == [
+        ("SUPERSEDE", "PENDING", "SUPERSEDED", "APPLIED")
+    ]
+
+
 def test_supersede_and_expire_report_outcome(app: Conn) -> None:
     item = _item(app)
     other = _item(app)

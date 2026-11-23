@@ -5,12 +5,13 @@ Runs in its own database (comm.event rows block the 0009 downgrade). People are 
 
 from __future__ import annotations
 
-import ast
+import json
 import secrets
+import subprocess
+import sys
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -180,19 +181,24 @@ def test_summary_is_per_person(app: Conn, owner: Conn, person: uuid.UUID) -> Non
     assert summary.reconnect_summary(app, person) == []
 
 
+FORBIDDEN_ROOTS = ("anthropic", "httpx", "openai", "requests")
+
+
 def test_summary_needs_no_brain() -> None:
-    """P2-E08: the summary module imports no brain, model or network code."""
-    source = Path(summary.__file__).read_text(encoding="utf-8")
-    imported: set[str] = set()
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            assert node.level == 0, "relative imports would hide what is imported"
-            imported.add(node.module or "")
-            imported.update(f"{node.module}.{alias.name}" for alias in node.names)
-    assert not any(name == "jarvis_server.brain" or name.startswith("jarvis_server.brain.")
-                   for name in imported)  # fmt: skip
-    assert not any(name.split(".")[0] in {"anthropic", "httpx", "requests"} for name in imported)
-    for dynamic in ("importlib", "__import__", "import_module"):  # no import behind our back
-        assert dynamic not in source
+    """P2-E08: importing the summary in a fresh interpreter loads no brain or model module,
+    directly or through anything it imports."""
+    probe = (
+        "import json, sys\n"
+        "import jarvis_server.core.summary\n"
+        "print(json.dumps(sorted(sys.modules)))\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", probe], check=True, capture_output=True, text=True
+    )
+    loaded = json.loads(out.stdout)
+    assert "jarvis_server.core.summary" in loaded  # the probe really imported it
+    brain = [
+        m for m in loaded if m == "jarvis_server.brain" or m.startswith("jarvis_server.brain.")
+    ]
+    model = [m for m in loaded if m.split(".")[0] in FORBIDDEN_ROOTS]
+    assert brain == [] and model == []
