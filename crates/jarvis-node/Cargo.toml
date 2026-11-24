@@ -1,0 +1,22 @@
+[package]
+name = "jarvis-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The JARVIS desktop node: the Phase 2 protocol, journal and actions (Plan B)."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+serde_jcs.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+data-encoding.workspace = true
+base64.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+hex = "0.4"
+jsonschema = { version = "0.30", default-features = false }

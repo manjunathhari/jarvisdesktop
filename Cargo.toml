@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/jarvis-core", "crates/jarvis-modules", "crates/jarvis-brain", "crates/jarvis-voice", "crates/jarvis-ears", "app/src-tauri"]
+members = ["crates/jarvis-core", "crates/jarvis-modules", "crates/jarvis-brain", "crates/jarvis-voice", "crates/jarvis-ears", "crates/jarvis-node", "app/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,3 +21,12 @@ jarvis-brain = { path = "crates/jarvis-brain" }
 jarvis-modules = { path = "crates/jarvis-modules" }
 jarvis-voice = { path = "crates/jarvis-voice" }
 jarvis-ears = { path = "crates/jarvis-ears" }
+jarvis-node = { path = "crates/jarvis-node" }
+# The node protocol (Plan B): signing, shared vectors, wire types.
+serde_jcs = "0.1"
+ed25519-dalek = "2"
+sha2 = "0.10"
+data-encoding = "2"
+base64 = "0.22"
+uuid = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
