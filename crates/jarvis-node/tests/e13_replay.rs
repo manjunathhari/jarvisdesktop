@@ -58,8 +58,25 @@ fn e13_trace_replays_clean() {
                     other => panic!("run {n}: unexpected frame {other}"),
                 }
             }
-            for (id, count) in shows {
-                assert_eq!(count, 1, "run {n} node {node}: {id} shown {count} times");
+            for (id, count) in &shows {
+                assert_eq!(*count, 1, "run {n} node {node}: {id} shown {count} times");
+            }
+            // Liveness: every item whose first frame here was outbox.item, before any
+            // outbox.cleared for it, was shown exactly once.
+            let mut first: HashMap<&str, &str> = HashMap::new();
+            for frame in frames {
+                first
+                    .entry(frame["outbox_id"].as_str().unwrap())
+                    .or_insert(frame["kind"].as_str().unwrap());
+            }
+            for (name, kind) in first {
+                let id = ids[name];
+                let want = usize::from(kind == "outbox.item");
+                assert_eq!(
+                    shows.get(&id).copied().unwrap_or(0),
+                    want,
+                    "run {n} node {node}: {name} (first frame {kind})"
+                );
             }
         }
     }

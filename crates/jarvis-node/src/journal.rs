@@ -46,6 +46,13 @@ pub enum Record {
     Seen { outbox_id: Uuid },
     /// The server cleared an outbox item; it is never shown after this.
     Cleared { outbox_id: Uuid },
+    /// The person saw this item: its `ack` is owed to the server, and is re-sent after
+    /// reconnects until the server clears it here or the intent is a week old (§8.2: a late
+    /// `ack` changes nothing else).
+    Acked {
+        outbox_id: Uuid,
+        at: DateTime<FixedOffset>,
+    },
     /// Written before step 1 of §9.4.
     Started {
         execution_key: Uuid,
@@ -71,6 +78,8 @@ pub enum Stage {
 pub struct JournalState {
     pub seen: HashSet<Uuid>,
     pub cleared: HashSet<Uuid>,
+    /// When each ack intent was recorded.
+    pub acked: HashMap<Uuid, DateTime<FixedOffset>>,
     pub executions: HashMap<Uuid, Stage>,
 }
 
@@ -104,7 +113,7 @@ impl JournalState {
     /// Whether `record` may follow the current state.
     fn check(&self, record: &Record) -> Result<(), JournalError> {
         let ok = match record {
-            Record::Seen { .. } | Record::Cleared { .. } => true,
+            Record::Seen { .. } | Record::Cleared { .. } | Record::Acked { .. } => true,
             Record::Started { execution_key, .. } => !self.executions.contains_key(execution_key),
             Record::Staged { execution_key } => {
                 matches!(self.executions.get(execution_key), Some(Stage::Started(_)))
@@ -121,7 +130,9 @@ impl JournalState {
             | Record::Done { execution_key, .. } => Err(JournalError::OutOfOrder {
                 execution_key: *execution_key,
             }),
-            Record::Seen { .. } | Record::Cleared { .. } => unreachable!("always allowed"),
+            Record::Seen { .. } | Record::Cleared { .. } | Record::Acked { .. } => {
+                unreachable!("always allowed")
+            }
         }
     }
 
@@ -133,6 +144,9 @@ impl JournalState {
             }
             Record::Cleared { outbox_id } => {
                 self.cleared.insert(*outbox_id);
+            }
+            Record::Acked { outbox_id, at } => {
+                self.acked.entry(*outbox_id).or_insert(*at);
             }
             Record::Started {
                 execution_key,

@@ -195,7 +195,8 @@ async fn a_cleared_item_is_never_shown_afterwards() {
 }
 
 #[tokio::test]
-async fn an_item_with_authz_waits_for_its_handler_and_is_not_marked_seen() {
+async fn an_item_with_authz_is_not_received_until_it_can_be_handled() {
+    // No `received`, so the gateway's sweep keeps offering it (Tasks 7 and 8 handle it).
     let mut r = rig().await;
     let id = Uuid::new_v4();
     let mut card = item(id, "URGENT");
@@ -205,10 +206,145 @@ async fn an_item_with_authz_waits_for_its_handler_and_is_not_marked_seen() {
         live_action(r.node_id, Uuid::new_v4(), now()),
     );
     r.push("outbox.item", card).await;
-    assert_eq!(recv(&mut r.ws).await["kind"], "received");
-    assert_eq!(r.ui_event(Duration::from_millis(300)).await, None);
+    assert_eq!(
+        recv_within(&mut r.ws, Duration::from_millis(500)).await,
+        None,
+        "nothing sent back"
+    );
+    assert_eq!(r.ui_event(Duration::from_millis(100)).await, None);
     let journal = std::fs::read_to_string(r.dir.path().join(node::JOURNAL_FILE)).unwrap();
     assert!(!journal.contains(&id.to_string()), "not in the seen-list");
+}
+
+/// Reconnect the rig's node (the gateway closes 4401), through a new welcome; returns the
+/// frames the node sent after the welcome, within `within`.
+async fn reconnect(r: &mut Rig, within: Duration) -> Vec<Value> {
+    support::net::close(&mut r.ws, 4401).await;
+    r.gw = Gw::new("gw-1", "gw-1");
+    r.ws = accept(&r.listener).await;
+    send(&mut r.ws, r.gw.challenge(now())).await;
+    assert_eq!(recv(&mut r.ws).await["kind"], "hello");
+    let welcome = r.gw.welcome(r.node_id, None, now());
+    send(&mut r.ws, welcome).await;
+    let mut got = Vec::new();
+    while let Some(frame) = recv_within(&mut r.ws, within).await {
+        got.push(frame);
+    }
+    got
+}
+
+fn acks(frames: &[Value]) -> Vec<Value> {
+    frames
+        .iter()
+        .filter(|f| f["kind"] == "ack")
+        .map(|f| f["payload"]["outbox_id"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn an_ack_is_re_sent_after_a_reconnect_until_cleared() {
+    // The gateway never re-sends an item it has a `received` for, so the node keeps owing
+    // the ack (e.g. the app died, or the link dropped, before it arrived).
+    let mut r = rig().await;
+    let id = Uuid::new_v4();
+    r.push("outbox.item", item(id, "URGENT")).await;
+    assert_eq!(recv(&mut r.ws).await["kind"], "received");
+    r.ui_event(Duration::from_secs(2)).await.expect("shown");
+    r.node.shown(id).await.unwrap();
+    assert_eq!(recv(&mut r.ws).await["kind"], "ack"); // pretend this one was lost
+    let got = reconnect(&mut r, Duration::from_millis(500)).await;
+    assert_eq!(acks(&got), vec![json!(id)], "re-sent after the welcome");
+    // Once the server clears it here, it is owed no more.
+    r.push(
+        "outbox.cleared",
+        json!({"outbox_id": id, "reason": "ACKNOWLEDGED"}),
+    )
+    .await;
+    r.ui_event(Duration::from_secs(2)).await;
+    let got = reconnect(&mut r, Duration::from_millis(500)).await;
+    assert!(acks(&got).is_empty(), "{got:?}");
+}
+
+#[tokio::test]
+async fn shown_while_disconnected_is_acked_on_reconnect() {
+    let mut r = rig().await;
+    let id = Uuid::new_v4();
+    r.push("outbox.item", item(id, "TODAY")).await;
+    assert_eq!(recv(&mut r.ws).await["kind"], "received");
+    r.ui_event(Duration::from_secs(2)).await.expect("shown");
+    support::net::close(&mut r.ws, 4401).await;
+    let mut status = r.node.status();
+    assert!(
+        wait_for(
+            &mut status,
+            |s| *s != LinkStatus::Connected,
+            Duration::from_secs(2)
+        )
+        .await
+    );
+    // Answered at once, even while the node is dialling the (unanswering) gateway.
+    let t = std::time::Instant::now();
+    assert!(r.node.shown(id).await.is_err(), "not connected right now");
+    assert!(
+        t.elapsed() < Duration::from_millis(500),
+        "took {:?}",
+        t.elapsed()
+    );
+    // The reconnect (driven by the node's own backoff) carries the owed ack.
+    r.gw = Gw::new("gw-1", "gw-1");
+    r.ws = accept(&r.listener).await;
+
+    send(&mut r.ws, r.gw.challenge(now())).await;
+    assert_eq!(recv(&mut r.ws).await["kind"], "hello");
+    let welcome = r.gw.welcome(r.node_id, None, now());
+    send(&mut r.ws, welcome).await;
+    let ack = recv(&mut r.ws).await;
+    assert_eq!(
+        (ack["kind"].as_str(), &ack["payload"]),
+        (Some("ack"), &json!({"outbox_id": id}))
+    );
+}
+
+#[tokio::test]
+async fn a_re_sent_item_whose_ack_is_owed_is_acked_again() {
+    let mut r = rig().await;
+    let id = Uuid::new_v4();
+    r.push("outbox.item", item(id, "TODAY")).await;
+    assert_eq!(recv(&mut r.ws).await["kind"], "received");
+    r.ui_event(Duration::from_secs(2)).await.expect("shown");
+    r.node.shown(id).await.unwrap();
+    assert_eq!(recv(&mut r.ws).await["kind"], "ack");
+    r.push("outbox.item", item(id, "TODAY")).await; // the received was lost: a sweep re-send
+    assert_eq!(recv(&mut r.ws).await["kind"], "received");
+    let ack = recv(&mut r.ws).await;
+    assert_eq!(
+        (ack["kind"].as_str(), &ack["payload"]),
+        (Some("ack"), &json!({"outbox_id": id}))
+    );
+    assert_eq!(
+        r.ui_event(Duration::from_millis(300)).await,
+        None,
+        "not shown again"
+    );
+}
+
+#[test]
+fn owed_acks_expire_after_the_retry_window() {
+    use jarvis_node::delivery::ACK_RETRY_WINDOW;
+    let dir = tempfile::tempdir().unwrap();
+    let inbox = inbox(&dir.path().join("journal.jsonl"));
+    let now = now();
+    let (old, fresh) = (Uuid::new_v4(), Uuid::new_v4());
+    inbox
+        .mark_acked(old, now - ACK_RETRY_WINDOW - chrono::Duration::seconds(1))
+        .unwrap();
+    inbox
+        .mark_acked(fresh, now - chrono::Duration::hours(1))
+        .unwrap();
+    assert_eq!(inbox.owed_acks(now), vec![fresh]);
+    assert!(!inbox.ack_owed(old, now) && inbox.ack_owed(fresh, now));
+    inbox.on_cleared(fresh).unwrap();
+    assert!(inbox.owed_acks(now).is_empty());
 }
 
 #[tokio::test]

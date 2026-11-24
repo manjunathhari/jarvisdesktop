@@ -313,12 +313,43 @@ async fn run(
             let _ = status.send(LinkStatus::Connecting);
         }
         let mut ready_at = None;
-        let end = match timeout(
+        // Dial, still answering the app meanwhile (a dial can take CONNECT_TIMEOUT).
+        let dial = timeout(
             CONNECT_TIMEOUT,
             tokio_tungstenite::connect_async(url.as_str()),
-        )
-        .await
-        {
+        );
+        tokio::pin!(dial);
+        let dialled = loop {
+            tokio::select! {
+                r = &mut dial => break Some(r),
+                cmd = cmds.recv() => match cmd {
+                    None => return,
+                    Some(Cmd::Send { reply, .. }) => { let _ = reply.send(Err(NotConnected)); }
+                    Some(Cmd::RequireReenrol) => {
+                        reenrol = Some(Reenrol::Final);
+                        break None;
+                    }
+                    Some(Cmd::Enrol { code, reply }) => {
+                        if enrolling.is_some() {
+                            let _ = reply.send(Err(EnrolError::Busy));
+                        } else if reenrol.is_some() {
+                            // NeedsReenrol is showing: the new code wins.
+                            start_enrolment(&code, reply, &mut enrolling, &mut attempt);
+                            if enrolling.is_some() {
+                                break None;
+                            }
+                        } else {
+                            let _ = reply.send(Err(EnrolError::AlreadyEnrolled));
+                        }
+                    }
+                },
+            }
+        };
+        let Some(dialled) = dialled else {
+            attempt = 0;
+            continue;
+        };
+        let end = match dialled {
             Ok(Ok((ws, _))) => {
                 let session = Session::new(key.clone(), st, start);
                 connection(

@@ -1,11 +1,14 @@
 //! The node runtime: the connection driver plus the routing of every verified gateway message
 //! (spec §8.2, §8.3, §13).
 //!
-//! - `outbox.item`: always `received`; shown once per `outbox_id` (the journal's seen-list);
+//! - `outbox.item`: `received`, then shown once per `outbox_id` (the journal's seen-list).
 //!   SILENT items are history only and acked at once; others become a `Notice` and are acked
-//!   when the app says they were shown (`NodeHandle::shown`). Items carrying an `authz`
-//!   (approval cards, approved actions) are refused and logged until Tasks 7 and 8, without
-//!   being marked seen, so a later version still handles a re-send.
+//!   when the app says they were shown (`NodeHandle::shown`). Every ack is journalled first and
+//!   re-sent after each reconnect until the server clears the item here (or for a week): once
+//!   an item is `received`, the gateway never re-sends it, so an ack lost to a crash or a
+//!   dropped link would otherwise never arrive. Items carrying an `authz` (approval cards,
+//!   approved actions) get no `received` until Tasks 7 and 8 handle them, so the gateway's
+//!   sweep keeps offering them instead of marking them delivered.
 //! - `outbox.cleared`: recorded, so the item never shows afterwards; the app is told.
 //! - `reply.chunk` (SPEECH): `received` with its `seq`, then broadcast to `subscribe_replies`.
 //!   Live actions arrive as `node.action` frames, never as ACTION chunks (Phase 2 ruling G4.2),
@@ -13,9 +16,17 @@
 //! - `node.action`: rules 2 to 4 of §7.1 (`check_node_action` under the trusted core keys);
 //!   accepted ones are broadcast. A core signature under a key this node doesn't trust asks
 //!   for re-enrolment (R12-29). Rule 5 and execution are Task 8's.
-//! - `welcome` summary: shown as lines, display only. The items in it arrive as their own
-//!   `outbox.item` frames and are shown and acked through those, so a summary line never
-//!   marks an approval card seen.
+//! - `welcome` summary: shown as lines, display only, so a summary line never marks an
+//!   approval card seen. The gateway sends the summary (every open item) and then, as
+//!   `outbox.item`, the items never sent to this node, so one id can appear in both: the app
+//!   collapses a summary entry when a `Notice` for one of its `outbox_ids` arrives, and may
+//!   call `shown` for summary ids it displayed.
+//! - A `node.action` under a core `key_id` this node doesn't trust asks for re-enrolment even
+//!   before its signature is checked (R12-29). That needs a valid gateway envelope, so only a
+//!   faulty gateway, not an outsider, can cause it.
+//! - Reply chunks are `received` before they are broadcast; a subscriber that lags behind the
+//!   broadcast buffer (256) loses chunks for good, so `ServerBrain` treats `Lagged` as a
+//!   failed reply.
 
 use std::sync::{Arc, Mutex};
 
@@ -80,6 +91,7 @@ pub struct NodeDeps {
 pub struct NodeHandle {
     client: Client,
     replies: broadcast::Sender<ReplyEvent>,
+    inbox: Inbox,
 }
 
 impl NodeHandle {
@@ -99,8 +111,14 @@ impl NodeHandle {
         self.client.enrol(code).await
     }
 
-    /// The app showed (or spoke) this item: acknowledge it (§8.2).
+    /// The app showed (or spoke) this item: acknowledge it (§8.2). The ack is journalled
+    /// first, so it is re-sent after a reconnect if it doesn't reach the server now; a
+    /// `NotConnected` here therefore loses nothing.
     pub async fn shown(&self, outbox_id: Uuid) -> Result<(), NotConnected> {
+        let now = chrono::Utc::now().fixed_offset();
+        if let Err(e) = self.inbox.mark_acked(outbox_id, now) {
+            tracing::error!(error = %e, "couldn't journal the ack; sending it once");
+        }
         self.client
             .send("ack", json!({"outbox_id": outbox_id}))
             .await
@@ -120,14 +138,18 @@ pub fn start(cfg: ClientConfig, deps: NodeDeps) -> Result<NodeHandle, JournalErr
     let client = client::spawn(cfg, deps.keystore, frames_tx);
     let (replies, _) = broadcast::channel(256);
     let router = Router {
-        inbox,
+        inbox: inbox.clone(),
         client: client.clone(),
         replies: replies.clone(),
         ui: deps.ui,
     };
     tokio::spawn(forward_status(client.status(), router.ui.clone()));
     tokio::spawn(router.run(frames));
-    Ok(NodeHandle { client, replies })
+    Ok(NodeHandle {
+        client,
+        replies,
+        inbox,
+    })
 }
 
 async fn forward_status(mut status: watch::Receiver<LinkStatus>, ui: mpsc::Sender<UiEvent>) {
@@ -155,6 +177,14 @@ impl Router {
         while let Some(output) = frames.recv().await {
             match output {
                 Output::Ready { summary, .. } => {
+                    // Owed acks first: the gateway won't re-send those items.
+                    let now = chrono::Utc::now().fixed_offset();
+                    for outbox_id in self.inbox.owed_acks(now) {
+                        let _ = self
+                            .client
+                            .send("ack", json!({"outbox_id": outbox_id}))
+                            .await;
+                    }
                     let _ = self.ui.send(UiEvent::Summary(summary)).await;
                 }
                 Output::ClockOff(ms) => {
@@ -193,18 +223,30 @@ impl Router {
         else {
             return Self::refused("outbox.item", "malformed");
         };
+        if p.get("authz").is_some_and(|a| !a.is_null()) {
+            // Approval cards and approved actions: Tasks 7 and 8. No `received`, so the
+            // gateway keeps offering them; not marked seen.
+            return Self::refused("outbox.item", "authz_not_handled_yet");
+        }
         // The transport confirmation comes first, whatever happens next (§8.2).
         let _ = self
             .client
             .send("received", json!({"outbox_id": outbox_id}))
             .await;
-        if p.get("authz").is_some_and(|a| !a.is_null()) {
-            // Approval cards and approved actions: Tasks 7 and 8. Not marked seen.
-            return Self::refused("outbox.item", "authz_not_handled_yet");
-        }
+        let now = chrono::Utc::now().fixed_offset();
         match self.inbox.on_item(outbox_id) {
             Ok(ItemFate::Show) if priority == "SILENT" => {
-                // History only: never shown, acknowledged at once.
+                // History only: never shown, acknowledged at once (durably).
+                if let Err(e) = self.inbox.mark_acked(outbox_id, now) {
+                    tracing::error!(error = %e, "couldn't journal the ack");
+                }
+                let _ = self
+                    .client
+                    .send("ack", json!({"outbox_id": outbox_id}))
+                    .await;
+            }
+            Ok(ItemFate::AlreadySeen) if self.inbox.ack_owed(outbox_id, now) => {
+                // A re-send of an item we acked: the ack may not have arrived.
                 let _ = self
                     .client
                     .send("ack", json!({"outbox_id": outbox_id}))
