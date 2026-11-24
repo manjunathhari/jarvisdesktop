@@ -1058,6 +1058,70 @@ def test_two_jobs_same_turn_one_call(
     assert statuses == [("DONE",), ("DONE",)]
 
 
+def test_two_jobs_then_owner_killed_indeterminate_once(
+    dsns: Dsns, app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """P2-B5, last clause: two jobs for one turn; B completes without calling while A is in
+    the call; then A (the owner) dies after the call. The sweep marks the turn INDETERMINATE
+    and notifies once, and A's retry never calls again."""
+    gate = GateBrain()
+    turn.set_brain(lambda: (gate, MODEL))
+    monkeypatch.setattr(turn, "_settle", _crash)  # A dies after think(), before settle
+    tid = _utter(owner, node, person)
+    job_a, job_b = _claim(app, _enqueue(app, tid)), _claim(app, _enqueue(app, tid))
+    a = InThread(dsns.app, lambda conn: dispatch.handle(conn, job_a))
+    assert gate.entered.wait(15)
+    InThread(dsns.app, lambda conn: dispatch.handle(conn, job_b)).join()
+    gate.release.set()
+    with pytest.raises(Crash):
+        a.join()
+    monkeypatch.undo()
+    assert gate.calls == 1
+    assert _reservations(app, tid) == ["ACTIVE"]
+    statuses = dict(
+        app.execute(
+            "SELECT id, status FROM ops.job WHERE id = ANY(%s)", ([job_a.id, job_b.id],)
+        ).fetchall()
+    )
+    assert statuses == {job_a.id: "RUNNING", job_b.id: "DONE"}
+    owner.execute("UPDATE ops.job SET locked_until = now() - interval '1 second' WHERE id = %s",
+                  (job_a.id,))  # fmt: skip
+    owner.execute("UPDATE ops.brain_reservation SET lease_until = now() - interval '1 second'"
+                  " WHERE turn_id = %s", (tid,))  # fmt: skip
+    _sweep(app)
+    _sweep(app)  # a second pass finds nothing more
+    assert _reservations(app, tid) == ["LAPSED"]
+    assert _outcome(app, tid) == "INDETERMINATE"
+    dispatch.handle(app, _claim(app, job_a.id))  # A's retry after its lease
+    assert gate.calls == 1
+    assert len(_items(app, person, "turn.indeterminate")) == 1
+    assert _events(app, "turn.indeterminate", tid) == 1
+    assert [r for r, _ in _messages(app, tid)] == ["PERSON"]
+
+
+def test_hand_inserted_duplicate_after_answer_makes_no_call(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine
+) -> None:  # P2-B5, "a duplicate inserted by hand"
+    brains = Brains([Speech("Only once.")])
+    turn.set_brain(brains)
+    tid = _turn(app, owner, node, person)
+    assert _outcome(app, tid) == "ANSWERED"
+    row = owner.execute(
+        "INSERT INTO ops.job (kind, payload) VALUES ('conv.turn', %s) RETURNING id",
+        (psycopg.types.json.Jsonb({"inbound_id": str(tid)}),),
+    ).fetchone()
+    assert row is not None
+    _run(app, int(row[0]))
+    assert brains.calls == 1
+    assert _reservations(app, tid) == ["SETTLED"]
+    assert _outcome(app, tid) == "ANSWERED"
+    assert [r for r, _ in _messages(app, tid)] == ["PERSON", "JARVIS"]
+    status = app.execute("SELECT status FROM ops.job WHERE id = %s", (row[0],)).fetchone()
+    assert status == ("DONE",)
+    assert _items(app, person, "turn.indeterminate") == []
+
+
 # --- cap holds (P2-B2) ----------------------------------------------------------------------
 
 

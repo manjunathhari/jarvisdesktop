@@ -385,6 +385,53 @@ def test_probe_every_two_minutes_while_down(app: Conn, owner: Conn) -> None:
     assert len(_of_kind(app, "brain.probe", since)) == 2
 
 
+def _reservation_count(app: Conn) -> int:
+    row = app.execute("SELECT count(*) FROM ops.brain_reservation").fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def test_reminders_and_expiries_run_while_claude_is_down(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID
+) -> None:
+    """P2-B1, "reminders, expiries and delivery continue": with the brain DOWN, one scheduler
+    tick queues the probe and the due expiries, and the approval reminder, the approval expiry
+    and the general outbox expiry all run through their handlers. Nothing calls Claude: no
+    reservation is made, and the brain is still DOWN afterwards."""
+    _brain_down(owner, True)
+    assert health.is_down(app)
+    reservations = _reservation_count(app)
+    approval_id = _proposed(app, owner, person, node)
+    reminder_key = jobs.job_key("approval.expiring", str(approval_id))
+    [reminder] = _keyed(app, "approval.expiring", reminder_key)
+    _run(app, reminder)
+    [card] = flow.items(app, person, "approval.requested")
+    [again] = flow.items(app, person, "approval.expiring")
+    assert card["state"] == "SUPERSEDED" and again["priority"] == "URGENT"
+
+    _drop(owner, "approval.expire", approval_id)
+    with owner.transaction():  # the approval's expiry has passed in the database's time
+        owner.execute("ALTER TABLE ledger.approval DISABLE TRIGGER approval_guard")
+        owner.execute(
+            "UPDATE ledger.approval SET expires_at = now() - interval '1 second' WHERE id = %s",
+            (approval_id,),
+        )
+        owner.execute("ALTER TABLE ledger.approval ENABLE TRIGGER approval_guard")
+    now = flow.db_now(app)
+    stale = _item(app, person, now - timedelta(minutes=1))
+    due = {k for k, _ in _due_kinds(app, now)}
+    assert {"brain.probe", "approval.expire", "outbox.expire"} <= due
+    [expire] = _keyed(app, "approval.expire", jobs.job_key("approval.expire", str(approval_id)))
+    _run(app, expire)
+    assert flow.approval_row(app, approval_id)["decision"] == "EXPIRED"
+    [sweep] = _keyed(app, "outbox.expire", jobs.job_key("outbox.expire", str(stale)))
+    _run(app, sweep)
+    row = app.execute("SELECT state FROM comm.outbox WHERE id = %s", (stale,)).fetchone()
+    assert row == ("EXPIRED",)
+    assert _reservation_count(app) == reservations
+    assert health.is_down(app)
+
+
 def test_retention_daily_at_0330_ist(app: Conn) -> None:
     since = _last_job(app)
     day = datetime(2031, 3, 5, tzinfo=IST)

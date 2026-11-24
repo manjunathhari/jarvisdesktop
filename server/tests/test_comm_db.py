@@ -805,6 +805,35 @@ def test_outbox_unknown_or_other_person_refused(gateway: Conn, app: Conn, dsns: 
         ]
 
 
+def test_targeted_item_refused_on_the_persons_other_node(
+    gateway: Conn, app: Conn, dsns: Dsns
+) -> None:
+    """Owner final-review area 5 at the SQL boundary (R12-23): an item addressed to node A
+    can't be sent to, received on or acknowledged by the same person's node B. Each is
+    refused `unknown_item` and audited; B gets no delivery row and the item stays open. A's
+    own acknowledgement still works afterwards."""
+    node_a, conn_a = _connected(app, gateway)
+    node_b, conn_b = _connected(app, gateway)
+    item = _item(app, target_node_id=node_a)
+    assert _one(gateway, SENT, (conn_a, item)) is True
+    since = _seq(app)
+    assert dbcall.audited_call(gateway, SENT, (conn_b, item)) == (False,)
+    assert dbcall.audited_call(gateway, RECEIVED, (conn_b, item)) == ("unknown_item",)
+    assert dbcall.audited_call(gateway, ACK, (conn_b, item)) == ("unknown_item",)
+    assert _state(app, item) == "DELIVERING"
+    with psycopg.connect(dsns.app, autocommit=True) as other:  # the refusals were committed
+        assert _audit(other, since) == [
+            ("outbox", item, action, None, None, "REJECTED", "unknown_item",
+             {"node_id": str(node_b)})
+            for action in ("SEND", "RECEIVE", "ACK")
+        ]  # fmt: skip
+        rows = other.execute(
+            "SELECT node_id FROM comm.delivery WHERE outbox_id = %s", (item,)
+        ).fetchall()
+    assert rows == [(node_a,)]
+    assert _one(gateway, ACK, (conn_a, item)) == "ACKNOWLEDGED"
+
+
 # --- the multi-node race (P2-E13, database half) ----------------------------------------------
 
 

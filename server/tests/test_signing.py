@@ -173,6 +173,21 @@ def test_verify_never_raises_on_a_bad_signature(bad_sig: Any) -> None:
     assert verify(Purpose.NODE_MSG, pub, "n-1", obj, bad_sig) is False
 
 
+@pytest.mark.parametrize("beyond", [2**53, -(2**53), 2**64, 2**70])
+def test_integers_beyond_the_jcs_range_never_sign_or_verify(beyond: int) -> None:
+    """Owner final-review area 1 (no widening): JCS (RFC 8785) limits signed integers to
+    ±(2^53 - 1). One more can't be signed, and verifying an object that carries it returns
+    False without raising, so a `hello` with a larger `last_seq` can never verify."""
+    edge = 2**53 - 1
+    for ok in (edge, -edge):
+        assert verify(Purpose.NODE_MSG, pub, "n-1", {"last_seq": ok},
+                      sign(Purpose.NODE_MSG, key, "n-1", {"last_seq": ok}))  # fmt: skip
+    with pytest.raises(ValueError, match="safe integer"):
+        sign(Purpose.NODE_MSG, key, "n-1", {"last_seq": beyond})
+    sig = sign(Purpose.NODE_MSG, key, "n-1", {"last_seq": edge})
+    assert verify(Purpose.NODE_MSG, pub, "n-1", {"last_seq": beyond}, sig) is False
+
+
 def test_verify_rejects_padded_or_non_canonical_encodings() -> None:
     sig = sign(Purpose.NODE_MSG, key, "n-1", obj)
     assert not verify(Purpose.NODE_MSG, pub, "n-1", obj, sig + "==")

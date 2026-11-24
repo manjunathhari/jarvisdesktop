@@ -36,7 +36,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from jarvis_server import comm, nodes
 from jarvis_server.comm import OutboxState, Priority
 from jarvis_server.contracts import Welcome
-from jarvis_server.core import rules
+from jarvis_server.core import rules, summary
 from jarvis_server.dbcall import OutboxRefused
 from jarvis_server.gateway import relay
 from jarvis_server.signing import fingerprint, public_bytes
@@ -416,6 +416,34 @@ def test_resume_huge_last_seq_reaches_the_database(gw: Gw, app_conn: Conn, ddb: 
     b.hello(resume=[{"reply_id": str(reply), "last_seq": 2**53 - 1}])
     assert chunk_seqs(b.sync(), reply) == [2, 3]
     assert [e["reason"] for e in resume_events(app_conn, a.node_id)] == ["beyond_max"]
+
+
+def test_resume_last_seq_beyond_two_to_the_53_is_refused(gw: Gw, app_conn: Conn, ddb: Dsns) -> None:
+    """Owner final-review area 1 (no widening): a `hello` whose `last_seq` is 2^53 can't
+    carry a valid signature (the node signs 2^53 - 1, the frame says 2^53). The gateway
+    refuses the handshake once as `bad_signature`; nothing reaches the resume function, no
+    connection opens and no chunk is sent."""
+    a, reply = _stored_three_acked_one(gw, app_conn, ddb)
+    connections = close_reason(app_conn, a.node_id)
+    b = reborn(gw, a)
+    b.connect()
+    assert b.challenge is not None
+    since = audit_seq(app_conn)
+
+    def widen(env: dict[str, Any]) -> None:
+        env["payload"]["resume"][0]["last_seq"] = 2**53
+
+    resume = [{"reply_id": str(reply), "last_seq": 2**53 - 1}]
+    b.send("hello", {"nonce": b.challenge["nonce"], "resume": resume}, mutate=widen)
+    assert '"last_seq": 9007199254740992' in b.last_sent  # the frame on the wire
+    got = closed(b)
+    assert chunk_seqs(got, reply) == [] and [e["kind"] for e in got] == []  # no welcome
+    rows = app_conn.execute(
+        "SELECT action::text, reason FROM audit.event WHERE seq > %s ORDER BY seq", (since,)
+    ).fetchall()
+    assert rows == [("CONNECT_REFUSED", "bad_signature")]
+    assert resume_events(app_conn, a.node_id) == []
+    assert close_reason(app_conn, a.node_id) == connections  # no connection was opened
 
 
 def test_resume_for_foreign_reply_ignored(gw: Gw, app_conn: Conn) -> None:
@@ -965,6 +993,60 @@ def test_welcome_without_open_session(gw: Gw, app_conn: Conn) -> None:
     assert reborn(gw, a).hello() == {"session_id": None, "summary": []}
 
 
+def test_summary_and_delivery_continue_while_claude_is_down(gw: Gw, app_conn: Conn) -> None:
+    """P2-E08 and the delivery half of P2-B1, end to end: with the brain marked DOWN, a
+    reconnecting device still gets its `welcome` summary (built by code), the queued item
+    and a new live item."""
+    from jarvis_server.brain import health
+
+    guest = person(app_conn)
+    a = enrolled(gw, guest)
+    a.close()
+    health.record_failure(app_conn)
+    health.record_failure(app_conn)
+    try:
+        assert health.is_down(app_conn)
+        down = item(app_conn, who=guest, priority=Priority.DIGEST, kind="brain.down",
+                    group_key="brain")  # fmt: skip
+        queued = item(app_conn, who=guest, kind="budget.80", group_key="budget")
+        b = reborn(gw, a)
+        welcome = b.hello()
+        assert welcome["summary"] == [
+            {"priority": "TODAY", "group_key": "budget", "outbox_ids": [str(queued)],
+             "line": summary.LINE["budget.80"]},
+            {"priority": "DIGEST", "group_key": "brain", "outbox_ids": [str(down)],
+             "line": summary.DIGEST_LINE.format(label=summary.LINE["brain.down"], count=1)},
+        ]  # fmt: skip
+        assert sorted(item_ids(b.sync())) == sorted([str(down), str(queued)])
+        live = str(item(app_conn, who=guest))
+        assert live in item_ids(collect(b, lambda e: live in item_ids(e)))
+        assert health.is_down(app_conn)  # nothing above needed Claude
+    finally:
+        health.record_success(app_conn)
+
+
+def test_gateway_process_loads_no_brain_or_memory_code() -> None:
+    """P2-E08, P2-B1 (delivery) and P2-S1: importing the gateway's entry point in a fresh
+    interpreter loads no brain, memory, turn or policy module and no HTTP client, so delivery,
+    acknowledgement and the reconnect summary can't depend on Claude being reachable."""
+    import subprocess
+    import sys
+
+    probe = "import json, sys, jarvis_server.gateway.app\nprint(json.dumps(sorted(sys.modules)))"
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", probe], check=True, capture_output=True, text=True
+    )
+    loaded = json.loads(out.stdout)
+    assert "jarvis_server.gateway.app" in loaded and "jarvis_server.core.summary" in loaded
+    forbidden = (
+        "jarvis_server.brain", "jarvis_server.memory", "jarvis_server.core.turn",
+        "jarvis_server.core.approvals", "jarvis_server.policy", "jarvis_server.atlas",
+        "httpx", "anthropic",
+    )  # fmt: skip
+    prefixes = tuple(f + "." for f in forbidden)
+    assert [m for m in loaded if m in forbidden or m.startswith(prefixes)] == []
+
+
 def test_three_missed_heartbeats_close_connection(gw: Gw, app_conn: Conn) -> None:
     a = enrolled(gw)
     a.answer_pings = False
@@ -1120,6 +1202,39 @@ def test_close_connection_failure_after_send_timeout(
         closed(a)  # the socket was closed regardless
 
 
+def test_close_connection_failure_after_missed_heartbeats(
+    gw: Gw, app_conn: Conn, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Owner final-review area 3, the heartbeat path: recording the `heartbeat` disconnect
+    fails. It is logged, the link stops and the socket still closes; the row left open is
+    closed `superseded` when the device next connects, which then works normally."""
+    from jarvis_server.gateway import session as gateway_session
+
+    real = gateway_session.audited_call_async
+
+    async def failing(conn: Any, sql: Any, params: Any) -> Any:
+        if "close_connection" in sql and params[1] == "heartbeat":
+            raise psycopg.errors.InternalError("injected")
+        return await real(conn, sql, params)
+
+    a = enrolled(gw)
+    a.answer_pings = False
+    monkeypatch.setattr(gateway_session, "audited_call_async", failing)
+    for _ in range(4):
+        gw.clock.advance(30)
+        _wait_for(lambda: False, 0.1)  # let the ticker see each step
+    closed(a)
+    assert _wait_for(lambda: a.node_id not in _relay(gw)._links, 5)
+    assert _wait_for(lambda: "could not close connection" in caplog.text, 5)
+    assert close_reason(app_conn, a.node_id) == [None]  # nothing recorded
+    monkeypatch.setattr(gateway_session, "audited_call_async", real)
+    again = reborn(gw, a)
+    again.hello()
+    assert close_reason(app_conn, a.node_id) == ["superseded", None]
+    outbox_id = str(item(app_conn))
+    assert outbox_id in item_ids(collect(again, lambda e: outbox_id in item_ids(e)))
+
+
 def test_confirmation_is_per_device(ddb: Dsns, tmp_path: Path, app_conn: Conn) -> None:
     """Owner ruling: A confirmed, B didn't. Past the re-send interval B gets the same
     outbox_id again and A doesn't; after both reconnect, the same per-device outcome. The
@@ -1194,3 +1309,35 @@ def test_shutdown_leaves_no_pending_tasks(
         if "destroyed but it is pending" in r.getMessage() or "never retrieved" in r.getMessage()
     ]
     assert bad == []
+
+
+def test_work_dropped_at_shutdown_is_delivered_after_restart(
+    ddb: Dsns, tmp_path: Path, app_conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner final-review area 4: the queue a shutdown cancels holds work, not state. A
+    device whose send was blocked at shutdown, with a second item still queued behind it,
+    reconnects to a new gateway process: the never-sent item comes with the connect, the
+    one whose send was cut off comes with the re-send pass, and each is shown once."""
+    with gateway(ddb, tmp_path, send_timeout=600, tick_interval=3600) as first:
+        guest = person(app_conn)  # its own person: no other test's items in the way
+        blocked = enrolled(first, guest)
+        link = _relay(first)._links[blocked.node_id]
+        with stuck_sends(monkeypatch, blocked) as stuck:
+            stuck.set()
+            cut = str(item(app_conn, who=guest))
+            assert _wait_for(lambda: attempts(app_conn, cut, blocked.node_id) == 1, 5)
+            queued = str(item(app_conn, who=guest))  # waits behind the blocked send
+            assert _wait_for(lambda: link._queue.qsize() >= 1, 5)
+        assert attempts(app_conn, queued, blocked.node_id) is None
+    stuck.clear()
+    assert link._sender.done() and link._queue.empty()
+    with gateway(ddb, tmp_path, keys_from=first, tick_interval=3600) as second:
+        again = reborn(second, blocked)
+        again.hello()
+        assert item_ids(again.sync()) == [queued]  # never sent: offered on connect
+        second.clock.advance(150)
+        _sweep(second)
+        assert item_ids(collect(again, lambda e: cut in item_ids(e))) == [cut]
+        again.sync()
+        assert again.displays[cut] == 1 and again.displays[queued] == 1
+        assert state(app_conn, cut) == "DELIVERED" and state(app_conn, queued) == "DELIVERED"
