@@ -10,12 +10,15 @@
 #   5. /etc/jarvis/secrets (root:10001, every file 0440):
 #      - four generated database passwords (superuser, owner, app, gateway);
 #      - two generated Ed25519 signing keys, core_signing_key and gateway_signing_key (PEM),
-#        and gateway_signing_key.pub (the raw 32-byte public key, for `jarvis-core keys init`);
+#        with core_signing_key.pub and gateway_signing_key.pub (raw 32-byte public keys, not
+#        secret: init records them as the trusted keys on the first deploy);
 #      - two provided secrets, asked for (hidden) when missing: tailscale_gateway_authkey and
 #        anthropic_api_key.
 #      Existing files are kept, never regenerated. No key or password is ever printed.
 #
 #   bash harden.sh --secrets-only   runs step 5 alone (e.g. to add the Phase 2 secrets).
+#   JARVIS_HARDEN_SECRETS_DIR=<dir> writes the secrets there instead (tests); only that
+#   directory itself is created or changed, never its parent.
 #
 # What it does NOT touch: pubmedgemini, Traefik, Ollama, the existing Postgres 16, Docker.
 set -euo pipefail
@@ -31,7 +34,11 @@ seal() { chown root:10001 "$1"; chmod 0440 "$1"; }
 secrets_step() {
   local name f value spki
   getent group 10001 >/dev/null || groupadd --system --gid 10001 jarvis-secrets
-  install -d -m 0750 -o root -g 10001 "${SECRETS_DIR%/*}" "$SECRETS_DIR"
+  if [[ $SECRETS_DIR == /etc/jarvis/secrets ]]; then
+    install -d -m 0750 -o root -g 10001 /etc/jarvis "$SECRETS_DIR"
+  else
+    install -d -m 0750 -o root -g 10001 "$SECRETS_DIR"
+  fi
 
   for name in pg_superuser_password pg_owner_password pg_app_password pg_gateway_password; do
     f=$SECRETS_DIR/$name
@@ -59,14 +66,16 @@ secrets_step() {
     fi
     seal "$f"
   done
-  # The raw public key is the last 32 bytes of the DER public key.
-  f=$SECRETS_DIR/gateway_signing_key.pub
-  (umask 0337; rm -f "$f.tmp"
-   openssl pkey -in "$SECRETS_DIR/gateway_signing_key" -pubout -outform DER | tail -c 32 > "$f.tmp")
-  [[ $(stat -c %s "$f.tmp") -eq 32 ]] || { echo "could not write $f" >&2; exit 1; }
-  mv -f "$f.tmp" "$f"
-  seal "$f"
-  echo "wrote gateway_signing_key.pub"
+  # The raw public keys: the last 32 bytes of each DER public key.
+  for name in core_signing_key gateway_signing_key; do
+    f=$SECRETS_DIR/$name.pub
+    (umask 0337; rm -f "$f.tmp"
+     openssl pkey -in "$SECRETS_DIR/$name" -pubout -outform DER | tail -c 32 > "$f.tmp")
+    [[ $(stat -c %s "$f.tmp") -eq 32 ]] || { echo "could not write $f" >&2; exit 1; }
+    mv -f "$f.tmp" "$f"
+    seal "$f"
+    echo "wrote $name.pub"
+  done
 
   for name in tailscale_gateway_authkey anthropic_api_key; do
     f=$SECRETS_DIR/$name
@@ -156,4 +165,4 @@ secrets_step
 say "Done"
 echo "Tailscale address: $(tailscale ip -4 2>/dev/null || echo 'not connected yet')"
 echo "Next: tell Claude it finished. The firewall is changed separately, through the Hostinger connector."
-echo "After the first deploy: docker exec jarvis-core-1 jarvis-core keys init (runbook §8)."
+echo "The first deploy's init records the signing keys as trusted (runbook §8.2)."

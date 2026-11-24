@@ -14,7 +14,7 @@ No addresses, hostnames or secrets belong in this file (the repository is public
 |---|---|
 | Code, migrations, compose file, hardening script | This repo (`server/`) |
 | Image | `ghcr.io/manjunathhari/jarvis-server:<commit>`, built and published by CI (`.github/workflows/server.yml`) after the tests pass on `main` or `phase-0-foundations` |
-| Secrets | `/etc/jarvis/secrets/` on the server (root:10001, 0440), created by `harden/harden.sh`: four database passwords, the core and gateway Ed25519 signing keys (and `gateway_signing_key.pub`), and two provided secrets, `tailscale_gateway_authkey` and `anthropic_api_key` (§8.1). Never in the repo, never in Hostinger's environment field |
+| Secrets | `/etc/jarvis/secrets/` on the server (root:10001, 0440), created by `harden/harden.sh`: four database passwords, the core and gateway Ed25519 signing keys (with their public keys `core_signing_key.pub` and `gateway_signing_key.pub`), and two provided secrets, `tailscale_gateway_authkey` and `anthropic_api_key` (§8.1). Never in the repo, never in Hostinger's environment field |
 | Data | Docker volume `jarvis_pgdata` (Postgres 17) |
 | Daily dumps | Docker volume `jarvis_backups` (`last/`, `daily/`, `weekly/`, `monthly/`; newest is `last/jarvis-latest.sql.gz`) |
 | Memory | Docker volume `jarvis_memory`: a private git repo of markdown files, mounted only into `core`. **No git remote, ever** — core refuses to start if one exists |
@@ -22,7 +22,7 @@ No addresses, hostnames or secrets belong in this file (the repository is public
 | Admin access | `tailscale ssh root@jarvis-server` from Manj's PC, or the Hostinger web console |
 | Gateway on the tailnet | Device `jarvis-gw` (tag `tag:jarvis-gateway`), port 8443, run by the `gateway-ts` sidecar; its state is in volume `jarvis_gateway_ts_state` |
 
-Containers (Docker project `jarvis`): `postgres`, `init` (one-shot), `core`, `scheduler`, `backup`, `gateway`, `gateway-ts`, `egress-proxy`. No port is published (CI fails the build if one appears). All sit on the internal network `jarvis_internal`, which has no internet route. Two also have one: `gateway-ts` (network `jarvis_ts_egress`, for Tailscale only) and `egress-proxy` (network `jarvis_egress`, which allows only `CONNECT api.anthropic.com:443`). The `gateway` runs inside `gateway-ts`'s network namespace, and the sidecar's entrypoint lets the gateway's UID out only on `tailscale0`, to `jarvis_internal`, and to loopback (§4.2).
+Containers (Docker project `jarvis`): `postgres`, `init` (one-shot), `core`, `scheduler`, `backup`, `gateway`, `gateway-ts`, `egress-proxy`. No port is published (CI fails the build if one appears). All sit on the internal network `jarvis_internal`, which has no internet route. Two also have one: `gateway-ts` (network `jarvis_ts_egress`, for Tailscale only) and `egress-proxy` (network `jarvis_egress`, which allows only `CONNECT api.anthropic.com:443`). The `gateway` runs inside `gateway-ts`'s network namespace and uses no DNS (R12-33). `jarvis_internal` has a fixed subnet, 10.214.14.0/24 (Docker hands out only .128–.255), and `postgres` the fixed address 10.214.14.10, which the gateway uses as its database host. The sidecar's entrypoint lets the gateway's UID open only TCP connections to 10.214.14.10:5432 and send only replies on `tailscale0`; everything else from it is dropped, IPv4 and IPv6 (§4.2).
 
 ## 2. Deploy a new version
 
@@ -41,7 +41,7 @@ Containers (Docker project `jarvis`): `postgres`, `init` (one-shot), `core`, `sc
    docker logs jarvis-init-1 | grep SMOKE
    ```
    Each smoke run leaves a few rows labelled `source_ref = 'smoke-check'` in the ledger, and a revoked smoke node with terminal outbox items for "Smoke Fictional". To turn the smoke off for a deploy, add `JARVIS_SMOKE_ON_INIT=0` to the environment.
-4. **First Phase 2 deploy only:** record the trusted keys (§8.2). Until then the `gateway` refuses to start and keeps restarting.
+4. **First Phase 2 deploy only:** the internal network now has a fixed subnet (R12-33), and an existing `jarvis_jarvis_internal` without one is not changed in place. Before this deploy, stop the old project so the network is created anew: `docker compose down` (**never** `-v`; the volumes stay), or stop and delete project `jarvis` through the connector **without** deleting its volumes. Then deploy. `init` records the trusted keys itself (§8.2), so the `gateway` starts on the first `up`.
 
 **Roll back:** deploy the previous commit the same way. Migrations only move forward on deploy; if a migration must be undone, use `jarvis-core downgrade` deliberately (see §6), never as part of a routine rollback.
 
@@ -55,7 +55,7 @@ Containers (Docker project `jarvis`): `postgres`, `init` (one-shot), `core`, `sc
    ```
    Approve the Tailscale link it prints. It creates fresh database passwords and the two signing keys in `/etc/jarvis/secrets/`, and asks (input hidden) for the Tailscale gateway auth key and the Anthropic API key (§8.1).
 3. **Firewall at the provider:** on a server of its own, allow **only** UDP 41641 (Tailscale) — no 22, 80 or 443. (On the shared server, 22/80/443 stay open for pubmedgemini.)
-4. **Deploy** as in §2, then `keys init` (§8.2). An empty JARVIS is a valid result; stop here if no data needs to move. A new server gets new signing keys, so every node enrols again (§8.4).
+4. **Deploy** as in §2 (init records the new signing keys, §8.2). An empty JARVIS is a valid result; stop here if no data needs to move. A new server gets new signing keys, so every node enrols again (§8.4).
 5. **Bring the data across (optional)** — §4 (ledger) and §7 (memory).
 6. **Verify:** `SMOKE PASS` ×18 in the `init` logs, `memory ready` in the `core` logs, and the gateway checks (§8.3); run the **Server network check** workflow after updating the `SERVER_IP` repository secret and the expected port list in `.github/workflows/network-check.yml`.
 7. **Retire the old copy:** stop the old project (`docker compose down`, or delete project `jarvis` through the connector). Keep its volumes until the new server has run for a week.
@@ -155,23 +155,22 @@ Commands below run on the server as root (over `tailscale ssh`). `docker exec ja
      { "src": ["<your-tailscale-login>"], "dst": ["tag:jarvis-gateway"], "ip": ["tcp:8443"] }
    ]
    ```
-   If the policy file still uses `acls`, the same rule is `{ "action": "accept", "src": ["<your-tailscale-login>"], "dst": ["tag:jarvis-gateway:8443"] }`. Nothing else may reach `tag:jarvis-gateway`.
+   If the policy file still uses `acls`, the same rule is `{ "action": "accept", "src": ["<your-tailscale-login>"], "dst": ["tag:jarvis-gateway:8443"] }`. Nothing else may reach `tag:jarvis-gateway`: the policy must have **no allow-all rule** (remove the default `*` → `*:*` one) and **no rule or grant with `tag:jarvis-gateway` as its source**. The gateway never opens a tailnet connection (its rules allow only replies), and the tag needs none.
 2. **Auth key for the sidecar.** Settings → Keys → Generate auth key: **not reusable**, **tagged** `tag:jarvis-gateway`, short expiry. It is used once, at the sidecar's first login (`TS_AUTH_ONCE`); after that the device lives in volume `jarvis_gateway_ts_state`.
 3. **Secrets.** Run the hardening script's secrets step (the same pinned-and-checked download as §3 step 2, then):
    ```bash
    bash /root/harden.sh --secrets-only
    ```
-   It keeps every existing file, and creates `pg_gateway_password`, `core_signing_key`, `gateway_signing_key` (Ed25519, PEM) and `gateway_signing_key.pub` (raw 32 bytes). It asks, with input hidden, for `tailscale_gateway_authkey` (step 2) and `anthropic_api_key`; Enter skips one. It never prints a key. Everything ends up root:10001, 0440. A missing provided secret is reported as `missing …`: place it by hand (`umask 0337; cat > /etc/jarvis/secrets/<name>`, then `chown root:10001`) before deploying, or `docker compose up` fails.
+   It keeps every existing file, and creates `pg_gateway_password`, `core_signing_key`, `gateway_signing_key` (Ed25519, PEM), and their public keys `core_signing_key.pub` and `gateway_signing_key.pub` (raw 32 bytes each, not secret). It asks, with input hidden, for `tailscale_gateway_authkey` (step 2) and `anthropic_api_key`; Enter skips one. It never prints a key. Everything ends up root:10001, 0440. A missing provided secret is reported as `missing …`: place it by hand (`umask 0337; cat > /etc/jarvis/secrets/<name>`, then `chown root:10001`) before deploying, or `docker compose up` fails.
 
-### 8.2 First deploy: record the trusted keys (once)
+### 8.2 First deploy: the trusted keys
 
-Deploy as in §2. Then, once, record the core key and the gateway's public key as the ACTIVE trusted keys:
+`init` records them on every deploy, from `core_signing_key.pub` and `gateway_signing_key.pub` (init holds no private key). The first deploy makes them the ACTIVE CORE and GATEWAY keys, so the gateway starts at once; every later deploy changes nothing. After a rotation (§8.5) a role's ACTIVE key differs: init logs `trusted keys left as they are (active_key_differs …)` and goes on. A missing `.pub` file stops init. Check:
 ```bash
-docker exec jarvis-core-1 jarvis-core keys init
+docker logs jarvis-init-1 2>&1 | grep 'trusted keys'
 docker exec jarvis-core-1 jarvis-core keys list     # CORE <id> ACTIVE, GATEWAY <id> ACTIVE
-docker compose restart gateway                       # or wait for its next restart
 ```
-`keys init` is idempotent, and refuses (`active_key_differs`) once a role has a different ACTIVE key, so after a rotation (§8.5) it is never needed again. Until it has run, the gateway refuses to start (no trusted keys) and Docker keeps restarting it; that is expected.
+**Manual fallback** (same effect, from core's private key and the gateway's public key): `docker exec jarvis-core-1 jarvis-core keys init`, then `docker compose restart gateway`. Without trusted keys the gateway refuses to start and Docker keeps restarting it.
 
 ### 8.3 Gateway checks
 
@@ -179,7 +178,7 @@ docker compose restart gateway                       # or wait for its next rest
 |---|---|---|
 | Bound to its tailnet address only | `docker logs jarvis-gateway-1 2>&1 \| grep -i 'running on'` | `http://100.x.y.z:8443`, never `0.0.0.0` |
 | Sidecar on the tailnet | `docker exec jarvis-gateway-ts-1 tailscale --socket=/var/run/tailscale/tailscaled.sock status` | `jarvis-gw`, tagged, online |
-| Gateway egress rules | `docker exec jarvis-gateway-ts-1 iptables -S JARVIS_GW_OUT` | ACCEPT on `lo` (127.0.0.0/8), on `tailscale0`, to the internal subnet; then DROP |
+| Gateway egress rules | `docker exec jarvis-gateway-ts-1 iptables -S JARVIS_GW_OUT` and `ip6tables -S JARVIS_GW_OUT` | IPv4: ACCEPT `-o tailscale0` with `--ctstate RELATED,ESTABLISHED`, ACCEPT `-d 10.214.14.10/32 -p tcp --dport 5432`, then DROP. IPv6: the tailscale0 rule, then DROP. Nothing for `lo` |
 | Trusted keys loaded | `docker logs jarvis-gateway-1 2>&1 \| grep 'trusted keys'` | no ERROR lines (an ERROR names a missing secret, §8.5) |
 | Proxy refuses other hosts | `docker logs jarvis-egress-proxy-1` | starts without config errors |
 
@@ -225,14 +224,25 @@ A key ID is the public key's fingerprint, `base32(sha256(public)[:10])`, lower c
 Scripted, fictional test phrases only (§5.7): what is said is stored on the shared server.
 
 1. **Smoke:** the `init` logs show 18 `SMOKE PASS` lines (§2 step 3).
-2. **Gateway path, end to end:** from Manj's PC on the tailnet, enrol a fresh test node with a new code (§8.4), then run the Python fake node once against `ws://<jarvis-gw tailnet address>:8443/v1/node` (plain WebSocket inside the encrypted tailnet): enrol, hello, one utterance with a fictional phrase, the reply chunks, ack. Revoke the test node afterwards. (The fake node in `server/tests/fakes/fake_node.py` drives an in-process test client today; this check needs a small runner that points it at the real gateway.)
-3. **Latency (§6.2, target: the first spoken sentence within 3 s of the end of speech):** in the same run, time from sending `utterance` to the first `reply.chunk` received, over five fictional phrases, and note the worst. Core writes each speech piece when the next one arrives and keeps the last piece back to write as the final chunk after the call is settled (Task 10), so the first chunk lags Claude's first text by one streaming delta, and a reply that arrives as a single delta appears only when the call ends. If a turn misses 3 s, the `core` and `gateway` timing logs show where (§15).
-4. **Gateway bound to the tailnet only:** §8.3, first row.
-5. **P2-S5 (gateway egress blocked):** over Tailscale SSH on the server,
+2. **Gateway path, end to end:** on the server, `docker exec -it jarvis-core-1 jarvis-core node enrol --person manj --kind DESKTOP --name "live check"` prints a fresh code. Then on Manj's PC (on the tailnet), from a checkout of this repo's `server/` with `uv sync`:
    ```bash
-   docker compose exec gateway python -c "import socket; socket.create_connection(('1.1.1.1', 443), 3)"
+   uv run python -m tests.fakes.live_node --gateway <jarvis-gw tailnet address> --code <code> --repeat 5
    ```
-   must fail (timeout or refused).
+   It enrols a throwaway node (its key only in memory), then for each of five fictional phrases sends `utterance`, checks every gateway message with the fake node's node-side rules, and acknowledges each reply chunk. It prints no key and not the code, and exits 1 with the reason if anything is refused. Afterwards revoke the node it printed (`jarvis-core node revoke <node_id>`).
+3. **Latency (§6.2, target: the first spoken sentence within 3 s of the end of speech):** the same run prints, per phrase, the time from sending `utterance` to the first `reply.chunk` and to the final one, each against 3 s, and the worst. These timings include the tailnet round trip, but not the desktop's speech recognition or speech output. Core writes each speech piece when the next one arrives and keeps the last piece back to write as the final chunk after the call is settled (Task 10), so the first chunk lags Claude's first text by one streaming delta, and a reply that arrives as a single delta appears only when the call ends. If a turn misses 3 s, the `core` and `gateway` timing logs show where (§15).
+4. **Gateway bound to the tailnet only:** §8.3, first row.
+5. **P2-S5 (gateway egress exactly per R12-33):** over Tailscale SSH on the server, as the gateway's own user (UID 10001). The first line must succeed; every other must fail (timeout, refused, or `Operation not permitted`):
+   ```bash
+   G='docker compose exec gateway python -c'
+   $G "import socket; socket.create_connection(('10.214.14.10', 5432), 3); print('postgres ok')"   # must succeed
+   $G "import socket; socket.create_connection(('1.1.1.1', 443), 3)"                              # internet
+   $G "import socket; print(socket.getaddrinfo('postgres', 5432))"                                 # any DNS
+   $G "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3); s.sendto(bytes(12), ('127.0.0.11', 53)); s.recv(512)"   # Docker DNS
+   PROXY=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' jarvis-egress-proxy-1)
+   for ip in $PROXY; do $G "import socket; socket.create_connection(('$ip', 3128), 3)"; done      # the egress proxy, both addresses
+   $G "import socket; socket.create_connection(('100.100.100.100', 53), 3)"                        # quad-100 DNS
+   $G "import socket; socket.create_connection(('<the server host's own tailnet address>', 22), 3)"   # a new tailnet connection
+   ```
 6. **P2-S7 (core reaches only Claude):** from `core`, any host other than `api.anthropic.com` must fail, directly and through the proxy, while a request to Claude through the proxy succeeds:
    ```bash
    docker compose exec core python -c "import socket; socket.create_connection(('1.1.1.1', 443), 3)"          # must fail

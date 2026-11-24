@@ -448,12 +448,16 @@ class FakeNode:
         ws = self.ws
         if ws is None:
             raise RuntimeError("not connected")
+        next_message = getattr(ws, "next_message", None)  # a live socket (live_node.py)
+        if next_message is not None:
+            message = next_message(timeout)
+        else:
 
-        async def _next() -> Any:
-            with anyio.fail_after(timeout):
-                return await ws._send_rx.receive()
+            async def _next() -> Any:
+                with anyio.fail_after(timeout):
+                    return await ws._send_rx.receive()
 
-        message = ws.portal.call(_next)
+            message = ws.portal.call(_next)
         if message["type"] == "websocket.close":
             self.close()
             self.last_close = message.get("code")

@@ -1,6 +1,7 @@
 """`jarvis-core`: the core process and its admin commands.
 
-jarvis-core init        bootstrap + migrate (+ smoke if JARVIS_SMOKE_ON_INIT=1), one-shot
+jarvis-core init        bootstrap + migrate + record the bootstrap signing keys (first deploy)
+                        (+ smoke if JARVIS_SMOKE_ON_INIT=1), one-shot
 jarvis-core bootstrap   create roles and database (superuser; once per server)
 jarvis-core migrate     apply migrations (owner role)
 jarvis-core downgrade   undo the newest migration (owner role; take a dump first)
@@ -15,7 +16,8 @@ jarvis-core node revoke <node_id>
 jarvis-core node reenrol <node_id>
                         revoke a node and print a new enrolment code (same person, kind and
                         name) with the current key fingerprints (R5-1)
-jarvis-core keys init   record the current core and gateway keys as ACTIVE (bootstrap; once)
+jarvis-core keys init   record the current core and gateway keys as ACTIVE (bootstrap; init
+                        does this itself; the manual fallback)
 jarvis-core keys announce --role CORE|GATEWAY --public-key-file <path>
                         announce a new key (raw 32-byte public key) to every active node
 jarvis-core keys retire <key_id>
@@ -225,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
         _bootstrap()
         migrate.upgrade(config.owner_dsn())
         log.info("bootstrap done; migrations at head")
+        record_bootstrap_keys()
         if os.environ.get("JARVIS_SMOKE_ON_INIT") == "1":
             return _smoke()
     elif args.command == "bootstrap":
@@ -335,6 +338,29 @@ def _read_public(path: Path) -> bytes:
     if len(public) != 32:
         raise SystemExit(f"{path} must hold a raw 32-byte Ed25519 public key")
     return public
+
+
+def record_bootstrap_keys() -> None:
+    """init, on every deploy: record `core_signing_key.pub` and `gateway_signing_key.pub` (raw
+    public keys written by harden.sh; init never holds a private key) as the ACTIVE trusted
+    keys. The first deploy records them, so the gateway can start; later deploys change
+    nothing. After a rotation a role's ACTIVE key differs, `keys.init_keys` refuses
+    (`active_key_differs`, nothing written), and that is logged, not a failed deploy. A missing
+    public key file stops init."""
+    core = _read_public(config.SECRETS_DIR / "core_signing_key.pub")
+    gateway = _read_public(config.SECRETS_DIR / "gateway_signing_key.pub")
+    with psycopg.connect(config.app_dsn(), autocommit=True) as conn:
+        try:
+            added = keys.init_keys(conn, core_public=core, gateway_public=gateway)
+        except keys.KeyRefused as e:
+            if e.reason != "active_key_differs":
+                raise
+            log.info("trusted keys left as they are (active_key_differs: a key has been rotated)")
+            return
+    if added:
+        log.info("trusted keys recorded: %s", ", ".join(added))
+    else:
+        log.info("trusted keys already recorded")
 
 
 def _keys(args: argparse.Namespace) -> int:

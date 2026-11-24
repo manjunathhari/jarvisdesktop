@@ -9,8 +9,9 @@
 # internal network `jarvis_internal`, which has no internet route. Two containers also join a
 # network with one (spec §4.2):
 #   gateway-ts    the gateway's Tailscale sidecar (tailnet device jarvis-gw, tag:jarvis-gateway).
-#                 The gateway runs in its network namespace; the sidecar's entrypoint lets the
-#                 gateway's UID out only on tailscale0, to jarvis_internal and to loopback.
+#                 The gateway runs in its network namespace and uses no DNS (R12-33): the
+#                 sidecar's entrypoint lets the gateway's UID open only TCP to Postgres's fixed
+#                 address on 5432, and send only replies on tailscale0.
 #   egress-proxy  squid, allowing only CONNECT api.anthropic.com:443. Core reaches Claude
 #                 through it (HTTPS_PROXY) and has no other way out.
 # Both third-party images are pinned by digest. Their entrypoint and config are inline
@@ -21,13 +22,17 @@
 # On every `up`, the one-shot `init` service bootstraps roles, applies migrations and (with
 # JARVIS_SMOKE_ON_INIT=1) prints "SMOKE PASS/FAIL" lines for P0-1 … P0-5, M1-M4 (memory
 # checks run in a temporary repo with fictional people) and the database-only Phase 2 rows;
-# core, scheduler and gateway start only if it succeeds. On the first Phase 2 deploy, run
-# `jarvis-core keys init` once (deploy/README.md §8.2); the gateway waits for it.
+# core, scheduler and gateway start only if it succeeds. init also records the bootstrap
+# signing keys as trusted on the first deploy (deploy/README.md §8.2), so the gateway can start.
 #
 # Memory (ADR-010): the private git repo lives in volume `memory`, mounted only into core.
 # core also writes a daily git bundle into its own volume `memory_backups`.
 
 name: jarvis
+
+# Postgres's fixed address on jarvis_internal (R12-33). The gateway reaches it by this address,
+# never by name. Outside the network's ip_range, so no other container can be given it.
+x-postgres-ip: &postgres_ip 10.214.14.10
 
 x-logging: &logging
   driver: json-file
@@ -58,7 +63,8 @@ services:
       TZ: Asia/Kolkata
     secrets: [pg_superuser_password]
     volumes: [pgdata:/var/lib/postgresql/data]
-    networks: [jarvis_internal]
+    networks:
+      jarvis_internal: { ipv4_address: *postgres_ip }
     mem_limit: 1g
     security_opt: ["no-new-privileges:true"]
     logging: *logging
@@ -82,8 +88,17 @@ services:
       JARVIS_SMOKE_ON_INIT: ${JARVIS_SMOKE_ON_INIT:-1}
       TZ: Asia/Kolkata
     # pg_gateway_password: bootstrap sets the gateway role's password, and the P2 smoke rows
-    # call the gateway's functions as that role.
-    secrets: [pg_superuser_password, pg_owner_password, pg_app_password, pg_gateway_password]
+    # call the gateway's functions as that role. The two public keys (never a private key):
+    # init records them as the trusted keys on the first deploy (runbook §8.2).
+    secrets:
+      - pg_superuser_password
+      - pg_owner_password
+      - pg_app_password
+      - pg_gateway_password
+      - source: core_signing_key_pub
+        target: core_signing_key.pub
+      - source: gateway_signing_key_pub
+        target: gateway_signing_key.pub
     mem_limit: 256m
 
   core:
@@ -92,7 +107,7 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       init: { condition: service_completed_successfully }
-      egress-proxy: { condition: service_started }
+      egress-proxy: { condition: service_healthy }
     networks: [jarvis_internal]
     environment:
       JARVIS_DB_HOST: postgres
@@ -104,7 +119,7 @@ services:
       TZ: Asia/Kolkata
     # Core refuses to start without anthropic_api_key or HTTPS_PROXY. core_signing_key signs
     # actions and approval cards, and only core can read it (§4.3). gateway_signing_key.pub is
-    # public: `jarvis-core keys init` records it as the ACTIVE gateway key.
+    # public, for the manual fallback `jarvis-core keys init` (init normally does it).
     secrets:
       - pg_app_password
       - anthropic_api_key
@@ -153,8 +168,9 @@ services:
     logging: *logging
 
   # The node gateway (spec §4, §4.2). It has only the sidecar's interfaces, binds only its
-  # tailnet address (port 8443), and refuses to start until `jarvis-core keys init` has
-  # recorded the trusted keys (runbook §8). The sidecar's API socket is shared with it alone.
+  # tailnet address (port 8443), and refuses to start without trusted keys (init records them,
+  # runbook §8.2). It uses no DNS: its database host is Postgres's fixed address (R12-33). The
+  # sidecar's API socket is shared with it alone.
   gateway:
     <<: *app
     entrypoint: ["jarvis-gateway"]
@@ -165,14 +181,14 @@ services:
       init: { condition: service_completed_successfully }
       gateway-ts: { condition: service_healthy }
     environment:
-      JARVIS_DB_HOST: postgres
+      JARVIS_DB_HOST: *postgres_ip
       JARVIS_DB_NAME: jarvis
       JARVIS_PROCESS: gateway
-      JARVIS_TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      JARVIS_TS_SOCKET: /ts-socket/tailscaled.sock
       TZ: Asia/Kolkata
     secrets: [pg_gateway_password, gateway_signing_key]
     volumes:
-      - ts_socket:/var/run/tailscale:ro
+      - ts_socket:/ts-socket:ro
     mem_limit: 256m
 
   # Tailscale sidecar, kernel mode. Its auth key is created once by Manj in the Tailscale admin
@@ -181,8 +197,6 @@ services:
   gateway-ts:
     image: tailscale/tailscale:stable@sha256:ed6480b33c6eb67c9cbd203ed42b9fb57e361986725b6856def71b7a3d9e276c
     restart: unless-stopped
-    depends_on:
-      postgres: { condition: service_healthy }   # the entrypoint finds jarvis_internal by it
     entrypoint: ["/bin/sh", "/etc/jarvis/gateway-ts-entrypoint.sh"]
     configs:
       - source: gateway_ts_entrypoint
@@ -194,22 +208,28 @@ services:
       TS_USERSPACE: "false"
       TS_ACCEPT_DNS: "false"
       TS_STATE_DIR: /var/lib/tailscale
-      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      TS_SOCKET: /ts-socket/tailscaled.sock
       JARVIS_GATEWAY_UID: "10001"
+      JARVIS_POSTGRES_IP: *postgres_ip
       TZ: Asia/Kolkata
     secrets: [tailscale_gateway_authkey]
     devices: ["/dev/net/tun:/dev/net/tun"]
-    cap_add: [NET_ADMIN]
+    # NET_ADMIN for tailscaled and the rules; NET_RAW for iptables (legacy backend).
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW]
+    read_only: true
+    tmpfs: [/tmp, /run]   # /run: the xtables lock
     volumes:
       - gateway_ts_state:/var/lib/tailscale
-      - ts_socket:/var/run/tailscale
+      - ts_socket:/ts-socket
     networks: [jarvis_internal, jarvis_ts_egress]
     security_opt: ["no-new-privileges:true"]
     mem_limit: 256m
     logging: *logging
     healthcheck:
-      # Healthy only with the gateway's egress rules in place and a tailnet address.
-      test: ["CMD-SHELL", "iptables -C OUTPUT -m owner --uid-owner 10001 -j JARVIS_GW_OUT && tailscale --socket=/var/run/tailscale/tailscaled.sock ip -4"]
+      # Healthy only with the gateway's egress rules in place (IPv4, and IPv6 wherever
+      # ip6tables works) and a tailnet address.
+      test: ["CMD-SHELL", "iptables -C OUTPUT -m owner --uid-owner 10001 -j JARVIS_GW_OUT && { ! ip6tables -S OUTPUT >/dev/null 2>&1 || ip6tables -C OUTPUT -m owner --uid-owner 10001 -j JARVIS_GW_OUT; } && tailscale --socket=/ts-socket/tailscaled.sock ip -4"]
       interval: 10s
       timeout: 5s
       retries: 30
@@ -225,9 +245,22 @@ services:
     environment:
       TZ: Asia/Kolkata
     networks: [jarvis_internal, jarvis_egress]
+    # squid starts as root and drops to its own user.
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, CHOWN]
+    read_only: true
+    tmpfs: [/run, /tmp, "/var/log/squid:mode=1777", "/var/spool/squid:mode=1777"]
     security_opt: ["no-new-privileges:true"]
     mem_limit: 128m
     logging: *logging
+    healthcheck:
+      # Healthy only with our config mounted: a missing mount must not fall back to the
+      # image's default config (fail closed; core waits for this).
+      test: ["CMD-SHELL", "grep -qx 'acl claude dstdomain -n api.anthropic.com' /etc/squid/squid.conf && grep -qx 'http_access deny all' /etc/squid/squid.conf"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   # Phase 2 placeholder: defined so the shape is fixed, never started (ADR-014).
   workers:
@@ -241,6 +274,10 @@ services:
 networks:
   jarvis_internal:
     internal: true
+    ipam:
+      config:
+        - subnet: 10.214.14.0/24
+          ip_range: 10.214.14.128/25   # dynamic addresses; Postgres's fixed one is outside it
   jarvis_ts_egress: {}   # gateway-ts only: Tailscale coordination and DERP relays
   jarvis_egress: {}      # egress-proxy only: api.anthropic.com
 
@@ -248,47 +285,55 @@ configs:
   gateway_ts_entrypoint:
     content: |
       #!/bin/sh
-      # gateway-ts entrypoint (spec §4.2, K2-4). The gateway runs in this container's network
-      # namespace (network_mode: service:gateway-ts), so these OUTPUT rules apply to it. Traffic from
-      # the gateway's UID may leave only on tailscale0 (replies to nodes), to the jarvis_internal
-      # subnet (Postgres), or to loopback (Docker's embedded DNS at 127.0.0.11, which the gateway
-      # needs to find postgres). Everything else from that UID is dropped. tailscaled runs as root
-      # and is not affected. Then the image's own entrypoint, containerboot, starts tailscaled.
+      # gateway-ts entrypoint (spec §4.2, K2-4, R12-33). The gateway runs in this container's network
+      # namespace (network_mode: service:gateway-ts), so these OUTPUT rules apply to it. The gateway
+      # uses no DNS: it reaches Postgres at a fixed address (JARVIS_POSTGRES_IP). Traffic from the
+      # gateway's UID may only
+      #   - open TCP connections to the Postgres address on port 5432, and
+      #   - send established or related packets on tailscale0 (replies to nodes).
+      # Everything else from that UID is dropped: no loopback (so no Docker DNS at 127.0.0.11), no
+      # other jarvis_internal host or port (so no egress proxy), and no new connection on tailscale0
+      # (so no quad-100 DNS and no other tailnet device). IPv6 gets the same rules (it has no
+      # Postgres address), and the sidecar refuses to start if IPv6 is on and they can't be
+      # installed. tailscaled runs as root and is not affected. Then the image's own entrypoint,
+      # containerboot, starts tailscaled.
       #
       # compose.yaml carries an inline copy of this file (configs: gateway_ts_entrypoint, with $$
       # written as $$$$); tests/test_compose.py checks the two match. P2-S5 checks it live.
       set -eu
 
       GW_UID="$${JARVIS_GATEWAY_UID:-10001}"
+      PG_IP="$${JARVIS_POSTGRES_IP:-}"
       CHAIN=JARVIS_GW_OUT
       fail() { echo "gateway-ts: $$*; refusing to start" >&2; exit 1; }
 
-      # jarvis_internal is the network that holds postgres: its interface and subnet.
-      pg_ip="$$(getent hosts postgres | awk '{ print $$1; exit }')"
-      [ -n "$$pg_ip" ] || fail "cannot resolve postgres"
-      dev="$$(ip -4 route get "$$pg_ip" | awk '{ for (i = 1; i < NF; i++) if ($$i == "dev") { print $$(i + 1); exit } }')"
-      [ -n "$$dev" ] || fail "no route to postgres"
-      subnet="$$(ip -4 route show dev "$$dev" scope link | awk '{ print $$1; exit }')"
-      [ -n "$$subnet" ] || fail "no subnet on $$dev"
+      case "$$PG_IP" in
+        "" | *[!0-9.]* ) fail "JARVIS_POSTGRES_IP is not an IPv4 address" ;;
+      esac
 
       iptables -N "$$CHAIN" 2>/dev/null || iptables -F "$$CHAIN"
-      iptables -A "$$CHAIN" -o lo -d 127.0.0.0/8 -j ACCEPT
-      iptables -A "$$CHAIN" -o tailscale0 -j ACCEPT
-      iptables -A "$$CHAIN" -o "$$dev" -d "$$subnet" -j ACCEPT
+      iptables -A "$$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      iptables -A "$$CHAIN" -d "$$PG_IP" -p tcp --dport 5432 -j ACCEPT
       iptables -A "$$CHAIN" -j DROP
       iptables -C OUTPUT -m owner --uid-owner "$$GW_UID" -j "$$CHAIN" 2>/dev/null \
         || iptables -I OUTPUT 1 -m owner --uid-owner "$$GW_UID" -j "$$CHAIN"
 
-      # IPv6, when the namespace has it: only loopback and tailscale0.
-      if [ -s /proc/net/if_inet6 ]; then
+      ipv6_on() {
+        [ -e /proc/net/if_inet6 ] && [ "$$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" = 0 ]
+      }
+      if ip6tables -S OUTPUT >/dev/null 2>&1; then
         ip6tables -N "$$CHAIN" 2>/dev/null || ip6tables -F "$$CHAIN"
-        ip6tables -A "$$CHAIN" -o lo -d ::1/128 -j ACCEPT
-        ip6tables -A "$$CHAIN" -o tailscale0 -j ACCEPT
+        ip6tables -A "$$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
         ip6tables -A "$$CHAIN" -j DROP
         ip6tables -C OUTPUT -m owner --uid-owner "$$GW_UID" -j "$$CHAIN" 2>/dev/null \
           || ip6tables -I OUTPUT 1 -m owner --uid-owner "$$GW_UID" -j "$$CHAIN"
+        v6="and IPv6"
+      elif ipv6_on; then
+        fail "IPv6 is on but ip6tables does not work"
+      else
+        v6="(IPv6 off)"
       fi
-      echo "gateway-ts: egress rules for UID $$GW_UID in place (internal $$subnet on $$dev)"
+      echo "gateway-ts: egress rules for UID $$GW_UID in place: Postgres $$PG_IP:5432, tailscale0 replies; IPv4 $$v6"
 
       # The auth key is read from its secret file here, so it is never in the container's config.
       # It is used only for the first login (TS_AUTH_ONCE); after that the state volume holds it.
@@ -339,6 +384,7 @@ secrets:
   pg_gateway_password: { file: /etc/jarvis/secrets/pg_gateway_password }
   core_signing_key: { file: /etc/jarvis/secrets/core_signing_key }
   gateway_signing_key: { file: /etc/jarvis/secrets/gateway_signing_key }
+  core_signing_key_pub: { file: /etc/jarvis/secrets/core_signing_key.pub }
   gateway_signing_key_pub: { file: /etc/jarvis/secrets/gateway_signing_key.pub }
   # Provided, not generated: harden.sh asks for them (runbook §8).
   tailscale_gateway_authkey: { file: /etc/jarvis/secrets/tailscale_gateway_authkey }
