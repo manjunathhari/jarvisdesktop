@@ -1055,34 +1055,42 @@ def test_node_rejects_transport_on_a_key_past_its_overlap(
         assert fake.prompt == "reenrol" and not fake.connected
 
 
-def test_transport_signed_under_an_unknown_key_prompts_reenrol(
+def test_transport_bad_signature_reconnects_expired_key_reenrols(
     app: Conn, dsns: Dsns, ks: Keys, tmp_path: Path
 ) -> None:
-    """M-1: a gw-transport envelope signed under a key the node never pinned: it runs nothing,
-    closes and asks to re-enrol. One signed by another pinned gateway key is refused without
-    the prompt."""
+    """Spec §7.1 / R12-29 (fix round 3): the node verifies every gw-transport envelope under the
+    challenge's key. A tampered envelope, or one signed by another key, while that key is
+    trusted is a bad signature: it runs nothing, closes and reconnects, and is never asked to
+    re-enrol. Once the challenge key's overlap has ended, the next envelope asks to re-enrol."""
     clock = _clock(app)
-    with gateway(dsns, ks, tmp_path, clock) as gw:
+    with gateway(dsns, ks, tmp_path, clock, refresh=3600) as gw:
         fake = _enrolled(gw, app)
         assert fake.node_id is not None
-        stranger = Ed25519PrivateKey.generate()
-        gw.gw_key = stranger  # gw_envelope signs with this key
         action = {"authz": _action(ks.core, _id(ks.core), fake.node_id, clock())}
+        tampered = gw.gw_envelope(fake, "node.action", action)
+        tampered["payload"]["authz"]["object"]["action_kind"] = "pc.delete_test_file"
+        with pytest.raises(Rejected) as e:
+            fake.inject(tampered)
+        assert e.value.reason == "bad_signature"
+        assert fake.prompt is None and fake.may_reconnect and fake.actions == []
+        assert not fake.connected and fake.state_path.exists()  # the journal is kept
+        fake.reconnect()
+        signer = gw.gw_key
+        gw.gw_key = Ed25519PrivateKey.generate()  # another key, the trusted one still current
         with pytest.raises(Rejected) as e:
             fake.inject(gw.gw_envelope(fake, "node.action", action))
-        assert e.value.reason == "unknown_key_id"
-        assert fake.prompt == "reenrol" and fake.actions == [] and not fake.connected
-        assert fake.state_path.exists()  # the journal is kept
-        # Another pinned gateway key on this connection: refused, but not a key change.
-        other = Ed25519PrivateKey.generate()
-        again = _again(gw, fake)
-        again.prompt = None
-        again.pinned_gateway[_id(other)] = public_bytes(other)
-        again.hello()
-        gw.gw_key = other
+        assert e.value.reason == "bad_signature" and fake.prompt is None and fake.may_reconnect
+        gw.gw_key = signer
+        fake.reconnect()
+        # The challenge key's overlap ends (a GATEWAY keyset accepted, then + 24 h).
+        new = Ed25519PrivateKey.generate()
+        key_id = keys.announce(app, role="GATEWAY", public_key=public_bytes(new))
+        assert _wait_for(lambda: _acked(app, key_id, fake))
+        clock.advance((DAY + timedelta(minutes=5)).total_seconds())
         with pytest.raises(Rejected) as e:
-            again.inject(gw.gw_envelope(again, "node.action", action))
-        assert e.value.reason == "bad_signature" and again.prompt is None and again.actions == []
+            fake.inject(gw.gw_envelope(fake, "node.action", action))
+        assert e.value.reason == "unpinned_key"
+        assert fake.prompt == "reenrol" and not fake.may_reconnect and fake.actions == []
 
 
 # ------------------------------------------------------------------------------ fix round 2

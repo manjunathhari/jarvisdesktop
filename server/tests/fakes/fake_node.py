@@ -32,11 +32,13 @@ node (R12-27). Only then does the node send ``received`` and ``ack`` for it. The
 added to the CORE or GATEWAY pins by role, and the role's existing keys stay trusted until
 24 h after the keyset's ``issued_at`` (``key_expiry``). A key still waiting out an earlier
 overlap is dropped when a later keyset arrives. On close code 4409, an unpinned gateway key in
-a challenge, a ``gw-transport`` envelope on a connection whose gateway key is no longer pinned
-or signed under a key it never pinned, or a core signature under an unknown ``key_id``, the
-node runs nothing, keeps its
+a challenge, a ``gw-transport`` envelope on a connection whose challenge key is no longer
+trusted (its overlap ended), or a core signature under an unknown ``key_id``, the node runs
+nothing, keeps its
 journal (the state file), closes and sets ``prompt = "reenrol"`` (R5-1). Any other close
-means reconnect (``may_reconnect``, ``reconnect()``; R12-29).
+means reconnect (``may_reconnect``, ``reconnect()``; R12-29). Every ``gw-transport`` envelope
+is verified under the challenge's key only; one that fails while that key is trusted is a bad
+signature: the node closes and reconnects, with no re-enrol prompt.
 
 Also here: ``FakeWhoIs`` (dict-backed ``whois``) and ``PeerFromHeader``, a test-only ASGI
 wrapper that sets the connection's peer address from a request header, because Starlette's
@@ -503,14 +505,10 @@ class FakeNode:
             # The connection's gateway key is no longer pinned (its overlap ended).
             self.prompt = "reenrol"
             self._refuse(what, "unpinned_key")
+        # Under the challenge's key only (R12-6). The key is still trusted, so a failure is a
+        # bad signature: close and reconnect, never re-enrol (spec §7.1, R12-29).
         if not verify_envelope(Purpose.GW_TRANSPORT, self._gw_public, self._gw_key_id, env):
-            known = any(
-                verify_envelope(Purpose.GW_TRANSPORT, public, key_id, env)
-                for key_id, public in self.pinned_gateway.items()
-            )
-            if not known:  # signed under a key_id it never pinned (spec §7.1, R5-1)
-                self.prompt = "reenrol"
-            self._refuse(what, "bad_signature" if known else "unknown_key_id")
+            self._refuse(what, "bad_signature")
         self.received_envelopes.append(env)
         kind, payload = env["kind"], env["payload"]
         if kind in CORE_CONTENT and not self._authorised:
