@@ -41,7 +41,7 @@ Containers (Docker project `jarvis`): `postgres`, `init` (one-shot), `core`, `sc
    docker logs jarvis-init-1 | grep SMOKE
    ```
    Each smoke run leaves a few rows labelled `source_ref = 'smoke-check'` in the ledger, and a revoked smoke node with terminal outbox items for "Smoke Fictional". To turn the smoke off for a deploy, add `JARVIS_SMOKE_ON_INIT=0` to the environment.
-4. **First Phase 2 deploy only:** the internal network now has a fixed subnet (R12-33), and an existing `jarvis_jarvis_internal` without one is not changed in place. Before this deploy, stop the old project so the network is created anew: `docker compose down` (**never** `-v`; the volumes stay), or stop and delete project `jarvis` through the connector **without** deleting its volumes. Then deploy. `init` records the trusted keys itself (§8.2), so the `gateway` starts on the first `up`.
+4. **First Phase 2 deploy only:** the internal network now has a fixed subnet (R12-33), and an existing `jarvis_jarvis_internal` without one is not changed in place. Before this deploy, stop the old project so the network is created anew: `docker compose down` (**never** `-v`; the volumes stay), run on the server. **Do not** use the connector's delete (`vps_docker_delete`) to keep data: it also removes the project's volumes (database, memory repo, backups). Use it only when the old data may go (as on 24 Nov 2026, when the owner chose to start Phase 2 from empty). Then deploy. `init` records the trusted keys itself (§8.2), so the `gateway` starts on the first `up`.
 
 **Roll back:** deploy the previous commit the same way. Migrations only move forward on deploy; if a migration must be undone, use `jarvis-core downgrade` deliberately (see §6), never as part of a routine rollback.
 
