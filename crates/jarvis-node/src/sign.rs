@@ -58,7 +58,9 @@ pub const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 /// different large integers could canonicalise to the same bytes and share one signature.
 /// Integers beyond the 64-bit range already arrive from `serde_json` as floats and can't be
 /// told apart from real floats (such as the RFC's own `1E30`); no JARVIS signer can produce
-/// them, since every signed JARVIS number is a safe integer (§7.1).
+/// them, since every signed JARVIS number is a safe integer (§7.1). This relies on serde_json's
+/// `arbitrary_precision` feature staying off: with it on, every large integer would look like
+/// a float here and pass.
 fn check_integers(v: &Value) -> Result<(), SignError> {
     match v {
         Value::Number(n) => {

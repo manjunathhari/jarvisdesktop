@@ -202,6 +202,7 @@ fn integers_beyond_the_jcs_range_never_sign_or_verify() {
         json!({"last_seq": edge + 1}),
         json!({"last_seq": -((edge + 1) as i64)}),
         json!({"last_seq": u64::MAX}),
+        json!({"last_seq": i64::MIN}),
         json!({"nested": [{"amount_paise": 9_007_199_254_740_993u64}]}),
     ];
     let sig = sign(&key, Purpose::NodeMsg, "n-1", &json!({"last_seq": edge})).unwrap();
