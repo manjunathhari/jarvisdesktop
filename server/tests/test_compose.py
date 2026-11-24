@@ -263,6 +263,13 @@ def test_sidecar_entrypoint_blocks_gateway_egress() -> None:
     assert 'IP6T="$(pick ip6tables)" || IP6T=""' in lines
     assert 'printf \'%s %s\\n\' "$IPT" "$IP6T" > /tmp/jarvis-iptables' in lines
     assert not [ln for ln in code if ln.startswith(("iptables ", "ip6tables "))]
+    # tailscaled's own rules use the same backend (re-review I-1).
+    assert "*-nft) TS_DEBUG_FIREWALL_MODE=nftables ;;" in lines
+    assert "*) TS_DEBUG_FIREWALL_MODE=iptables ;;" in lines
+    assert "export TS_DEBUG_FIREWALL_MODE" in lines
+    assert code.index("export TS_DEBUG_FIREWALL_MODE") < code.index(
+        "exec /usr/local/bin/containerboot"
+    )
     assert "GW_UID" not in script and "--uid-owner 10001" not in script
     assert not [ln for ln in code if "--uid-owner" in ln and "! --uid-owner 0" not in ln]
     assert 'PG_IP="${JARVIS_POSTGRES_IP:-}"' in lines

@@ -70,6 +70,15 @@ fi
 printf '%s %s\n' "$IPT" "$IP6T" > /tmp/jarvis-iptables
 echo "gateway-ts: egress rules for every non-root UID in place ($IPT): Postgres $PG_IP:5432, tailscale0 replies; IPv4 $v6"
 
+# tailscaled sets up its own firewall rules too: make it use the same backend as ours, so the two
+# never mix in one table (nftables mode uses its own ts-* tables; iptables mode the image's
+# legacy iptables).
+case "$IPT" in
+  *-nft) TS_DEBUG_FIREWALL_MODE=nftables ;;
+  *) TS_DEBUG_FIREWALL_MODE=iptables ;;
+esac
+export TS_DEBUG_FIREWALL_MODE
+
 # The auth key is read from its secret file here, so it is never in the container's config.
 # It is used only for the first login (TS_AUTH_ONCE); after that the state volume holds it.
 TS_AUTHKEY="$(cat /run/secrets/tailscale_gateway_authkey)"
