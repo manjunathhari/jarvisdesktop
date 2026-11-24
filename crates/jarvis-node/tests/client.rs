@@ -85,6 +85,7 @@ async fn start_with(
     let mut cfg = ClientConfig::new(listener.local_addr().unwrap().to_string(), dir.path());
     cfg.heartbeat_timeout = heartbeat;
     cfg.reenrol_retry = Duration::from_millis(300);
+    cfg.recheck = Duration::from_millis(200);
     let (tx, frames) = mpsc::unbounded_channel();
     let client = client::spawn(cfg, keystore.clone(), tx);
     (
@@ -420,5 +421,143 @@ async fn needs_reenrol_accepts_a_new_code() {
             Duration::from_secs(2)
         )
         .await
+    );
+}
+
+/// A key store that can be made to fail, to test recovery from an unreadable store.
+#[derive(Default)]
+struct FlakyStore {
+    fail: std::sync::atomic::AtomicBool,
+    inner: MemoryKeyStore,
+}
+
+impl KeyStore for FlakyStore {
+    fn load(
+        &self,
+    ) -> Result<Option<ed25519_dalek::SigningKey>, jarvis_node::keystore::KeyStoreError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(jarvis_node::keystore::KeyStoreError::Unprotect(
+                "locked".into(),
+            ));
+        }
+        self.inner.load()
+    }
+    fn save(
+        &self,
+        key: &ed25519_dalek::SigningKey,
+    ) -> Result<(), jarvis_node::keystore::KeyStoreError> {
+        self.inner.save(key)
+    }
+    fn delete(&self) -> Result<(), jarvis_node::keystore::KeyStoreError> {
+        self.inner.delete()
+    }
+}
+
+#[tokio::test]
+async fn a_briefly_unreadable_key_store_recovers_without_a_command() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = ClientConfig::new(listener.local_addr().unwrap().to_string(), dir.path());
+    cfg.recheck = Duration::from_millis(200);
+    let store = Arc::new(FlakyStore::default());
+    store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (tx, _frames) = mpsc::unbounded_channel();
+    let client = client::spawn(cfg, store.clone(), tx);
+    let mut status = client.status();
+    assert!(
+        wait_for(
+            &mut status,
+            |s| matches!(s, LinkStatus::Failed(_)),
+            Duration::from_secs(2)
+        )
+        .await
+    );
+    store.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        wait_for(
+            &mut status,
+            |s| *s == LinkStatus::NotEnrolled,
+            Duration::from_secs(2)
+        )
+        .await,
+        "re-checked on its own"
+    );
+}
+
+#[tokio::test]
+async fn a_new_code_wins_over_a_silent_retry_connection() {
+    let (listener, node) = start(Duration::from_secs(95)).await;
+    let mut gw = Gw::new("gw-1", "gw-1");
+    let (mut ws, _) = enrol(&listener, &node, &mut gw).await;
+    close(&mut ws, 4401).await;
+    let mut stray = Gw::new("unknown-1", "gw-x");
+    let mut ws = accept(&listener).await;
+    send(&mut ws, stray.challenge(now())).await;
+    let mut status = node.client.status();
+    assert!(
+        wait_for(
+            &mut status,
+            |s| *s == LinkStatus::NeedsReenrol,
+            Duration::from_secs(2)
+        )
+        .await
+    );
+    // The next retry reaches a peer that accepts and then says nothing at all.
+    let _silent = accept(&listener).await;
+    // Meanwhile Manj types a new code: it starts an enrolment straight away.
+    let mut gw2 = Gw::new("gw-1", "gw-1");
+    let code = code_for(&core_public(), &gw2.public());
+    let client = node.client.clone();
+    let enrolment = tokio::spawn(async move { client.enrol(&code).await });
+    let mut ws = accept(&listener).await;
+    send(&mut ws, gw2.challenge(now())).await;
+    assert_eq!(recv(&mut ws).await["kind"], "enrol");
+    let node_id = Uuid::new_v4();
+    send(
+        &mut ws,
+        gw2.welcome(node_id, Some(("core-1", core_public())), now()),
+    )
+    .await;
+    enrolment.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_new_code_after_4409_keeps_needs_reenrol() {
+    let (listener, node) = start(Duration::from_secs(95)).await;
+    let mut gw = Gw::new("gw-1", "gw-1");
+    let (mut ws, _) = enrol(&listener, &node, &mut gw).await;
+    close(&mut ws, 4409).await;
+    let mut status = node.client.status();
+    assert!(
+        wait_for(
+            &mut status,
+            |s| *s == LinkStatus::NeedsReenrol,
+            Duration::from_secs(2)
+        )
+        .await
+    );
+    // A used or expired code: the gateway refuses the enrolment with 4401.
+    let mut gw2 = Gw::new("gw-1", "gw-1");
+    let code = code_for(&core_public(), &gw2.public());
+    let client = node.client.clone();
+    let enrolment = tokio::spawn(async move { client.enrol(&code).await });
+    let mut ws = accept(&listener).await;
+    send(&mut ws, gw2.challenge(now())).await;
+    assert_eq!(recv(&mut ws).await["kind"], "enrol");
+    close(&mut ws, 4401).await;
+    assert!(enrolment.await.unwrap().is_err());
+    assert!(
+        wait_for(
+            &mut status,
+            |s| *s == LinkStatus::NeedsReenrol,
+            Duration::from_secs(2)
+        )
+        .await
+    );
+    // The old identity is not tried again: no hello goes out.
+    let again = tokio::time::timeout(Duration::from_millis(1500), listener.accept()).await;
+    assert!(
+        again.is_err(),
+        "no connection with the old identity after a failed code"
     );
 }

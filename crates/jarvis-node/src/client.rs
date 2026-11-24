@@ -36,6 +36,8 @@ pub const STATE_FILE: &str = "node-state.json";
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(95);
 /// While a challenge's key is unknown, `hello` is retried this often (see `Reenrol::Retry`).
 pub const REENROL_RETRY: Duration = Duration::from_secs(30);
+/// While not connecting (no identity, or the files can't be read), look again this often.
+pub const RECHECK: Duration = Duration::from_secs(30);
 /// A link must stay up this long before the backoff starts again from 1 s.
 const STABLE_LINK: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -48,6 +50,7 @@ pub struct ClientConfig {
     pub data_dir: PathBuf,
     pub heartbeat_timeout: Duration,
     pub reenrol_retry: Duration,
+    pub recheck: Duration,
 }
 
 impl ClientConfig {
@@ -57,6 +60,7 @@ impl ClientConfig {
             data_dir: data_dir.into(),
             heartbeat_timeout: HEARTBEAT_TIMEOUT,
             reenrol_retry: REENROL_RETRY,
+            recheck: RECHECK,
         }
     }
 }
@@ -188,6 +192,8 @@ enum End {
     Stopped { stop: Stop, ready: bool },
     /// The app dropped its handle.
     Shutdown,
+    /// A new enrolment code arrived while a re-enrol retry was connected: start over with it.
+    Restart,
 }
 
 /// The local code for a link that went silent or broke without a close frame.
@@ -198,7 +204,9 @@ const LINK_LOST: u16 = 1006;
 enum Reenrol {
     /// The server said so (4409), or the node's own pins rule it out (an expired gateway key
     /// mid-connection, no core key, a key that doesn't match the state). Only a new
-    /// enrolment helps, so nothing is retried.
+    /// enrolment helps, so nothing is retried. This lives in memory only: after a restart an
+    /// expired gateway key shows up as an unpinned challenge key, which is `Retry`. That is
+    /// harmless, since the node still runs nothing and sends nothing until a pinned key answers.
     Final,
     /// A challenge came with a gateway key this node never pinned. That is what a rotated
     /// gateway key looks like, but it is unauthenticated, so one stray frame must not cost the
@@ -262,21 +270,25 @@ async fn run(
                     reenrol = Some(Reenrol::Final);
                 }
                 let _ = status.send(show);
-                // Wait for an enrolment code; everything else is refused meanwhile.
-                match cmds.recv().await {
-                    None => return,
-                    Some(Cmd::Send { reply, .. }) => {
-                        let _ = reply.send(Err(NotConnected));
-                    }
-                    Some(Cmd::Enrol { code, reply }) => {
-                        start_enrolment(&code, reply, &mut enrolling, &mut reenrol, &mut attempt);
-                    }
+                // Wait for an enrolment code (everything else is refused meanwhile), and look
+                // at the files again now and then, so a briefly unreadable key store recovers.
+                tokio::select! {
+                    cmd = cmds.recv() => match cmd {
+                        None => return,
+                        Some(Cmd::Send { reply, .. }) => {
+                            let _ = reply.send(Err(NotConnected));
+                        }
+                        Some(Cmd::Enrol { code, reply }) => {
+                            start_enrolment(&code, reply, &mut enrolling, &mut attempt);
+                        }
+                    },
+                    _ = sleep(cfg.recheck) => {}
                 }
                 continue;
             }
         };
 
-        if reenrol.is_none() {
+        if reenrol.is_none() || enrolling.is_some() {
             let _ = status.send(LinkStatus::Connecting);
         }
         let mut ready_at = None;
@@ -300,6 +312,7 @@ async fn run(
                     &status,
                     &mut enrolling,
                     &mut ready_at,
+                    reenrol.is_some(),
                 )
                 .await
             }
@@ -316,6 +329,10 @@ async fn run(
         let mut wait = backoff(attempt);
         match end {
             End::Shutdown => return,
+            End::Restart => {
+                attempt = 0;
+                continue;
+            }
             End::Closed(code) => {
                 if let Some(mut e) = enrolling.take() {
                     // The device stores nothing; a new attempt needs the code again.
@@ -360,7 +377,7 @@ async fn run(
                     Some(Cmd::Enrol { code, reply }) => {
                         if reenrol.is_some() {
                             // A new code is exactly what NeedsReenrol asks for.
-                            start_enrolment(&code, reply, &mut enrolling, &mut reenrol, &mut attempt);
+                            start_enrolment(&code, reply, &mut enrolling, &mut attempt);
                             if enrolling.is_some() {
                                 break;
                             }
@@ -375,11 +392,14 @@ async fn run(
 }
 
 /// Begin an enrolment with `code`, or answer that the code is bad.
+///
+/// Any re-enrol state is kept until the new enrolment's welcome is saved: if the code fails
+/// (expired, used), the node goes back to showing NeedsReenrol rather than trying its old
+/// identity again.
 fn start_enrolment(
     code: &str,
     reply: oneshot::Sender<Result<(), EnrolError>>,
     enrolling: &mut Option<Enrolling>,
-    reenrol: &mut Option<Reenrol>,
     attempt: &mut u32,
 ) {
     match EnrolmentCode::parse(code) {
@@ -387,8 +407,6 @@ fn start_enrolment(
             let _ = reply.send(Err(EnrolError::BadCode));
         }
         Ok(code) => {
-            // A new enrolment replaces the old identity, re-enrol request included.
-            *reenrol = None;
             *attempt = 0;
             *enrolling = Some(Enrolling {
                 code,
@@ -412,6 +430,7 @@ async fn connection<S>(
     status: &watch::Sender<LinkStatus>,
     enrolling: &mut Option<Enrolling>,
     ready_at: &mut Option<Instant>,
+    retrying: bool,
 ) -> End
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
@@ -499,9 +518,20 @@ where
                         Err(_) => { let _ = reply.send(Err(NotConnected)); }
                     }
                 }
-                Some(Cmd::Enrol { reply, .. }) => {
-                    let busy = enrolling.is_some();
-                    let _ = reply.send(Err(if busy { EnrolError::Busy } else { EnrolError::AlreadyEnrolled }));
+                Some(Cmd::Enrol { code, reply }) => {
+                    if enrolling.is_some() {
+                        let _ = reply.send(Err(EnrolError::Busy));
+                    } else if retrying && ready_at.is_none() {
+                        // NeedsReenrol is showing and this is only a retry: the new code wins.
+                        let mut attempt = 0;
+                        start_enrolment(&code, reply, enrolling, &mut attempt);
+                        if enrolling.is_some() {
+                            let _ = sink.close().await;
+                            return End::Restart;
+                        }
+                    } else {
+                        let _ = reply.send(Err(EnrolError::AlreadyEnrolled));
+                    }
                 }
             },
             _ = tokio::time::sleep_until(deadline) => {
