@@ -75,29 +75,45 @@ x-gateway-ts-entrypoint: &gateway_ts_entrypoint |
     "" | *[!0-9.]* ) fail "JARVIS_POSTGRES_IP is not an IPv4 address" ;;
   esac
 
-  iptables -N "$$CHAIN" 2>/dev/null || iptables -F "$$CHAIN"
-  iptables -A "$$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-  iptables -A "$$CHAIN" -d "$$PG_IP" -p tcp --dport 5432 -j ACCEPT
-  iptables -A "$$CHAIN" -j DROP
-  iptables -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN" 2>/dev/null \
-    || iptables -I OUTPUT 1 -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN"
+  # Use the iptables backend this kernel offers: nftables first (Ubuntu 24.04 hosts have no legacy
+  # tables, and the image's plain `iptables` is the legacy one), then legacy. The choice is written
+  # to /tmp/jarvis-iptables for the health check; a backend that can't list OUTPUT is never used.
+  pick() {
+    for b in "$$1-nft" "$$1-legacy" "$$1"; do
+      if command -v "$$b" >/dev/null 2>&1 && "$$b" -t filter -S OUTPUT >/dev/null 2>&1; then
+        echo "$$b"
+        return 0
+      fi
+    done
+    return 1
+  }
+  IPT="$$(pick iptables)" || fail "no working iptables backend (nft or legacy)"
+  IP6T="$$(pick ip6tables)" || IP6T=""
+
+  "$$IPT" -N "$$CHAIN" 2>/dev/null || "$$IPT" -F "$$CHAIN"
+  "$$IPT" -A "$$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  "$$IPT" -A "$$CHAIN" -d "$$PG_IP" -p tcp --dport 5432 -j ACCEPT
+  "$$IPT" -A "$$CHAIN" -j DROP
+  "$$IPT" -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN" 2>/dev/null \
+    || "$$IPT" -I OUTPUT 1 -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN"
 
   ipv6_on() {
     [ -e /proc/net/if_inet6 ] && [ "$$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" = 0 ]
   }
-  if ip6tables -S OUTPUT >/dev/null 2>&1; then
-    ip6tables -N "$$CHAIN" 2>/dev/null || ip6tables -F "$$CHAIN"
-    ip6tables -A "$$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    ip6tables -A "$$CHAIN" -j DROP
-    ip6tables -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN" 2>/dev/null \
-      || ip6tables -I OUTPUT 1 -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN"
+  if [ -n "$$IP6T" ]; then
+    "$$IP6T" -N "$$CHAIN" 2>/dev/null || "$$IP6T" -F "$$CHAIN"
+    "$$IP6T" -A "$$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    "$$IP6T" -A "$$CHAIN" -j DROP
+    "$$IP6T" -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN" 2>/dev/null \
+      || "$$IP6T" -I OUTPUT 1 -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN"
     v6="and IPv6"
   elif ipv6_on; then
     fail "IPv6 is on but ip6tables does not work"
   else
     v6="(IPv6 off)"
   fi
-  echo "gateway-ts: egress rules for every non-root UID in place: Postgres $$PG_IP:5432, tailscale0 replies; IPv4 $$v6"
+  printf '%s %s\n' "$$IPT" "$$IP6T" > /tmp/jarvis-iptables
+  echo "gateway-ts: egress rules for every non-root UID in place ($$IPT): Postgres $$PG_IP:5432, tailscale0 replies; IPv4 $$v6"
 
   # The auth key is read from its secret file here, so it is never in the container's config.
   # It is used only for the first login (TS_AUTH_ONCE); after that the state volume holds it.
@@ -315,7 +331,7 @@ services:
       TZ: Asia/Kolkata
     secrets: [tailscale_gateway_authkey]
     devices: ["/dev/net/tun:/dev/net/tun"]
-    # NET_ADMIN for tailscaled and the rules; NET_RAW for iptables (legacy backend).
+    # NET_ADMIN for tailscaled and the rules; NET_RAW for iptables.
     cap_drop: [ALL]
     cap_add: [NET_ADMIN, NET_RAW]
     read_only: true
@@ -329,8 +345,9 @@ services:
     logging: *logging
     healthcheck:
       # Healthy only with the gateway's egress rules in place for every non-root UID (IPv4, and
-      # IPv6 wherever ip6tables works) and a tailnet address.
-      test: ["CMD-SHELL", "iptables -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j JARVIS_GW_OUT && { ! ip6tables -S OUTPUT >/dev/null 2>&1 || ip6tables -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j JARVIS_GW_OUT; } && tailscale --socket=/ts-socket/tailscaled.sock ip -4"]
+      # IPv6 wherever ip6tables works), checked with the backend the entrypoint chose, and a
+      # tailnet address.
+      test: ["CMD-SHELL", "read -r IPT IP6T < /tmp/jarvis-iptables && $$IPT -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j JARVIS_GW_OUT && { [ -z \"$$IP6T\" ] || $$IP6T -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j JARVIS_GW_OUT; } && tailscale --socket=/ts-socket/tailscaled.sock ip -4"]
       interval: 10s
       timeout: 5s
       retries: 30

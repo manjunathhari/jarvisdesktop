@@ -28,6 +28,7 @@ DEPLOY = SERVER / "deploy"
 COMPOSE = DEPLOY / "compose.yaml"
 ENTRYPOINT = DEPLOY / "gateway-ts" / "entrypoint.sh"
 SQUID = DEPLOY / "egress-proxy" / "squid.conf"
+CHOICE = "/tmp/jarvis-iptables"  # noqa: S108 (inside the sidecar: the backend its entrypoint chose)
 
 live = pytest.mark.skipif(
     os.environ.get("JARVIS_DOCKER_LIVE") != "1", reason="needs Docker; set JARVIS_DOCKER_LIVE=1"
@@ -132,17 +133,19 @@ def test_egress_proxy_starts_read_only_and_allows_only_claude(
         _docker("exec", name, "/bin/sh", "-c", health[1])  # check=True: must pass
         # A client on the same private network: CONNECT to Claude is let through, anything else
         # is refused by squid itself (403), before any connection is made.
-        probe = ["run", "--rm", "--network", network, proxy["image"], "/bin/sh", "-c"]
+        probe = ["run", "--rm", "--network", network, "--entrypoint", "/bin/bash", proxy["image"]]
+        probe.append("-c")
         ask = (
             'printf \'CONNECT %s HTTP/1.1\\r\\nHost: %s\\r\\n\\r\\n\' "$0" "$0" '
             f"| timeout 10 bash -c 'exec 3<>/dev/tcp/{name}/3128; cat >&3; head -n1 <&3'"
         )
-        refused = _docker(*probe, ask, "example.com:443", check=False).stdout
-        assert " 403 " in refused, refused
-        other_port = _docker(*probe, ask, "api.anthropic.com:80", check=False).stdout
-        assert " 403 " in other_port, other_port
-        allowed = _docker(*probe, ask, "api.anthropic.com:443", check=False).stdout
-        assert " 200 " in allowed, allowed
+        for target, status in (
+            ("example.com:443", " 403 "),
+            ("api.anthropic.com:80", " 403 "),
+            ("api.anthropic.com:443", " 200 "),
+        ):
+            done = _docker(*probe, ask, target, check=False)
+            assert status in done.stdout, f"{target}: {done.stdout!r} {done.stderr!r}"
     finally:
         _docker("rm", "-f", name, check=False)
 
@@ -151,8 +154,9 @@ def test_egress_proxy_starts_read_only_and_allows_only_claude(
 def test_gateway_sidecar_starts_read_only_and_installs_rules(
     rendered: dict[str, Any], network: str, tmp_path: Path
 ) -> None:
-    """The sidecar runs its entrypoint from /tmp and installs the gateway's egress rules. The
-    auth key is a dummy, so Tailscale never logs in; the rules are in place before that."""
+    """The sidecar runs its entrypoint from /tmp and installs the gateway's egress rules with a
+    backend this kernel offers. The auth key is a dummy, so Tailscale never logs in; the rules
+    are in place before that."""
     ts = rendered["gateway-ts"]
     name = f"jarvis-gwts-{uuid.uuid4().hex[:8]}"
     key = tmp_path / "tailscale_gateway_authkey"
@@ -164,18 +168,27 @@ def test_gateway_sidecar_starts_read_only_and_installs_rules(
     try:
         _docker(*args, ts["image"], *ts["entrypoint"][1:])
         deadline = time.monotonic() + 30
-        rules = ""
-        while time.monotonic() < deadline:
-            rules = _docker("exec", name, "iptables", "-S", "JARVIS_GW_OUT", check=False).stdout
-            if "-j DROP" in rules:
+        chosen = ""
+        while time.monotonic() < deadline:  # the entrypoint writes its backend choice last
+            chosen = _docker("exec", name, "cat", CHOICE, check=False).stdout
+            if chosen.strip():
                 break
             time.sleep(1)
         logs = _docker("logs", name, check=False)
-        assert "-j DROP" in rules, f"{rules}\n{logs.stdout}\n{logs.stderr}"
+        assert chosen.strip(), f"no rules installed:\n{logs.stdout}\n{logs.stderr}"
+        ipt, *ip6t = chosen.split()
+        rules = _docker("exec", name, ipt, "-S", "JARVIS_GW_OUT").stdout
         pg_ip = ts["environment"]["JARVIS_POSTGRES_IP"]
-        assert f"-d {pg_ip}/32 -p tcp -m tcp --dport 5432 -j ACCEPT" in rules
+        assert rules.splitlines()[1:] == [
+            "-A JARVIS_GW_OUT -o tailscale0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
+            f"-A JARVIS_GW_OUT -d {pg_ip}/32 -p tcp -m tcp --dport 5432 -j ACCEPT",
+            "-A JARVIS_GW_OUT -j DROP",
+        ], rules
         assert "egress rules for every non-root UID in place" in logs.stdout + logs.stderr
-        jump = _docker("exec", name, "iptables", "-S", "OUTPUT").stdout
+        jump = _docker("exec", name, ipt, "-S", "OUTPUT").stdout
         assert "--socket-exists" in jump and "! --uid-owner 0 -j JARVIS_GW_OUT" in jump
+        for tool in ip6t:  # IPv6 rules too, wherever ip6tables works
+            v6 = _docker("exec", name, tool, "-S", "JARVIS_GW_OUT").stdout
+            assert v6.splitlines()[-1] == "-A JARVIS_GW_OUT -j DROP", v6
     finally:
         _docker("rm", "-f", name, check=False)

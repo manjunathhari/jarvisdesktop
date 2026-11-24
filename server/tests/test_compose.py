@@ -135,7 +135,9 @@ def test_sidecar_runs_tailscale_in_kernel_mode(stack: dict[str, Any]) -> None:
     assert "configs" not in ts
     health = " ".join(ts["healthcheck"]["test"])  # healthy only with both rule jumps in place
     jump = "OUTPUT -m owner --socket-exists ! --uid-owner 0 -j JARVIS_GW_OUT"
-    assert f"iptables -C {jump}" in health and f"ip6tables -C {jump}" in health
+    assert "read -r IPT IP6T < /tmp/jarvis-iptables && " in health  # the chosen backend
+    assert f"$$IPT -C {jump}" in health and f"$$IP6T -C {jump}" in health
+    assert '[ -z "$$IP6T" ] ||' in health  # no IPv6 backend: only when IPv6 is off
     assert "--uid-owner 10001" not in health
     assert "JARVIS_GATEWAY_UID" not in env  # the rules no longer name one UID (S-2)
 
@@ -239,21 +241,28 @@ def test_sidecar_entrypoint_blocks_gateway_egress() -> None:
     code = [ln for ln in lines if ln and not ln.startswith("#")]
     assert "set -eu" in lines
     assert lines[-1] == "exec /usr/local/bin/containerboot"
-    rules = [ln for ln in lines if ln.startswith('iptables -A "$CHAIN"')]
+    rules = [ln for ln in lines if ln.startswith('"$IPT" -A "$CHAIN"')]
     assert rules == [
-        'iptables -A "$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
-        'iptables -A "$CHAIN" -d "$PG_IP" -p tcp --dport 5432 -j ACCEPT',
-        'iptables -A "$CHAIN" -j DROP',
+        '"$IPT" -A "$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
+        '"$IPT" -A "$CHAIN" -d "$PG_IP" -p tcp --dport 5432 -j ACCEPT',
+        '"$IPT" -A "$CHAIN" -j DROP',
     ]
-    v6 = [ln for ln in lines if ln.startswith('ip6tables -A "$CHAIN"')]
+    v6 = [ln for ln in lines if ln.startswith('"$IP6T" -A "$CHAIN"')]
     assert v6 == [
-        'ip6tables -A "$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
-        'ip6tables -A "$CHAIN" -j DROP',
+        '"$IP6T" -A "$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
+        '"$IP6T" -A "$CHAIN" -j DROP',
     ]
     jump = '-m owner --socket-exists ! --uid-owner 0 -j "$CHAIN"'
-    for tool in ("iptables", "ip6tables"):
+    for tool in ('"$IPT"', '"$IP6T"'):
         assert f"{tool} -I OUTPUT 1 {jump}" in script
         assert f"{tool} -C OUTPUT {jump}" in script
+    # The backend is the one the kernel offers, nftables first (24 Nov 2026: Ubuntu 24.04 has
+    # no legacy tables), and the health check reads the same choice.
+    assert 'for b in "$1-nft" "$1-legacy" "$1"; do' in lines
+    assert 'IPT="$(pick iptables)" || fail "no working iptables backend (nft or legacy)"' in lines
+    assert 'IP6T="$(pick ip6tables)" || IP6T=""' in lines
+    assert 'printf \'%s %s\\n\' "$IPT" "$IP6T" > /tmp/jarvis-iptables' in lines
+    assert not [ln for ln in code if ln.startswith(("iptables ", "ip6tables "))]
     assert "GW_UID" not in script and "--uid-owner 10001" not in script
     assert not [ln for ln in code if "--uid-owner" in ln and "! --uid-owner 0" not in ln]
     assert 'PG_IP="${JARVIS_POSTGRES_IP:-}"' in lines
