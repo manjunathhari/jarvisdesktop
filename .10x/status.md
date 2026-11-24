@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). **Architecture v2 Phase 0 (server): complete, PR #2 merged 2026-11-21; running on the shared server. Phase 1 (memory engine): **complete, PR #3 merged 2026-11-22** (main `f373775`); 236 tests green; live check passed (`SMOKE PASS` ×10, `memory ready: 0 entries`). Next: Phase 2 (Jarvis core + nodes).**
+**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). Architecture v2 Phase 0 (server) complete, PR #2 merged 2026-11-21, running on the shared server. Phase 1 (memory engine) complete, PR #3 merged 2026-11-22. **Phase 2 server (core + nodes): Tasks 1–15 complete on `phase-2-server`; PR #5 to `main` open, not merged, not deployed. 1 202 tests green (`-W error`); final QA and security reviews 2026-11-24 found no blocking issues after one fix wave. Spec Revision 12 with owner rulings R12-1 to R12-34. Next: Manj's merge decision, then the deploy and the runbook's live checks (P2-S5, P2-S7, P0-8, 3 s first-chunk latency), then Plan B (the Rust desktop node).**
 **Started:** 2026-11-21
 
 ## Known so far

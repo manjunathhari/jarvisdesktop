@@ -96,3 +96,16 @@ Markers:
 | P2-E13 Rust half; P2-S4 Rust half | They need the Rust node. The inputs are in the repo: `server/tests/fakes/traces/e13.jsonl` and `contracts/signing-vectors/`. |
 | P2-E13 node half at 1,000 runs | The gateway-level test runs 200 randomised runs and the database half runs 1,000. The 200 runs take about 24 s locally, so 1,000 would add about 2 minutes to every CI run. Raising it means editing an existing test (allowed, since it strengthens it), but it is the owner's call because of the CI cost, so it is not done here. |
 | P2-S5 and P2-S7 live; P0-8; P2-A1 live | They need the deployed stack or the real desktop, and deploying is not authorised in Task 15. The static halves are mapped above. |
+
+## Added by the final fix wave (commit e93118a)
+
+The final QA and security fixes added 51 tests:
+- forged, mismatched and replayed node envelopes refused for decisions, receipts and listings (S-1 / R12-34);
+- the gateway UID guard (S-2);
+- job error hygiene (S-5);
+- per-node reconnect summary (I-1);
+- every disconnect path recorded (I-2);
+- E13 gateway-frame and database-state assertions, with an opt-in 1 000-run mode (I-3);
+- integer-only `last_seq` (M-1).
+
+They strengthen the P2-A1, A2, A9, S2, S4, S5 (static), E05, E07, E13 and E10 rows above, and owner areas 1, 3 and 5. See `.superpowers` final-fix-report for the exact names.

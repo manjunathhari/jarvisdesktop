@@ -1,0 +1,24 @@
+# Security — phase-2-core-and-nodes
+- **Three signing purposes, three keys** (`node-msg`, `gw-transport`, `core-authz`).
+  - A node never accepts a key from the gateway alone.
+  - Keysets are core-signed and targeted at one node.
+  - Rotation activates at 23 h, while nodes keep the old key for 24 h.
+  - A stale node gets only the challenge, then 4409.
+- **Irreversible actions need:**
+  - a valid, unexpired, unconsumed approval from the right person's non-revoked node, with the exact card signature;
+  - exactly one execution;
+  - a receipt accepted once and bound to the file ID and hash;
+  - verification that fails closed.
+  - Core re-verifies the node's own signature before every irreversible step (R12-34), so the gateway is not trusted for approvals.
+- **Roles:**
+  - `jarvis_gateway` has six `gw` functions plus named `conv`/`comm` functions and column grants only. It has no audit or memory access.
+  - Every SECURITY DEFINER function has a fixed `search_path` and PUBLIC revoked.
+  - Refusals are audited with fixed codes.
+- **Identity:** person and viewer always come from the authenticated connection, never from message or Claude content (P2-S2).
+- **Egress (R12-33):**
+  - The gateway (UID 10001, pinned) may only open TCP to the Postgres IP on 5432 and send replies on `tailscale0`. It uses no DNS, and IPv6 fails closed.
+  - Core reaches only `api.anthropic.com:443` through squid.
+  - No published ports.
+  - Images are pinned by digest.
+- **Gate:** the P2-S5 and P2-S7 live proofs must pass after deploy, before enrolling a real node. There must be no real memories until JARVIS is on its own server.
+- **Review:** `reviews/2026-11-24-phase-2-security.md` (S-1 fixed in `e93118a` with R12-34; S-2 and S-5 fixed; the rest are low and deferred).
