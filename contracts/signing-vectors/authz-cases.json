@@ -377,6 +377,7 @@
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
     "now": "2026-11-22T10:01:00Z",
     "payload": {
       "role": "core",
@@ -406,7 +407,8 @@
       "sig": "N6xJJwr8Zu_e1yPAUH6DyLPBN8vfCWFuNegh6B4zk81cKrFn8IW66Bl_IkPORTgsHiDhXJpXOA1Zn5MSxuE4Cg"
     },
     "expect": "accept",
-    "reason": null
+    "reason": null,
+    "pins_as": "core"
   },
   {
     "name": "reject-keyset-expired",
@@ -414,6 +416,7 @@
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
     "now": "2026-11-23T10:00:31Z",
     "payload": {
       "role": "core",
@@ -451,6 +454,7 @@
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
     "now": "2026-11-23T10:00:29Z",
     "payload": {
       "role": "core",
@@ -480,7 +484,8 @@
       "sig": "N6xJJwr8Zu_e1yPAUH6DyLPBN8vfCWFuNegh6B4zk81cKrFn8IW66Bl_IkPORTgsHiDhXJpXOA1Zn5MSxuE4Cg"
     },
     "expect": "accept",
-    "reason": null
+    "reason": null,
+    "pins_as": "core"
   },
   {
     "name": "reject-keyset-payload-mismatch",
@@ -488,6 +493,7 @@
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
     "now": "2026-11-22T10:01:00Z",
     "payload": {
       "role": "core",
@@ -525,6 +531,7 @@
     "trusted_keys": {
       "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
     },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
     "now": "2026-11-22T10:01:00Z",
     "payload": {
       "role": "core",
@@ -555,6 +562,122 @@
     },
     "expect": "reject",
     "reason": "malformed"
+  },
+  {
+    "name": "reject-keyset-other-target",
+    "check": "keyset",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+    "now": "2026-11-22T10:01:00Z",
+    "payload": {
+      "role": "core",
+      "key_id": "core-2",
+      "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
+    },
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "keyset",
+        "action_kind": "keyset.add",
+        "args": {
+          "role": "core",
+          "key_id": "core-2",
+          "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
+        },
+        "target_node_id": "9c8b7a6f-5e4d-4c3b-8a29-1f0e0d0c0b0a",
+        "person_id": null,
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": null,
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-23T10:00:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "CzA7uYdm85coeAgCYiUwSXw554LwF8c_DT1EpWJ9US56C8vCmnBM49zgGyt9J2TYsf21BpSYLMQal0UHoaEgAA"
+    },
+    "expect": "reject",
+    "reason": "wrong_target"
+  },
+  {
+    "name": "accept-keyset-for-this-node",
+    "check": "keyset",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+    "now": "2026-11-22T10:01:00Z",
+    "payload": {
+      "role": "core",
+      "key_id": "core-2",
+      "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
+    },
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "keyset",
+        "action_kind": "keyset.add",
+        "args": {
+          "role": "core",
+          "key_id": "core-2",
+          "public_key": "K5X1c0jLjIeMXZ52ydFPkKGxFkkumFlXihy5Q2URXvI"
+        },
+        "target_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+        "person_id": null,
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": null,
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-23T10:00:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "-kh1n2nYNPqFpJuPNQZEMr3Ut4sTWIIhsNLAZ0Thh9_lfLLuupyp1R_W0H9qGSILsJ7TJqP68BOl_RPMguYxBg"
+    },
+    "expect": "accept",
+    "reason": null,
+    "pins_as": "core"
+  },
+  {
+    "name": "accept-keyset-gateway-role",
+    "check": "keyset",
+    "trusted_keys": {
+      "core-1": "f8bce226091e4769b551439aaf48694189ccf0873435783418adac98e26c78f6"
+    },
+    "receiving_node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+    "now": "2026-11-22T10:01:00Z",
+    "payload": {
+      "role": "gateway",
+      "key_id": "gw-2",
+      "public_key": "byJ-mtV2nL_UmRDscG5qR__HAbj2v9vEbNQ6VGwBvjk"
+    },
+    "authz": {
+      "object": {
+        "v": 1,
+        "kind": "keyset",
+        "action_kind": "keyset.add",
+        "args": {
+          "role": "gateway",
+          "key_id": "gw-2",
+          "public_key": "byJ-mtV2nL_UmRDscG5qR__HAbj2v9vEbNQ6VGwBvjk"
+        },
+        "target_node_id": null,
+        "person_id": null,
+        "approval_id": null,
+        "execution_key": null,
+        "reply_id": null,
+        "summary": null,
+        "issued_at": "2026-11-22T10:00:00Z",
+        "valid_until": "2026-11-23T10:00:00Z"
+      },
+      "key_id": "core-1",
+      "sig": "-5pBvtASBJL_Z4v8l25tG4NQcr-7MElvx2iXi8AtspdkOF-56OkHFeuCaoAIMiYQjj_Jg-Hrc4fakL4jEWp3Bw"
+    },
+    "expect": "accept",
+    "reason": null,
+    "pins_as": "gateway"
   },
   {
     "name": "accept-challenge",

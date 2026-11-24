@@ -39,6 +39,7 @@ const KEYS = {
   "core-1": keyFor("core-1"),
   "core-2": keyFor("core-2"),
   "gw-1": keyFor("gw-1"),
+  "gw-2": keyFor("gw-2"),
   "node-1": keyFor("node-1"),
   "unknown-1": keyFor("unknown-1"),
 };
@@ -206,15 +207,27 @@ const NEW_CORE_KEY = {
   public_key: KEYS["core-2"].pubRaw.toString("base64url"),
 };
 
-const keysetCase = (name, now, payload, expect, reason, overrides = {}) => ({
+// A gateway key announcement (R6-3): accepted, but its key is pinned as a GATEWAY key and
+// never enters core trust.
+const NEW_GATEWAY_KEY = {
+  role: "gateway",
+  key_id: "gw-2",
+  public_key: KEYS["gw-2"].pubRaw.toString("base64url"),
+};
+
+// `receiving_node_id` is the node checking it (the target rule, R12-27); an accepted
+// keyset also says which pin set its key goes to (`pins_as`, the role rule, R6-3).
+const keysetCase = (name, now, payload, expect, reason, overrides = {}, args = NEW_CORE_KEY) => ({
   name,
   check: "keyset",
   trusted_keys: TRUSTED,
+  receiving_node_id: ME,
   now,
   payload,
-  authz: authzOf(keysetObject(NEW_CORE_KEY, overrides)),
+  authz: authzOf(keysetObject(args, overrides)),
   expect,
   reason,
+  ...(expect === "accept" ? { pins_as: args.role } : {}),
 });
 
 const tampered = () => {
@@ -405,6 +418,22 @@ const authzCases = () => [
     "reject",
     "malformed",
     { valid_until: "2026-11-23T10:00:00" },
+  ),
+  // keyset target (R12-27) and role (R6-3): S-9
+  keysetCase("reject-keyset-other-target", "2026-11-22T10:01:00Z", NEW_CORE_KEY, "reject", "wrong_target", {
+    target_node_id: OTHER_NODE,
+  }),
+  keysetCase("accept-keyset-for-this-node", "2026-11-22T10:01:00Z", NEW_CORE_KEY, "accept", null, {
+    target_node_id: ME,
+  }),
+  keysetCase(
+    "accept-keyset-gateway-role",
+    "2026-11-22T10:01:00Z",
+    NEW_GATEWAY_KEY,
+    "accept",
+    null,
+    {},
+    NEW_GATEWAY_KEY,
   ),
   // challenge
   challengeCase("accept-challenge", challengeEnvelope(), PINNED_GW, null, "accept", null),

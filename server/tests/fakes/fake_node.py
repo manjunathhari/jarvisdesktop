@@ -52,7 +52,7 @@ import json
 import uuid
 from collections import Counter, defaultdict
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -82,6 +82,7 @@ from .node_rules import (
     KEYSET_FIELDS,
     Rejected,
     SeqChecker,
+    apply_keyset,
     check_challenge,
     check_enrolment_welcome,
     check_keyset,
@@ -93,7 +94,6 @@ PEER_HEADER = "x-test-peer-ip"
 CORE_CONTENT = frozenset({"node.action", "keyset", "outbox.item", "reply.chunk"})
 ROUTE = "/v1/node"
 REENROL_CLOSE = 4409
-OVERLAP = timedelta(hours=24)  # old keys stay trusted this long after a keyset's issued_at
 
 
 class FakeWhoIs:
@@ -564,25 +564,18 @@ class FakeNode:
         except ValidationError:
             raise Rejected("malformed") from None
         signed = {f: payload[f] for f in KEYSET_FIELDS}  # without outbox_id and authz
-        obj = check_keyset(signed, payload["authz"], trusted=self.trusted_core, now=self.clock())
-        if obj["target_node_id"] not in (None, str(self.node_id)):
-            raise Rejected("wrong_target")
-        args = obj["args"]
-        raw = b64url_decode(args["public_key"], 32)
-        assert raw is not None  # check_keyset validated it
-        pins = self.trusted_core if args["role"] == "core" else self.pinned_gateway
-        new_id = args["key_id"]
-        if pins.get(new_id) != raw or new_id in self.key_expiry:  # a re-send changes nothing
-            until = datetime.fromisoformat(obj["issued_at"]) + OVERLAP
-            for key_id in list(pins):
-                if key_id == new_id:
-                    continue
-                if key_id in self.key_expiry:  # still in an earlier overlap: this ends it
-                    del pins[key_id], self.key_expiry[key_id]
-                else:
-                    self.key_expiry[key_id] = until
-            pins[new_id] = raw
-            self.key_expiry.pop(new_id, None)
+        assert self.node_id is not None
+        obj = check_keyset(
+            signed, payload["authz"], trusted=self.trusted_core, me=self.node_id, now=self.clock()
+        )
+        before = (dict(self.trusted_core), dict(self.pinned_gateway), dict(self.key_expiry))
+        apply_keyset(
+            obj,
+            trusted_core=self.trusted_core,
+            pinned_gateway=self.pinned_gateway,
+            key_expiry=self.key_expiry,
+        )
+        if (self.trusted_core, self.pinned_gateway, self.key_expiry) != before:
             self._save()
         if self.ws is not None:
             outbox_id = str(keyset.outbox_id)

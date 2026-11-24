@@ -1,5 +1,7 @@
 # Handoff
-**Now:** Phase 2 server (Jarvis core + nodes) is built and reviewed on `phase-2-server`, with **PR #5 to `main` open and not merged**. Nothing is deployed. 1 202 tests pass with `-W error`, and ruff, mypy and the compose config are clean. The final QA and security reviews (`reviews/2026-11-24-phase-2-qa.md`, `reviews/2026-11-24-phase-2-security.md`) found nothing blocking after one fix wave. The test map is in `reviews/2026-11-24-phase-2-test-map.md`.
+**Now:** Phase 2 server is merged (PR #5, PR #6) and **live** on the shared server at `main` = `c75fb9c`. All live checks passed (init smoke 18/18, P2-S5, P2-S7, P0-8, end to end from Manj's PC with fictional phrases). No devices are enrolled. **Plan B (the Rust desktop node) is in progress** on the local branch `plan-b`: plan `.10x/plans/2026-11-24-plan-b-desktop-node.md` (approved 2026-11-24, with D-1 to D-3 and the recovery table). Task 1 (S-9: shared keyset target and role cases) is done and in review. Nothing from Plan B is pushed.
+
+The "Before deploying" list below is historical: it was done for the 24 Nov deploy.
 
 **Read first:**
 - spec `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md` (Revision 12; §20 has R12-1 to R12-34);
@@ -30,7 +32,7 @@
   - S-6: the gateway reads historical outbox bodies; move to the dedicated server.
   - S-7: STATED memory written by Claude; fix before real memory.
   - S-8: read-only tool arguments aren't schema-validated.
-  - S-9: shared keyset-target and keyset-role cases; needed before Plan B.
+  - ~~S-9: shared keyset-target and keyset-role cases~~ (Plan B Task 1).
   - S-10: lax payload validation.
   - S-5 remainder: exception text still logged at `relay.py:640/718` and `core_main.py:69/83/178`.
   - `approvals.py:346` parses `approval_id` before the signature check (fails closed).

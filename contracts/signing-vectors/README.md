@@ -34,7 +34,7 @@ node generate.mjs authz-cases > /tmp/a.json && diff authz-cases.json /tmp/a.json
 ```
 
 **Keys.** Every key is a fixed *test* seed: SHA-256 of the public label
-`jarvis-signing-vectors test seed: <label>` (labels `core-1`, `core-2`, `gw-1`, `node-1`,
+`jarvis-signing-vectors test seed: <label>` (labels `core-1`, `core-2`, `gw-1`, `gw-2`, `node-1`,
 `unknown-1`). They are not secrets and must never be used outside tests.
 
 **The `rfc8785-appendix` case** uses the sample published in RFC 8785: the input of §3.2.2,
@@ -61,10 +61,12 @@ and `pinned_gateway` are raw 32-byte public keys in hex; in messages they are ba
 | `check` | Inputs | Reasons, in order |
 |---|---|---|
 | `node_action` | `trusted_keys` (CORE keys only), `receiving_node_id`, `now`, `authz` | `malformed` (including a time without an offset), `untrusted_key_id`, `bad_signature`, `wrong_kind`, `wrong_target`, `expired` (`now` > `valid_until` + 30 s) |
-| `keyset` | `trusted_keys`, `now`, `payload` (the keyset payload without its unsigned `outbox_id` and its `authz`, R12-26), `authz` | `malformed`, `untrusted_key_id`, `bad_signature`, `wrong_kind`, `expired` (from the signed `authz.object.valid_until`, + 30 s), `keyset_mismatch` (payload `role`, `key_id` or `public_key` differs from `authz.object.args`) |
+| `keyset` | `trusted_keys`, `receiving_node_id`, `now`, `payload` (the keyset payload without its unsigned `outbox_id` and its `authz`, R12-26), `authz`; an accepted case also has `pins_as` | `malformed`, `untrusted_key_id`, `bad_signature`, `wrong_kind`, `wrong_target` (the signed `target_node_id` is neither null nor `receiving_node_id`, R12-27), `expired` (from the signed `authz.object.valid_until`, + 30 s), `keyset_mismatch` (payload `role`, `key_id` or `public_key` differs from `authz.object.args`) |
 | `challenge` | `envelope` (the full signed envelope), `pinned_gateway` (GATEWAY keys, or null while enrolling), `enrol_fingerprint` (the code's gateway fingerprint, or null) | `malformed`, `malformed_key`, `unpinned_key`, `fingerprint_mismatch`, `bad_signature` (`gw-transport`) |
 | `enrolment_welcome` | `welcome` (payload), `core_fingerprint` (from the code) | `malformed`, `enrolment_missing`, `malformed_key`, `core_fingerprint_mismatch` |
 | `seq` | `seqs`: a fresh checker is fed each value in order | `bad_seq` on the last value; every earlier one passes |
+
+**`pins_as` (R6-3).** For an accepted keyset, `pins_as` is the pin set the new key joins: `core` or `gateway`, from the signed `args.role`. A `gateway` key is pinned as a GATEWAY key only and never enters core trust, so it can never authorise an action (case `accept-keyset-gateway-role`).
 
 Base64url keys and signatures are decoded strictly: no padding, URL-safe alphabet only, and a final character with non-zero unused trailing bits is rejected (`malformed_key` for a key), never normalised (case `reject-non-canonical-base64url-key`).
 
