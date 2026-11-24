@@ -1,9 +1,11 @@
 """The deployable stack (plan Task 14; spec §4.2, §4.3; P2-S5 and P2-S7 static checks).
 
 `deploy/compose.yaml` is the only file the server fetches, so the sidecar's entrypoint and the
-proxy's config travel inside it as inline `configs`. Their reviewable copies are
-`deploy/gateway-ts/entrypoint.sh` and `deploy/egress-proxy/squid.conf`; the inline copies must
-match them (compose escapes `$` as `$$`).
+proxy's config travel inside it as inline blocks (x-gateway-ts-entrypoint, x-egress-proxy-squid),
+passed to their read-only containers as environment values and written to /tmp at start: Compose
+can place only `file` configs in a read-only container (first deploy, 24 Nov 2026). Their
+reviewable copies are `deploy/gateway-ts/entrypoint.sh` and `deploy/egress-proxy/squid.conf`;
+the inline copies must match them (compose escapes `$` as `$$`).
 
 The init smoke (`jarvis-core smoke`) runs database-only Phase 2 rows: no node, no gateway
 process, no brain. Everything here is fictional.
@@ -125,10 +127,12 @@ def test_sidecar_runs_tailscale_in_kernel_mode(stack: dict[str, Any]) -> None:
     assert env["TS_EXTRA_ARGS"] == "--advertise-tags=tag:jarvis-gateway"
     assert env["TS_AUTH_ONCE"] == "true"  # a non-reusable key is used once; state keeps it
     assert env["TS_SOCKET"] == "/ts-socket/tailscaled.sock"
-    assert ts["entrypoint"] == ["/bin/sh", "/etc/jarvis/gateway-ts-entrypoint.sh"]
-    assert ts["configs"] == [
-        {"source": "gateway_ts_entrypoint", "target": "/etc/jarvis/gateway-ts-entrypoint.sh"}
-    ]
+    assert ts["entrypoint"][:2] == ["/bin/sh", "-c"]
+    start = ts["entrypoint"][2]
+    assert '[ -n "$${JARVIS_TS_ENTRYPOINT:-}" ] || {' in start and "exit 1; }" in start
+    assert start.endswith("exec /bin/sh /tmp/gateway-ts-entrypoint.sh")
+    assert env["JARVIS_TS_ENTRYPOINT"] == stack["x-gateway-ts-entrypoint"]
+    assert "configs" not in ts
     health = " ".join(ts["healthcheck"]["test"])  # healthy only with both rule jumps in place
     jump = "OUTPUT -m owner --socket-exists ! --uid-owner 0 -j JARVIS_GW_OUT"
     assert f"iptables -C {jump}" in health and f"ip6tables -C {jump}" in health
@@ -146,13 +150,19 @@ def test_core_has_no_egress_network(stack: dict[str, Any]) -> None:
     assert core["depends_on"]["egress-proxy"] == {"condition": "service_healthy"}
     proxy = services["egress-proxy"]
     assert _networks(proxy) == ["jarvis_egress", "jarvis_internal"]
-    assert proxy["configs"] == [{"source": "egress_proxy_squid", "target": "/etc/squid/squid.conf"}]
+    assert "configs" not in proxy
+    assert proxy["entrypoint"][:2] == ["/bin/sh", "-c"] and proxy["command"] == []
+    start = proxy["entrypoint"][2]
+    assert '[ -n "$${JARVIS_SQUID_CONF:-}" ] || {' in start and "exit 1; }" in start
+    assert start.endswith("exec /usr/sbin/squid -f /tmp/squid.conf -NYC")
+    assert proxy["environment"]["JARVIS_SQUID_CONF"] == stack["x-egress-proxy-squid"]
+    assert "/tmp" in proxy["tmpfs"]  # noqa: S108 (a container path, not ours)
     assert proxy["cap_drop"] == ["ALL"] and proxy["cap_add"] == ["SETUID", "SETGID", "CHOWN"]
     assert proxy["read_only"] is True
     # Healthy only with our config mounted, so a lost mount can't fall back to the default.
     health = " ".join(proxy["healthcheck"]["test"])
-    assert "acl claude dstdomain -n api.anthropic.com" in health
-    assert "http_access deny all" in health
+    assert "acl claude dstdomain -n api.anthropic.com' /tmp/squid.conf" in health
+    assert "http_access deny all' /tmp/squid.conf" in health
     egress = {"jarvis_egress", "jarvis_ts_egress"}
     for name, service in services.items():  # only the sidecar and the proxy reach the internet
         if name not in ("gateway-ts", "egress-proxy", "backup", "postgres"):
@@ -196,13 +206,22 @@ def test_all_third_party_images_pinned(stack: dict[str, Any]) -> None:
 # --- the sidecar entrypoint and the proxy config -----------------------------------------------
 
 
+def test_no_inline_configs_in_read_only_services(stack: dict[str, Any]) -> None:
+    """Compose refuses an inline (`content`) config in a read-only service: only `file` configs
+    can be placed there. The first deploy failed on exactly this (24 Nov 2026)."""
+    assert "configs" not in stack
+    for name, service in _services(stack).items():
+        assert "configs" not in service, name
+
+
 @pytest.mark.parametrize(
-    ("config_name", "path"), [("gateway_ts_entrypoint", ENTRYPOINT), ("egress_proxy_squid", SQUID)]
+    ("block", "path"),
+    [("x-gateway-ts-entrypoint", ENTRYPOINT), ("x-egress-proxy-squid", SQUID)],
 )
-def test_inline_configs_match_their_files(
-    stack: dict[str, Any], config_name: str, path: Path
-) -> None:
-    inline = stack["configs"][config_name]["content"]
+def test_inline_copies_match_their_files(stack: dict[str, Any], block: str, path: Path) -> None:
+    raw = COMPOSE.read_text()  # yaml loads the escaped text; compose turns $$ into $
+    inline = stack[block]
+    assert f"\n{block}: &" in raw
     assert inline.replace("$$", "$") == path.read_text()
     assert "$" not in re.sub(r"\$\$", "", inline)  # every $ escaped from compose
 

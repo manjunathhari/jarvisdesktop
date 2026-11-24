@@ -16,8 +16,10 @@
 # tailscaled runs as root and is not affected. Then the image's own entrypoint, containerboot,
 # starts tailscaled.
 #
-# compose.yaml carries an inline copy of this file (configs: gateway_ts_entrypoint, with $
-# written as $$); tests/test_compose.py checks the two match. P2-S5 checks it live.
+# compose.yaml carries an inline copy of this file (x-gateway-ts-entrypoint, with $ written as
+# $$), passed in as JARVIS_TS_ENTRYPOINT and written to /tmp at start, because the container is
+# read-only and Compose can't place an inline config file in it. tests/test_compose.py checks the
+# two match. P2-S5 checks it live.
 set -eu
 
 PG_IP="${JARVIS_POSTGRES_IP:-}"
