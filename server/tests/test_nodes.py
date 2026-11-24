@@ -1409,6 +1409,9 @@ def test_cli_enrol_and_revoke(
     monkeypatch.setenv("JARVIS_DB_PORT", str(parts.get("port", "5432")))
     monkeypatch.setenv("JARVIS_DB_NAME", ndb.database)
 
+    with pytest.raises(SystemExit, match="keys init"):  # no trusted keys yet (Task 12)
+        core_main.main(["node", "enrol", "--person", "manj", "--kind", "DESKTOP", "--name", "x"])
+    assert core_main.main(["keys", "init"]) == 0  # the bootstrap keys, from the secret files
     argv = ["node", "enrol", "--person", "manj", "--kind", "desktop", "--name", "study PC"]
     assert core_main.main(argv) == 0
     token, core_fp, gw_fp = nodes.parse_enrolment_code(capsys.readouterr().out.split()[-1])
@@ -1418,6 +1421,8 @@ def test_cli_enrol_and_revoke(
     assert core_main.main(["node", "revoke", str(node_id)]) == 1
     with pytest.raises(SystemExit):
         core_main.main(["node", "enrol", "--person", "nobody", "--kind", "PHONE", "--name", "x"])
+    with psycopg.connect(ndb.owner, autocommit=True) as conn:  # the module's later tests
+        conn.execute("DELETE FROM gw.trusted_key")  # downgrade, which keys would refuse
 
 
 # --- migration 0008 rollback (R7-6) ------------------------------------------------------------

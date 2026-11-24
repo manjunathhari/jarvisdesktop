@@ -29,7 +29,7 @@ from jarvis_server.contracts import (
     Authz,
     AuthzKind,
     Challenge,
-    Keyset,
+    KeysetAnnouncement,
     MessageKind,
     NodeEnvelope,
     Welcome,
@@ -98,14 +98,15 @@ def check_keyset(
 ) -> dict[str, Any]:
     """The signed keyset object, or ``Rejected(reason)``.
 
-    ``payload`` is the ``keyset`` message payload; its own ``authz`` key, if present, is
-    ignored in favour of ``authz``. Validity comes only from the signed ``authz.object``
+    ``payload`` is the ``keyset`` message payload without its unsigned ``outbox_id`` and its
+    ``authz`` (R12-26): ``role``, ``key_id`` and ``public_key``; ``authz`` comes separately.
+    Validity comes only from the signed ``authz.object``
     (R6-2). Reasons, in order: ``malformed``, ``untrusted_key_id``, ``bad_signature``,
     ``wrong_kind``, ``expired`` (``now`` > ``valid_until`` + 30 s), ``keyset_mismatch`` (the
     payload's role, key_id or public_key differs from ``authz.object.args``).
     """
     try:
-        Keyset.model_validate({**payload, "authz": authz})
+        KeysetAnnouncement.model_validate({**payload, "authz": authz})
     except ValidationError:
         raise Rejected("malformed") from None
     parsed = _verified(authz, trusted)

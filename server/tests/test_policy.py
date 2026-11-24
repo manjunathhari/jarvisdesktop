@@ -219,18 +219,18 @@ def test_atlas_accepts_inside_the_callers_transaction(app: Conn, person: uuid.UU
 # --- the core key -----------------------------------------------------------------------------
 
 
-def test_active_core_key_reads_the_secret(core_key: Any) -> None:
-    key, key_id = keys.active_core_key()
+def test_active_core_key_reads_the_secret(app: Conn, core_key: Any) -> None:
+    key, key_id = keys.active_core_key(app)
     assert signing.public_bytes(key) == signing.public_bytes(core_key)
     assert key_id == signing.fingerprint(signing.public_bytes(core_key))
 
 
 def test_active_core_key_missing_secret_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    app: Conn, core_key: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(config, "SECRETS_DIR", tmp_path)
     with pytest.raises(RuntimeError, match="core_signing_key"):
-        keys.active_core_key()
+        keys.active_core_key(app)
 
 
 # --- memory.write from conversation (§12, P2-S2) -------------------------------------------

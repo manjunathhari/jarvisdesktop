@@ -187,9 +187,14 @@ def test_shared_case_inputs_match_the_contracts(case: dict[str, Any]) -> None:
             with pytest.raises(ValidationError):
                 c.Authz.model_validate(case["authz"])
     if case["check"] == "keyset" and ok:
+        # The message adds the unsigned outbox_id; the case payload (what check_keyset gets)
+        # leaves it out (R12-26).
         payload = {**case["payload"], "authz": case["authz"]}
-        validator(_schema("keyset")).validate(payload)
-        c.Keyset.model_validate(payload)
+        c.KeysetAnnouncement.model_validate(payload)
+        message = {**payload, "outbox_id": "6f1c2b9e-3d4a-4e5f-9a8b-7c6d5e4f3a2b"}
+        validator(_schema("keyset")).validate(message)
+        c.Keyset.model_validate(message)
+        assert not validator(_schema("keyset")).is_valid(payload)  # outbox_id is required
     if case["check"] == "challenge":
         envelope_schema = json.loads((CONTRACTS / "node-envelope.schema.json").read_text())
         validator(envelope_schema).validate(case["envelope"])

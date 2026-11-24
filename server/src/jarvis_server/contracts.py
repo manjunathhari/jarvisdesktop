@@ -599,11 +599,20 @@ class KeyRole(StrEnum):
     GATEWAY = "gateway"
 
 
-class Keyset(_Contract):
+class KeysetAnnouncement(_Contract):
+    """The signed part of a `keyset`: what `check_keyset` checks (R12-26)."""
+
     role: KeyRole
     key_id: KeyId
     public_key: PublicKey
     authz: Authz
+
+
+class Keyset(KeysetAnnouncement):
+    """The `keyset` message: the announcement and the unsigned `outbox_id` of its
+    `keys.keyset` item, which the node acks once the keyset is accepted (R12-26)."""
+
+    outbox_id: UUID
 
 
 class Ping(_Contract):

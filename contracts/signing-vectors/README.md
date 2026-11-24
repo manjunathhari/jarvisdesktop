@@ -61,7 +61,7 @@ and `pinned_gateway` are raw 32-byte public keys in hex; in messages they are ba
 | `check` | Inputs | Reasons, in order |
 |---|---|---|
 | `node_action` | `trusted_keys` (CORE keys only), `receiving_node_id`, `now`, `authz` | `malformed` (including a time without an offset), `untrusted_key_id`, `bad_signature`, `wrong_kind`, `wrong_target`, `expired` (`now` > `valid_until` + 30 s) |
-| `keyset` | `trusted_keys`, `now`, `payload` (the keyset payload without its `authz`), `authz` | `malformed`, `untrusted_key_id`, `bad_signature`, `wrong_kind`, `expired` (from the signed `authz.object.valid_until`, + 30 s), `keyset_mismatch` (payload `role`, `key_id` or `public_key` differs from `authz.object.args`) |
+| `keyset` | `trusted_keys`, `now`, `payload` (the keyset payload without its unsigned `outbox_id` and its `authz`, R12-26), `authz` | `malformed`, `untrusted_key_id`, `bad_signature`, `wrong_kind`, `expired` (from the signed `authz.object.valid_until`, + 30 s), `keyset_mismatch` (payload `role`, `key_id` or `public_key` differs from `authz.object.args`) |
 | `challenge` | `envelope` (the full signed envelope), `pinned_gateway` (GATEWAY keys, or null while enrolling), `enrol_fingerprint` (the code's gateway fingerprint, or null) | `malformed`, `malformed_key`, `unpinned_key`, `fingerprint_mismatch`, `bad_signature` (`gw-transport`) |
 | `enrolment_welcome` | `welcome` (payload), `core_fingerprint` (from the code) | `malformed`, `enrolment_missing`, `malformed_key`, `core_fingerprint_mismatch` |
 | `seq` | `seqs`: a fresh checker is fed each value in order | `bad_seq` on the last value; every earlier one passes |

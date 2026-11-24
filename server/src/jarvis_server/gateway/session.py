@@ -11,7 +11,9 @@ with `seq` 1, this connection's nonce (constant time), before `expires_at`. Then
   connection's `whois` identity (never the message's), then `gw.open_connection`, and `welcome`
   carries the `enrolment` block.
 
-Every refusal closes with 4401 (4409 for a STALE node, Task 12) and is audited once: through
+A STALE node (`gw.node.key_state`, Task 12) whose `hello` passes path A is refused
+`reenrol_required` and closed with 4409 instead of `welcome`: after the challenge it is sent
+nothing (R6-6). Every other refusal closes with 4401. Each is audited once: through
 `gw.refuse_handshake` for the gateway's own codes, or by `gw.enrol_node` / `gw.open_connection`
 for theirs (R12-1). The refusal commits before the socket closes. The nonce lives only in this
 object and is consumed by the first reply, whatever its outcome.
@@ -30,6 +32,10 @@ answers the gateway's heartbeat. Any other database error on an established conn
 connection registers with the process's `Relay`, which stops an older connection of the same
 node (`superseded`), and gets its pending items and unacknowledged chunks. The relay can stop
 the connection (`stop`): fenced, superseded, a database failure or three missed heartbeats.
+
+**Keys.** A connection keeps the gateway keys it started with (`ctx.keys` at the time), so
+every envelope is signed under the key its challenge announced (R12-6), even if the keys are
+re-read meanwhile.
 
 **Sends are bounded** by `send_timeout` (10 s in service): a send that doesn't finish in time
 closes the connection through `gw.close_connection(conn_id, 'send_timeout')`.
@@ -204,6 +210,7 @@ class Session:
         self._out_seq = 0
         self._in_seq = 0
         self._send_lock = asyncio.Lock()
+        self.keys = ctx.keys  # this connection's keys, for its whole life (R12-6)
 
     # ------------------------------------------------------------------ running
 
@@ -285,7 +292,7 @@ class Session:
                 "payload": payload,
             }
             signed = signing.sign_envelope(
-                signing.Purpose.GW_TRANSPORT, self.ctx.keys.gw_key, self.ctx.keys.gw_key_id, env
+                signing.Purpose.GW_TRANSPORT, self.keys.gw_key, self.keys.gw_key_id, env
             )
             # Bounded: a peer that stops reading must not hold this connection (or the
             # relay's sender for it) for minutes (fix round 1, I-1).
@@ -347,8 +354,8 @@ class Session:
                 "nonce": nonce,
                 "issued_at": issued_at.isoformat(),
                 "expires_at": expires_at.isoformat(),
-                "key_id": self.ctx.keys.gw_key_id,
-                "public_key": _b64(self.ctx.keys.gw_public),
+                "key_id": self.keys.gw_key_id,
+                "public_key": _b64(self.keys.gw_public),
             },
         )
         text = await self._first_frame()
@@ -412,8 +419,8 @@ class Session:
             raise HandshakeRefused("malformed")
         async with self.ctx.pool.connection() as conn:
             cur = await conn.execute(
-                "SELECT public_key, tailscale_identity, revoked_at, person_id FROM gw.node"
-                " WHERE id = %s",
+                "SELECT public_key, tailscale_identity, revoked_at, person_id, key_state"
+                " FROM gw.node WHERE id = %s",
                 (node_id,),
             )
             row = await cur.fetchone()
@@ -429,18 +436,16 @@ class Session:
             raise HandshakeRefused("revoked", node_id)
         if identity != self.identity:
             raise HandshakeRefused("identity_mismatch", node_id)
-        self._check_key_state(node_id)
+        self._check_key_state(node_id, str(row[4]))
         await self._open(node_id, public_key, skew)
         await self.send(MessageKind.WELCOME, await relay.welcome(self.ctx.pool, self.person_id))
 
-    def _check_key_state(self, node_id: UUID) -> None:
-        """The node's `key_state` decision point (§6.1 step 6, R6-6).
-
-        Every registered, non-revoked node is CURRENT until Task 12 adds `gw.node.key_state`
-        (migration 0011, with the gateway's column grant). Task 12 adds here: STALE →
-        `raise HandshakeRefused("reenrol_required", node_id)`, which closes 4409 with no
-        welcome and no post-handshake content.
-        """
+    def _check_key_state(self, node_id: UUID, key_state: str) -> None:
+        """The node's `key_state` decision point (§6.1 step 6, R6-6): CURRENT goes on to
+        `welcome`; STALE is refused `reenrol_required`, closed 4409 with no welcome and no
+        post-handshake content, and no connection row is opened."""
+        if key_state != "CURRENT":
+            raise HandshakeRefused("reenrol_required", node_id)
 
     async def _path_b(self, raw: dict[str, Any], enrol: Enrol, skew: int | None) -> None:
         """A new enrolment (`enrol`, nil node ID): proof of the carried key, then gw.enrol_node
@@ -467,7 +472,7 @@ class Session:
         assert row is not None  # nodes are never deleted
         self.person_id = UUID(str(row[0]))
         await self._open(node_id, public_key, skew)
-        core_key_id, core_public = self.ctx.keys.current_core_key
+        core_key_id, core_public = self.keys.current_core_key
         await self.send(
             MessageKind.WELCOME,
             {

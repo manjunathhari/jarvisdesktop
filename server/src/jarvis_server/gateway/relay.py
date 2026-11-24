@@ -34,8 +34,11 @@ Otherwise a candidate restarts at `max(acked_seq, max(last_seq, 0)) + 1`.
 
 **The outbox.** An open item goes to every connected node of its person that hasn't been sent it
 (on its NOTIFY and on connect); an item with a `target_node_id` goes to that node only, and only
-that node is re-sent it or sent its `outbox.cleared` (R12-23). The sweep re-sends, with the same
-ID, items a connected node was sent more than 2 minutes ago and hasn't confirmed (`received`).
+that node is re-sent it or sent its `outbox.cleared` (R12-23). A `keys.keyset` item is sent as
+a `keyset` message carrying its unsigned `outbox_id` and the announcement from its signed
+`authz` (R12-26); pending keysets go first, before any other item, chunk or action (Task 12
+ruling 5). The sweep re-sends, with the same ID, items a connected node was sent more than 2
+minutes ago and hasn't confirmed (`received`).
 A terminal item's NOTIFY sends `outbox.cleared` with the state as reason to the connected nodes
 that were sent it, other than a node that acknowledged it here.
 
@@ -74,6 +77,7 @@ SERVER_ERROR = "server_error"
 HEARTBEAT_REASON = "heartbeat"
 SEND_TIMEOUT = "send_timeout"
 SEND_TIMEOUT_S = 10.0  # real seconds one socket send may take (fix round 1, I-1)
+KEYSET_KIND = "keys.keyset"  # core.keys.KEYSET_KIND: sent as a `keyset` message
 
 Pool = AsyncConnectionPool[psycopg.AsyncConnection[Any]]
 
@@ -152,6 +156,23 @@ def summary_groups(entries: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return groups
 
 
+# ------------------------------------------------------------------ keyset
+
+
+def keyset_payload(outbox_id: UUID, authz: dict[str, Any]) -> dict[str, Any]:
+    """The `keyset` message for a `keys.keyset` item: its unsigned `outbox_id`, and the role,
+    key_id and public key copied from the signed `authz.object.args`, then the authz itself
+    (R12-26). The node accepts it only if the copies equal the signed args."""
+    args = authz["object"]["args"]
+    return {
+        "outbox_id": str(outbox_id),
+        "role": args["role"],
+        "key_id": args["key_id"],
+        "public_key": args["public_key"],
+        "authz": authz,
+    }
+
+
 # ------------------------------------------------------------------ connections
 
 
@@ -198,7 +219,7 @@ WHERE o.person_id = %(person)s AND o.state IN ('PENDING', 'DELIVERING', 'DELIVER
   AND (o.target_node_id IS NULL OR o.target_node_id = %(node)s)
   AND coalesce(d.attempts, 0) = 0
   AND (%(item)s::uuid IS NULL OR o.id = %(item)s::uuid)
-ORDER BY o.created_at, o.id
+ORDER BY (o.kind = 'keys.keyset') DESC, o.created_at, o.id
 """
 # The sweep: those, and items sent to this node before %(before)s that it hasn't confirmed.
 _DUE: LiteralString = """
@@ -208,7 +229,7 @@ WHERE o.person_id = %(person)s AND o.state IN ('PENDING', 'DELIVERING', 'DELIVER
   AND (o.target_node_id IS NULL OR o.target_node_id = %(node)s)
   AND (coalesce(d.attempts, 0) = 0
        OR (d.received_at IS NULL AND d.last_sent_at < %(before)s))
-ORDER BY o.created_at, o.id
+ORDER BY (o.kind = 'keys.keyset') DESC, o.created_at, o.id
 """
 _CHUNKS: LiteralString = """
 SELECT seq, type, text, authz, final, target_node_id, valid_until FROM conv.stream_chunk
@@ -358,6 +379,9 @@ class NodeLink:
                     conn, "SELECT comm.record_sent(%s, %s)", (self.conn_id, outbox_id)
                 )
             if not sent:  # terminal by now, or refused: "don't send"
+                continue
+            if kind == KEYSET_KIND:
+                await self.endpoint.send(MessageKind.KEYSET, keyset_payload(outbox_id, authz))
                 continue
             text = body.get("text") if isinstance(body, dict) else None
             if not isinstance(text, str) or not text:

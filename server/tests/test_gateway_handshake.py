@@ -7,8 +7,9 @@ jarvis_gateway; tests read and act as jarvis_app (and the owner for ops.job), ea
 audit row on a separate, new connection after the socket closed (R7-1). Keys and identities
 are random test values; the only person is the seeded fictional household member.
 
-STALE nodes (4409, `reenrol_required`) arrive with `gw.node.key_state` in Task 12, so
-`test_stale_node_refusal_recorded` moves there (controller ruling).
+STALE nodes (4409, `reenrol_required`) arrive with `gw.node.key_state` in Task 12:
+`test_stale_node_refusal_recorded` is in test_key_rotation.py (controller ruling). The gateway
+loads its keys from gw.trusted_key (Task 12); `running_gateway` installs them.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from typing import Any
 
 import psycopg
 import pytest
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -192,6 +194,18 @@ class Gw:
         )
 
 
+def install_trusted_keys(dsns: Dsns, *, core: bytes, gateway: bytes) -> None:
+    """Make `core` and `gateway` the only trusted keys, both ACTIVE (as the owner)."""
+    with psycopg.connect(dsns.owner, autocommit=True) as conn, conn.transaction():
+        conn.execute("DELETE FROM gw.trusted_key")
+        for role, public in (("CORE", core), ("GATEWAY", gateway)):
+            conn.execute(
+                "INSERT INTO gw.trusted_key (key_id, role, public_key, state, activated_at)"
+                " VALUES (%s, %s, %s, 'ACTIVE', now())",
+                (fingerprint(public), role, public),
+            )
+
+
 @contextmanager
 def running_gateway(
     dsns: Dsns,
@@ -206,25 +220,41 @@ def running_gateway(
     clock: FakeClock | None = None,
     tick_interval: float = 0.05,
     send_timeout: float = 10.0,
+    install_keys: bool = True,
+    secrets_dir: Path | None = None,
+    key_refresh_interval: float = 60.0,
 ) -> Iterator[Gw]:
+    """A gateway under a TestClient. With `install_keys` (the default), `gw_key` and the core
+    key it serves (`advertised_core`, else `core_key`) become the ACTIVE trusted keys, and
+    `gw_key` is placed as its secret `gateway_signing_key_<key_id>` in a new secrets directory.
+    Without it, the keys already in gw.trusted_key and `secrets_dir` are used."""
     clock = clock or FakeClock()
     whois = FakeWhoIs()
     gw_key = gw_key or Ed25519PrivateKey.generate()
     core_key = core_key or Ed25519PrivateKey.generate()
     served_core = advertised_core or core_key
+    if install_keys:
+        secrets_dir = tmp / f"gw-secrets-{secrets.token_hex(4)}"
+        secrets_dir.mkdir()
+        (secrets_dir / f"gateway_signing_key_{fingerprint(public_bytes(gw_key))}").write_bytes(
+            gw_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+        )
+        install_trusted_keys(dsns, core=public_bytes(served_core), gateway=public_bytes(gw_key))
+    assert secrets_dir is not None
     app = create_app(
         dsn=dsn or dsns.gateway,
         whois=whois,
-        gw_key=gw_key,
-        gw_key_id=fingerprint(public_bytes(gw_key)),
-        core_public_keys={
-            fingerprint(public_bytes(served_core)): public_bytes(served_core),
-        },
+        secrets_dir=secrets_dir,
         bind_check=bind_check,
         clock=clock,
         recheck_interval=recheck_interval,
         tick_interval=tick_interval,
         send_timeout=send_timeout,
+        key_refresh_interval=key_refresh_interval,
     )
     with TestClient(PeerFromHeader(app)) as client:
         gw = Gw(dsns, client, clock, whois, gw_key, core_key, tmp, app=app)

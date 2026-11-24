@@ -10,6 +10,15 @@ jarvis-core node enrol --person <slug> --kind DESKTOP|PHONE --name <text>
                         create a one-time enrolment (15 min) and print its enrolment code
 jarvis-core node revoke <node_id>
                         revoke a node; its open connection is fenced at once
+jarvis-core node reenrol <node_id>
+                        revoke a node and print a new enrolment code (same person, kind and
+                        name) with the current key fingerprints (R5-1)
+jarvis-core keys init   record the current core and gateway keys as ACTIVE (bootstrap; once)
+jarvis-core keys announce --role CORE|GATEWAY --public-key-file <path>
+                        announce a new key (raw 32-byte public key) to every active node
+jarvis-core keys retire <key_id>
+                        end a retired key's overlap, or withdraw a NEXT key
+jarvis-core keys list   the trusted keys and the STALE nodes that need `node reenrol`
 """
 
 from __future__ import annotations
@@ -23,6 +32,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -31,7 +41,7 @@ from jarvis_server import config, jobs, migrate, nodes, signing, smoke
 from jarvis_server.bootstrap import bootstrap
 from jarvis_server.brain import budget as _budget_jobs  # noqa: F401  registers job kinds
 from jarvis_server.brain import health as _health_jobs  # noqa: F401  registers job kinds
-from jarvis_server.core import dispatch, turn
+from jarvis_server.core import dispatch, keys, turn
 from jarvis_server.dbcall import Refused
 from jarvis_server.memory import checks as memory_checks
 from jarvis_server.memory import format as memory_format
@@ -149,10 +159,22 @@ def main(argv: list[str] | None = None) -> int:
     enrol.add_argument("--name", required=True)
     revoke = node.add_parser("revoke")
     revoke.add_argument("node_id", type=uuid.UUID)
+    reenrol = node.add_parser("reenrol")
+    reenrol.add_argument("node_id", type=uuid.UUID)
+    key = commands.add_parser("keys").add_subparsers(dest="keys_command", required=True)
+    key.add_parser("init")
+    key.add_parser("list")
+    announce = key.add_parser("announce")
+    announce.add_argument("--role", required=True, type=str.upper, choices=keys.ROLES)
+    announce.add_argument("--public-key-file", required=True, type=Path)
+    retire = key.add_parser("retire")
+    retire.add_argument("key_id")
     args = parser.parse_args(argv)
 
     if args.command == "node":
         return _node(args)
+    if args.command == "keys":
+        return _keys(args)
     if args.command == "init":
         _bootstrap()
         migrate.upgrade(config.owner_dsn())
@@ -201,26 +223,25 @@ def _person_id(slug: str) -> uuid.UUID:
     return person.person_id
 
 
-def _key_fingerprints() -> tuple[str, str]:
-    """(core_fp, gw_fp) for an enrolment code. Temporary until the keyset (plan Task 12): the
-    core key from secret `core_signing_key`, the gateway's public key (raw 32 bytes, not
-    secret) from `gateway_signing_key.pub` in the secrets folder."""
-    core = signing.load_private_key(config.SECRETS_DIR / "core_signing_key")
-    gw_path = config.SECRETS_DIR / "gateway_signing_key.pub"
+def _key_fingerprints(conn: psycopg.Connection[Any]) -> tuple[str, str]:
+    """(core_fp, gw_fp) for an enrolment code: the ACTIVE CORE and GATEWAY key IDs in
+    gw.trusted_key (a key ID is its public key's fingerprint)."""
     try:
-        gw_public = gw_path.read_bytes()
-    except FileNotFoundError as e:
-        raise SystemExit(f"{gw_path} is missing") from e
-    if len(gw_public) != 32:
-        raise SystemExit(f"{gw_path} must hold a raw 32-byte Ed25519 public key")
-    return signing.fingerprint(signing.public_bytes(core)), signing.fingerprint(gw_public)
+        return keys.active_key(conn, "CORE").key_id, keys.active_key(conn, "GATEWAY").key_id
+    except RuntimeError as e:
+        raise SystemExit(str(e)) from e
+
+
+def _print_code(code: str) -> None:
+    # The code goes to the terminal only, never to the log (§7.2 step 1).
+    print(f"Enrolment code (valid 15 minutes, single use): {code}", flush=True)
 
 
 def _node(args: argparse.Namespace) -> int:
     with psycopg.connect(config.app_dsn(), autocommit=True) as conn:
         try:
             if args.node_command == "enrol":
-                core_fp, gw_fp = _key_fingerprints()
+                core_fp, gw_fp = _key_fingerprints(conn)
                 code = nodes.create_enrolment(
                     conn,
                     person_id=_person_id(args.person),
@@ -229,12 +250,61 @@ def _node(args: argparse.Namespace) -> int:
                     core_fp=core_fp,
                     gw_fp=gw_fp,
                 )
-                # The code goes to the terminal only, never to the log (§7.2 step 1).
-                print(f"Enrolment code (valid 15 minutes, single use): {code}", flush=True)
+                _print_code(code)
+            elif args.node_command == "reenrol":
+                code = nodes.reenrol(conn, args.node_id, *_key_fingerprints(conn))
+                log.info("node %s revoked for re-enrolment", args.node_id)
+                _print_code(code)
             else:
                 nodes.revoke(conn, args.node_id)
                 log.info("node %s revoked", args.node_id)
         except Refused as e:
+            log.error("refused: %s", e.reason)
+            return 1
+    return 0
+
+
+def _read_public(path: Path) -> bytes:
+    try:
+        public = path.read_bytes()
+    except FileNotFoundError as e:
+        raise SystemExit(f"{path} is missing") from e
+    if len(public) != 32:
+        raise SystemExit(f"{path} must hold a raw 32-byte Ed25519 public key")
+    return public
+
+
+def _keys(args: argparse.Namespace) -> int:
+    """`keys init|announce|retire|list`. Prints key IDs (public fingerprints), never a key."""
+    with psycopg.connect(config.app_dsn(), autocommit=True) as conn:
+        try:
+            if args.keys_command == "init":
+                core = signing.load_private_key(config.SECRETS_DIR / keys.SECRET_NAMES["CORE"])
+                gw_public = _read_public(config.SECRETS_DIR / "gateway_signing_key.pub")
+                added = keys.init_keys(
+                    conn, core_public=signing.public_bytes(core), gateway_public=gw_public
+                )
+                log.info("trusted keys initialised (%d added)", len(added))
+            elif args.keys_command == "announce":
+                key_id = keys.announce(
+                    conn, role=args.role, public_key=_read_public(args.public_key_file)
+                )
+                print(
+                    f"Announced {args.role} key {key_id}. Its private key must be the secret"
+                    f" {keys.secret_name(args.role, key_id)} before it activates.",
+                    flush=True,
+                )
+            elif args.keys_command == "retire":
+                keys.retire(conn, args.key_id)
+                log.info("key %s retired", args.key_id)
+            else:
+                for k in keys.list_keys(conn):
+                    retired = "" if k.retired_at is None else f" retired {k.retired_at.isoformat()}"
+                    pending = " (overlap)" if k.state == "RETIRED" and k.retired_at is None else ""
+                    print(f"{k.role} {k.key_id} {k.state}{pending}{retired}", flush=True)
+                for node_id, name in keys.stale_nodes(conn):
+                    print(f"STALE {node_id} {name}  (run: jarvis-core node reenrol {node_id})")
+        except keys.KeyRefused as e:
             log.error("refused: %s", e.reason)
             return 1
     return 0

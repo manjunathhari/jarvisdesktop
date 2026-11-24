@@ -1,4 +1,5 @@
-"""Node admin on the core side (spec §7.2): enrolment codes, enrolment and revocation.
+"""Node admin on the core side (spec §7.1, §7.2): enrolment codes, enrolment, revocation and
+re-enrolment (R5-1).
 
 The enrolment code is ``"<token>.<core_fp>.<gw_fp>"``: a 128-bit random token (lower-case
 base32, no padding: 26 characters) and the core and gateway key fingerprints
@@ -18,8 +19,9 @@ from typing import Any
 from uuid import UUID
 
 import psycopg
+from psycopg.pq import TransactionStatus
 
-from jarvis_server.dbcall import EnrolmentRefused, RevokeRefused, audited_call
+from jarvis_server.dbcall import EnrolmentRefused, RevokeRefused, TransactionNotIdle, audited_call
 
 KINDS = ("DESKTOP", "PHONE")
 TOKEN_BYTES = 16  # 128 bits
@@ -96,3 +98,49 @@ def revoke(conn: psycopg.Connection[Any], node_id: UUID) -> None:
     )
     if not applied:
         raise RevokeRefused(str(refusal))
+
+
+def reenrol(conn: psycopg.Connection[Any], node_id: UUID, core_fp: str, gw_fp: str) -> str:
+    """Revoke a node and create a fresh enrolment for the same person, kind and name, in one
+    transaction; return the new enrolment code (spec §7.1, R5-1; Task 12 ruling 6).
+
+    `core_fp` and `gw_fp` are the current ACTIVE fingerprints. The old node's open items
+    addressed to it alone (`target_node_id`, such as `action.approved` and `keys.keyset`) are
+    superseded, never re-targeted, because their signed authz names the old node.
+    Person-addressed items reach the new node through the normal rule. A revocation refusal
+    (`unknown_node`, `already_revoked`) commits its audit row, creates nothing and raises
+    `RevokeRefused`.
+    """
+    _check_fingerprint(core_fp)
+    _check_fingerprint(gw_fp)
+    if conn.info.transaction_status != TransactionStatus.IDLE:
+        raise TransactionNotIdle("reenrol runs in its own transaction")
+    token = new_token()
+    with conn.transaction():
+        row = conn.execute(
+            "SELECT person_id, kind, name FROM gw.node WHERE id = %s", (node_id,)
+        ).fetchone()
+        applied, refusal = _row(
+            conn.execute("SELECT applied, refusal FROM gw.revoke_node(%s)", (node_id,)).fetchone()
+        )
+        if applied:
+            assert row is not None  # revoke_node applies to a registered node only
+            for (item,) in conn.execute(
+                "SELECT id FROM comm.outbox WHERE target_node_id = %s"
+                " AND state IN ('PENDING', 'DELIVERING', 'DELIVERED') ORDER BY created_at, id",
+                (node_id,),
+            ).fetchall():
+                conn.execute("SELECT comm.supersede(%s)", (item,))
+            conn.execute(
+                "SELECT gw.create_enrolment(%s, %s, %s, %s)",
+                (token_hash(token), row[0], row[1], row[2]),
+            )
+    if not applied:  # the refusal's audit row has committed
+        raise RevokeRefused(str(refusal))
+    return f"{token}.{core_fp}.{gw_fp}"
+
+
+def _row(row: Any) -> tuple[Any, ...]:
+    if row is None:
+        raise RuntimeError("gw.revoke_node returned no row")
+    return tuple(row)

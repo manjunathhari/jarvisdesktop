@@ -110,9 +110,9 @@ def authz_object(
     }
 
 
-def sign(obj: dict[str, Any]) -> rules.AuthzDict:
-    """`{object, key_id, sig}` under the active core key (purpose `core-authz`)."""
-    key, key_id = keys.active_core_key()
+def sign(conn: psycopg.Connection[Any], obj: dict[str, Any]) -> rules.AuthzDict:
+    """`{object, key_id, sig}` under the ACTIVE core key (purpose `core-authz`)."""
+    key, key_id = keys.active_core_key(conn)
     return cast(rules.AuthzDict, signing.make_authz(key, key_id, obj))
 
 
@@ -133,6 +133,7 @@ def issue_live(
     """Write one signed ACTION chunk (the next `seq` of the reply) and NOTIFY; return its seq."""
     valid_until = now + LIVE_VALIDITY
     authz = sign(
+        conn,
         authz_object(
             kind="node.action", action_kind=action_kind, args=args,
             target_node_id=target_node_id, person_id=person_id, issued_at=now,

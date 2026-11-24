@@ -527,7 +527,7 @@ A valid gateway signature alone is never enough.
 | `approval.decision` | → | `approval_id`, `decision`, `card_sig` |
 | `node.action` | ← | `authz` (§7.1) |
 | `action.receipt` | → | `execution_key` (or `reply_id` + `seq` for live actions), `result`, `evidence` |
-| `keyset` | ← | new role, `key_id`, public key, and `authz` (kind `keyset`) signed by the current core key; the payload must equal `authz.object.args` |
+| `keyset` | ← | `outbox_id` (unsigned: the `keys.keyset` item the node acks once it accepts the keyset, R12-26), new role, `key_id`, public key, and `authz` (kind `keyset`, `target_node_id` and `person_id` naming the node, R12-27) signed by the current core key; the payload's role, `key_id` and public key must equal `authz.object.args` |
 | `ping` / `pong` | both | heartbeat, every 30 s; 3 missed = offline (v2 §13.3) |
 
 Payload schemas go in `contracts/` with examples and contract tests, before feature code (v2 §15).

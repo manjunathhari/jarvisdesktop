@@ -431,8 +431,8 @@ def test_every_approval_refusal_follows_the_rule(
         sig = _wrong_sig(app, approval_id)
     elif case == "forged_card":  # the sig matches the stored card, but no trusted key made it
         code = "bad_card_sig"
-        monkeypatch.setattr(keys, "active_core_key", lambda: (Ed25519PrivateKey.generate(),
-                                                              "a" * 16))  # fmt: skip
+        stranger = signing.public_bytes(Ed25519PrivateKey.generate())
+        monkeypatch.setattr(keys, "trusted_core_keys", lambda conn: {"a" * 16: stranger})
     elif case == "other_person":
         who = flow.new_person(owner, "Ravi Fictional")
         sender = flow.new_node(owner, who)
@@ -505,7 +505,7 @@ def test_later_job_failure_cannot_erase_committed_refusal(
                            sig=_wrong_sig(app, proposed))  # fmt: skip
     assert flow.job_status(app, first) == "DONE"
 
-    def broken() -> Any:
+    def broken(conn: Conn) -> Any:
         raise RuntimeError("core_signing_key is unreadable")
 
     monkeypatch.setattr(keys, "active_core_key", broken)

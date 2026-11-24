@@ -155,6 +155,32 @@ def load_private_key(pem_path: Path) -> Ed25519PrivateKey:
     return key
 
 
+def load_rotating_key(
+    secrets_dir: Path, name: str, key_id: str, public_key: bytes
+) -> Ed25519PrivateKey:
+    """The private key of a trusted key (`gw.trusted_key`), from the secret `<name>_<key_id>`.
+
+    For the bootstrap key only, the legacy secret `<name>` is used instead, and only when its
+    public key's fingerprint is `key_id`. Raises RuntimeError naming the secret file (never its
+    content) if neither holds the key whose public key is `public_key`.
+    """
+    if fingerprint(public_key) != key_id:
+        raise RuntimeError(f"{name}: key_id {key_id} is not the fingerprint of its public key")
+    named = secrets_dir / f"{name}_{key_id}"
+    if named.exists():
+        key = load_private_key(named)
+    else:
+        legacy = secrets_dir / name
+        if not legacy.exists():
+            raise RuntimeError(f"secret {named.name} is missing (and there is no {name})")
+        key = load_private_key(legacy)
+        if fingerprint(public_bytes(key)) != key_id:
+            raise RuntimeError(f"secret {named.name} is missing, and {name} is not key {key_id}")
+    if public_bytes(key) != public_key:
+        raise RuntimeError(f"secret {named.name} does not match key {key_id}")
+    return key
+
+
 def public_bytes(key: Ed25519PrivateKey) -> bytes:
     """The raw 32-byte public key."""
     return key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)

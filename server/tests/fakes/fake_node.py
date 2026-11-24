@@ -26,6 +26,15 @@ item it has seen or that ``outbox.cleared`` removed; the cleared list lives in t
 too. ``log`` records each display and each clear in order, for the P2-E13 invariants.
 ``sync()`` is a barrier: a ``ping`` whose ``pong`` follows everything the gateway sent first.
 
+Keys (Task 12): a ``keyset`` (carrying its unsigned ``outbox_id``, R12-26) is accepted only if
+``check_keyset`` passes with a pinned CORE key and its signed ``target_node_id`` is null or this
+node (R12-27). Only then does the node send ``received`` and ``ack`` for it. The new key is
+added to the CORE or GATEWAY pins by role, and the role's existing keys stay trusted until
+24 h after the keyset's ``issued_at`` (``key_expiry``). A key still waiting out an earlier
+overlap is dropped when a later keyset arrives. On close code 4409, an unpinned gateway key in
+a challenge, or a core signature under an unknown ``key_id``, the node runs nothing, keeps its
+journal (the state file), closes and sets ``prompt = "reenrol"`` (R5-1).
+
 Also here: ``FakeWhoIs`` (dict-backed ``whois``) and ``PeerFromHeader``, a test-only ASGI
 wrapper that sets the connection's peer address from a request header, because Starlette's
 TestClient has one fixed client address. The gateway itself never reads that header.
@@ -38,18 +47,19 @@ import json
 import uuid
 from collections import Counter, defaultdict
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import anyio
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from pydantic import ValidationError
 from starlette.testclient import TestClient
 from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.websockets import WebSocketDisconnect
 
-from jarvis_server.contracts import NIL_UUID
+from jarvis_server.contracts import NIL_UUID, Keyset
 from jarvis_server.nodes import parse_enrolment_code
 from jarvis_server.signing import (
     AuthzInvalid,
@@ -64,6 +74,7 @@ from jarvis_server.signing import (
 
 from ..schema_registry import CONTRACTS, validator
 from .node_rules import (
+    KEYSET_FIELDS,
     Rejected,
     SeqChecker,
     check_challenge,
@@ -76,6 +87,8 @@ PEER_HEADER = "x-test-peer-ip"
 # Refused until the core key is pinned (§6.1 step 7): anything core-authorised or shown.
 CORE_CONTENT = frozenset({"node.action", "keyset", "outbox.item", "reply.chunk"})
 ROUTE = "/v1/node"
+REENROL_CLOSE = 4409
+OVERLAP = timedelta(hours=24)  # old keys stay trusted this long after a keyset's issued_at
 
 
 class FakeWhoIs:
@@ -139,6 +152,7 @@ class FakeNode:
         self.clock = clock or (lambda: datetime.now(UTC))
         self.pinned_gateway: dict[str, bytes] = {}
         self.trusted_core: dict[str, bytes] = {}
+        self.key_expiry: dict[str, datetime] = {}  # key_id -> no longer trusted after this
         self.seen_outbox: set[str] = set()
         self.cleared: set[str] = set()
         self.last_shown: dict[str, int] = {}
@@ -157,6 +171,8 @@ class FakeNode:
         self.used_keys: set[str] = set()  # execution keys run (the desktop's journal, §9.4)
         self.received_envelopes: list[dict[str, Any]] = []
         self.discarded = False
+        self.prompt: str | None = None  # "reenrol": Jarvis's keys have changed (R5-1)
+        self.sent: list[str] = []  # the kinds this FakeNode sent, in order
         self.challenge: dict[str, Any] | None = None
         self.last_sent: str | None = None
         self._ctx: Any = None
@@ -177,6 +193,9 @@ class FakeNode:
             self.node_id = UUID(state["node_id"])
         self.pinned_gateway = {k: bytes.fromhex(v) for k, v in state["gateway_keys"].items()}
         self.trusted_core = {k: bytes.fromhex(v) for k, v in state["core_keys"].items()}
+        self.key_expiry = {
+            k: datetime.fromisoformat(v) for k, v in state.get("key_expiry", {}).items()
+        }
         self.seen_outbox = set(state["seen_outbox"])
         self.cleared = set(state.get("cleared", []))
         self.last_shown = dict(state["shown"])
@@ -188,6 +207,7 @@ class FakeNode:
                     "node_id": str(self.node_id) if self.node_id else None,
                     "gateway_keys": {k: v.hex() for k, v in self.pinned_gateway.items()},
                     "core_keys": {k: v.hex() for k, v in self.trusted_core.items()},
+                    "key_expiry": {k: v.isoformat() for k, v in self.key_expiry.items()},
                     "seen_outbox": sorted(self.seen_outbox),
                     "cleared": sorted(self.cleared),
                     "shown": self.last_shown,
@@ -218,6 +238,7 @@ class FakeNode:
         self._seq = 0
         self._peer_seq = SeqChecker()
         self._authorised = False
+        self._prune()
         env = self._receive(2.0)
         try:
             payload = check_challenge(
@@ -227,6 +248,8 @@ class FakeNode:
             )
             self._peer_seq.expect(env["seq"])
         except Rejected as e:
+            if e.reason == "unpinned_key":
+                self.prompt = "reenrol"  # a gateway key it never pinned (R5-1)
             self._refuse("challenge", e.reason)
         self._gw_key_id = payload["key_id"]
         self._gw_public = b64url_decode(payload["public_key"], 32)
@@ -237,6 +260,19 @@ class FakeNode:
         if self._ctx is not None:
             ctx, self._ctx, self.ws = self._ctx, None, None
             ctx.__exit__(None, None, None)
+
+    def _prune(self) -> None:
+        """Drop the keys whose overlap has ended."""
+        now = self.clock()
+        for key_id, until in list(self.key_expiry.items()):
+            if now > until:
+                self.trusted_core.pop(key_id, None)
+                self.pinned_gateway.pop(key_id, None)
+                del self.key_expiry[key_id]
+                self._save()
+
+    def sent_kinds(self) -> list[str]:
+        return list(self.sent)
 
     def _refuse(self, what: str, reason: str) -> Any:
         """Record a rejection, close the connection without replying, and raise."""
@@ -353,6 +389,7 @@ class FakeNode:
         if mutate is not None:
             mutate(env)
         self.send_raw(json.dumps(env))
+        self.sent.append(kind)
         return UUID(env["message_id"])
 
     def send_raw(self, text: str) -> None:
@@ -395,6 +432,8 @@ class FakeNode:
         message = ws.portal.call(_next)
         if message["type"] == "websocket.close":
             self.close()
+            if message.get("code") == REENROL_CLOSE:
+                self.prompt = "reenrol"  # runs nothing; the state file (journal) is kept
             raise WebSocketDisconnect(code=message.get("code", 1000))
         return dict(json.loads(message["text"]))
 
@@ -442,6 +481,7 @@ class FakeNode:
         if kind in CORE_CONTENT and not self._authorised:
             self.rejected.append((kind, "unauthorised"))
             return
+        self._prune()
         try:
             if kind == "node.action":
                 assert self.node_id is not None
@@ -450,14 +490,7 @@ class FakeNode:
                 )
                 self.actions.append(dict(payload["authz"]["object"]))
             elif kind == "keyset":
-                obj = check_keyset(
-                    payload, payload["authz"], trusted=self.trusted_core, now=self.clock()
-                )
-                raw = b64url_decode(obj["args"]["public_key"], 32)
-                assert raw is not None  # check_keyset validated it
-                target = self.trusted_core if obj["args"]["role"] == "core" else self.pinned_gateway
-                target[obj["args"]["key_id"]] = raw
-                self._save()
+                self._keyset(payload)
             elif kind == "outbox.item":
                 authz = payload.get("authz")
                 if authz is not None:
@@ -484,6 +517,41 @@ class FakeNode:
                 self._chunk(payload)
         except Rejected as e:
             self.rejected.append((kind, e.reason))
+            if e.reason == "untrusted_key_id":  # a core key_id it never pinned (R5-1)
+                self.prompt = "reenrol"
+                self.close()
+
+    def _keyset(self, payload: dict[str, Any]) -> None:
+        """Accept a ``keyset`` (R6-2, R12-26, R12-27), then ``received`` and ``ack`` its item."""
+        try:
+            keyset = Keyset.model_validate(payload)
+        except ValidationError:
+            raise Rejected("malformed") from None
+        signed = {f: payload[f] for f in KEYSET_FIELDS}  # without outbox_id and authz
+        obj = check_keyset(signed, payload["authz"], trusted=self.trusted_core, now=self.clock())
+        if obj["target_node_id"] not in (None, str(self.node_id)):
+            raise Rejected("wrong_target")
+        args = obj["args"]
+        raw = b64url_decode(args["public_key"], 32)
+        assert raw is not None  # check_keyset validated it
+        pins = self.trusted_core if args["role"] == "core" else self.pinned_gateway
+        new_id = args["key_id"]
+        if pins.get(new_id) != raw or new_id in self.key_expiry:  # a re-send changes nothing
+            until = datetime.fromisoformat(obj["issued_at"]) + OVERLAP
+            for key_id in list(pins):
+                if key_id == new_id:
+                    continue
+                if key_id in self.key_expiry:  # still in an earlier overlap: this ends it
+                    del pins[key_id], self.key_expiry[key_id]
+                else:
+                    self.key_expiry[key_id] = until
+            pins[new_id] = raw
+            self.key_expiry.pop(new_id, None)
+            self._save()
+        if self.ws is not None:
+            outbox_id = str(keyset.outbox_id)
+            self.send("received", {"outbox_id": outbox_id})
+            self.send("ack", {"outbox_id": outbox_id})
 
     def _approved_action(self, authz: dict[str, Any]) -> None:
         """§7.1 rules 2 to 4 (``check_node_action``), then rule 5: an IRREVERSIBLE action needs

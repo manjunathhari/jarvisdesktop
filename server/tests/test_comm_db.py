@@ -1238,11 +1238,14 @@ GATEWAY_TABLES = {
     "SELECT conv.stream_cursor",
     "SELECT comm.outbox",
     "SELECT comm.delivery",
+    "SELECT gw.trusted_key",  # Task 12 (migration 0011): public keys only, read-only
 }
 GATEWAY_NODE_COLUMNS = {
     f"SELECT gw.node.{c}"
-    for c in ("id", "person_id", "kind", "public_key", "tailscale_identity", "revoked_at")
-}
+    # key_state: Task 12 (migration 0011), read for the STALE refusal (R6-6).
+    for c in ("id", "person_id", "kind", "public_key", "tailscale_identity", "revoked_at",
+              "key_state")
+}  # fmt: skip
 GATEWAY_SESSION_COLUMNS = {f"SELECT conv.session.{c}" for c in ("id", "person_id", "closed_at")}
 GATEWAY_EXECUTE = {
     "gw.enrol_node(text,bytea,text)",

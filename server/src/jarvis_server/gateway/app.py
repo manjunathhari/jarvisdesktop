@@ -4,6 +4,11 @@
 It connects to Postgres only as `jarvis_gateway` (it refuses to start as any other role) through
 a psycopg `AsyncConnectionPool`.
 
+Keys (Task 12): at startup the gateway loads its ACTIVE key and core's ACTIVE public key from
+`gw.trusted_key` and its secret, and refuses to start if that fails. It re-reads them every
+`key_refresh_interval` (60 s). A failed re-read keeps the keys it has. A new key applies to new
+connections only, since each connection signs under the key its challenge announced (R12-6).
+
 `main` asks the Tailscale sidecar for its tailnet IPv4 address and binds uvicorn only to that
 address, port 8443. It exits non-zero if the address is unknown or isn't a tailnet address, so
 it can never bind `0.0.0.0`. uvicorn trusts no proxy headers, so the peer address used for
@@ -12,23 +17,25 @@ it can never bind `0.0.0.0`. uvicorn trusts no proxy headers, so the peer addres
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import os
 import sys
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import psycopg
 import uvicorn
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import FastAPI, WebSocket
 from psycopg_pool import AsyncConnectionPool
 
 from jarvis_server import config
 from jarvis_server.bootstrap import GATEWAY_ROLE
-from jarvis_server.gateway.keys import GatewayKeys, load_keys
+from jarvis_server.gateway.keys import load_keys
 from jarvis_server.gateway.relay import SEND_TIMEOUT_S, TICK_S, Relay
 from jarvis_server.gateway.session import GatewayContext, Session
 from jarvis_server.gateway.tailscale import LocalApiWhoIs, WhoIs, is_tailnet_address, tailnet_ipv4
@@ -37,6 +44,7 @@ log = logging.getLogger(__name__)
 
 PORT = 8443
 RECHECK_INTERVAL_S = 60.0  # the revocation re-check (§7.2, P2-E10)
+KEY_REFRESH_S = 60.0  # the trusted-key re-read (Task 12)
 # uvicorn's frame ceiling sits above the gateway's own 65,536-byte limit, so a frame between
 # the two gets `error too_large` and the connection stays open.
 WS_MAX_SIZE = 1 << 20
@@ -54,25 +62,44 @@ async def _check_role(pool: AsyncConnectionPool[psycopg.AsyncConnection[Any]]) -
         raise RuntimeError(f"the gateway connects only as {GATEWAY_ROLE}")
 
 
+async def _refresh_keys(
+    ctx: GatewayContext,
+    pool: AsyncConnectionPool[psycopg.AsyncConnection[Any]],
+    secrets_dir: Path,
+    interval: float,
+) -> None:
+    """Re-read the trusted keys every `interval` real seconds; keep the current ones on failure."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            async with pool.connection() as conn:
+                keys = await load_keys(conn, secrets_dir)
+        except Exception as e:  # the message names a secret file or a role, never a key
+            log.warning("trusted keys not reloaded: %s", e)
+            continue
+        if keys.ids != ctx.keys.ids:
+            log.info("trusted keys reloaded: gateway key %s, core key %s", *keys.ids)
+        ctx.keys = keys
+
+
 def create_app(
     *,
     dsn: str,
     whois: WhoIs,
-    gw_key: Ed25519PrivateKey,
-    gw_key_id: str,
-    core_public_keys: Mapping[str, bytes],
+    secrets_dir: Path,
     bind_check: bool = True,
     clock: Callable[[], datetime] = _utcnow,
     recheck_interval: float = RECHECK_INTERVAL_S,
     tick_interval: float = TICK_S,
     send_timeout: float = SEND_TIMEOUT_S,
+    key_refresh_interval: float = KEY_REFRESH_S,
 ) -> FastAPI:
     """The gateway app. `bind_check` refuses a connection that arrived on a local address that
     isn't a Tailscale address (recorded `unknown_peer`); `clock`, `recheck_interval` and the
     relay's `tick_interval` (how often, in real seconds, it checks the clock for heartbeats
-    and the re-send sweep) and `send_timeout` (the bound on one socket send, in real seconds)
-    are injectable for tests."""
-    keys = GatewayKeys(gw_key=gw_key, gw_key_id=gw_key_id, core_public_keys=dict(core_public_keys))
+    and the re-send sweep), `send_timeout` (the bound on one socket send, in real seconds) and
+    `key_refresh_interval` (the trusted-key re-read, in real seconds) are injectable for
+    tests. Keys come from `gw.trusted_key` and `secrets_dir`."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -82,6 +109,8 @@ def create_app(
         await pool.open(wait=True)
         try:
             await _check_role(pool)
+            async with pool.connection() as conn:
+                keys = await load_keys(conn, secrets_dir)  # refuses to start without them
             relay = Relay(pool=pool, dsn=dsn, clock=clock, tick_interval=tick_interval)
             await relay.start()
             try:
@@ -95,7 +124,15 @@ def create_app(
                     relay=relay,
                     send_timeout=send_timeout,
                 )
-                yield
+                refresher = asyncio.create_task(
+                    _refresh_keys(app.state.gateway, pool, secrets_dir, key_refresh_interval)
+                )
+                try:
+                    yield
+                finally:
+                    refresher.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await refresher
             finally:
                 await relay.stop()
         finally:
@@ -111,13 +148,10 @@ def create_app(
 
 
 def _build_app(socket_path: str) -> FastAPI:
-    keys = load_keys(config.SECRETS_DIR)
     return create_app(
         dsn=config.gateway_dsn(),
         whois=LocalApiWhoIs(socket_path),
-        gw_key=keys.gw_key,
-        gw_key_id=keys.gw_key_id,
-        core_public_keys=keys.core_public_keys,
+        secrets_dir=config.SECRETS_DIR,
     )
 
 

@@ -172,6 +172,7 @@ def propose_delete(
     expires_at = now + APPROVAL_EXPIRY
     summary = f"Delete test file `{name}`?"
     card = actions.sign(
+        conn,
         actions.authz_object(
             kind="approval.card", action_kind=actions.DELETE, args=file,
             target_node_id=node_id, person_id=person_id, issued_at=now,
@@ -236,11 +237,11 @@ def _open_cards(conn: psycopg.Connection[Any], approval_id: UUID) -> list[UUID]:
     return [UUID(str(r[0])) for r in rows]
 
 
-def _card_verifies(card: Any, approval_id: UUID) -> bool:
-    """The stored card is a valid `core-authz` from a trusted core key, for this approval."""
-    key, key_id = keys.active_core_key()
+def _card_verifies(conn: psycopg.Connection[Any], card: Any, approval_id: UUID) -> bool:
+    """The stored card is a valid `core-authz` from a trusted core key (ACTIVE, or retired
+    but still in its overlap), for this approval."""
     try:
-        obj = signing.check_authz(card, {key_id: signing.public_bytes(key)})
+        obj = signing.check_authz(card, keys.trusted_core_keys(conn))
     except signing.AuthzInvalid:
         return False
     return obj.get("kind") == "approval.card" and obj.get("approval_id") == str(approval_id)
@@ -259,7 +260,7 @@ def _check(
     if approval is None:
         return "unknown_approval"
     _, requested_from, _, card, decision, expired = approval[:6]
-    if card_sig != card.get("sig") or not _card_verifies(card, approval_id):
+    if card_sig != card.get("sig") or not _card_verifies(conn, card, approval_id):
         return "bad_card_sig"
     if requested_from != person_id or card["object"].get("person_id") != str(person_id):
         return "other_person"
@@ -387,6 +388,7 @@ def on_decision(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     )
     db_now = actions.db_now(conn)
     authz = actions.sign(
+        conn,
         actions.authz_object(
             kind="node.action", action_kind=actions.DELETE, args=args,
             target_node_id=requesting_node, person_id=person_id, issued_at=db_now,

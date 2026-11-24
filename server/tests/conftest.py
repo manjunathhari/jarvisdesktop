@@ -22,6 +22,7 @@ from psycopg import sql
 
 from jarvis_server import config, migrate
 from jarvis_server.bootstrap import APP_ROLE, GATEWAY_ROLE, OWNER_ROLE, bootstrap
+from jarvis_server.signing import fingerprint, public_bytes
 
 
 @dataclass(frozen=True)
@@ -91,10 +92,21 @@ def gateway(dsns: Dsns) -> Iterator[psycopg.Connection[Any]]:
 
 
 @pytest.fixture
-def core_key(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Any:
-    """A throwaway core signing key, served as the secret `core_signing_key` from a temporary
-    secrets directory (`core.keys.active_core_key` reads it through `config.secret`)."""
+def core_key(
+    dsns: Dsns, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Any:
+    """A throwaway core signing key: the ACTIVE CORE key in the test database's gw.trusted_key
+    (replacing any other CORE key), served as the bootstrap secret `core_signing_key` from a
+    temporary secrets directory (`core.keys.active_core_key` reads both)."""
     key = Ed25519PrivateKey.generate()
+    public = public_bytes(key)
+    with psycopg.connect(dsns.owner, autocommit=True) as conn, conn.transaction():
+        conn.execute("DELETE FROM gw.trusted_key WHERE role = 'CORE'")
+        conn.execute(
+            "INSERT INTO gw.trusted_key (key_id, role, public_key, state, activated_at)"
+            " VALUES (%s, 'CORE', %s, 'ACTIVE', now())",
+            (fingerprint(public), public),
+        )
     directory = tmp_path_factory.mktemp("secrets")
     (directory / "core_signing_key").write_bytes(
         key.private_bytes(

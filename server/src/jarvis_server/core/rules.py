@@ -13,7 +13,8 @@ The caller passes one typed `NotifyContext` (R11-3, 11b). Every field is optiona
   default group, never a placeholder such as "None" (comm.outbox.group_key stays NOT NULL).
 - `text`: replaces the fixed text (the reply itself, for `turn.completed_after_hold`).
 - `target_node_id`: the one node the item is for (R12-23); omitted, every node of the person.
-  Required for `action.approved`: the signed action goes to the requesting node only.
+  Required for `action.approved` (the signed action goes to the requesting node only) and
+  `keys.keyset` (each node's keyset names that node, R12-27).
 - `authz`: the raw signed dict `{object, key_id, sig}`, checked for exactly that shape and
   carried unchanged. It is never parsed into a model and rebuilt, and nothing here checks its
   signature or marks it trusted: the node does that under §7.1.
@@ -102,9 +103,13 @@ RULES: dict[str, Rule] = {
         Priority.URGENT, "approval", "That decision could not be applied"
     ),
     "brain.config_error": Rule(Priority.TODAY, "brain.config", "Claude configuration error"),
+    # Task 12 (plan-mandated): a new key announced to one node, sent as a `keyset` (R12-26).
+    "keys.keyset": Rule(Priority.SILENT, "keys", "Jarvis's keys are being updated"),
 }
 
 EVENT_KINDS: tuple[str, ...] = tuple(RULES)
+# Items always addressed to one node, with a signed authz naming it.
+_TARGETED = frozenset({"action.approved", "keys.keyset"})
 
 # brain.back supersedes the person's newest open item of these kinds (§8.1 "Claude back").
 _DOWN_KINDS = ("brain.down", "brain.down.with_held")
@@ -191,10 +196,10 @@ def notify(
     if rule is None:
         raise UnknownEvent(f"no notification rule for event kind {event_kind!r}")
     context = _checked(context)
-    if event_kind == "action.approved" and (
+    if event_kind in _TARGETED and (
         context.get("target_node_id") is None or "authz" not in context
     ):
-        raise ValueError("action.approved needs context['target_node_id'] and ['authz']")
+        raise ValueError(f"{event_kind} needs context['target_node_id'] and ['authz']")
     expires_at = context.get("expires_at")
     supersedes_id = context.get("supersedes_id")
     group_key = context.get("group_key") or rule.group_key  # None or "" -> the kind's default
