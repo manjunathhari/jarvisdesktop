@@ -108,4 +108,4 @@ The final QA and security fixes added 51 tests:
 - E13 gateway-frame and database-state assertions, with an opt-in 1 000-run mode (I-3);
 - integer-only `last_seq` (M-1).
 
-They strengthen the P2-A1, A2, A9, S2, S4, S5 (static), E05, E07, E13 and E10 rows above, and owner areas 1, 3 and 5. See `.superpowers` final-fix-report for the exact names.
+They strengthen the P2-A1, A2, A9, S2, S4, S5 (static), E05, E07, E13 and E10 rows above, and owner areas 1, 3 and 5. The exact test names are in the diff of commit `e93118a` (`git show --stat e93118a`).
