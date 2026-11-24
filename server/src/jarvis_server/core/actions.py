@@ -549,6 +549,6 @@ def on_outbox_expire(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     if row is None or row[0] not in ("PENDING", "DELIVERING", "DELIVERED") or row[1] is None:
         return
     if not row[1]:
-        jobs.enqueue(conn, "outbox.expire", dict(job.payload), delay=row[2])
+        jobs.enqueue(conn, "outbox.expire", jobs.requeue_payload(job.payload), delay=row[2])
         return
     audited_call_in_job(conn, "SELECT comm.expire(%s)", (outbox_id,))

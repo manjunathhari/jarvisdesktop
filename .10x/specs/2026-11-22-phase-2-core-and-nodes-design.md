@@ -371,6 +371,7 @@ Core only.
 | `conv.inbound` | 30 days | Duplicates `conv.message`; kept for debugging and replay |
 | `comm.delivery`, `gw.node_connection` | 90 days | Operational detail |
 | `ops.brain_usage`, `ops.brain_reservation` | 13 months | Budget history |
+| `ops.job` (finished: DONE or FAILED) | 30 days after it finished (R12-32) | Operational detail. QUEUED and RUNNING jobs are never deleted, nor a job a kept reservation references |
 
 **Operational implications:**
 - Text only, so growth is small: tens of MB a year at personal use. The daily dumps include it, and on the dedicated server it is covered by encryption at rest.

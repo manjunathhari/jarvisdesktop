@@ -457,7 +457,7 @@ def on_expire(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
         return
     person_id, task_id = UUID(str(row[0])), UUID(str(row[1]))
     if not row[3]:  # ran early: try again at the expiry
-        jobs.enqueue(conn, "approval.expire", dict(job.payload), delay=row[4])
+        jobs.enqueue(conn, "approval.expire", jobs.requeue_payload(job.payload), delay=row[4])
         return
     conn.execute("UPDATE ledger.approval SET decision = 'EXPIRED' WHERE id = %s", (approval_id,))
     for card_item in _open_cards(conn, approval_id):

@@ -52,6 +52,13 @@ def job_key(kind: str, item: str) -> str:
     return f"{kind}:{item}"
 
 
+def requeue_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """A job's payload for a later run of the same work (a handler re-queueing itself), without
+    its `job_key`: the key stays with the first job, so the unique index would refuse a copy,
+    and an item's key keeps the scheduler from queueing it again (R12-32)."""
+    return {k: v for k, v in payload.items() if k != JOB_KEY}
+
+
 def enqueue_once(
     conn: psycopg.Connection[Any],
     kind: str,
@@ -62,17 +69,20 @@ def enqueue_once(
 ) -> int | None:
     """Enqueue `kind` with `key` in its payload (`job_key`), unless a job of that kind with the
     same key exists already, in any status: at most one job per due item (plan Task 13). Returns
-    the new job's ID, or None. A transaction-level advisory lock on the key orders two callers,
-    so the second sees the first's job once it commits; inside a job transaction the lock is
-    held until the job commits."""
-    with conn.transaction():
-        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"ops.job:{key}",))
-        if conn.execute(
-            "SELECT 1 FROM ops.job WHERE kind = %s AND payload->>'job_key' = %s LIMIT 1",
-            (kind, key),
-        ).fetchone():
-            return None
-        return enqueue(conn, kind, {**(payload or {}), JOB_KEY: key}, delay=delay)
+    the new job's ID, or None.
+
+    The unique index `ops.job_one_per_key` (migration 0013, R12-32) is the guarantee: a conflict
+    means the job is already queued. A second caller racing an uncommitted insert of the same
+    key waits for it, then gets None if it commits, or inserts if it rolls back. One statement,
+    so it works alike in autocommit and inside a job transaction, and needs no lock of its own.
+    Finished jobs are deleted after 30 days (§5.7), and only then can a key be queued again."""
+    row = conn.execute(
+        "INSERT INTO ops.job (kind, payload, run_at) VALUES (%s, %s, now() + %s)"
+        " ON CONFLICT (kind, (payload->>'job_key')) WHERE payload ? 'job_key' DO NOTHING"
+        " RETURNING id",
+        (kind, Jsonb({**(payload or {}), JOB_KEY: key}), delay),
+    ).fetchone()
+    return None if row is None else int(row[0])
 
 
 def claim(

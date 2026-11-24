@@ -132,6 +132,82 @@ def test_enqueue_once_dedups_by_job_key(app: Conn) -> None:
     assert jobs.job_key("approval.expire", "abc") == "approval.expire:abc"
 
 
+JOB_INSERT = "INSERT INTO ops.job (kind, payload) VALUES (%s, %s) RETURNING id"
+
+
+def test_job_key_index_refuses_a_second_job(app: Conn, owner: Conn) -> None:
+    """R12-32: one job per (kind, job_key) is a database guarantee, whoever inserts it."""
+    row = owner.execute(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = 'ops' AND indexname = 'job_one_per_key'"
+    ).fetchone()
+    assert row is not None
+    assert "UNIQUE INDEX" in row[0] and "(payload ? 'job_key'::text)" in row[0]
+    key = f"noop:{uuid.uuid4()}"
+    app.execute(JOB_INSERT, ("noop", Jsonb({"job_key": key})))
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        app.execute(JOB_INSERT, ("noop", Jsonb({"job_key": key, "x": "other payload"})))
+    app.execute(JOB_INSERT, ("retention.sweep", Jsonb({"job_key": key})))  # another kind: fine
+    for _ in range(2):  # jobs without a key are never deduplicated
+        app.execute(JOB_INSERT, ("noop", Jsonb({"x": "same"})))
+    assert len(_keyed(app, "noop", key)) == 1
+
+
+def test_keyed_approval_expire_run_early_requeues_without_its_key(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID
+) -> None:
+    """The approval's own keyed `approval.expire` job, run before the expiry, re-queues itself
+    for the expiry. The re-queued job carries no `job_key` (the first job keeps it, R12-32), so
+    the index doesn't refuse it, and the scheduler still never adds a second one."""
+    approval_id = _proposed(app, owner, person, node)
+    key = jobs.job_key("approval.expire", str(approval_id))
+    [first] = _keyed(app, "approval.expire", key)
+    _run(app, first)
+    assert flow.approval_row(app, approval_id)["decision"] == "PENDING"
+    rows = app.execute(
+        "SELECT payload, status FROM ops.job WHERE kind = 'approval.expire'"
+        " AND payload->>'approval_id' = %s ORDER BY id",
+        (str(approval_id),),
+    ).fetchall()
+    assert rows == [({"approval_id": str(approval_id), "job_key": key}, "DONE"),
+                    ({"approval_id": str(approval_id)}, "QUEUED")]  # fmt: skip
+    after = _expires(app, approval_id) + timedelta(seconds=1)
+    assert jobs.enqueue_once(app, "approval.expire", key, {}) is None
+    assert all(k[0] != "approval.expire" for k in _due_kinds(app, after))
+
+
+def _due_kinds(app: Conn, now: datetime) -> list[tuple[str, Any]]:
+    """The (kind, payload) of the jobs one scheduler tick at `now` creates."""
+    created = Scheduler().tick(app, now)
+    rows = app.execute(
+        "SELECT kind, payload FROM ops.job WHERE id = ANY(%s) ORDER BY id", (created,)
+    ).fetchall()
+    return [(str(r[0]), r[1]) for r in rows]
+
+
+def test_enqueue_once_waits_on_the_index_not_a_lock(app: Conn, dsns: Dsns) -> None:
+    """Two connections race for one key. The second waits on the first's uncommitted row (the
+    unique index, `transactionid`), not on an advisory lock; it then gets None if the first
+    commits, or the job if the first rolls back."""
+    from .helpers.threads import InThread
+
+    for outcome in ("commit", "rollback"):
+        key = f"noop:{uuid.uuid4()}"
+        with psycopg.connect(dsns.app) as first:  # not autocommit: the insert stays open
+            first_id = jobs.enqueue_once(first, "noop", key)
+            assert first_id is not None
+            second = InThread(dsns.app, lambda c, k=key: jobs.enqueue_once(c, "noop", k))
+            assert second.wait_until_blocked(dsns.superuser) == "transactionid"
+            if outcome == "commit":
+                first.commit()
+            else:
+                first.rollback()
+            got = second.join()
+        if outcome == "commit":
+            assert got is None and _keyed(app, "noop", key) == [first_id]
+        else:
+            assert got is not None and _keyed(app, "noop", key) == [got]
+
+
 def test_scheduler_enqueues_each_due_item_once(app: Conn, owner: Conn, person: uuid.UUID,
                                                node: uuid.UUID) -> None:  # fmt: skip
     """Two scheduler ticks (and a restarted scheduler) → one approval.expire job per approval."""

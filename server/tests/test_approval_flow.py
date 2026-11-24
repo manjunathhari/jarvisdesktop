@@ -839,14 +839,16 @@ def test_approved_item_expires_at_valid_until(
         (str(item["id"]),),
     ).fetchone()
     assert row is not None and abs((row[2] - item["expires_at"]).total_seconds()) < 1
-    flow.run(app, "outbox.expire", dict(row[1]))  # early: re-queued, the item still open
+    assert row[1]["job_key"] == f"outbox.expire:{item['id']}"
+    dispatch.handle(app, flow.claim(app, row[0]))  # the keyed job itself, run early: re-queued
     assert _issued(app, person)[0]["state"] == "PENDING"
     requeued = app.execute(
-        "SELECT count(*) FROM ops.job WHERE kind = 'outbox.expire' AND status = 'QUEUED'"
+        "SELECT payload FROM ops.job WHERE kind = 'outbox.expire' AND status = 'QUEUED'"
         " AND payload->>'outbox_id' = %s",
         (str(item["id"]),),
-    ).fetchone()
-    assert requeued == (2,)
+    ).fetchall()
+    # R12-32: the key stays with the first job, so the re-queued one carries none.
+    assert requeued == [({"outbox_id": str(item["id"])},)]
     expired = flow.db_now(app) - timedelta(minutes=11)  # an item whose valid_until has passed
     event = comm.record_event(app, "test.notice", subject_type="test", subject_id="t-exp",
                               person_id=person, details={})  # fmt: skip

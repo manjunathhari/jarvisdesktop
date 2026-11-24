@@ -4,8 +4,10 @@ jarvis-core init        bootstrap + migrate (+ smoke if JARVIS_SMOKE_ON_INIT=1),
 jarvis-core bootstrap   create roles and database (superuser; once per server)
 jarvis-core migrate     apply migrations (owner role)
 jarvis-core downgrade   undo the newest migration (owner role; take a dump first)
-jarvis-core serve       run the core loop: heartbeat + job queue (app role)
-jarvis-core smoke       check P0-1 … P0-5 (live database, app role) and M1-M4 (temporary repo)
+jarvis-core serve       run the core loop: heartbeat + job queue (app role). Needs the secret
+                        anthropic_api_key and HTTPS_PROXY (the egress proxy), or refuses to start
+jarvis-core smoke       check P0-1 … P0-5 (live database, app role), M1-M4 (temporary repo) and
+                        the database-only P2 rows (app and gateway roles; run it in `init`)
 jarvis-core node enrol --person <slug> --kind DESKTOP|PHONE --name <text>
                         create a one-time enrolment (15 min) and print its enrolment code
 jarvis-core node revoke <node_id>
@@ -41,7 +43,8 @@ from jarvis_server import config, jobs, migrate, nodes, signing, smoke
 from jarvis_server import retention as _retention_jobs  # noqa: F401  registers job kinds
 from jarvis_server.bootstrap import bootstrap
 from jarvis_server.brain import budget as _budget_jobs  # noqa: F401  registers job kinds
-from jarvis_server.brain import health as _health_jobs  # noqa: F401  registers job kinds
+from jarvis_server.brain import health, prices
+from jarvis_server.brain.claude import ClaudeBrain
 from jarvis_server.core import dispatch, keys, turn
 from jarvis_server.dbcall import Refused
 from jarvis_server.memory import checks as memory_checks
@@ -104,7 +107,49 @@ def run_loop(
             log.warning("job %s (%s) not completed: %s: %s", job.id, job.kind, type(e).__name__, e)
 
 
+API_KEY_SECRET = "anthropic_api_key"  # noqa: S105  the secret file's name, not a secret
+
+
+def _per_job_brains(api_key: str, proxy: str) -> Callable[[], tuple[ClaudeBrain, str]]:
+    """A brain factory: a new `ClaudeBrain` for each job (Task 8 carry-over b), on the default
+    model (R12-12). Core runs one job at a time, so building the next job's brain closes the
+    previous one's HTTP client."""
+    previous: list[ClaudeBrain] = []
+
+    def build() -> tuple[ClaudeBrain, str]:
+        while previous:
+            previous.pop().close()
+        model = prices.default_model()
+        brain = ClaudeBrain(api_key, model, proxy=proxy)
+        previous.append(brain)
+        return brain, model
+
+    return build
+
+
+def wire_brain() -> None:
+    """Give the conversation turn and the health probe their Claude brains (§10, R12-12).
+
+    Refuses (SystemExit) without the secret `anthropic_api_key` or `HTTPS_PROXY`: core reaches
+    Claude only through the egress proxy (§4.2). The key is never logged."""
+    try:
+        api_key = config.secret(API_KEY_SECRET)
+    except RuntimeError as e:  # names the file, never its content
+        raise SystemExit(f"core cannot start: {e}") from None
+    proxy = os.environ.get("HTTPS_PROXY", "")
+    if not proxy:
+        raise SystemExit(
+            "core cannot start: HTTPS_PROXY is not set (core reaches Claude only through the"
+            " egress proxy)"
+        )
+    model = prices.default_model()  # the price table must load before any job runs
+    turn.set_brain(_per_job_brains(api_key, proxy))
+    health.set_probe_brain(_per_job_brains(api_key, proxy))
+    log.info("Claude brain wired: model %s, through the egress proxy", model)
+
+
 def serve(poll_seconds: float = 2.0) -> None:
+    wire_brain()  # before anything else: refuses to start without the key or the proxy
     worker = f"core@{socket.gethostname()}"
     stopping = False
 
@@ -343,6 +388,13 @@ def _smoke() -> int:
         results.append(("memory audit function", bool(row and row[0]), "app may record"))
     # M1-M4 in a throwaway repo with fictional people: no live memory, no live audit rows.
     results += memory_checks.run()
+    # The database-only Phase 2 rows, as the app and gateway roles (needs pg_gateway_password,
+    # which init has). No node, gateway process or brain.
+    with (
+        psycopg.connect(config.app_dsn(), autocommit=True) as app,
+        psycopg.connect(config.gateway_dsn(), autocommit=True) as gateway,
+    ):
+        results += smoke.run_phase2(app, gateway)
     for name, ok, detail in results:
         print(f"SMOKE {'PASS' if ok else 'FAIL'}  {name}  ({detail})", flush=True)
     return 0 if all(ok for _, ok, _ in results) else 1

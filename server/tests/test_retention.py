@@ -12,6 +12,8 @@ calls it from the `retention.sweep` job through `audited_call_in_job`.
 - `gw.node_connection`: closed, 90 days after `closed_at`.
 - `ops.brain_usage`: 13 months.
 - `ops.brain_reservation`: 13 months, not ACTIVE, no usage row left.
+- `ops.job`: DONE or FAILED, 30 days after `finished_at`, unless a kept reservation names it
+  (R12-32). QUEUED and RUNNING jobs never.
 
 Everything else is kept. Rows are written as the owner with past timestamps, so the database's
 own `now()` is the sweep's time. Runs in its own database; every person is fictional.
@@ -46,6 +48,7 @@ TABLES = (
     "gw.node_connection",
     "ops.brain_usage",
     "ops.brain_reservation",
+    "ops.job",
 )
 KEPT = ("conv.session", "conv.message", "comm.outbox", "comm.event", "audit.event")
 SIGNATURE = "ops.retention_sweep(timestamp with time zone)"
@@ -64,7 +67,8 @@ def _empty(owner: Conn) -> Iterator[None]:
         "DELETE FROM conv.stream_cursor; DELETE FROM conv.stream_chunk; DELETE FROM comm.delivery;"
         " DELETE FROM gw.node_connection; DELETE FROM ops.brain_usage;"
         " DELETE FROM ops.brain_reservation; DELETE FROM conv.inbound;"
-        " UPDATE ops.job SET status = 'DONE' WHERE status IN ('QUEUED', 'RUNNING')"
+        " UPDATE ops.job SET status = 'DONE' WHERE status IN ('QUEUED', 'RUNNING');"
+        " DELETE FROM ops.job WHERE finished_at < now() - interval '20 days'"
     )
     yield
 
@@ -341,6 +345,67 @@ def test_thirteen_months_is_calendar_months(app: Conn, owner: Conn) -> None:
     assert outside not in _ids(app, "SELECT id FROM ops.brain_reservation")
 
 
+def _job(owner: Conn, status: str, *, finished_age: timedelta | None,
+         age: timedelta = D * 60) -> int:  # fmt: skip
+    """A job created `age` ago, finished `finished_age` ago (None: no finished_at)."""
+    row = owner.execute(
+        "INSERT INTO ops.job (kind, payload, status, run_at, created_at, finished_at)"
+        " VALUES ('noop', '{}', %s, now() - %s, now() - %s, now() - %s::interval) RETURNING id",
+        (status, age, age, finished_age),
+    ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def _job_ids(conn: Conn) -> set[int]:
+    return _ids(conn, "SELECT id FROM ops.job")
+
+
+def test_finished_jobs_after_30_days(app: Conn, owner: Conn) -> None:
+    """R12-32: DONE and FAILED jobs go 30 days after they finished, and stay at 29."""
+    gone = {_job(owner, s, finished_age=D * 30) for s in ("DONE", "FAILED")}
+    kept = {_job(owner, s, finished_age=D * 29) for s in ("DONE", "FAILED")}
+    counts = _sweep(app)
+    assert gone.isdisjoint(_job_ids(app)) and kept <= _job_ids(app)
+    assert counts["ops.job"] == 2
+
+
+def test_queued_and_running_jobs_are_never_deleted(app: Conn, owner: Conn) -> None:
+    """R12-32: an unfinished job is kept however old, even with a stale finished_at."""
+    old = D * 400
+    unfinished = {
+        _job(owner, s, finished_age=f, age=old) for s in ("QUEUED", "RUNNING") for f in (None, old)
+    }
+    counts = _sweep(app)
+    assert unfinished <= _job_ids(app)
+    assert counts["ops.job"] == 0
+
+
+def test_a_job_a_kept_reservation_names_is_kept(app: Conn, owner: Conn) -> None:
+    """R12-30: `ops.brain_reservation.job_id` references the job, and reservations are kept 13
+    months, so their finished job stays until the reservation itself is deleted."""
+    reservation = _reservation(owner, D * 40)
+    owner.execute(
+        "UPDATE ops.job SET finished_at = now() - interval '40 days' WHERE id ="
+        " (SELECT job_id FROM ops.brain_reservation WHERE id = %s)",
+        (reservation,),
+    )
+    row = owner.execute(
+        "SELECT job_id FROM ops.brain_reservation WHERE id = %s", (reservation,)
+    ).fetchone()
+    assert row is not None
+    counts = _sweep(app)
+    assert row[0] in _job_ids(app) and counts["ops.job"] == 0
+    # Once the reservation has gone (13 months), the same sweep deletes its job.
+    owner.execute(
+        "UPDATE ops.brain_reservation SET created_at = now() - interval '400 days' WHERE id = %s",
+        (reservation,),
+    )
+    counts = _sweep(app)
+    assert counts["ops.brain_reservation"] == 1 and counts["ops.job"] == 1
+    assert row[0] not in _job_ids(app)
+
+
 # --- audit and the time it may be given ---------------------------------------------------------
 
 
@@ -435,6 +500,29 @@ def test_no_table_grant_was_added(owner: Conn) -> None:
         assert owner.execute(
             "SELECT has_table_privilege(%s, %s, 'DELETE')", (role, table)
         ).fetchone() == (ok,), (role, table)
+
+
+# --- migration 0013 (R12-32) -------------------------------------------------------------------
+
+
+def test_0013_down_and_up() -> None:
+    """Down to 0012: no job index, and the 0012 sweep (seven tables, jobs kept). Up again: both."""
+    index = "SELECT to_regclass('ops.job_one_per_key')"
+    with fresh_database() as d:
+        migrate.downgrade(d.owner, "0012")
+        with psycopg.connect(d.owner, autocommit=True) as conn:
+            assert conn.execute(index).fetchone() == (None,)
+            old = _job(conn, "DONE", finished_age=D * 40)
+        with psycopg.connect(d.app, autocommit=True) as conn:
+            rows = conn.execute("SELECT * FROM ops.retention_sweep(now())").fetchall()
+            assert [r[0] for r in rows] == list(TABLES[:-1])
+            assert old in _job_ids(conn)
+        migrate.upgrade(d.owner, "head")
+        with psycopg.connect(d.app, autocommit=True) as conn:
+            assert conn.execute(index).fetchone() == ("ops.job_one_per_key",)
+            rows = conn.execute("SELECT * FROM ops.retention_sweep(now())").fetchall()
+            assert [r[0] for r in rows] == list(TABLES)
+            assert old not in _job_ids(conn)
 
 
 # --- migration 0012 ----------------------------------------------------------------------------

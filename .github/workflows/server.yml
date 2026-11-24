@@ -53,6 +53,15 @@ jobs:
         run: docker compose -f deploy/compose.yaml config --quiet
         env:
           JARVIS_REF: ${{ github.sha }}
+      - name: No service publishes a port (P0-8, P2-S5)
+        run: |
+          docker compose -f deploy/compose.yaml --profile '*' config > "$RUNNER_TEMP/compose.yaml"
+          if grep -nE '^\s*ports:' "$RUNNER_TEMP/compose.yaml"; then
+            echo "deploy/compose.yaml must not publish ports" >&2
+            exit 1
+          fi
+        env:
+          JARVIS_REF: ${{ github.sha }}
       - name: Image builds
         run: docker build --tag jarvis-server:ci .
 
