@@ -162,4 +162,7 @@ fn times_need_an_explicit_offset() {
     assert!(parse_ts("2026-11-22T10:02:00").is_none());
     assert!(parse_ts("2026-11-22").is_none());
     assert!(parse_ts("not a time").is_none());
+    // A leap second is refused, as the server's models refuse it.
+    assert!(parse_ts("2026-12-31T23:59:60Z").is_none());
+    assert!(parse_ts("2026-12-31T23:59:59.999999999Z").is_some());
 }

@@ -4,13 +4,17 @@
 //! Parsing is strict and mirrors the server's contract models: every field present (null if
 //! unused), no extra fields, and the same patterns. A value that fails here is `malformed`.
 
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, Timelike as _};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
 /// An RFC 3339 time with an explicit offset; `None` for one without (R6-4).
+///
+/// A leap second (`:60`) is refused, as the server's contract models refuse it: chrono would
+/// accept it, and the node must never accept a time the server would not.
 pub fn parse_ts(text: &str) -> Option<DateTime<FixedOffset>> {
-    DateTime::parse_from_rfc3339(text).ok()
+    let t = DateTime::parse_from_rfc3339(text).ok()?;
+    (t.nanosecond() < 1_000_000_000).then_some(t)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

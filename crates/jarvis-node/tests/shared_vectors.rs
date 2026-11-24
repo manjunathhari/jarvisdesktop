@@ -165,10 +165,10 @@ fn b64url_is_strict() {
     assert_eq!(good.len(), 43);
     assert_eq!(b64url_decode(&good, 32).unwrap(), raw);
     assert!(b64url_decode(&format!("{good}="), 32).is_none(), "padding");
-    assert!(
-        b64url_decode(&good.replace('-', "+").replace('_', "/"), 32).is_none()
-            || !good.contains(['-', '_'])
-    );
+    // 0xfb 0xff is "-_8" in base64url and "+/8" in the standard alphabet.
+    assert_eq!(b64url(&[0xfb, 0xff]), "-_8");
+    assert_eq!(b64url_decode("-_8", 2).unwrap(), vec![0xfb, 0xff]);
+    assert!(b64url_decode("+/8", 2).is_none(), "standard alphabet");
     assert!(b64url_decode("+/+/", 3).is_none(), "standard alphabet");
     assert!(b64url_decode(&good, 31).is_none(), "wrong length");
     assert!(b64url_decode("", 32).is_none());
