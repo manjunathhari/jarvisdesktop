@@ -18,6 +18,7 @@ Time is injected: the gateway's and the nodes' FakeClock, and `activate_ready(no
 from __future__ import annotations
 
 import dataclasses
+import logging
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -962,6 +963,87 @@ def test_node_reenrol_cli(
         "SELECT person_id, kind, name FROM gw.enrolment ORDER BY expires_at DESC LIMIT 1"
     ).fetchone()
     assert row == (MANJ, "DESKTOP", "pc")
+
+
+# ------------------------------------------- Task 13 carry-overs (a missing secret, enrol warning)
+
+
+def test_core_activation_without_its_secret_is_loud(
+    app: Conn, owner: Conn, dsns: Dsns, ks: Keys, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture[str],
+) -> None:  # fmt: skip
+    """No notification rule kind fits, so the signal is an ERROR log at activation and a
+    `keys list` line while the secret is missing (Task 13 ruling 4b)."""
+    monkeypatch.setattr(config, "app_dsn", lambda: dsns.app)
+    new = Ed25519PrivateKey.generate()
+    key_id = keys.announce(app, role="CORE", public_key=public_bytes(new))
+    secret = f"core_signing_key_{key_id}"
+    assert keys.missing_secrets(app) == [("CORE", key_id, secret)]
+    capsys.readouterr()
+    assert core_main.main(["keys", "list"]) == 0
+    assert f"MISSING SECRET CORE {key_id}: place {secret}" in capsys.readouterr().out
+    caplog.set_level(logging.ERROR, logger="jarvis.core.keys")
+    assert keys.activate_ready(app, _created(app, key_id) + timedelta(hours=23)) == [key_id]
+    [record] = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert secret in record.getMessage() and "cannot sign" in record.getMessage()
+    ks.place(secret, new)
+    assert keys.missing_secrets(app) == []
+    capsys.readouterr()
+    assert core_main.main(["keys", "list"]) == 0
+    assert "MISSING SECRET" not in capsys.readouterr().out
+
+
+def test_gateway_without_its_new_secret_logs_an_error(
+    app: Conn, dsns: Dsns, ks: Keys, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Core can't see the gateway's secrets; the gateway's re-read says so at ERROR, every
+    time, and keeps signing with the old key until the secret is placed."""
+    caplog.set_level(logging.ERROR, logger="jarvis_server.gateway.app")
+    clock = _clock(app)
+    with gateway(dsns, ks, tmp_path, clock) as gw:
+        new = Ed25519PrivateKey.generate()
+        key_id = keys.announce(app, role="GATEWAY", public_key=public_bytes(new))
+        assert keys.activate_ready(app, _created(app, key_id) + timedelta(hours=23)) == [key_id]
+
+        def complained() -> bool:
+            return any(r.levelno == logging.ERROR and f"gateway_signing_key_{key_id}"
+                       in r.getMessage() and _id(ks.gw) in r.getMessage()
+                       for r in caplog.records)  # fmt: skip
+
+        assert _wait_for(complained)
+        probe = gw.node()
+        assert probe.connect(enrol_gateway_fingerprint=_id(ks.gw))["key_id"] == _id(ks.gw)
+        probe.close()
+
+
+@pytest.mark.parametrize("command", ["enrol", "reenrol"])
+def test_enrolment_warns_while_a_next_key_exists(
+    app: Conn, owner: Conn, dsns: Dsns, ks: Keys, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str], command: str,
+) -> None:  # fmt: skip
+    """A device enrolled during a rotation never gets the new key, so it goes STALE when the
+    key activates (Task 12 concern b). Both commands warn; the code is still the last thing
+    printed on stdout."""
+    monkeypatch.setattr(config, "app_dsn", lambda: dsns.app)
+    monkeypatch.setattr(core_main, "_person_id", lambda slug: MANJ)
+
+    def run() -> tuple[str, str]:
+        node = flow.new_node(owner, MANJ)
+        argv = (["node", "enrol", "--person", "manj", "--kind", "DESKTOP", "--name", "pc"]
+                if command == "enrol" else ["node", "reenrol", str(node)])  # fmt: skip
+        assert core_main.main(argv) == 0
+        out, err = capsys.readouterr()
+        nodes.parse_enrolment_code(out.rsplit(" ", 1)[1].strip())
+        return out, err
+
+    capsys.readouterr()
+    assert "STALE" not in run()[1]
+    key_id = keys.announce(
+        app, role="GATEWAY", public_key=public_bytes(Ed25519PrivateKey.generate())
+    )
+    out, err = run()
+    assert f"GATEWAY key {key_id}" in err and "STALE" in err and "node reenrol" in err
+    assert "Warning" not in out
 
 
 # ------------------------------------------------------------------------------ migration

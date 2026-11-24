@@ -4,8 +4,9 @@ heartbeat and the `welcome` contents (spec §6.2, §8.2, §8.3; R8-1, R9-1, R12-
 **One `Relay` per gateway process.** It keeps the registry of live connections (one `NodeLink`
 per node: a newer connection of the same node replaces and stops the older one, whose row
 `gw.open_connection` has already closed as `superseded`), LISTENs on `jarvis_stream`,
-`jarvis_outbox` and `jarvis_keys` (a key activated: the app re-reads its keys at once, R12-28),
-and runs a ticker for the heartbeat and the 60 s re-send sweep. Time comes from the injected
+`jarvis_outbox`, `jarvis_keys` (a key activated: the app re-reads its keys at once, R12-28) and
+`jarvis_resend` (core's `outbox.resend_sweep` job: run the re-send sweep now), and runs a ticker
+for the heartbeat and the 60 s re-send sweep. Time comes from the injected
 clock (`now()`), never from sleeps.
 
 **Nothing shared waits on a socket (fix round 1, I-1).** Each link has its own queue and sender
@@ -59,7 +60,7 @@ from uuid import UUID
 import psycopg
 from psycopg_pool import AsyncConnectionPool
 
-from jarvis_server.comm import OutboxState
+from jarvis_server.comm import RESEND_CHANNEL, OutboxState
 from jarvis_server.contracts import MessageKind, OutboxRef, ReplyPosition, ResumePosition
 from jarvis_server.core import summary
 from jarvis_server.dbcall import FENCED_SQLSTATE, OutboxRefused, audited_call_async
@@ -626,6 +627,7 @@ class Relay:
                     await conn.execute("LISTEN jarvis_stream")
                     await conn.execute("LISTEN jarvis_outbox")
                     await conn.execute("LISTEN jarvis_keys")  # R12-28
+                    await conn.execute("LISTEN jarvis_resend")  # comm.RESEND_CHANNEL
                     if self._listening.is_set():  # a re-LISTEN: catch up on what was missed
                         await self._catch_up()
                     self._listening.set()
@@ -649,6 +651,10 @@ class Relay:
     async def _on_notify(self, channel: str, payload: str) -> None:
         if channel == "jarvis_keys":  # a key activated: re-read at once (R12-28)
             await self._keys_changed()
+            return
+        if channel == RESEND_CHANNEL:  # core's outbox.resend_sweep: the same sweep, now
+            self._next_sweep = self.now() + RESEND_SWEEP
+            await self.sweep()
             return
         try:
             key = UUID(payload)

@@ -19,6 +19,10 @@ from psycopg.types.json import Jsonb
 
 # Kinds and subject types are codes; subject IDs and detail values are codes or IDs. The same
 # shapes are CHECK constraints on comm.event.
+# NOTIFY channel: the `outbox.resend_sweep` job wakes the gateway's own 60 s re-send sweep
+# (§5.4, §8.2). A wake-up only: the gateway's sweep is the one re-send path.
+RESEND_CHANNEL = "jarvis_resend"
+
 _CODE = re.compile(r"[a-z][a-z0-9_.]{0,63}")
 _ID = re.compile(r"[A-Za-z0-9_.:-]{1,100}")
 

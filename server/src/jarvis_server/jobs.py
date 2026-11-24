@@ -44,6 +44,37 @@ def enqueue(
     return int(row[0])
 
 
+JOB_KEY = "job_key"
+
+
+def job_key(kind: str, item: str) -> str:
+    """The deterministic key of the one job for `item` (an ID, or a period such as a minute)."""
+    return f"{kind}:{item}"
+
+
+def enqueue_once(
+    conn: psycopg.Connection[Any],
+    kind: str,
+    key: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    delay: timedelta = timedelta(0),
+) -> int | None:
+    """Enqueue `kind` with `key` in its payload (`job_key`), unless a job of that kind with the
+    same key exists already, in any status: at most one job per due item (plan Task 13). Returns
+    the new job's ID, or None. A transaction-level advisory lock on the key orders two callers,
+    so the second sees the first's job once it commits; inside a job transaction the lock is
+    held until the job commits."""
+    with conn.transaction():
+        conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"ops.job:{key}",))
+        if conn.execute(
+            "SELECT 1 FROM ops.job WHERE kind = %s AND payload->>'job_key' = %s LIMIT 1",
+            (kind, key),
+        ).fetchone():
+            return None
+        return enqueue(conn, kind, {**(payload or {}), JOB_KEY: key}, delay=delay)
+
+
 def claim(
     conn: psycopg.Connection[Any], worker: str, lease: timedelta = timedelta(minutes=5)
 ) -> Job | None:

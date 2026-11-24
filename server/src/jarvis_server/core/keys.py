@@ -135,6 +135,24 @@ def trusted_core_keys(conn: psycopg.Connection[Any]) -> dict[str, bytes]:
     return {str(k): bytes(p) for k, p in rows}
 
 
+def missing_secrets(conn: psycopg.Connection[Any]) -> list[tuple[Role, str, str]]:
+    """(role, key_id, secret name) of each NEXT or ACTIVE CORE key whose private key core can't
+    load. Core sees only its own secrets; the gateway reports its own at ERROR on every re-read
+    (`gateway.app`). Task 13 ruling 4b: no notification rule kind fits, so this is a
+    `keys list` line and an error log."""
+    rows = conn.execute(
+        "SELECT key_id, public_key FROM gw.trusted_key WHERE role = 'CORE'"
+        " AND state IN ('NEXT', 'ACTIVE') ORDER BY created_at, key_id"
+    ).fetchall()
+    missing: list[tuple[Role, str, str]] = []
+    for key_id, public in rows:
+        try:
+            signing.load_rotating_key(config.SECRETS_DIR, SECRET_NAMES["CORE"], key_id, public)
+        except RuntimeError:
+            missing.append(("CORE", str(key_id), secret_name("CORE", str(key_id))))
+    return missing
+
+
 def stale_nodes(conn: psycopg.Connection[Any]) -> list[tuple[UUID, str]]:
     """(node_id, name) of the non-revoked STALE nodes: each needs `node reenrol`."""
     rows = conn.execute(
@@ -330,6 +348,13 @@ def activate_ready(conn: psycopg.Connection[Any], now: datetime) -> list[str]:
             conn.execute("SELECT pg_notify('jarvis_keys', %s)", (key_id,))
             log.info("activated %s key %s; %d nodes marked STALE", role, key_id, len(stale))
             activated.append(str(key_id))
+        for _, key_id, secret in missing_secrets(conn) if activated else ():
+            if key_id in activated:  # loud: core signs nothing until it is placed (ruling 4b)
+                log.error(
+                    "CORE key %s is ACTIVE but its secret %s is missing: core cannot sign"
+                    " approvals or keysets until it is placed",
+                    key_id, secret,
+                )  # fmt: skip
     return activated
 
 

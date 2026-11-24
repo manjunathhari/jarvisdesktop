@@ -7,7 +7,8 @@ a psycopg `AsyncConnectionPool`.
 Keys (Task 12): at startup the gateway loads its ACTIVE key and core's ACTIVE public key from
 `gw.trusted_key` and its secret, and refuses to start if that fails. It re-reads them at once on
 `NOTIFY jarvis_keys`, which core sends when a key activates (R12-28), and every
-`key_refresh_interval` (60 s) as a backstop. A failed re-read keeps the keys it has. A new key
+`key_refresh_interval` (60 s) as a backstop. A failed re-read keeps the keys it has; a missing
+secret or key row is logged at ERROR on every re-read (Task 13). A new key
 applies to new connections, since each connection signs under the key its challenge announced
 (R12-6). A new ACTIVE gateway key also closes the connections still on the old one (`key_rotated`),
 so they reconnect under it (fix round 1, I-1).
@@ -77,7 +78,13 @@ async def _reload_keys(
         try:
             async with pool.connection() as conn:
                 keys = await load_keys(conn, secrets_dir)
-        except Exception as e:  # the message names a secret file or a role, never a key
+        except RuntimeError as e:  # a missing secret or key row: loud (Task 13 ruling 4b)
+            log.error(  # the message names a secret file or a role, never a key
+                "trusted keys not reloaded, still signing with gateway key %s: %s",
+                ctx.keys.gw_key_id, e,
+            )  # fmt: skip
+            return
+        except Exception as e:
             log.warning("trusted keys not reloaded: %s", e)
             return
         if keys.ids != ctx.keys.ids:

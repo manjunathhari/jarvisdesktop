@@ -69,6 +69,7 @@ class EntityType(StrEnum):
     OUTBOX = "outbox"
     STREAM = "stream"
     APPROVAL = "approval"
+    RETENTION = "retention"
 
 
 class AuditAction(StrEnum):
@@ -93,6 +94,8 @@ class AuditAction(StrEnum):
     CONSUME = "CONSUME"
     DECIDE = "DECIDE"
     RECEIPT = "RECEIPT"
+    SET_VISIBILITY = "SET_VISIBILITY"
+    RETENTION = "RETENTION"
 
 
 class AuditOutcome(StrEnum):

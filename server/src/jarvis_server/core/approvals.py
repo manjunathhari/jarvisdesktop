@@ -214,10 +214,12 @@ def propose_delete(
             context={"expires_at": expires_at, "authz": card, "text": summary,
                      "group_key": f"approval:{approval_id}"},
         )  # fmt: skip
-        payload = {"approval_id": str(approval_id)}
-        delay = expires_at - now
-        jobs.enqueue(conn, "approval.expiring", payload, delay=delay - RESURFACE_BEFORE)
-        jobs.enqueue(conn, "approval.expire", payload, delay=delay)
+        # Under the job keys the scheduler uses, so it never queues a second (Task 13).
+        payload, item, delay = {"approval_id": str(approval_id)}, str(approval_id), expires_at - now
+        jobs.enqueue_once(conn, "approval.expiring", jobs.job_key("approval.expiring", item),
+                          payload, delay=delay - RESURFACE_BEFORE)  # fmt: skip
+        jobs.enqueue_once(conn, "approval.expire", jobs.job_key("approval.expire", item),
+                          payload, delay=delay)  # fmt: skip
     return approval_id
 
 
@@ -404,8 +406,10 @@ def on_decision(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
         context={"authz": authz, "target_node_id": requesting_node, "expires_at": valid_until,
                  "text": f"Deleting {args.get('name')}", "group_key": f"action:{approval_id}"},
     )  # fmt: skip
-    # The item ends at its valid_until (outbox.expire), or when its receipt is handled.
-    jobs.enqueue(conn, "outbox.expire", {"outbox_id": str(item)}, delay=valid_until - db_now)
+    # The item ends at its valid_until (outbox.expire), or when its receipt is handled. The job
+    # key is the scheduler's general sweep's, so the item is never expired twice (Task 13).
+    jobs.enqueue_once(conn, "outbox.expire", jobs.job_key("outbox.expire", str(item)),
+                      {"outbox_id": str(item)}, delay=valid_until - db_now)  # fmt: skip
     _answered(conn, inbound_id)
     log.info("approval %s: action issued (expires %s)", approval_id, expires_at)
 

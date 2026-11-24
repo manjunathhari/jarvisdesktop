@@ -38,6 +38,7 @@ from typing import Any
 import psycopg
 
 from jarvis_server import config, jobs, migrate, nodes, signing, smoke
+from jarvis_server import retention as _retention_jobs  # noqa: F401  registers job kinds
 from jarvis_server.bootstrap import bootstrap
 from jarvis_server.brain import budget as _budget_jobs  # noqa: F401  registers job kinds
 from jarvis_server.brain import health as _health_jobs  # noqa: F401  registers job kinds
@@ -232,6 +233,21 @@ def _key_fingerprints(conn: psycopg.Connection[Any]) -> tuple[str, str]:
         raise SystemExit(str(e)) from e
 
 
+def _warn_next_keys(conn: psycopg.Connection[Any]) -> None:
+    """A device enrolled while a key is NEXT never gets it, and goes STALE when it activates
+    (Task 12 concern b). Says so on stderr, so the code stays the last thing on stdout."""
+    for k in keys.list_keys(conn):
+        if k.state == "NEXT":
+            by = (k.created_at + keys.ACTIVATE_BY).isoformat()
+            print(
+                f"Warning: {k.role} key {k.key_id} is being rotated in (activates when every"
+                f" node acks, or at {by}). This device won't get it and will be marked STALE"
+                " then: run `jarvis-core node reenrol <node_id>` for it after activation.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
 def _print_code(code: str) -> None:
     # The code goes to the terminal only, never to the log (§7.2 step 1).
     print(f"Enrolment code (valid 15 minutes, single use): {code}", flush=True)
@@ -250,10 +266,12 @@ def _node(args: argparse.Namespace) -> int:
                     core_fp=core_fp,
                     gw_fp=gw_fp,
                 )
+                _warn_next_keys(conn)
                 _print_code(code)
             elif args.node_command == "reenrol":
                 code = nodes.reenrol(conn, args.node_id, *_key_fingerprints(conn))
                 log.info("node %s revoked for re-enrolment", args.node_id)
+                _warn_next_keys(conn)
                 _print_code(code)
             else:
                 nodes.revoke(conn, args.node_id)
@@ -305,6 +323,8 @@ def _keys(args: argparse.Namespace) -> int:
                         by = (k.created_at + keys.ACTIVATE_BY).isoformat()
                         pending = f" (activates when every node acks, or at {by})"
                     print(f"{k.role} {k.key_id} {k.state}{pending}{retired}", flush=True)
+                for role, key_id, secret in keys.missing_secrets(conn):
+                    print(f"MISSING SECRET {role} {key_id}: place {secret}", flush=True)
                 for node_id, name in keys.stale_nodes(conn):
                     print(f"STALE {node_id} {name}  (run: jarvis-core node reenrol {node_id})")
         except keys.KeyRefused as e:

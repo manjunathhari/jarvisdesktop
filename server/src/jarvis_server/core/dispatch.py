@@ -28,7 +28,7 @@ from uuid import UUID
 import psycopg
 from psycopg.pq import TransactionStatus
 
-from jarvis_server import jobs
+from jarvis_server import comm, jobs
 from jarvis_server.core import rules
 from jarvis_server.dbcall import TransactionNotIdle, job_transaction
 
@@ -82,6 +82,13 @@ def handle(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
 @register("noop")
 def _noop(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     log.info("noop job %s ran", job.id)
+
+
+@register("outbox.resend_sweep")
+def _resend_sweep(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
+    """Wake the gateway's re-send sweep (§5.4, §8.2); delivered when the job commits. The
+    gateway re-sends; nothing here does (Task 13 ruling 2)."""
+    conn.execute("SELECT pg_notify(%s, '')", (comm.RESEND_CHANNEL,))
 
 
 @register("system.event")

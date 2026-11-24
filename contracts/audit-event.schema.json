@@ -52,7 +52,8 @@
         "inbound",
         "outbox",
         "stream",
-        "approval"
+        "approval",
+        "retention"
       ]
     },
     "entity_id": {
@@ -81,7 +82,9 @@
         "CHUNK_RECEIVE",
         "CONSUME",
         "DECIDE",
-        "RECEIPT"
+        "RECEIPT",
+        "SET_VISIBILITY",
+        "RETENTION"
       ]
     },
     "from_state": {
