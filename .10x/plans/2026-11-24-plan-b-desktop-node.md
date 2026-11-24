@@ -6,7 +6,7 @@
 
 **Architecture:** A new crate, `crates/jarvis-node`, holds everything that isn't UI. Most of it is platform-neutral and tested on Linux: the signing rules, the handshake as a sans-IO state machine, the WebSocket driver, the durable journal, the outbox inbox, `ServerBrain`, the approval-card model, and the delete executor. Two Windows-only parts sit behind traits, `KeyStore` (DPAPI) and `FolderOps` (the §9.4 file handling), and are tested on the `windows-latest` runner and on Manj's PC. The Tauri app picks `ClaudeBrain` or `ServerBrain` from a local `node.toml`, and only adds an enrolment screen, an approval card and a notice strip. Panels, voice and modules are unchanged.
 
-**Tech Stack:** Rust (workspace edition 2021), tokio, `tokio-tungstenite` (plain `ws://` over the tailnet), `serde_jcs`, `ed25519-dalek` 2, `sha2`, `data-encoding` (base32), `base64` 0.22, `uuid`, `chrono`, the `windows` crate (Win32 file, security, COM shell and DPAPI APIs), `jsonschema` (dev only); Tauri 2 and TypeScript for the UI; for Task 1 and the end-to-end test, Python 3.12 with uv and pytest, and Node 22 for the vector generator.
+**Tech Stack:** Rust (workspace edition 2021), tokio, `tokio-tungstenite` (plain `ws://` over the tailnet), `serde_json_canonicalizer` (R12-35), `ed25519-dalek` 2, `sha2`, `data-encoding` (base32), `base64` 0.22, `uuid`, `chrono`, the `windows` crate (Win32 file, security, COM shell and DPAPI APIs), `jsonschema` (dev only); Tauri 2 and TypeScript for the UI; for Task 1 and the end-to-end test, Python 3.12 with uv and pytest, and Node 22 for the vector generator.
 
 **Spec:** `.10x/specs/2026-11-22-phase-2-core-and-nodes-design.md`, Revision 12. The scope is §13. The rules come from §6.1, §7, §8.2–8.3, §9.3–9.4 and §14, and from rulings R12-6, R12-10, R12-25 to R12-29 and R12-34. Read the spec alongside this plan. The Python reference node is `server/tests/fakes/{fake_node.py,node_rules.py,live_node.py}`; where this plan says "as FakeNode does", that file is the behaviour to match.
 
@@ -20,7 +20,7 @@ As in the Phase 2 plan, shared interfaces belong to the spec and the contracts. 
 
 - **The repo is public:** no secrets, gateway address, tailnet IPs, server IDs or enrolment codes in any committed file. `node.toml` and everything the node stores live in the app's local data folder, never in the repo.
 - **Rust CI is unchanged:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` must pass on `ubuntu-latest` and `windows-latest`.
-- **Signed bytes:** `"jarvis-sig-v1\n" + purpose + "\n" + key_id + "\n" + JCS(object)`. The purposes are `node-msg`, `gw-transport` and `core-authz`. JCS is `serde_jcs`; Ed25519 signatures are base64url without padding.
+- **Signed bytes:** `"jarvis-sig-v1\n" + purpose + "\n" + key_id + "\n" + JCS(object)`. The purposes are `node-msg`, `gw-transport` and `core-authz`. JCS is `serde_json_canonicalizer` (R12-35, replacing `serde_jcs`); object keys sort by UTF-16 code units; Ed25519 signatures are base64url without padding.
 - **Fingerprint:** the first 10 bytes of SHA-256 of the raw 32-byte public key, as lower-case base32 without padding (16 characters).
 - **Envelope `key_id` (R12-6):** the node signs `node-msg` under `fingerprint(own public key)`. Gateway envelopes are verified under the `key_id` its `challenge` announced.
 - **Timestamps:** RFC 3339 with an explicit offset. One without an offset is malformed. Clock tolerance is 30 s.
@@ -149,7 +149,7 @@ As in the Phase 2 plan, shared interfaces belong to the spec and the contracts. 
 - [ ] **Step 2: Run them and see them fail.**
   Run: `cargo test -p jarvis-node`
   Expected: FAIL to compile, because the functions don't exist yet.
-- [ ] **Step 3: Implement `sign.rs`, `wire.rs` and `rules.rs` against the interfaces above.** If `serde_jcs` fails any vector, stop and report under the operating rule. Don't patch around it.
+- [ ] **Step 3: Implement `sign.rs`, `wire.rs` and `rules.rs` against the interfaces above.** If the JCS library fails any vector, stop and report under the operating rule. Don't patch around it. (It happened: `serde_jcs` failed key sorting, and Manj ruled R12-35.)
 - [ ] **Step 4: Run the tests and clippy.**
   Run: `cargo test -p jarvis-node && cargo clippy -p jarvis-node --all-targets -- -D warnings`
   Expected: PASS.

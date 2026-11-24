@@ -23,7 +23,8 @@ jarvis-voice = { path = "crates/jarvis-voice" }
 jarvis-ears = { path = "crates/jarvis-ears" }
 jarvis-node = { path = "crates/jarvis-node" }
 # The node protocol (Plan B): signing, shared vectors, wire types.
-serde_jcs = "0.1"
+# RFC 8785 JCS; sorts keys by UTF-16 code units (R12-35: replaces serde_jcs, whose key order is wrong).
+serde_json_canonicalizer = "0.4"
 ed25519-dalek = "2"
 sha2 = "0.10"
 data-encoding = "2"

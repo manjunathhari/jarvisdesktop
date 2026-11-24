@@ -20,7 +20,13 @@ fn purpose(v: &Value) -> Purpose {
 #[test]
 fn every_signing_vector_matches() {
     let vectors = support::vectors();
-    assert!(vectors.len() >= 11, "the committed vectors are missing");
+    assert!(vectors.len() >= 13, "the committed vectors are missing");
+    for required in ["rfc8785-appendix", "rfc8785-sorting", "key-order-utf16"] {
+        assert!(
+            vectors.iter().any(|v| v["name"] == required),
+            "{required} is missing"
+        );
+    }
     for v in &vectors {
         let name = v["name"].as_str().unwrap();
         let key_id = v["key_id"].as_str().unwrap();

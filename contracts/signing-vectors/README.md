@@ -44,6 +44,8 @@ from the RFC text at rfc-editor.org (`rfc8785.txt`). The generator refuses to ru
 bytes independently. This case has non-integer numbers; JARVIS's own signed objects
 use integers only.
 
+**The `rfc8785-sorting` case** is the RFC 8785 §3.2.3 property-sorting sample, also copied from the RFC text. The RFC lists the order of its values after sorting; the generator refuses to run unless `canonicalize` produces that order. **`key-order-utf16`** holds keys whose UTF-16 order differs from the order of their escaped UTF-8 bytes (`"a"` before `"a b"`, `"\n"` before `"A"`, `"\""` before `"#"`, an emoji before U+FFFF), so a signer that sorts serialised bytes fails it (R12-35).
+
 ## `vectors.json`
 
 A list of `{name, purpose, key_id, seed_hex, object, expected_canonical_utf8,

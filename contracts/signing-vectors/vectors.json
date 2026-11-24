@@ -24,6 +24,48 @@
     "expected_sig": "m80lq13ODPZ2R0bdwepsqPQ5Eofg6H3SRLhkPLaBa-ITnrilOvRuTnBAf53BhbH9SOSRKMYqkRpzrs36BJ-9Bg"
   },
   {
+    "name": "rfc8785-sorting",
+    "purpose": "core-authz",
+    "key_id": "core-1",
+    "seed_hex": "f264e9f21d91e25c527e7fed93838c7bdcb6ecebc7c2006919c39ed65eaadfd6",
+    "object": {
+      "1": "One",
+      "€": "Euro Sign",
+      "\r": "Carriage Return",
+      "דּ": "Hebrew Letter Dalet With Dagesh",
+      "😀": "Emoji: Grinning Face",
+      "": "Control",
+      "ö": "Latin Small Letter O With Diaeresis"
+    },
+    "expected_canonical_utf8": "{\"\\r\":\"Carriage Return\",\"1\":\"One\",\"\":\"Control\",\"ö\":\"Latin Small Letter O With Diaeresis\",\"€\":\"Euro Sign\",\"😀\":\"Emoji: Grinning Face\",\"דּ\":\"Hebrew Letter Dalet With Dagesh\"}",
+    "expected_signed_bytes_hex": "6a61727669732d7369672d76310a636f72652d617574687a0a636f72652d310a7b225c72223a2243617272696167652052657475726e222c2231223a224f6e65222c22c280223a22436f6e74726f6c222c22c3b6223a224c6174696e20536d616c6c204c6574746572204f205769746820446961657265736973222c22e282ac223a224575726f205369676e222c22f09f9880223a22456d6f6a693a204772696e6e696e672046616365222c22efacb3223a22486562726577204c65747465722044616c6574205769746820446167657368227d",
+    "expected_sig": "YtAzCNM48V1jKztSvw4KxsPayLvFeSCeidz_KFks7_n0BXnacTgw7che1_cBeLIEO6t6niubxekPRAZMQq-0Ag"
+  },
+  {
+    "name": "key-order-utf16",
+    "purpose": "core-authz",
+    "key_id": "core-1",
+    "seed_hex": "f264e9f21d91e25c527e7fed93838c7bdcb6ecebc7c2006919c39ed65eaadfd6",
+    "object": {
+      "a b": 2,
+      "a": 1,
+      "A": 4,
+      "\n": 3,
+      "": 5,
+      "￿": 7,
+      "😀": 6,
+      "#": 9,
+      "\"": 8,
+      "args": {
+        "name!": "y",
+        "name": "x"
+      }
+    },
+    "expected_canonical_utf8": "{\"\":5,\"\\n\":3,\"\\\"\":8,\"#\":9,\"A\":4,\"a\":1,\"a b\":2,\"args\":{\"name\":\"x\",\"name!\":\"y\"},\"😀\":6,\"￿\":7}",
+    "expected_signed_bytes_hex": "6a61727669732d7369672d76310a636f72652d617574687a0a636f72652d310a7b22223a352c225c6e223a332c225c22223a382c2223223a392c2241223a342c2261223a312c22612062223a322c2261726773223a7b226e616d65223a2278222c226e616d6521223a2279227d2c22f09f9880223a362c22efbfbf223a377d",
+    "expected_sig": "tOT2Vaj4NX4Lc5x4pbVihslOnaJPdz03rzDIzZrbOhBQKHYGEbDuSQhB052_pJJVP1y16V2nbih5PFleME5BCQ"
+  },
+  {
     "name": "ascii-simple",
     "purpose": "node-msg",
     "key_id": "node-1",

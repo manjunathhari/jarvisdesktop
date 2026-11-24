@@ -1,7 +1,8 @@
 //! Canonical signing (spec §7.1).
 //!
 //! Signed bytes are `"jarvis-sig-v1\n" + purpose + "\n" + key_id + "\n" + JCS(object)`, with JCS
-//! from RFC 8785 (`serde_jcs`) and Ed25519 signatures in base64url without padding. Signatures
+//! from RFC 8785 (`serde_json_canonicalizer`, R12-35) and Ed25519 signatures in base64url
+//! without padding. Signatures
 //! are always checked over the JSON object exactly as received, never over a re-serialised
 //! struct.
 
@@ -46,9 +47,10 @@ pub enum SignError {
     NotAnObject,
 }
 
-/// RFC 8785 (JCS) serialisation.
+/// RFC 8785 (JCS) serialisation: object keys sorted by their UTF-16 code units, as Python's
+/// `rfc8785` does (vectors `rfc8785-sorting` and `key-order-utf16`).
 pub fn canonical(obj: &Value) -> Result<Vec<u8>, SignError> {
-    serde_jcs::to_vec(obj).map_err(|e| SignError::Canonical(e.to_string()))
+    serde_json_canonicalizer::to_vec(obj).map_err(|e| SignError::Canonical(e.to_string()))
 }
 
 /// The exact bytes that are signed.

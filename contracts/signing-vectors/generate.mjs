@@ -87,6 +87,55 @@ if (Buffer.from(jcs(rfcObject), "utf8").toString("hex") !== RFC8785_OUTPUT_HEX) 
   throw new Error("canonicalize does not reproduce RFC 8785 §3.2.3/§3.2.4");
 }
 
+// RFC 8785 §3.2.3 property-sorting sample, copied from the RFC text at rfc-editor.org. Keys
+// sort by their UTF-16 code units; the RFC lists the resulting order of the values. The
+// generator refuses to run if `canonicalize` gives any other order.
+const RFC8785_SORTING_INPUT = String.raw`{
+  "€": "Euro Sign",
+  "\r": "Carriage Return",
+  "דּ": "Hebrew Letter Dalet With Dagesh",
+  "1": "One",
+  "😀": "Emoji: Grinning Face",
+  "\u0080": "Control",
+  "ö": "Latin Small Letter O With Diaeresis"
+}`;
+const RFC8785_SORTED_VALUES = [
+  "Carriage Return",
+  "One",
+  "Control",
+  "Latin Small Letter O With Diaeresis",
+  "Euro Sign",
+  "Emoji: Grinning Face",
+  "Hebrew Letter Dalet With Dagesh",
+];
+const rfcSortingObject = JSON.parse(RFC8785_SORTING_INPUT);
+// Checked on the canonical text itself: re-parsing it would not keep the order, because a
+// JavaScript object always lists integer-like keys such as "1" first.
+{
+  const text = jcs(rfcSortingObject);
+  const at = RFC8785_SORTED_VALUES.map((value) => text.indexOf(`"${value}"`));
+  if (at.some((i, n) => i < 0 || (n > 0 && i <= at[n - 1]))) {
+    throw new Error("canonicalize does not reproduce the RFC 8785 §3.2.3 property order");
+  }
+}
+
+// Keys whose UTF-16 order differs from the order of their escaped UTF-8 bytes: a prefix
+// followed by a character below '"' ("a" < "a b"), an escaped control character before a
+// letter ("\n" < "A"), an escaped quote ('"' < "#"), and an astral character (a surrogate
+// pair, D83D) before U+FFFF. Signers that sort serialised bytes get these wrong.
+const KEY_ORDER_OBJECT = {
+  "a b": 2,
+  a: 1,
+  A: 4,
+  "\n": 3,
+  "": 5,
+  "￿": 7,
+  "😀": 6,
+  "#": 9,
+  '"': 8,
+  args: { "name!": "y", name: "x" },
+};
+
 // ---------------------------------------------------------------- vectors
 
 const vector = (name, purpose, keyLabel, keyId, object) => ({
@@ -104,6 +153,8 @@ const SHARED = { kind: "ping", note: "same object, different binding", seq: 7 };
 
 const vectors = () => [
   vector("rfc8785-appendix", "core-authz", "core-1", "core-1", rfcObject),
+  vector("rfc8785-sorting", "core-authz", "core-1", "core-1", rfcSortingObject),
+  vector("key-order-utf16", "core-authz", "core-1", "core-1", KEY_ORDER_OBJECT),
   vector("ascii-simple", "node-msg", "node-1", "node-1", { kind: "ping", text: "hello jarvis" }),
   vector("nested-keys-unsorted", "gw-transport", "gw-1", "gw-1", {
     zeta: 1,
