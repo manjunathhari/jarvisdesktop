@@ -165,4 +165,7 @@ fn times_need_an_explicit_offset() {
     // A leap second is refused, as the server's models refuse it.
     assert!(parse_ts("2026-12-31T23:59:60Z").is_none());
     assert!(parse_ts("2026-12-31T23:59:59.999999999Z").is_some());
+    // The year 0000 is refused too (the server's earliest year is 0001).
+    assert!(parse_ts("0000-01-01T00:00:00Z").is_none());
+    assert!(parse_ts("0001-01-01T00:00:00Z").is_some());
 }

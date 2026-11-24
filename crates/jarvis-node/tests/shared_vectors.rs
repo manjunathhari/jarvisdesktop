@@ -184,3 +184,42 @@ fn b64url_is_strict() {
     assert_eq!(b64url_decode("AA", 1).unwrap(), vec![0]);
     assert!(b64url_decode("A A", 2).is_none(), "whitespace");
 }
+
+#[test]
+fn integers_beyond_the_jcs_range_never_sign_or_verify() {
+    // As Python's test of the same name: JCS limits signed integers to ±(2^53 - 1).
+    let key = support::test_key("node-1");
+    let public = key.verifying_key().to_bytes();
+    let edge = jarvis_node::sign::MAX_SAFE_INTEGER;
+    for ok in [
+        json!({"last_seq": edge}),
+        json!({"last_seq": -(edge as i64)}),
+    ] {
+        let sig = sign(&key, Purpose::NodeMsg, "n-1", &ok).unwrap();
+        assert!(verify(&public, Purpose::NodeMsg, "n-1", &ok, &sig));
+    }
+    let beyond = [
+        json!({"last_seq": edge + 1}),
+        json!({"last_seq": -((edge + 1) as i64)}),
+        json!({"last_seq": u64::MAX}),
+        json!({"nested": [{"amount_paise": 9_007_199_254_740_993u64}]}),
+    ];
+    let sig = sign(&key, Purpose::NodeMsg, "n-1", &json!({"last_seq": edge})).unwrap();
+    for big in &beyond {
+        assert!(canonical(big).is_err(), "{big}");
+        assert!(sign(&key, Purpose::NodeMsg, "n-1", big).is_err(), "{big}");
+        assert!(
+            !verify(&public, Purpose::NodeMsg, "n-1", big, &sig),
+            "{big}"
+        );
+    }
+    // The review's malleability case: 2^53 and 2^53 + 1 would share canonical bytes as floats.
+    let a: Value = serde_json::from_str(r#"{"amount_paise":9007199254740992}"#).unwrap();
+    let b: Value = serde_json::from_str(r#"{"amount_paise":9007199254740993}"#).unwrap();
+    assert!(canonical(&a).is_err() && canonical(&b).is_err());
+    // Floats are still JCS-formatted (the RFC sample uses them); JARVIS objects never carry any.
+    assert_eq!(
+        canonical(&json!({"x": 1e30})).unwrap(),
+        br#"{"x":1e+30}"#.to_vec()
+    );
+}

@@ -45,11 +45,45 @@ pub enum SignError {
     Canonical(String),
     #[error("an envelope must be a JSON object")]
     NotAnObject,
+    #[error("an integer is outside the safe integer range ±(2^53 - 1)")]
+    UnsafeInteger,
+}
+
+/// The largest integer JCS (RFC 8785) can represent exactly: 2^53 - 1.
+pub const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
+/// Refuse any integer outside ±(2^53 - 1), as Python's `rfc8785` does (`IntegerDomainError`).
+///
+/// `serde_json_canonicalizer` writes every integer through `f64`, so without this check two
+/// different large integers could canonicalise to the same bytes and share one signature.
+/// Integers beyond the 64-bit range already arrive from `serde_json` as floats and can't be
+/// told apart from real floats (such as the RFC's own `1E30`); no JARVIS signer can produce
+/// them, since every signed JARVIS number is a safe integer (§7.1).
+fn check_integers(v: &Value) -> Result<(), SignError> {
+    match v {
+        Value::Number(n) => {
+            let safe = match (n.as_i64(), n.as_u64()) {
+                (Some(i), _) => i.unsigned_abs() <= MAX_SAFE_INTEGER,
+                (None, Some(u)) => u <= MAX_SAFE_INTEGER,
+                (None, None) => true, // a float
+            };
+            if safe {
+                Ok(())
+            } else {
+                Err(SignError::UnsafeInteger)
+            }
+        }
+        Value::Array(items) => items.iter().try_for_each(check_integers),
+        Value::Object(map) => map.values().try_for_each(check_integers),
+        _ => Ok(()),
+    }
 }
 
 /// RFC 8785 (JCS) serialisation: object keys sorted by their UTF-16 code units, as Python's
-/// `rfc8785` does (vectors `rfc8785-sorting` and `key-order-utf16`).
+/// `rfc8785` does (vectors `rfc8785-sorting` and `key-order-utf16`). An integer outside
+/// ±(2^53 - 1) is refused, so it can never be signed or verify.
 pub fn canonical(obj: &Value) -> Result<Vec<u8>, SignError> {
+    check_integers(obj)?;
     serde_json_canonicalizer::to_vec(obj).map_err(|e| SignError::Canonical(e.to_string()))
 }
 
