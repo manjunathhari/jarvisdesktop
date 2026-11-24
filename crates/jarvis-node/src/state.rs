@@ -3,9 +3,13 @@
 //!
 //! Saves are atomic: the new content goes to `node-state.json.tmp`, is `sync_all`'d, and is then
 //! renamed over the old file, so a crash leaves either the old state or the new one, never a
-//! mix. On Unix the folder is then synced so the rename itself is durable; on Windows the
-//! rename is `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, which returns only once it is on disk
-//! (Windows has no way to sync a folder handle from std).
+//! mix. On Unix the folder is then synced so the rename itself is durable. On Windows the
+//! rename is `MoveFileExW` (`MOVEFILE_REPLACE_EXISTING`); a same-volume rename is atomic through
+//! the NTFS log, but `MOVEFILE_WRITE_THROUGH` alone doesn't promise that log entry is on disk
+//! when the call returns, so the new file is then opened and flushed (`FlushFileBuffers`), which
+//! commits the NTFS log, rename included.
+//!
+//! One process owns these files (the app runs as a single instance); nothing here locks them.
 //!
 //! A state file that can't be read is an error, never "no state": the node then refuses to
 //! connect rather than silently re-enrolling.
@@ -33,6 +37,8 @@ const VERSION: u32 = 1;
 #[serde(deny_unknown_fields)]
 struct StateFile {
     v: u32,
+    /// Required (null when not enrolled): a missing key is a corrupt file, not "not enrolled".
+    #[serde(deserialize_with = "Option::deserialize")]
     node_id: Option<Uuid>,
     trust: Trust,
 }
@@ -116,7 +122,9 @@ fn rename_durable(from: &Path, to: &Path) -> io::Result<()> {
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     }
-    .map_err(io::Error::other)
+    .map_err(io::Error::other)?;
+    // FlushFileBuffers on the renamed file (it needs a writable handle) commits the NTFS log.
+    OpenOptions::new().write(true).open(to)?.sync_all()
 }
 
 #[cfg(not(windows))]
@@ -124,8 +132,9 @@ fn rename_durable(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
-/// Make a new or renamed entry in `path`'s folder durable. On Unix, fsync the folder; on
-/// Windows this is a no-op, because the rename above is write-through.
+/// Make a new or renamed entry in `path`'s folder durable. On Unix, fsync the folder. On
+/// Windows this is a no-op: a folder can't be flushed through std, and flushing the file
+/// itself (`sync_all`, which callers do) commits the NTFS log that holds the entry.
 pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -210,6 +219,7 @@ mod tests {
             br#"{"v":2,"node_id":null,"trust":{"core":{},"gateway":{}}}"#,
             br#"{"v":1,"node_id":null,"trust":{"core":{},"gateway":{}},"extra":1}"#,
             br#"{"v":1,"node_id":null}"#,
+            br#"{"v":1,"trust":{"core":{},"gateway":{}}}"#,
             b"",
         ] {
             std::fs::write(&path, bad).unwrap();

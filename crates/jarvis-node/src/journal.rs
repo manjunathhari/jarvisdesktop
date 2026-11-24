@@ -13,6 +13,10 @@
 //!
 //! After a failed write the file is cut back to its last good length and the journal refuses
 //! every later append (`Poisoned`), so a half-written line can never sit in the middle.
+//!
+//! One process owns the journal: the app runs as a single instance. On Windows the file is
+//! opened with read sharing only, so no other process can write, rename or delete it while it
+//! is open; on Unix nothing enforces this.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -92,6 +96,37 @@ impl JournalState {
     /// optionally `staged`, then `done` exactly once (a refusal before staging goes straight
     /// from `started` to `done`).
     fn apply(&mut self, record: &Record) -> Result<(), JournalError> {
+        self.check(record)?;
+        self.apply_checked(record);
+        Ok(())
+    }
+
+    /// Whether `record` may follow the current state.
+    fn check(&self, record: &Record) -> Result<(), JournalError> {
+        let ok = match record {
+            Record::Seen { .. } | Record::Cleared { .. } => true,
+            Record::Started { execution_key, .. } => !self.executions.contains_key(execution_key),
+            Record::Staged { execution_key } => {
+                matches!(self.executions.get(execution_key), Some(Stage::Started(_)))
+            }
+            Record::Done { execution_key, .. } => matches!(
+                self.executions.get(execution_key),
+                Some(Stage::Started(_) | Stage::Staged(_))
+            ),
+        };
+        match record {
+            _ if ok => Ok(()),
+            Record::Started { execution_key, .. }
+            | Record::Staged { execution_key }
+            | Record::Done { execution_key, .. } => Err(JournalError::OutOfOrder {
+                execution_key: *execution_key,
+            }),
+            Record::Seen { .. } | Record::Cleared { .. } => unreachable!("always allowed"),
+        }
+    }
+
+    /// Apply a record that `check` accepted.
+    fn apply_checked(&mut self, record: &Record) {
         match record {
             Record::Seen { outbox_id } => {
                 self.seen.insert(*outbox_id);
@@ -104,41 +139,22 @@ impl JournalState {
                 args,
                 ..
             } => {
-                if self.executions.contains_key(execution_key) {
-                    return Err(JournalError::OutOfOrder {
-                        execution_key: *execution_key,
-                    });
-                }
                 self.executions
                     .insert(*execution_key, Stage::Started(args.clone()));
             }
-            Record::Staged { execution_key } => match self.executions.get(execution_key) {
-                Some(Stage::Started(args)) => {
-                    let args = args.clone();
+            Record::Staged { execution_key } => {
+                if let Some(Stage::Started(args)) = self.executions.remove(execution_key) {
                     self.executions.insert(*execution_key, Stage::Staged(args));
                 }
-                _ => {
-                    return Err(JournalError::OutOfOrder {
-                        execution_key: *execution_key,
-                    })
-                }
-            },
+            }
             Record::Done {
                 execution_key,
                 receipt,
-            } => match self.executions.get(execution_key) {
-                Some(Stage::Started(_) | Stage::Staged(_)) => {
-                    self.executions
-                        .insert(*execution_key, Stage::Done(receipt.clone()));
-                }
-                _ => {
-                    return Err(JournalError::OutOfOrder {
-                        execution_key: *execution_key,
-                    })
-                }
-            },
+            } => {
+                self.executions
+                    .insert(*execution_key, Stage::Done(receipt.clone()));
+            }
         }
-        Ok(())
     }
 }
 
@@ -159,22 +175,38 @@ pub struct Journal {
 impl Journal {
     /// Open (creating if missing) and replay the journal at `path`.
     pub fn open(path: &Path) -> Result<Journal, JournalError> {
-        let existed = path.exists();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        if !existed {
-            file.sync_all()?;
-            crate::state::sync_parent_dir(path)?;
-        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        // One writer only: while the node has it open, nothing else may write, rename or
+        // delete the journal (std's default would allow all three).
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::share_mode(
+            &mut options,
+            0x1, /* FILE_SHARE_READ */
+        );
+        let mut file = options.open(path)?;
+        // Make the file's folder entry durable on every open, not only on creation: a crash
+        // between creating the file and syncing its folder would otherwise never be repaired.
+        file.sync_all()?;
+        crate::state::sync_parent_dir(path)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
 
         // Everything after the last newline is a torn write: drop it.
-        let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        let mut complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        // A final line holding a NUL byte is torn too: pages of one write can reach the disk
+        // out of order, and an unwritten page reads back as zeros. JSON never contains a raw
+        // NUL, so no line `append` confirmed can look like this. Only the last line is ever in
+        // flight, so only it is checked; a NUL anywhere earlier stays corrupt.
+        if complete > 0 {
+            let start = bytes[..complete - 1]
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |i| i + 1);
+            if bytes[start..complete].contains(&0) {
+                complete = start;
+            }
+        }
         if complete < bytes.len() {
             file.set_len(complete as u64)?;
             file.sync_all()?;
@@ -208,8 +240,7 @@ impl Journal {
         if self.poisoned {
             return Err(JournalError::Poisoned);
         }
-        let mut next = self.state.clone();
-        next.apply(record)?;
+        self.state.check(record)?;
         let mut line = serde_json::to_vec(record).expect("a record always serialises");
         line.push(b'\n');
         if let Err(e) = self.write_line(&line) {
@@ -221,7 +252,7 @@ impl Journal {
             return Err(e.into());
         }
         self.len += line.len() as u64;
-        self.state = next;
+        self.state.apply_checked(record);
         Ok(())
     }
 
@@ -324,6 +355,29 @@ mod tests {
         let j = Journal::open(&path).unwrap();
         assert!(j.state().seen.is_empty());
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_final_line_with_nul_bytes_is_torn_not_corrupt() {
+        // Out-of-order page writes: the newline reached the disk, the start of the line didn't.
+        let (_dir, path) = journal();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let good = format!("{{\"t\":\"seen\",\"outbox_id\":\"{a}\"}}\n");
+        let torn = format!("\0\0\0\0{{\"t\":\"seen\",\"outbox_id\":\"{b}\"}}\n");
+        std::fs::write(&path, format!("{good}{torn}")).unwrap();
+        let j = Journal::open(&path).unwrap();
+        assert_eq!(j.state().seen, HashSet::from([a]));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            good,
+            "cut back to the good line"
+        );
+        // A NUL in an earlier line is not a torn write: that is corruption.
+        std::fs::write(&path, format!("{torn}{good}")).unwrap();
+        assert!(matches!(
+            Journal::open(&path),
+            Err(JournalError::Corrupt { line: 1 })
+        ));
     }
 
     #[test]

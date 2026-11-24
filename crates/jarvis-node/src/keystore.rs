@@ -164,12 +164,12 @@ mod dpapi {
                 Err(e) => return Err(e.into()),
             };
             let plain = unprotect(&sealed)?;
-            let seed: Zeroizing<[u8; 32]> = Zeroizing::new(
-                plain
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| KeyStoreError::Corrupt)?,
-            );
+            if plain.len() != 32 {
+                return Err(KeyStoreError::Corrupt);
+            }
+            // Copy straight into a zeroised buffer, with no unzeroised temporary.
+            let mut seed = Zeroizing::new([0u8; 32]);
+            seed.copy_from_slice(&plain);
             Ok(Some(SigningKey::from_bytes(&seed)))
         }
 
