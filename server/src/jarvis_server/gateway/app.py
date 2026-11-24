@@ -5,11 +5,12 @@ It connects to Postgres only as `jarvis_gateway` (it refuses to start as any oth
 a psycopg `AsyncConnectionPool`.
 
 Keys (Task 12): at startup the gateway loads its ACTIVE key and core's ACTIVE public key from
-`gw.trusted_key` and its secret, and refuses to start if that fails. It re-reads them every
-`key_refresh_interval` (60 s). A failed re-read keeps the keys it has. A new key applies to new
-connections, since each connection signs under the key its challenge announced (R12-6). A new
-ACTIVE gateway key also closes the connections still on the old one (`key_rotated`), so they
-reconnect under it (fix round 1, I-1).
+`gw.trusted_key` and its secret, and refuses to start if that fails. It re-reads them at once on
+`NOTIFY jarvis_keys`, which core sends when a key activates (R12-28), and every
+`key_refresh_interval` (60 s) as a backstop. A failed re-read keeps the keys it has. A new key
+applies to new connections, since each connection signs under the key its challenge announced
+(R12-6). A new ACTIVE gateway key also closes the connections still on the old one (`key_rotated`),
+so they reconnect under it (fix round 1, I-1).
 
 `main` asks the Tailscale sidecar for its tailnet IPv4 address and binds uvicorn only to that
 address, port 8443. It exits non-zero if the address is unknown or isn't a tailnet address, so
@@ -24,7 +25,7 @@ import contextlib
 import logging
 import os
 import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -64,28 +65,35 @@ async def _check_role(pool: AsyncConnectionPool[psycopg.AsyncConnection[Any]]) -
         raise RuntimeError(f"the gateway connects only as {GATEWAY_ROLE}")
 
 
-async def _refresh_keys(
+async def _reload_keys(
     ctx: GatewayContext,
     pool: AsyncConnectionPool[psycopg.AsyncConnection[Any]],
     secrets_dir: Path,
-    interval: float,
+    lock: asyncio.Lock,
 ) -> None:
-    """Re-read the trusted keys every `interval` real seconds; keep the current ones on failure."""
-    while True:
-        await asyncio.sleep(interval)
+    """Re-read the trusted keys; keep the current ones on failure. A new ACTIVE gateway key
+    closes the connections still on the old one (`key_rotated`), so they reconnect under it."""
+    async with lock:
         try:
             async with pool.connection() as conn:
                 keys = await load_keys(conn, secrets_dir)
         except Exception as e:  # the message names a secret file or a role, never a key
             log.warning("trusted keys not reloaded: %s", e)
-            continue
+            return
         if keys.ids != ctx.keys.ids:
             log.info("trusted keys reloaded: gateway key %s, core key %s", *keys.ids)
         rotated = keys.gw_key_id != ctx.keys.gw_key_id
         ctx.keys = keys
-        if rotated:  # connections still on the old key reconnect under the new one (I-1)
+        if rotated:  # fix round 1, I-1
             closed = ctx.relay.close_rotated(keys.gw_key_id)
             log.info("closed %d connections on the replaced gateway key", closed)
+
+
+async def _refresh_keys(reload: Callable[[], Awaitable[None]], interval: float) -> None:
+    """The backstop: re-read the trusted keys every `interval` real seconds."""
+    while True:
+        await asyncio.sleep(interval)
+        await reload()
 
 
 def create_app(
@@ -130,9 +138,13 @@ def create_app(
                     relay=relay,
                     send_timeout=send_timeout,
                 )
-                refresher = asyncio.create_task(
-                    _refresh_keys(app.state.gateway, pool, secrets_dir, key_refresh_interval)
-                )
+                lock = asyncio.Lock()
+
+                async def reload() -> None:
+                    await _reload_keys(app.state.gateway, pool, secrets_dir, lock)
+
+                relay.on_keys = reload  # NOTIFY jarvis_keys: re-read at once (R12-28)
+                refresher = asyncio.create_task(_refresh_keys(reload, key_refresh_interval))
                 try:
                     yield
                 finally:

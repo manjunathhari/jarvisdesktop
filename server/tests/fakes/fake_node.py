@@ -35,7 +35,8 @@ overlap is dropped when a later keyset arrives. On close code 4409, an unpinned 
 a challenge, a ``gw-transport`` envelope on a connection whose gateway key is no longer pinned
 or signed under a key it never pinned, or a core signature under an unknown ``key_id``, the
 node runs nothing, keeps its
-journal (the state file), closes and sets ``prompt = "reenrol"`` (R5-1).
+journal (the state file), closes and sets ``prompt = "reenrol"`` (R5-1). Any other close
+means reconnect (``may_reconnect``, ``reconnect()``; R12-29).
 
 Also here: ``FakeWhoIs`` (dict-backed ``whois``) and ``PeerFromHeader``, a test-only ASGI
 wrapper that sets the connection's peer address from a request header, because Starlette's
@@ -174,6 +175,7 @@ class FakeNode:
         self.received_envelopes: list[dict[str, Any]] = []
         self.discarded = False
         self.prompt: str | None = None  # "reenrol": Jarvis's keys have changed (R5-1)
+        self.last_close: int | None = None  # the gateway's last close code
         self.sent: list[str] = []  # the kinds this FakeNode sent, in order
         self.challenge: dict[str, Any] | None = None
         self.last_sent: str | None = None
@@ -274,6 +276,21 @@ class FakeNode:
                 self.pinned_gateway.pop(key_id, None)
                 del self.key_expiry[key_id]
                 self._save()
+
+    @property
+    def may_reconnect(self) -> bool:
+        """R12-29: reconnect after any close except 4409 (4401 with any reason, such as
+        `key_rotated`, `superseded`, `heartbeat` or `send_timeout`), unless a signature under a
+        key it never pinned or no longer trusts has asked for re-enrolment."""
+        return self.prompt is None and self.last_close != REENROL_CLOSE
+
+    def reconnect(self) -> dict[str, Any]:
+        """Connect again and say ``hello``; returns the ``welcome`` payload."""
+        if not self.may_reconnect:
+            raise RuntimeError("this device must be re-enrolled")
+        self.close()
+        self.connect()
+        return self.hello()
 
     def sent_kinds(self) -> list[str]:
         return list(self.sent)
@@ -437,6 +454,7 @@ class FakeNode:
         message = ws.portal.call(_next)
         if message["type"] == "websocket.close":
             self.close()
+            self.last_close = message.get("code")
             if message.get("code") == REENROL_CLOSE:
                 self.prompt = "reenrol"  # runs nothing; the state file (journal) is kept
             raise WebSocketDisconnect(code=message.get("code", 1000))

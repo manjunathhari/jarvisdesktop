@@ -17,6 +17,7 @@ Time is injected: the gateway's and the nodes' FakeClock, and `activate_ready(no
 
 from __future__ import annotations
 
+import dataclasses
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -428,11 +429,12 @@ def test_activation_waits_for_all_acks_or_24h(app: Conn, owner: Conn, dsns: Dsns
     t0 = _created(app, key_id)
     assert keys.activate_ready(app, t0 + timedelta(hours=1)) == []
     _ack_as_gateway(dsns, a, _item_of(app, key_id, a)["id"])
-    assert keys.activate_ready(app, t0 + timedelta(hours=23, minutes=59)) == []  # b hasn't
+    assert keys.activate_ready(app, t0 + timedelta(hours=22, minutes=59)) == []  # b hasn't
     assert _row(app, key_id)["state"] == "NEXT" and _state(app, b) == "CURRENT"
-    assert keys.activate_ready(app, t0 + DAY) == [key_id]
+    # R12-28: at 23 h, an hour before nodes drop the old key.
+    assert keys.activate_ready(app, t0 + timedelta(hours=23)) == [key_id]
     assert _row(app, key_id)["state"] == "ACTIVE"
-    assert _row(app, key_id)["activated_at"] == t0 + DAY
+    assert _row(app, key_id)["activated_at"] == t0 + timedelta(hours=23)
     old = _row(app, _id(ks.core))
     assert old["state"] == "RETIRED" and old["retired_at"] is None  # retired, pending
     assert (_state(app, a), _state(app, b)) == ("CURRENT", "STALE")
@@ -717,8 +719,8 @@ def _stale_after_core_rotation(
     key_id = keys.announce(app, role=role, public_key=public_bytes(new))
     assert _wait_for(lambda: _acked(app, key_id, a))
     t0 = _created(app, key_id)
-    assert keys.activate_ready(app, t0 + timedelta(hours=23)) == []
-    clock.now = t0 + DAY + timedelta(minutes=1)
+    assert keys.activate_ready(app, t0 + timedelta(hours=22)) == []
+    clock.now = t0 + timedelta(hours=23)  # the timeout activation (R12-28)
     assert keys.activate_ready(app, clock()) == [key_id]
     assert (_state(app, a.node_id), _state(app, b.node_id)) == ("CURRENT", "STALE")
     return a, b, key_id, new
@@ -1081,3 +1083,136 @@ def test_transport_signed_under_an_unknown_key_prompts_reenrol(
         with pytest.raises(Rejected) as e:
             again.inject(gw.gw_envelope(again, "node.action", action))
         assert e.value.reason == "bad_signature" and again.prompt is None and again.actions == []
+
+
+# ------------------------------------------------------------------------------ fix round 2
+
+
+def _closed(fake: FakeNode) -> bool:
+    if not fake.connected:
+        return True
+    try:
+        fake.drain(0.02)
+    except WebSocketDisconnect:
+        return True
+    return not fake.connected
+
+
+def _close_reason(app: Conn, node_id: uuid.UUID | None) -> list[str | None]:
+    rows = app.execute(
+        "SELECT close_reason FROM gw.node_connection WHERE node_id = %s ORDER BY id", (node_id,)
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def test_timeout_activation_at_23h_moves_acked_nodes_via_notify(
+    app: Conn, dsns: Dsns, ks: Keys, tmp_path: Path
+) -> None:
+    """R12-28: B never acks, so the GATEWAY key activates at issued_at + 23 h. Core's NOTIFY
+    jarvis_keys makes the gateway re-read at once (the 60 s backstop is off here) and close A's
+    old-key connection. A reconnects under the new key and is never asked to re-enrol, also
+    after the old key's 24 h; B is STALE."""
+    clock = _clock(app)
+    with gateway(dsns, ks, tmp_path, clock, refresh=3600) as gw:
+        a = _enrolled(gw, app)
+        b = _enrolled(gw, app)
+        b.close()
+        new = Ed25519PrivateKey.generate()
+        key_id = keys.announce(app, role="GATEWAY", public_key=public_bytes(new))
+        ks.place(f"gateway_signing_key_{key_id}", new)
+        assert _wait_for(lambda: _acked(app, key_id, a))
+        t0 = _created(app, key_id)
+        assert keys.activate_ready(app, t0 + timedelta(hours=22, minutes=59)) == []
+        clock.now = t0 + timedelta(hours=23)
+        a.sync()  # still on the old key, which A trusts until + 24 h
+        assert keys.activate_ready(app, clock()) == [key_id]
+        assert _wait_for(lambda: _closed(a))
+        assert _close_reason(app, a.node_id)[-1] == "key_rotated"
+        assert a.last_close == 4401 and a.may_reconnect and a.prompt is None
+        a.reconnect()
+        assert a.challenge is not None and a.challenge["key_id"] == key_id
+        clock.now = t0 + DAY + timedelta(minutes=1)  # A drops the old key
+        a.sync()
+        assert _id(ks.gw) not in a.pinned_gateway
+        assert a.prompt is None and a.rejected == [] and a.connected
+        assert (_state(app, a.node_id), _state(app, b.node_id)) == ("CURRENT", "STALE")
+
+
+def test_all_acks_activation_rereads_at_once(
+    app: Conn, dsns: Dsns, ks: Keys, tmp_path: Path
+) -> None:
+    """R12-28: an activation from all acks wakes the gateway through NOTIFY too."""
+    clock = _clock(app)
+    with gateway(dsns, ks, tmp_path, clock, refresh=3600) as gw:
+        a = _enrolled(gw, app)
+        new = Ed25519PrivateKey.generate()
+        key_id = keys.announce(app, role="GATEWAY", public_key=public_bytes(new))
+        ks.place(f"gateway_signing_key_{key_id}", new)
+        assert _wait_for(lambda: _acked(app, key_id, a))
+        assert keys.activate_ready(app, clock()) == [key_id]
+        assert _wait_for(lambda: _closed(a))
+        assert _close_reason(app, a.node_id)[-1] == "key_rotated"
+        assert gw.app.state.gateway.keys.gw_key_id == key_id
+        a.reconnect()
+        assert a.challenge is not None and a.challenge["key_id"] == key_id
+        assert a.prompt is None and a.rejected == []
+
+
+def test_close_codes_follow_r12_29(app: Conn, dsns: Dsns, ks: Keys, tmp_path: Path) -> None:
+    """R12-29: 4401 with any reason means reconnect; only 4409 means re-enrol."""
+    clock = _clock(app)
+    with gateway(dsns, ks, tmp_path, clock) as gw:
+        a = _enrolled(gw, app)
+        # superseded: the same device connects again.
+        second = _again(gw, a)
+        second.hello()
+        assert _wait_for(lambda: _closed(a))
+        assert a.last_close == 4401 and a.may_reconnect and a.prompt is None
+        second.close()
+        a.reconnect()
+        # heartbeat: three pings left unanswered.
+        a.answer_pings = False
+        for _ in range(5):
+            clock.advance(31)
+            _wait_for(lambda: _closed(a), timeout=0.3)
+        assert _wait_for(lambda: _closed(a))
+        assert _close_reason(app, a.node_id)[-1] == "heartbeat"
+        assert a.last_close == 4401 and a.may_reconnect and a.prompt is None
+        a.answer_pings = True
+        a.reconnect()
+        a.close()
+        # 4409: re-enrol, never reconnect.
+        app.execute("UPDATE gw.node SET key_state = 'STALE' WHERE id = %s", (a.node_id,))
+        with pytest.raises(WebSocketDisconnect):
+            a.connect()
+            a.hello()
+        assert a.last_close == 4409 and a.prompt == "reenrol" and not a.may_reconnect
+        with pytest.raises(RuntimeError, match="re-enrolled"):
+            a.reconnect()
+
+
+def test_handshake_caught_by_a_key_swap_delivers_nothing(
+    app: Conn, dsns: Dsns, ks: Keys, tmp_path: Path
+) -> None:
+    """Re-review Minor: a session that finishes its handshake on a key the gateway has just
+    replaced is closed `key_rotated`, and its link delivers nothing (no outbox item)."""
+    clock = _clock(app)
+    with gateway(dsns, ks, tmp_path, clock, refresh=3600) as gw:
+        a = _enrolled(gw, app)
+        a.close()
+        _person_item(app)
+        ctx = gw.app.state.gateway
+        old = ctx.keys
+        # The swap lands between this connection's challenge and its registration.
+        fake_new = dataclasses.replace(old, gw_key_id="b" * 16)
+        again = _again(gw, a)
+        again.connect()
+        ctx.keys = fake_new
+        try:
+            again.hello()
+            assert _wait_for(lambda: _closed(again))
+        finally:
+            ctx.keys = old
+        assert not any(e["kind"] == "outbox.item" for e in again.received_envelopes)
+        assert _close_reason(app, a.node_id)[-1] == "key_rotated"
+        assert again.may_reconnect and again.prompt is None

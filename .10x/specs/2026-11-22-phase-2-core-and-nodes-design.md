@@ -508,6 +508,7 @@ A valid gateway signature alone is never enough.
   - Nodes that hadn't acknowledged are marked STALE.
   - **Refusing a stale node (R6-6):** every connection, a stale node's included, first receives the pre-authentication `challenge` (§6.1 step 2). The challenge authorises nothing and carries no Jarvis content: a nonce, times and the gateway's key. After a STALE node's `hello` passes path A's checks, the gateway closes with code **4409** (`reenrol_required`) **instead of** `welcome`. It sends no welcome, summary, outbox item, reply chunk or action. If the gateway key itself was rotated, the stale node can't verify the challenge (an unpinned key) and closes before sending `hello` (§6.1 step 3).
   - A node that sees 4409, or any signature with an unknown `key_id`, runs nothing and asks to be re-enrolled.
+  - Any other close, including 4401 with any reason (`key_rotated`, `superseded`, `heartbeat`, `send_timeout`), means reconnect, never re-enrol (R12-29). A `gw-transport` envelope carries no `key_id`, so a node treats one that verifies under none of its pinned gateway keys as signed under an unknown key.
   - `jarvis-core node reenrol <node_id>` revokes the old node and issues a new enrolment code carrying the current fingerprints.
   - A node never accepts a key from the gateway alone.
 - **Compromise:** if the core key leaks, every node is re-enrolled (there's a runbook step). The keys are kept in the secret files, so a leak needs server access.

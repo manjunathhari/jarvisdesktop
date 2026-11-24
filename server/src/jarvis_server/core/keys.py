@@ -19,11 +19,12 @@ legacy secret `core_signing_key` when its fingerprint is the ACTIVE key_id
   the node. The overlap starts at `issued_at` (the key row's `created_at`), and `valid_until` is
   `issued_at` + 24 h (R6-2, R12-27).
 - `activate_ready` makes a NEXT key ACTIVE once every keyset item for a non-revoked node is
-  ACKNOWLEDGED, or once 24 h have passed. The previous ACTIVE key of that role becomes
-  retired-pending. In the same transaction it marks every non-revoked CURRENT node without an
-  acknowledged item STALE (R5-1). This includes a node enrolled after the announcement: it
-  never learned the new key. The job `keys.activate` runs it (the scheduler queues it every
-  minute, Task 13).
+  ACKNOWLEDGED, or once 23 h have passed (R12-28), an hour before nodes drop the old key. The
+  previous ACTIVE key of that role becomes retired-pending. In the same transaction it marks every
+  non-revoked CURRENT node without an acknowledged item STALE (R5-1). This includes a node
+  enrolled after the announcement: it never learned the new key. Each activation NOTIFYs
+  `jarvis_keys`, so the gateway re-reads its keys at once. The job `keys.activate` runs it (the
+  scheduler queues it every minute, Task 13).
 - `retire` ends a retired-pending key's overlap. A NEXT key is never withdrawn (I-2), and only
   one key is announced at a time, for either role (M-4).
 
@@ -51,7 +52,9 @@ log = logging.getLogger("jarvis.core.keys")
 Role = Literal["CORE", "GATEWAY"]
 ROLES: tuple[Role, ...] = ("CORE", "GATEWAY")
 SECRET_NAMES: dict[Role, str] = {"CORE": "core_signing_key", "GATEWAY": "gateway_signing_key"}
-OVERLAP = timedelta(hours=24)  # the keyset's validity and the longest wait for acknowledgements
+OVERLAP = timedelta(hours=24)  # the keyset's validity: nodes keep the old key this long
+# The latest activation: an hour before any node drops the old key (R12-28).
+ACTIVATE_BY = timedelta(hours=23)
 KEYSET_KIND = "keys.keyset"
 ACTIVATE_JOB = "keys.activate"
 # One lock for every change to the trusted keys (announce, activate, retire, init).
@@ -283,10 +286,11 @@ def announce(conn: psycopg.Connection[Any], *, role: Role, public_key: bytes) ->
 def activate_ready(conn: psycopg.Connection[Any], now: datetime) -> list[str]:
     """Activate every NEXT key that is ready at `now`; return their key_ids.
 
-    Ready: no keyset item addressed to a non-revoked node is still unacknowledged, or
-    `now >= created_at + 24 h`. In the same transaction the role's previous ACTIVE key becomes
-    retired-pending, and every non-revoked CURRENT node without an ACKNOWLEDGED item for the key
-    is marked STALE.
+    Ready: no keyset item addressed to a non-revoked node is still unacknowledged, or `now >=
+    created_at + 23 h` (R12-28: an hour before nodes drop the old key at + 24 h). Each activation
+    NOTIFYs `jarvis_keys` with the key_id, so the gateway re-reads at once. In the same transaction
+    the role's previous ACTIVE key becomes retired-pending, and every non-revoked CURRENT node
+    without an ACKNOWLEDGED item for the key is marked STALE.
     """
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must carry a time zone")
@@ -304,7 +308,7 @@ def activate_ready(conn: psycopg.Connection[Any], now: datetime) -> list[str]:
                 (items,),
             ).fetchone()
             assert waiting is not None
-            if waiting[0] > 0 and now < created_at + OVERLAP:
+            if waiting[0] > 0 and now < created_at + ACTIVATE_BY:
                 continue
             conn.execute(
                 "UPDATE gw.trusted_key SET state = 'RETIRED' WHERE role = %s AND state = 'ACTIVE'",
@@ -322,6 +326,8 @@ def activate_ready(conn: psycopg.Connection[Any], now: datetime) -> list[str]:
                 " RETURNING id",
                 (items,),
             ).fetchall()
+            # The gateway re-reads its keys at once (R12-28); delivered on commit.
+            conn.execute("SELECT pg_notify('jarvis_keys', %s)", (key_id,))
             log.info("activated %s key %s; %d nodes marked STALE", role, key_id, len(stale))
             activated.append(str(key_id))
     return activated

@@ -301,6 +301,9 @@ def _keys(args: argparse.Namespace) -> int:
                 for k in keys.list_keys(conn):
                     retired = "" if k.retired_at is None else f" retired {k.retired_at.isoformat()}"
                     pending = " (overlap)" if k.state == "RETIRED" and k.retired_at is None else ""
+                    if k.state == "NEXT":  # R12-28: all acks, or this deadline
+                        by = (k.created_at + keys.ACTIVATE_BY).isoformat()
+                        pending = f" (activates when every node acks, or at {by})"
                     print(f"{k.role} {k.key_id} {k.state}{pending}{retired}", flush=True)
                 for node_id, name in keys.stale_nodes(conn):
                     print(f"STALE {node_id} {name}  (run: jarvis-core node reenrol {node_id})")

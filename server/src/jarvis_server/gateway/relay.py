@@ -3,9 +3,10 @@ heartbeat and the `welcome` contents (spec §6.2, §8.2, §8.3; R8-1, R9-1, R12-
 
 **One `Relay` per gateway process.** It keeps the registry of live connections (one `NodeLink`
 per node: a newer connection of the same node replaces and stops the older one, whose row
-`gw.open_connection` has already closed as `superseded`), LISTENs on `jarvis_stream` and
-`jarvis_outbox`, and runs a ticker for the heartbeat and the 60 s re-send sweep. Time comes from
-the injected clock (`now()`), never from sleeps.
+`gw.open_connection` has already closed as `superseded`), LISTENs on `jarvis_stream`,
+`jarvis_outbox` and `jarvis_keys` (a key activated: the app re-reads its keys at once, R12-28),
+and runs a ticker for the heartbeat and the 60 s re-send sweep. Time comes from the injected
+clock (`now()`), never from sleeps.
 
 **Nothing shared waits on a socket (fix round 1, I-1).** Each link has its own queue and sender
 task; the listener, fan-out, ticker and sweep only enqueue. Every send is bounded by the send
@@ -257,7 +258,7 @@ class NodeLink:
         person_id: UUID,
         conn_id: int,
         connected_at: datetime,
-        gw_key_id: str = "",
+        gw_key_id: str,
     ) -> None:
         self.relay = relay
         self.gw_key_id = gw_key_id  # the gateway key this connection signs under (R12-6)
@@ -571,6 +572,8 @@ class Relay:
         self._tasks: list[asyncio.Task[None]] = []
         self._listening = asyncio.Event()
         self._next_sweep: datetime | None = None
+        # Re-reads the trusted keys (set by the app): run on `jarvis_keys` and on a re-LISTEN.
+        self.on_keys: Callable[[], Awaitable[None]] | None = None
 
     async def start(self) -> None:
         self._tasks = [asyncio.create_task(self._listen()), asyncio.create_task(self._tick())]
@@ -622,6 +625,7 @@ class Relay:
                 ) as conn:
                     await conn.execute("LISTEN jarvis_stream")
                     await conn.execute("LISTEN jarvis_outbox")
+                    await conn.execute("LISTEN jarvis_keys")  # R12-28
                     if self._listening.is_set():  # a re-LISTEN: catch up on what was missed
                         await self._catch_up()
                     self._listening.set()
@@ -634,10 +638,18 @@ class Relay:
                 await asyncio.sleep(1.0)
 
     async def _catch_up(self) -> None:
+        await self._keys_changed()
         for link in list(self._links.values()):
             link.resync()
 
+    async def _keys_changed(self) -> None:
+        if self.on_keys is not None:
+            await self.on_keys()
+
     async def _on_notify(self, channel: str, payload: str) -> None:
+        if channel == "jarvis_keys":  # a key activated: re-read at once (R12-28)
+            await self._keys_changed()
+            return
         try:
             key = UUID(payload)
         except ValueError:

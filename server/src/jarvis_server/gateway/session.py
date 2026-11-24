@@ -234,7 +234,8 @@ class Session:
             )
             self.ctx.relay.register(self.link)
             if self.keys.gw_key_id != self.ctx.keys.gw_key_id:  # rotated during the handshake
-                self.stop(relay.KEY_ROTATED, relay.KEY_ROTATED)
+                # Stops the link too, so on_connect delivers nothing under the replaced key.
+                self.link._stop(relay.KEY_ROTATED, relay.KEY_ROTATED)
             try:
                 await self.link.on_connect(self._resume)
                 await self._established()
