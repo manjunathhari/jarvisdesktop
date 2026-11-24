@@ -16,7 +16,22 @@ data-encoding.workspace = true
 base64.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+zeroize.workspace = true
+
+# DPAPI key storage and write-through renames (Windows only).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+] }
+
+[features]
+# Test doubles (MemoryKeyStore) for this crate's integration tests and test tools.
+test-support = []
 
 [dev-dependencies]
+jarvis-node = { path = ".", features = ["test-support"] }
+tempfile = "3"
 hex = "0.4"
 jsonschema = { version = "0.30", default-features = false }
