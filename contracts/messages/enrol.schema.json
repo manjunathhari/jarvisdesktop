@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/enrol.schema.json",
+  "title": "Payload of `enrol`",
+  "description": "node → gateway: a new device's reply to `challenge` (§7.2 step 3): the enrolment token, the device's new public key and the challenge's nonce. Envelope `node_id` = the nil UUID, `seq` = 1, signed `node-msg` with the new key.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "token",
+    "public_key",
+    "nonce"
+  ],
+  "properties": {
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{16,128}$"
+    },
+    "public_key": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "description": "Raw 32-byte Ed25519 public key, base64url without padding."
+    },
+    "nonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "description": "32 random bytes, base64url without padding (43 characters); the challenge's nonce."
+    }
+  }
+}

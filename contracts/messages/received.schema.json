@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/received.schema.json",
+  "title": "Payload of `received`",
+  "description": "node → gateway: transport confirmation. `{outbox_id}` for an outbox item, or `{reply_id, seq}`, which acknowledges every chunk of the reply up to `seq`.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "outbox_id"
+      ],
+      "properties": {
+        "outbox_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reply_id",
+        "seq"
+      ],
+      "properties": {
+        "reply_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  ]
+}

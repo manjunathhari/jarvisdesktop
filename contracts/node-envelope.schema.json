@@ -2,16 +2,18 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/node-envelope.schema.json",
   "title": "Node message envelope",
-  "description": "Wrapper for every message between a node (desktop, phone) and the gateway. STUB: shape may grow before it is used.",
+  "description": "Wrapper for every message between a node (desktop, phone) and the gateway (spec §7.1). `sig` is Ed25519 over every other field: purpose `node-msg` from a node, `gw-transport` from the gateway. `seq` is per sender, per connection, from 1, going up by exactly 1. The payload shape for each kind is in messages/<kind>.schema.json.",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "version",
     "message_id",
     "node_id",
+    "seq",
     "sent_at",
     "kind",
-    "payload"
+    "payload",
+    "sig"
   ],
   "properties": {
     "version": {
@@ -23,8 +25,8 @@
     },
     "node_id": {
       "type": "string",
-      "minLength": 1,
-      "maxLength": 100
+      "format": "uuid",
+      "description": "The node's gw.node.id: the sender for node messages, the recipient for gateway messages. The nil UUID only on `challenge` and on an `enrol` from a device without a node ID (§6.1)."
     },
     "session_id": {
       "type": [
@@ -33,17 +35,67 @@
       ],
       "format": "uuid"
     },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Per sender, per connection (R6-8): each side numbers the messages it sends from 1 (`challenge` for the gateway; `hello` or `enrol` for the node), going up by exactly 1. Each side checks the other side's counter; a gap, repeat or decrease closes the connection."
+    },
     "sent_at": {
       "type": "string",
       "format": "date-time"
     },
     "kind": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 100
+      "enum": [
+        "challenge",
+        "enrol",
+        "hello",
+        "welcome",
+        "utterance",
+        "reply.chunk",
+        "outbox.item",
+        "outbox.cleared",
+        "received",
+        "ack",
+        "approval.decision",
+        "node.action",
+        "action.receipt",
+        "keyset",
+        "ping",
+        "pong",
+        "error"
+      ]
     },
     "payload": {
       "type": "object"
+    },
+    "sig": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{86}$",
+      "description": "Ed25519 signature, base64url without padding (64 bytes)."
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "node_id": {
+            "const": "00000000-0000-0000-0000-000000000000"
+          }
+        },
+        "required": [
+          "node_id"
+        ]
+      },
+      "then": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "challenge",
+              "enrol"
+            ]
+          }
+        }
+      }
+    }
+  ]
 }

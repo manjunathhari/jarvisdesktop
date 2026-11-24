@@ -1,5 +1,6 @@
 # QA — index
 ## Active features
+- phase-2-core-and-nodes — reviewed 2026-11-24, no blocking issues after the final fix wave
 - phase-1-memory-engine — reviewed 2026-11-22, no blocking issues
 - phase-0-foundations — server foundations (72 tests; P0-7 deferred)
 ## Principles

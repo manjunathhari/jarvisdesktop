@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/reply.chunk.schema.json",
+  "title": "Payload of `reply.chunk`",
+  "description": "gateway → node: one chunk of a streamed reply. SPEECH carries `text` (authz null); ACTION carries `authz` (text null).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "reply_id",
+    "seq",
+    "type",
+    "text",
+    "authz",
+    "final"
+  ],
+  "properties": {
+    "reply_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "type": {
+      "enum": [
+        "SPEECH",
+        "ACTION"
+      ]
+    },
+    "text": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "maxLength": 4000
+    },
+    "authz": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "authz.schema.json"
+        }
+      ]
+    },
+    "final": {
+      "type": "boolean"
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "type": {
+          "const": "SPEECH"
+        },
+        "text": {
+          "type": "string"
+        },
+        "authz": {
+          "type": "null"
+        }
+      }
+    },
+    {
+      "properties": {
+        "type": {
+          "const": "ACTION"
+        },
+        "text": {
+          "type": "null"
+        },
+        "authz": {
+          "type": "object"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/node.action.schema.json",
+  "title": "Payload of `node.action`",
+  "description": "gateway → node: an action to run, authorised only by the core-signed `authz` (§7.1).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "authz"
+  ],
+  "properties": {
+    "authz": {
+      "$ref": "authz.schema.json"
+    }
+  }
+}

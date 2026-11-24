@@ -44,6 +44,47 @@ def enqueue(
     return int(row[0])
 
 
+JOB_KEY = "job_key"
+
+
+def job_key(kind: str, item: str) -> str:
+    """The deterministic key of the one job for `item` (an ID, or a period such as a minute)."""
+    return f"{kind}:{item}"
+
+
+def requeue_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """A job's payload for a later run of the same work (a handler re-queueing itself), without
+    its `job_key`: the key stays with the first job, so the unique index would refuse a copy,
+    and an item's key keeps the scheduler from queueing it again (R12-32)."""
+    return {k: v for k, v in payload.items() if k != JOB_KEY}
+
+
+def enqueue_once(
+    conn: psycopg.Connection[Any],
+    kind: str,
+    key: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    delay: timedelta = timedelta(0),
+) -> int | None:
+    """Enqueue `kind` with `key` in its payload (`job_key`), unless a job of that kind with the
+    same key exists already, in any status: at most one job per due item (plan Task 13). Returns
+    the new job's ID, or None.
+
+    The unique index `ops.job_one_per_key` (migration 0013, R12-32) is the guarantee: a conflict
+    means the job is already queued. A second caller racing an uncommitted insert of the same
+    key waits for it, then gets None if it commits, or inserts if it rolls back. One statement,
+    so it works alike in autocommit and inside a job transaction, and needs no lock of its own.
+    Finished jobs are deleted after 30 days (§5.7), and only then can a key be queued again."""
+    row = conn.execute(
+        "INSERT INTO ops.job (kind, payload, run_at) VALUES (%s, %s, now() + %s)"
+        " ON CONFLICT (kind, (payload->>'job_key')) WHERE payload ? 'job_key' DO NOTHING"
+        " RETURNING id",
+        (kind, Jsonb({**(payload or {}), JOB_KEY: key}), delay),
+    ).fetchone()
+    return None if row is None else int(row[0])
+
+
 def claim(
     conn: psycopg.Connection[Any], worker: str, lease: timedelta = timedelta(minutes=5)
 ) -> Job | None:

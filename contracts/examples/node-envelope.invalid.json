@@ -1,9 +1,14 @@
 {
-  "version": 2,
+  "version": 1,
   "message_id": "0b8f7c1e-3a8e-4d4f-9a55-2f6f1c3d9e01",
-  "node_id": "desktop-manj",
+  "node_id": "00000000-0000-0000-0000-000000000000",
+  "session_id": null,
+  "seq": 1,
   "sent_at": "2026-11-21T10:00:00Z",
   "kind": "utterance",
-  "payload": {},
-  "extra": true
+  "payload": {
+    "text": "what's on Thursday?",
+    "screen_summary": null
+  },
+  "sig": "dksluO19FKvR7rLL6JmCBaSW8aAm3Nt4ejBNgqyQ9zOR1vqG9KhecJnrosb7VIEsnpAIh_L0EPjm0FbPeYK7Bg"
 }

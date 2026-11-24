@@ -30,6 +30,17 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Signing vectors are reproducible (independent generator)
+        working-directory: contracts/signing-vectors
+        run: |
+          npm ci
+          node generate.mjs vectors > /tmp/v.json
+          node generate.mjs authz-cases > /tmp/a.json
+          diff vectors.json /tmp/v.json
+          diff authz-cases.json /tmp/a.json
       - name: Install
         run: uv sync --locked --python 3.12
       - name: Lint
@@ -40,6 +51,15 @@ jobs:
         run: uv run pytest -v
       - name: Compose file is valid
         run: docker compose -f deploy/compose.yaml config --quiet
+        env:
+          JARVIS_REF: ${{ github.sha }}
+      - name: No service publishes a port (P0-8, P2-S5)
+        run: |
+          docker compose -f deploy/compose.yaml --profile '*' config > "$RUNNER_TEMP/compose.yaml"
+          if grep -nE '^\s*ports:' "$RUNNER_TEMP/compose.yaml"; then
+            echo "deploy/compose.yaml must not publish ports" >&2
+            exit 1
+          fi
         env:
           JARVIS_REF: ${{ github.sha }}
       - name: Image builds

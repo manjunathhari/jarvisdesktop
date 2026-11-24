@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/outbox.item.schema.json",
+  "title": "Payload of `outbox.item`",
+  "description": "gateway → node: one outbox item (§8.2). `authz` is set for approval cards and approved actions, otherwise null.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "outbox_id",
+    "priority",
+    "kind",
+    "body",
+    "expires_at",
+    "authz"
+  ],
+  "properties": {
+    "outbox_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "priority": {
+      "enum": [
+        "URGENT",
+        "TODAY",
+        "DIGEST",
+        "SILENT"
+      ]
+    },
+    "kind": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.]{0,63}$"
+    },
+    "body": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000
+    },
+    "expires_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "authz": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "authz.schema.json"
+        }
+      ]
+    }
+  }
+}

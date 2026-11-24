@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/keyset.schema.json",
+  "title": "Payload of `keyset`",
+  "description": "gateway → node: a new core or gateway public key, announced in an `authz` (kind `keyset`) signed by the current core key. The node accepts it only if `authz.object.args` names the same role, key_id and public_key, and `authz.object.target_node_id` is null or the node itself (R12-27). `outbox_id` is the unsigned ID of the `keys.keyset` outbox item; the node acks it only after accepting the keyset (R12-26).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "outbox_id",
+    "role",
+    "key_id",
+    "public_key",
+    "authz"
+  ],
+  "properties": {
+    "outbox_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The `keys.keyset` outbox item; not signed (R12-26)."
+    },
+    "role": {
+      "enum": [
+        "core",
+        "gateway"
+      ]
+    },
+    "key_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+    },
+    "public_key": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "description": "Raw 32-byte Ed25519 public key, base64url without padding."
+    },
+    "authz": {
+      "$ref": "authz.schema.json"
+    }
+  }
+}

@@ -1,0 +1,88 @@
+"""Provider-neutral brain types (spec §10).
+
+Prompts and outputs are plain frozen dataclasses so a second provider can sit behind the same
+`Brain` interface later. Nothing here knows about Claude or HTTP.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Any, Literal, Protocol
+
+
+@dataclass(frozen=True)
+class Turn:
+    role: Literal["person", "jarvis"]
+    text: str
+
+
+@dataclass(frozen=True)
+class MemoryLine:
+    memory_id: str
+    text: str
+    drives_action: bool
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class BrainRequest:
+    system: str
+    history: list[Turn]
+    utterance: str
+    screen_summary: str
+    memory: list[MemoryLine]
+    tools: list[ToolSpec]
+    max_tokens: int
+
+
+@dataclass(frozen=True)
+class Speech:
+    text: str
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    name: str
+    args: dict[str, Any]
+
+
+BrainEvent = Speech | ToolCall
+
+
+class CallPhase(StrEnum):
+    """Where a failed call stopped (§10.1 step 4).
+
+    CONNECT: no request byte was written, so the budget reservation may be released.
+    SEND: the request may have reached the provider, so the reservation is indeterminate.
+    """
+
+    CONNECT = "CONNECT"
+    SEND = "SEND"
+
+
+class BrainCallFailed(Exception):
+    """A brain call did not complete. `phase` says whether a request could have been sent."""
+
+    def __init__(self, phase: CallPhase, status: int | None = None, detail: str = "") -> None:
+        self.phase = phase
+        self.status = status
+        self.detail = detail
+        super().__init__(f"brain call failed in {phase} phase (status={status}) {detail}".strip())
+
+
+class Brain(Protocol):
+    """A brain call streams events; after a completed stream `usage` is
+    `(input_tokens, output_tokens)` as the provider reported them, or None if it did not
+    complete (or reported none, which the caller treats as fail closed)."""
+
+    usage: tuple[int, int] | None
+
+    def think(self, req: BrainRequest) -> Iterator[BrainEvent]: ...

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/pc.list_test_folder.args.schema.json",
+  "title": "Arguments of `pc.list_test_folder`",
+  "description": "The `authz.object.args` of a live `pc.list_test_folder` action (§9.3 step 2): none.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {}
+}

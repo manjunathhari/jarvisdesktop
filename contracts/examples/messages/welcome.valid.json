@@ -1,0 +1,24 @@
+{
+  "session_id": "6f5e4d3c-2b1a-4098-8776-655443322110",
+  "summary": [
+    {
+      "priority": "URGENT",
+      "group_key": null,
+      "outbox_ids": [
+        "0b8f7c1e-3a8e-4d4f-9a55-2f6f1c3d9e01"
+      ],
+      "line": null
+    },
+    {
+      "priority": "DIGEST",
+      "group_key": "brain",
+      "outbox_ids": [],
+      "line": "Claude was unavailable for 12 minutes; it is back."
+    }
+  ],
+  "enrolment": {
+    "node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+    "core_key_id": "core-1",
+    "core_public_key": "-LziJgkeR2m1UUOar0hpQYnM8Ic0NXg0GK2smOJsePY"
+  }
+}

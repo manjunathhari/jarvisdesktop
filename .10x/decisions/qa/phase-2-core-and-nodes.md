@@ -1,0 +1,17 @@
+# QA — phase-2-core-and-nodes
+- **Strategy:**
+  - Every task went through test-driven development plus an independent task review, with fix loops until no Critical or Important findings remained.
+  - Tests run against real Postgres, with real concurrency on separate connections.
+  - Gateway tests use an in-process FakeNode that enforces the node rules through the shared `node_rules` checkers.
+  - Clocks are injected, so there are no real sleeps.
+  - Mutation checks confirmed the key guards.
+- **Coverage:**
+  - Every spec §14 ID and the owner's five final-review areas map to named tests (`reviews/2026-11-24-phase-2-test-map.md`).
+  - Plan B rows (A7, A8, A10, and the Rust halves of E13 and S4) and live rows (S5 and S7 live, P0-8) are marked.
+  - P2-E13 runs 200 times by default; `JARVIS_E13_RUNS=1000` gives the full run.
+- **Gates:**
+  - 1 202 tests green with `-W error`.
+  - ruff, ruff format and mypy are clean.
+  - The compose config is valid.
+  - The init smoke shows the eight database-only P2 rows.
+- **Report:** `reviews/2026-11-24-phase-2-qa.md` (with fixes: I-1 summary per node, I-2 disconnects recorded, I-3 E13 gateway assertions, M-1 integer resume; all addressed in `e93118a`).

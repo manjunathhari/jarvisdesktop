@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/approval.decision.schema.json",
+  "title": "Payload of `approval.decision`",
+  "description": "node → gateway: the person's decision on an approval card. `card_sig` is the card's `authz.sig`, byte for byte.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "approval_id",
+    "decision",
+    "card_sig"
+  ],
+  "properties": {
+    "approval_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "decision": {
+      "enum": [
+        "APPROVED",
+        "DENIED"
+      ]
+    },
+    "card_sig": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{86}$",
+      "description": "Ed25519 signature, base64url without padding (64 bytes)."
+    }
+  }
+}

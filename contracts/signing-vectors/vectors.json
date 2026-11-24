@@ -1,0 +1,181 @@
+[
+  {
+    "name": "rfc8785-appendix",
+    "purpose": "core-authz",
+    "key_id": "core-1",
+    "seed_hex": "f264e9f21d91e25c527e7fed93838c7bdcb6ecebc7c2006919c39ed65eaadfd6",
+    "object": {
+      "numbers": [
+        333333333.3333333,
+        1e+30,
+        4.5,
+        0.002,
+        1e-27
+      ],
+      "string": "€$\u000f\nA'B\"\\\\\"/",
+      "literals": [
+        null,
+        true,
+        false
+      ]
+    },
+    "expected_canonical_utf8": "{\"literals\":[null,true,false],\"numbers\":[333333333.3333333,1e+30,4.5,0.002,1e-27],\"string\":\"€$\\u000f\\nA'B\\\"\\\\\\\\\\\"/\"}",
+    "expected_signed_bytes_hex": "6a61727669732d7369672d76310a636f72652d617574687a0a636f72652d310a7b226c69746572616c73223a5b6e756c6c2c747275652c66616c73655d2c226e756d62657273223a5b3333333333333333332e333333333333332c31652b33302c342e352c302e3030322c31652d32375d2c22737472696e67223a22e282ac245c75303030665c6e4127425c225c5c5c5c5c222f227d",
+    "expected_sig": "m80lq13ODPZ2R0bdwepsqPQ5Eofg6H3SRLhkPLaBa-ITnrilOvRuTnBAf53BhbH9SOSRKMYqkRpzrs36BJ-9Bg"
+  },
+  {
+    "name": "ascii-simple",
+    "purpose": "node-msg",
+    "key_id": "node-1",
+    "seed_hex": "899bece9e8387a6a0e5c11c05ce14a0d19f5366830be13d3f1de93e768b49c70",
+    "object": {
+      "kind": "ping",
+      "text": "hello jarvis"
+    },
+    "expected_canonical_utf8": "{\"kind\":\"ping\",\"text\":\"hello jarvis\"}",
+    "expected_signed_bytes_hex": "6a61727669732d7369672d76310a6e6f64652d6d73670a6e6f64652d310a7b226b696e64223a2270696e67222c2274657874223a2268656c6c6f206a6172766973227d",
+    "expected_sig": "Ytgo25d5lFTOf0-S4zq87lItIy6i8m5xe5zuEKLr7sFsRkStANfhxGdFF843BPiUrHYbO1J4MjZfPpUWAmB9CA"
+  },
+  {
+    "name": "nested-keys-unsorted",
+    "purpose": "gw-transport",
+    "key_id": "gw-1",
+    "seed_hex": "29583bffdd99485c17aef964b6f26de9924496bf66050d761e8aeb89bc53298a",
+    "object": {
+      "zeta": 1,
+      "alpha": {
+        "yankee": [
+          {
+            "delta": 1,
+            "charlie": 2
+          }
+        ],
+        "bravo": "b"
+      },
+      "mike": null
+    },
+    "expected_canonical_utf8": "{\"alpha\":{\"bravo\":\"b\",\"yankee\":[{\"charlie\":2,\"delta\":1}]},\"mike\":null,\"zeta\":1}",
+    "expected_signed_bytes_hex": "6a61727669732d7369672d76310a67772d7472616e73706f72740a67772d310a7b22616c706861223a7b22627261766f223a2262222c2279616e6b6565223a5b7b22636861726c6965223a322c2264656c7461223a317d5d7d2c226d696b65223a6e756c6c2c227a657461223a317d",
+    "expected_sig": "MFvBZtVDE3T3sp2QARVkKodSGojsfUvSs47rAijpQ9amvM3rpH4-5dvZbki3YFUo5662fo1gmv9KbjDPh0pfDQ"
+  },
+  {
+    "name": "kannada-and-emoji",
+    "purpose": "node-msg",
+    "key_id": "node-1",
+    "seed_hex": "899bece9e8387a6a0e5c11c05ce14a0d19f5366830be13d3f1de93e768b49c70",
+    "object": {
+      "screen_summary": null,
+      "text": "ನಮಸ್ಕಾರ 🙏"
+    },
+    "expected_canonical_utf8": "{\"screen_summary\":null,\"text\":\"ನಮಸ್ಕಾರ 🙏\"}",
+    "expected_signed_bytes_hex": "6a61727669732d7369672d76310a6e6f64652d6d73670a6e6f64652d310a7b2273637265656e5f73756d6d617279223a6e756c6c2c2274657874223a22e0b2a8e0b2aee0b2b8e0b38de0b295e0b2bee0b2b020f09f998f227d",
+    "expected_sig": "62AzbpkswsuK0xPRI9_-b93tHGdqYgbIwa83pTsmBiDAqqOIr2W8F1VGUSmfaYNB89FpoacAfcpzVSYpE6fAAQ"
+  },
+  {
+    "name": "hindi",
+    "purpose": "node-msg",
+    "key_id": "node-1",
+    "seed_hex": "899bece9e8387a6a0e5c11c05ce14a0d19f5366830be13d3f1de93e768b49c70",
+    "object": {
+      "screen_summary": "समाचार",
+      "text": "नमस्ते, आज का मौसम कैसा है?"
+    },
+    "expected_canonical_utf8": "{\"screen_summary\":\"समाचार\",\"text\":\"नमस्ते, आज का मौसम कैसा है?\"}",
+    "expected_signed_bytes_hex": "6a61727669732d7369672d76310a6e6f64652d6d73670a6e6f64652d310a7b2273637265656e5f73756d6d617279223a22e0a4b8e0a4aee0a4bee0a49ae0a4bee0a4b0222c2274657874223a22e0a4a8e0a4aee0a4b8e0a58de0a4a4e0a5872c20e0a486e0a49c20e0a495e0a4be20e0a4aee0a58ce0a4b8e0a4ae20e0a495e0a588e0a4b8e0a4be20e0a4b9e0a5883f227d",
+    "expected_sig": "_oojQIIyVMpZmQmIcHY5AeZBT--74Ba2eYW_9FMjK9dAyyTFLmcyZNl1UH0L1xTT4RduC4tx17fRXH18H3KHBQ"
+  },
+  {
+    "name": "integers-only",
+    "purpose": "core-authz",
+    "key_id": "core-1",
+    "seed_hex": "f264e9f21d91e25c527e7fed93838c7bdcb6ecebc7c2006919c39ed65eaadfd6",
+    "object": {
+      "amount_paise": 500000,
+      "attempts": 0,
+      "cap_paise": 400000,
+      "last_seq": 2147483647,
+      "seq": 1
+    },
+    "expected_canonical_utf8": "{\"amount_paise\":500000,\"attempts\":0,\"cap_paise\":400000,\"last_seq\":2147483647,\"seq\":1}",
+    "expected_signed_bytes_hex": "6a61727669732d7369672d76310a636f72652d617574687a0a636f72652d310a7b22616d6f756e745f7061697365223a3530303030302c22617474656d707473223a302c226361705f7061697365223a3430303030302c226c6173745f736571223a323134373438333634372c22736571223a317d",
+    "expected_sig": "It58FrPEMBx6VuLeju00zAiGfC0pe7wwxxtwMSUH6IboexrNr5nr6hWVXC2mDGTu8WFygPF-VFckKzksagoRBg"
+  },
+  {
+    "name": "same-object-two-purposes:node-msg",
+    "purpose": "node-msg",
+    "key_id": "core-1",
+    "seed_hex": "f264e9f21d91e25c527e7fed93838c7bdcb6ecebc7c2006919c39ed65eaadfd6",
+    "object": {
+      "kind": "ping",
+      "note": "same object, different binding",
+      "seq": 7
+    },
+    "expected_canonical_utf8": "{\"kind\":\"ping\",\"note\":\"same object, different binding\",\"seq\":7}",
+    "expected_signed_bytes_hex": "6a61727669732d7369672d76310a6e6f64652d6d73670a636f72652d310a7b226b696e64223a2270696e67222c226e6f7465223a2273616d65206f626a6563742c20646966666572656e742062696e64696e67222c22736571223a377d",
+    "expected_sig": "l12RkKv-jYVoiHuuTczbjs3PHTvy_iHr07dgc55_UzjjzIMpIlnWYOrXBq1Y8p6PmohIEZLNnI2E2YJvfa9-BQ"
+  },
+  {
+    "name": "same-object-two-purposes:core-authz",
+    "purpose": "core-authz",
+    "key_id": "core-1",
+    "seed_hex": "f264e9f21d91e25c527e7fed93838c7bdcb6ecebc7c2006919c39ed65eaadfd6",
+    "object": {
+      "kind": "ping",
+      "note": "same object, different binding",
+      "seq": 7
+    },
+    "expected_canonical_utf8": "{\"kind\":\"ping\",\"note\":\"same object, different binding\",\"seq\":7}",
+    "expected_signed_bytes_hex": "6a61727669732d7369672d76310a636f72652d617574687a0a636f72652d310a7b226b696e64223a2270696e67222c226e6f7465223a2273616d65206f626a6563742c20646966666572656e742062696e64696e67222c22736571223a377d",
+    "expected_sig": "kYYbFwrC9AIi7h8fa4yJUvvoVKeY-8JXe5sd5mi8QxaqJiWPFk-4S4QxCYG-PltxPuCJmYGgOmgjf18q-RYTAg"
+  },
+  {
+    "name": "same-object-two-key-ids:core-1",
+    "purpose": "core-authz",
+    "key_id": "core-1",
+    "seed_hex": "f264e9f21d91e25c527e7fed93838c7bdcb6ecebc7c2006919c39ed65eaadfd6",
+    "object": {
+      "kind": "ping",
+      "note": "same object, different binding",
+      "seq": 7
+    },
+    "expected_canonical_utf8": "{\"kind\":\"ping\",\"note\":\"same object, different binding\",\"seq\":7}",
+    "expected_signed_bytes_hex": "6a61727669732d7369672d76310a636f72652d617574687a0a636f72652d310a7b226b696e64223a2270696e67222c226e6f7465223a2273616d65206f626a6563742c20646966666572656e742062696e64696e67222c22736571223a377d",
+    "expected_sig": "kYYbFwrC9AIi7h8fa4yJUvvoVKeY-8JXe5sd5mi8QxaqJiWPFk-4S4QxCYG-PltxPuCJmYGgOmgjf18q-RYTAg"
+  },
+  {
+    "name": "same-object-two-key-ids:core-2",
+    "purpose": "core-authz",
+    "key_id": "core-2",
+    "seed_hex": "f264e9f21d91e25c527e7fed93838c7bdcb6ecebc7c2006919c39ed65eaadfd6",
+    "object": {
+      "kind": "ping",
+      "note": "same object, different binding",
+      "seq": 7
+    },
+    "expected_canonical_utf8": "{\"kind\":\"ping\",\"note\":\"same object, different binding\",\"seq\":7}",
+    "expected_signed_bytes_hex": "6a61727669732d7369672d76310a636f72652d617574687a0a636f72652d320a7b226b696e64223a2270696e67222c226e6f7465223a2273616d65206f626a6563742c20646966666572656e742062696e64696e67222c22736571223a377d",
+    "expected_sig": "nCZWiAMAAl5TRW82qJaIAsiKlpJ5xJjRAWz-2ofNMMgrYJqBI2NszGF9E5oGdw90CKIEfo29V3krXusV1sSPBg"
+  },
+  {
+    "name": "envelope-utterance",
+    "purpose": "node-msg",
+    "key_id": "node-1",
+    "seed_hex": "899bece9e8387a6a0e5c11c05ce14a0d19f5366830be13d3f1de93e768b49c70",
+    "object": {
+      "version": 1,
+      "message_id": "0b8f7c1e-3a8e-4d4f-9a55-2f6f1c3d9e01",
+      "node_id": "7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5",
+      "session_id": null,
+      "seq": 3,
+      "sent_at": "2026-11-22T10:00:00Z",
+      "kind": "utterance",
+      "payload": {
+        "text": "ನಮಸ್ಕಾರ 🙏",
+        "screen_summary": null
+      }
+    },
+    "expected_canonical_utf8": "{\"kind\":\"utterance\",\"message_id\":\"0b8f7c1e-3a8e-4d4f-9a55-2f6f1c3d9e01\",\"node_id\":\"7a1d3c5e-0f2b-4c6d-8e9f-a0b1c2d3e4f5\",\"payload\":{\"screen_summary\":null,\"text\":\"ನಮಸ್ಕಾರ 🙏\"},\"sent_at\":\"2026-11-22T10:00:00Z\",\"seq\":3,\"session_id\":null,\"version\":1}",
+    "expected_signed_bytes_hex": "6a61727669732d7369672d76310a6e6f64652d6d73670a6e6f64652d310a7b226b696e64223a227574746572616e6365222c226d6573736167655f6964223a2230623866376331652d336138652d346434662d396135352d326636663163336439653031222c226e6f64655f6964223a2237613164336335652d306632622d346336642d386539662d613062316332643365346635222c227061796c6f6164223a7b2273637265656e5f73756d6d617279223a6e756c6c2c2274657874223a22e0b2a8e0b2aee0b2b8e0b38de0b295e0b2bee0b2b020f09f998f227d2c2273656e745f6174223a22323032362d31312d32325431303a30303a30305a222c22736571223a332c2273657373696f6e5f6964223a6e756c6c2c2276657273696f6e223a317d",
+    "expected_sig": "KYtN3DKPcCd0ZH29LQBVKuiNQVdCmJMxbR8JIXH1dSKcCsYUOkO1AZVW-x-1gcawF5hWYwC5cLWEqwgEPvopBQ"
+  }
+]

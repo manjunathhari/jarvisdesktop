@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/action.receipt.schema.json",
+  "title": "Payload of `action.receipt`",
+  "description": "node → gateway: the outcome of an action: `execution_key` for an approved action, or `reply_id` + `seq` for a live one.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "execution_key",
+        "result",
+        "evidence"
+      ],
+      "properties": {
+        "execution_key": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "result": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z_]{0,39}$",
+          "description": "Result code, e.g. RECYCLED, MISMATCH, NOT_FOUND, REFUSED, ERROR for the delete (§9.4)."
+        },
+        "evidence": {
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reply_id",
+        "seq",
+        "result",
+        "evidence"
+      ],
+      "properties": {
+        "reply_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "result": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z_]{0,39}$",
+          "description": "Result code, e.g. RECYCLED, MISMATCH, NOT_FOUND, REFUSED, ERROR for the delete (§9.4)."
+        },
+        "evidence": {
+          "type": "object"
+        }
+      }
+    }
+  ]
+}

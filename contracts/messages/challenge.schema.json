@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/challenge.schema.json",
+  "title": "Payload of `challenge`",
+  "description": "gateway → node: the first message on every connection, signed `gw-transport` (§6.1 step 2, R6-1). A fresh single-use nonce, the gateway's clock (`expires_at` = `issued_at` + 30 s) and the gateway's current key. Pre-authentication: it authorises nothing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "nonce",
+    "issued_at",
+    "expires_at",
+    "key_id",
+    "public_key"
+  ],
+  "properties": {
+    "nonce": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "description": "32 random bytes, base64url without padding (43 characters); the challenge's nonce."
+    },
+    "issued_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "key_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+    },
+    "public_key": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "description": "Raw 32-byte Ed25519 public key, base64url without padding."
+    }
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/pc.delete_test_file.args.schema.json",
+  "title": "Arguments of `pc.delete_test_file` (one file of the test folder)",
+  "description": "The `authz.object.args` of an approval card and of the approved `node.action` (§9.3, §9.4): the exact file object the person approves deleting. Also one entry of a folder listing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "size",
+    "sha256",
+    "file_id"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$",
+      "not": {
+        "pattern": "^([Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(\\.|$)"
+      },
+      "description": "A plain file name (§9.4): no separator, `..`, drive letter, stream (`:`) or device name."
+    },
+    "size": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Bytes."
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256, lower-case hex."
+    },
+    "file_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}:[0-9a-f]{32}$",
+      "description": "Windows file ID: the 64-bit volume serial number and the 128-bit file ID from `GetFileInformationByHandleEx(FileIdInfo)`, lower-case hex, joined by `:`."
+    }
+  }
+}

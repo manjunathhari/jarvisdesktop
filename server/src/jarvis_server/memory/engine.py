@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -478,6 +478,37 @@ class MemoryEngine:
             return memory_id, entry, old.tag.value
 
         self._apply(AuditAction.ARCHIVE, memory_id, by, change, reason=reason)
+
+    def set_visibility(
+        self,
+        memory_id: str,
+        visibility: Visibility,
+        shared_with: Sequence[str] = (),
+        *,
+        by: str,
+    ) -> None:
+        """Change who may see an entry (spec §12). Only a person may, and only the entry's
+        subject or its recorder: for a household entry, its recorder. `by` is the authenticated
+        person, never content. The tag and wording are unchanged; like every change, it is a
+        new git version with one audit row."""
+
+        def change() -> tuple[str, MemoryEntry, str | None]:
+            if by not in self._people:
+                raise _Refusal("person-required")
+            old = self._changeable(memory_id, by)
+            if by not in (old.subject, old.by):
+                raise _Refusal("not-subject-or-recorder")
+            names = tuple(shared_with)
+            for name in names:
+                if name not in self._people:
+                    raise _Refusal("unknown-shared-with")
+            if old.visibility is visibility and old.shared_with == names:
+                raise _Refusal("visibility-unchanged")
+            entry = self._build(**{**old.model_dump(), "visibility": visibility,
+                                   "shared_with": names})  # fmt: skip
+            return memory_id, entry, old.tag.value
+
+        self._apply(AuditAction.SET_VISIBILITY, memory_id, by, change, reason="set-visibility")
 
     def add_person(self, slug: str, person_id: UUID, display_name: str, *, by: str) -> None:
         """Make a ledger person a memory subject (spec §4.2)."""

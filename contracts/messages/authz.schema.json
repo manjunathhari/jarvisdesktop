@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/authz.schema.json",
+  "title": "Core authorisation (authz)",
+  "description": "Core-signed authorisation (spec §7.1): `sig` is Ed25519 over the signed bytes for purpose `core-authz`, `key_id` and JCS(`object`). Every object field is always present (null where not applicable), so both sides canonicalise the same bytes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "object",
+    "key_id",
+    "sig"
+  ],
+  "properties": {
+    "object": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "kind",
+        "action_kind",
+        "args",
+        "target_node_id",
+        "person_id",
+        "approval_id",
+        "execution_key",
+        "reply_id",
+        "summary",
+        "issued_at",
+        "valid_until"
+      ],
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "kind": {
+          "enum": [
+            "node.action",
+            "approval.card",
+            "keyset"
+          ]
+        },
+        "action_kind": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.]{0,63}$"
+        },
+        "args": {
+          "type": "object",
+          "description": "For the delete: name, size, SHA-256, file ID. For `keyset`: role, key_id, public_key of the new key."
+        },
+        "target_node_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "person_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "approval_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "execution_key": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "reply_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "issued_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "valid_until": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "key_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+    },
+    "sig": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{86}$",
+      "description": "Ed25519 signature, base64url without padding (64 bytes)."
+    }
+  }
+}

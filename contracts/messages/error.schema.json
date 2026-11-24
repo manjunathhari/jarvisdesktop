@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/error.schema.json",
+  "title": "Payload of `error`",
+  "description": "gateway → node: a message was refused (codes only, no content).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "code",
+    "detail"
+  ],
+  "properties": {
+    "code": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
+    "detail": {
+      "type": "string",
+      "maxLength": 500
+    }
+  }
+}
