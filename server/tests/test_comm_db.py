@@ -54,7 +54,7 @@ ACTIONS_0008 = [
 ]
 
 CONN_FUNCTIONS = {
-    "conv.record_inbound(bigint,uuid,text,jsonb)",
+    "conv.record_inbound(bigint,uuid,text,jsonb,jsonb)",  # R12-34: + envelope
     "comm.record_sent(bigint,uuid)",
     "comm.record_received(bigint,uuid)",
     "comm.acknowledge(bigint,uuid)",
@@ -65,7 +65,9 @@ CONN_FUNCTIONS = {
 SENT = "SELECT comm.record_sent(%s, %s)"
 RECEIVED = "SELECT comm.record_received(%s, %s)"
 ACK = "SELECT comm.acknowledge(%s, %s)"
-INBOUND = "SELECT recorded, refusal FROM conv.record_inbound(%s, %s, %s, %s)"
+# The node's signed envelope (R12-34) is stored for core, never read here: NULL in these tests
+# (test_inbound_stores_the_envelope_as_given covers it).
+INBOUND = "SELECT recorded, refusal FROM conv.record_inbound(%s, %s, %s, %s, NULL)"
 CHUNK = "SELECT recorded, refusal FROM conv.record_chunk_received(%s, %s, %s)"
 
 TERMINAL = {"ACKNOWLEDGED", "SUPERSEDED", "EXPIRED"}
@@ -240,7 +242,7 @@ def test_inbound_id_conflict_across_nodes(gateway: Conn, app: Conn, dsns: Dsns) 
     since = _seq(app)
     row = dbcall.audited_call(
         gateway,
-        "SELECT recorded, refusal FROM conv.record_inbound(%s, %s, %s, %s)",
+        "SELECT recorded, refusal FROM conv.record_inbound(%s, %s, %s, %s, NULL)",
         (conn_b, message_id, "utterance", payload),
     )
     assert row == (False, "id_conflict")
@@ -294,13 +296,34 @@ def test_inbound_person_comes_from_node_row(gateway: Conn, app: Conn) -> None:
     assert row == (node_id, MANJ, "utterance", None, None)
 
 
+def test_inbound_stores_the_envelope_as_given(gateway: Conn, app: Conn) -> None:
+    """R12-34: the node's complete signed envelope is stored as the gateway passed it (core
+    re-verifies it); NULL is stored as NULL (core refuses it); a non-object is malformed."""
+    _, conn_id = _connected(app, gateway)
+    message_id = uuid.uuid4()
+    payload = {"text": "A fictional phrase"}
+    envelope = {"version": 1, "message_id": str(message_id), "kind": "utterance",
+                "payload": payload, "sig": "x"}  # fmt: skip
+    sql = "SELECT recorded, refusal FROM conv.record_inbound(%s, %s, %s, %s, %s)"
+    row = gateway.execute(sql, (conn_id, message_id, "utterance", Jsonb(payload), Jsonb(envelope)))
+    assert row.fetchone() == (True, None)
+    stored = _one(app, "SELECT envelope FROM conv.inbound WHERE id = %s", (message_id,))
+    assert stored == envelope
+    bare = uuid.uuid4()
+    gateway.execute(sql, (conn_id, bare, "utterance", Jsonb(payload), None))
+    assert _one(app, "SELECT envelope FROM conv.inbound WHERE id = %s", (bare,)) is None
+    for bad in ([1], "text", 3):
+        with pytest.raises(psycopg.errors.InvalidParameterValue):
+            gateway.execute(sql, (conn_id, uuid.uuid4(), "utterance", Jsonb(payload), Jsonb(bad)))
+
+
 def test_inbound_unknown_kind_refused(gateway: Conn, app: Conn, dsns: Dsns) -> None:
     node_id, conn_id = _connected(app, gateway)
     message_id = uuid.uuid4()
     since = _seq(app)
     recorded, refusal = dbcall.audited_call(
         gateway,
-        "SELECT recorded, refusal FROM conv.record_inbound(%s, %s, %s, %s)",
+        "SELECT recorded, refusal FROM conv.record_inbound(%s, %s, %s, %s, NULL)",
         (conn_id, message_id, "hello", Jsonb({"text": "A fictional phrase"})),
     )
     assert (recorded, refusal) == (False, "unknown_kind")

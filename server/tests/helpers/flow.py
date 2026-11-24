@@ -2,6 +2,8 @@
 
 Rows the gateway would write (`conv.inbound`, `gw.node`) are written as the owner, as
 test_turn does; everything core does goes through the real code on a `jarvis_app` connection.
+Each node made here has a real Ed25519 key, and each `conv.inbound` row carries the node's
+signed envelope, as the gateway stores it (R12-34), unless a test passes another.
 """
 
 from __future__ import annotations
@@ -15,9 +17,10 @@ from datetime import datetime
 from typing import Any
 
 import psycopg
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from psycopg.types.json import Jsonb
 
-from jarvis_server import jobs
+from jarvis_server import jobs, signing
 from jarvis_server.core import approvals, dispatch
 
 from ..schema_registry import CONTRACTS, validator
@@ -79,14 +82,47 @@ def new_person(owner: Conn, name: str = "Asha Fictional") -> uuid.UUID:
     return pid
 
 
+_NODE_KEYS: dict[uuid.UUID, Ed25519PrivateKey] = {}
+SIGNED: Any = object()  # `inbound`'s default: the node's own signed envelope
+
+
 def new_node(owner: Conn, person: uuid.UUID, kind: str = "DESKTOP") -> uuid.UUID:
+    key = Ed25519PrivateKey.generate()
     row = owner.execute(
         "INSERT INTO gw.node (person_id, kind, name, public_key, tailscale_identity)"
         " VALUES (%s, %s, 'pc', %s, %s) RETURNING id",
-        (person, kind, secrets.token_bytes(32), f"ts:pc-{secrets.token_hex(4)}"),
+        (person, kind, signing.public_bytes(key), f"ts:pc-{secrets.token_hex(4)}"),
     ).fetchone()
     assert row is not None
-    return uuid.UUID(str(row[0]))
+    node_id = uuid.UUID(str(row[0]))
+    _NODE_KEYS[node_id] = key
+    return node_id
+
+
+def node_key(node: uuid.UUID, key: Ed25519PrivateKey) -> None:
+    """Sign `node`'s planted messages with `key` (a node enrolled by a FakeNode)."""
+    _NODE_KEYS[node] = key
+
+
+def node_envelope(
+    node: uuid.UUID,
+    message_id: uuid.UUID,
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    key: Ed25519PrivateKey | None = None,
+    **fields: Any,
+) -> dict[str, Any]:
+    """The `node-msg` envelope `node` sends (signed with its key, or `key`), with `fields`
+    overriding the envelope's own before signing."""
+    signer = key or _NODE_KEYS[node]
+    env = {
+        "version": 1, "message_id": str(message_id), "node_id": str(node), "seq": 2,
+        "sent_at": datetime.now().astimezone().isoformat(), "kind": kind, "payload": payload,
+        **fields,
+    }  # fmt: skip
+    key_id = signing.fingerprint(signing.public_bytes(signer))
+    return signing.sign_envelope(signing.Purpose.NODE_MSG, signer, key_id, env)
 
 
 def open_session(app: Conn, person: uuid.UUID) -> uuid.UUID:
@@ -116,14 +152,22 @@ def inbound(
     payload: dict[str, Any],
     *,
     received_at: datetime | None = None,
+    envelope: Any = SIGNED,
 ) -> uuid.UUID:
-    """A `conv.inbound` row as `conv.record_inbound` writes it (person from the node)."""
+    """A `conv.inbound` row as `conv.record_inbound` writes it (person from the node), with
+    the node's signed envelope; `envelope` replaces it (None: none, a callable: built from
+    the inbound ID)."""
     iid = uuid.uuid4()
+    if envelope is SIGNED:
+        env = node_envelope(node, iid, kind, payload)
+    else:
+        env = envelope(iid) if callable(envelope) else envelope
     owner.execute(
-        "INSERT INTO conv.inbound (id, node_id, person_id, kind, payload, received_at)"
-        " VALUES (%s, %s, %s, %s, %s, coalesce(%s, now()))",
-        (iid, node, person, kind, Jsonb(payload), received_at),
-    )
+        "INSERT INTO conv.inbound (id, node_id, person_id, kind, payload, envelope, received_at)"
+        " VALUES (%s, %s, %s, %s, %s, %s, coalesce(%s, now()))",
+        (iid, node, person, kind, Jsonb(payload), None if env is None else Jsonb(env),
+         received_at),
+    )  # fmt: skip
     return iid
 
 

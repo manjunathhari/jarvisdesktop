@@ -5,7 +5,8 @@ folder on the requesting desktop as a live action and waits for the listing (10 
 holds no lock and no open transaction: it runs on the turn's committing connection
 (`budget.committing_connection`, autocommit), and each poll is a single READ COMMITTED
 statement on `conv.inbound`, so it sees the gateway's `conv.record_inbound` row as soon as the
-gateway's own transaction has committed. The `action.receipt` job that row enqueues later only
+gateway's own transaction has committed. A listing not signed by the node (R12-34) proposes
+nothing. The `action.receipt` job that row enqueues later only
 records the receipt's outcome. Time for the wait comes from `set_wait` (tests), else
 `time.monotonic` / `time.sleep`. A file that isn't listed proposes nothing (None).
 
@@ -17,8 +18,10 @@ URGENT `approval.requested` card, and the scheduled `approval.expiring` (2 minut
 `approval.expire` jobs.
 
 **Deciding (job `approval.decision`).** In the job's one transaction, under `SELECT … FOR
-UPDATE` on the approval, the §9.3 step 6 checks run in the fixed order of R12-21:
-`unknown_approval`, `bad_card_sig`, `other_person`, `node_revoked`, `not_pending`, `expired`.
+UPDATE` on the approval, the §9.3 step 6 checks run in the fixed order of R12-21, after R12-34's
+`bad_node_signature` (the stored envelope must be the node's own valid signature over this
+message, and the decision APPROVED or DENIED; `core.node_signature`): `unknown_approval`,
+`bad_card_sig`, `other_person`, `node_revoked`, `not_pending`, `expired`.
 Expiry is checked here, before any decision UPDATE, so the backstop trigger never raises inside
 a transaction that holds a refusal. A failed check: the `approval.decision_refused` item to the
 deciding node's person with the approval's real state, the inbound's REFUSED outcome, and last
@@ -55,7 +58,7 @@ from psycopg.types.json import Jsonb
 from jarvis_server import comm, jobs, ledger, signing
 from jarvis_server.atlas import ApprovedPlan, Atlas
 from jarvis_server.contracts import ActorKind, EntityType, TaskState
-from jarvis_server.core import actions, dispatch, keys, rules
+from jarvis_server.core import actions, dispatch, keys, node_signature, rules
 from jarvis_server.dbcall import audited_call_in_job
 from jarvis_server.ledger import Actor
 from jarvis_server.policy import Tier
@@ -72,8 +75,9 @@ ATLAS = Atlas()
 CARD_KINDS = ("approval.requested", "approval.expiring")
 _OPEN = ("PENDING", "DELIVERING", "DELIVERED")
 
-# R12-21, in check order.
+# R12-21, in check order; R12-34's node signature first.
 DECISION_REFUSALS = (
+    node_signature.BAD_NODE_SIGNATURE,
     "unknown_approval",
     "bad_card_sig",
     "other_person",
@@ -106,7 +110,7 @@ class ListingUnavailable(Exception):
 # --- proposing ---------------------------------------------------------------------------------
 
 _RECEIPT = """
-SELECT payload, received_at <= %(valid_until)s FROM conv.inbound
+SELECT payload, received_at <= %(valid_until)s, id, envelope FROM conv.inbound
 WHERE kind = 'action.receipt' AND node_id = %(node)s AND person_id = %(person)s
   AND payload->>'reply_id' = %(reply)s AND payload->'seq' = to_jsonb(%(seq)s::integer)
 ORDER BY received_at, id LIMIT 1
@@ -130,7 +134,14 @@ def _await_listing(
              "reply": str(reply_id), "seq": seq},
         ).fetchone()  # fmt: skip
         if row is not None:
-            payload, in_time = row
+            payload, in_time, inbound_id, envelope = row
+            # R12-34: only the node's own signed listing proposes anything. A forged one is
+            # refused here, and audited by its `action.receipt` job (bad_node_signature).
+            if not node_signature.signed_by_node(
+                conn, inbound_id=UUID(str(inbound_id)), node_id=node_id, kind="action.receipt",
+                payload=payload, envelope=envelope,
+            ):  # fmt: skip
+                raise ListingUnavailable("listing not signed by the node")
             listing = actions.parse_listing(payload)  # OK, in the contract's shape, or None
             if not in_time or listing is None:
                 raise ListingUnavailable("late or unusable listing")
@@ -323,7 +334,7 @@ def on_decision(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     """Handler of `approval.decision`, payload `{inbound_id}` (§9.3 step 6)."""
     inbound_id = UUID(job.payload["inbound_id"])
     row = conn.execute(
-        "SELECT node_id, person_id, kind, payload, outcome FROM conv.inbound"
+        "SELECT node_id, person_id, kind, payload, outcome, envelope FROM conv.inbound"
         " WHERE id = %s FOR UPDATE",
         (inbound_id,),
     ).fetchone()
@@ -333,14 +344,19 @@ def on_decision(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     if kind != "approval.decision":
         raise ValueError(f"inbound {inbound_id} is a {kind}, not an approval.decision")
     approval_id = UUID(str(payload["approval_id"]))
-    decision = str(payload["decision"])
+    decision = payload.get("decision")
+    # R12-34: acted on only as the node's own signed decision, APPROVED or DENIED.
+    signed = node_signature.signed_by_node(
+        conn, inbound_id=inbound_id, node_id=node_id, kind=kind, payload=payload,
+        envelope=row[5],
+    ) and decision in ("APPROVED", "DENIED")  # fmt: skip
     approval = conn.execute(
         "SELECT task_id, requested_from_person_id, requesting_node_id, card_authz, decision,"
         " now() >= expires_at, action_args, expires_at, least(now() + %s, expires_at)"
         " FROM ledger.approval WHERE id = %s FOR UPDATE",
         (actions.LIVE_VALIDITY, approval_id),
     ).fetchone()
-    code = _check(
+    code = node_signature.BAD_NODE_SIGNATURE if not signed else _check(
         conn, approval, approval_id, node_id=node_id, person_id=person_id,
         card_sig=payload.get("card_sig"),
     )  # fmt: skip

@@ -117,15 +117,16 @@ async def acknowledge(
 # ------------------------------------------------------------------ welcome
 
 
-async def welcome(pool: Pool, person_id: UUID) -> dict[str, Any]:
-    """`{session_id, summary}`: the person's open session, if any, and the reconnect summary
-    (§8.3) as the message schema's groups."""
+async def welcome(pool: Pool, person_id: UUID, node_id: UUID) -> dict[str, Any]:
+    """`{session_id, summary}`: the person's open session, if any, and `node_id`'s reconnect
+    summary (§8.3; an item addressed to another node is never in it, R12-23) as the message
+    schema's groups."""
     async with pool.connection() as conn:
         cur = await conn.execute(
             "SELECT id FROM conv.session WHERE person_id = %s AND closed_at IS NULL", (person_id,)
         )
         row = await cur.fetchone()
-        cur = await conn.execute(summary.QUERY, (person_id,))
+        cur = await conn.execute(summary.QUERY, (person_id, node_id))
         rows = await cur.fetchall()
     return {
         "session_id": None if row is None else str(row[0]),

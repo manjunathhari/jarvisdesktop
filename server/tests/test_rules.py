@@ -330,7 +330,7 @@ def test_authz_carried_untrusted(app: Conn, person: uuid.UUID) -> None:
     assert set(stored) == {"object", "key_id", "sig"}
     assert set(stored["object"]) == set(TAMPERED["authz"]["object"])
     assert body == {"event": "approval.requested", "text": rules.RULES["approval.requested"].text}
-    lines = summary.reconnect_summary(app, person)
+    lines = summary.reconnect_summary(app, person, uuid.uuid4())  # untargeted: on every node
     assert [line["outbox_ids"] for line in lines] == [[item]]
     for line in lines:
         assert not {"verified", "trusted", "authz", "sig"} & set(line)

@@ -320,8 +320,8 @@ def test_audited_call_in_job_refuses_outside_job(app: Conn) -> None:
 def test_refuse_decision_codes_and_malformed_calls(
     app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID
 ) -> None:
-    for code in ("unknown_approval", "bad_card_sig", "other_person", "node_revoked",
-                 "not_pending", "expired"):  # fmt: skip
+    for code in ("bad_node_signature", "unknown_approval", "bad_card_sig", "other_person",
+                 "node_revoked", "not_pending", "expired"):  # fmt: skip
         approval_id = uuid.uuid4()
         (result,) = _one_row(
             app, "SELECT ledger.refuse_decision(%s, %s, %s)", (approval_id, node, code)
@@ -422,8 +422,9 @@ def test_refuse_receipt_codes_privileges_and_entities(
 ) -> None:
     """R12-24: the fixed receipt codes, one REJECTED row each and nothing else; definer,
     EXECUTE for jarvis_app only."""
-    codes = ("unknown_key", "reused_key", "unknown_action", "late", "malformed", "not_recycled",
-             "file_mismatch", "listing_failed", "still_listed", "listing_missing")  # fmt: skip
+    codes = ("bad_node_signature", "unknown_key", "reused_key", "unknown_action", "late",
+             "malformed", "not_recycled", "file_mismatch", "listing_failed", "still_listed",
+             "listing_missing")  # fmt: skip
     assert codes == actions.RECEIPT_REFUSALS
     for code in codes:
         ref = uuid.uuid4()

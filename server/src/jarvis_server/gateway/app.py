@@ -172,6 +172,9 @@ def create_app(
     return app
 
 
+GATEWAY_UID = 10001  # the image's `jarvis` user and compose's `user:` (final review S-2)
+
+
 def _build_app(socket_path: str) -> FastAPI:
     return create_app(
         dsn=config.gateway_dsn(),
@@ -182,6 +185,11 @@ def _build_app(socket_path: str) -> FastAPI:
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    if os.getuid() != GATEWAY_UID:
+        # The sidecar's egress rules (R12-33) are written for this UID; never run outside them.
+        log.error("the gateway must run as UID %d (it is %d); refusing to start", GATEWAY_UID,
+                  os.getuid())  # fmt: skip
+        return 2
     socket_path = os.environ.get("JARVIS_TS_SOCKET")
     if not socket_path:
         log.error("JARVIS_TS_SOCKET is not set; refusing to start")

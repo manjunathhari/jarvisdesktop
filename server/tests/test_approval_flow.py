@@ -23,6 +23,7 @@ from typing import Any
 import psycopg
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from psycopg.types.json import Jsonb
 from starlette.websockets import WebSocketDisconnect
 
 from jarvis_server import comm, jobs, nodes, policy, signing
@@ -864,6 +865,210 @@ def test_approved_item_expires_at_valid_until(
     assert len(flow.audit(app, old)) == 1
 
 
+# --- R12-34: core re-verifies the node's signature (final review S-1) ------------------------
+#
+# A compromised gateway records messages through conv.record_inbound with whatever envelope it
+# likes. Each forgery below has the stored payload a real node would send, but an envelope that
+# is missing, isn't signed by the node's key, or doesn't match the stored row.
+
+Forge = Callable[[uuid.UUID, uuid.UUID, str, dict[str, Any]], dict[str, Any] | None]
+
+
+def _bad_sig(env: dict[str, Any]) -> dict[str, Any]:
+    sig = env["sig"]
+    return {**env, "sig": ("B" if sig[0] == "A" else "A") + sig[1:]}
+
+
+FORGERIES: dict[str, Forge] = {
+    "missing": lambda node, iid, kind, payload: None,
+    "other_key": lambda node, iid, kind, payload: flow.node_envelope(
+        node,
+        iid,
+        kind,
+        payload,
+        key=Ed25519PrivateKey.generate(),  # e.g. the gateway's own
+    ),
+    "bad_sig": lambda node, iid, kind, payload: _bad_sig(
+        flow.node_envelope(node, iid, kind, payload)
+    ),
+    "payload": lambda node, iid, kind, payload: flow.node_envelope(
+        node, iid, kind, {**payload, "forged": "the node signed something else"}
+    ),
+    "message_id": lambda node, iid, kind, payload: flow.node_envelope(
+        node,
+        uuid.uuid4(),
+        kind,
+        payload,  # a real message of the node, replayed under iid
+    ),
+    "node_id": lambda node, iid, kind, payload: flow.node_envelope(
+        node, iid, kind, payload, node_id=str(uuid.uuid4())
+    ),
+    "kind": lambda node, iid, kind, payload: flow.node_envelope(node, iid, "utterance", payload),
+}
+
+
+def _record(
+    gateway: Conn, node: uuid.UUID, kind: str, payload: dict[str, Any], forge: Forge
+) -> uuid.UUID:
+    """What a compromised gateway can do: open a connection for the node and record a message
+    with the envelope it chooses. Returns the inbound ID (its job is queued)."""
+    row = gateway.execute("SELECT conn_id FROM gw.open_connection(%s)", (node,)).fetchone()
+    assert row is not None
+    iid = uuid.uuid4()
+    env = forge(node, iid, kind, payload)
+    recorded = gateway.execute(
+        "SELECT recorded, refusal FROM conv.record_inbound(%s, %s, %s, %s, %s)",
+        (row[0], iid, kind, Jsonb(payload), None if env is None else Jsonb(env)),
+    ).fetchone()
+    assert recorded == (True, None)
+    return iid
+
+
+def _decision_payload(app: Conn, approval_id: uuid.UUID, decision: Any) -> dict[str, Any]:
+    return {"approval_id": str(approval_id), "decision": decision,
+            "card_sig": flow.card_sig(app, approval_id)}  # fmt: skip
+
+
+def _assert_decision_refused(
+    app: Conn, person: uuid.UUID, approval_id: uuid.UUID, inbound_id: uuid.UUID, job_id: int | None
+) -> None:
+    """Refused and audited (`bad_node_signature`); nothing decided, consumed or issued."""
+    assert job_id is not None and flow.job_status(app, job_id) == "DONE"
+    row = flow.approval_row(app, approval_id)
+    assert row["decision"] == "PENDING" and row["decided_by_node_id"] is None
+    assert row["consumed_at"] is None and row["execution_key"] is None
+    assert flow.audit(app, approval_id) == [
+        ("CREATE", "APPLIED", "created", None, "PENDING"),
+        ("DECIDE", "REJECTED", "bad_node_signature", "PENDING", None),
+    ]
+    assert flow.outcome_of(app, inbound_id) == "REFUSED"
+    assert flow.task_state(app, approval_id) == "APPROVAL_PENDING"
+    assert _issued(app, person) == []
+    [card] = flow.items(app, person, "approval.requested")
+    assert card["state"] != "SUPERSEDED"  # the card stays open for the real decision
+    [refused] = flow.items(app, person, "approval.decision_refused")
+    assert refused["priority"] == "URGENT"
+
+
+@pytest.mark.parametrize("forgery", sorted(FORGERIES))
+def test_forged_decision_is_refused(
+    app: Conn, owner: Conn, gateway: Conn, person: uuid.UUID, node: uuid.UUID,
+    proposed: uuid.UUID, forgery: str,
+) -> None:  # fmt: skip
+    """S-1: a decision with the card's real signature, recorded straight through
+    conv.record_inbound, but without the node's valid signed envelope for it, is refused. The
+    real decision still works afterwards."""
+    payload = _decision_payload(app, proposed, "APPROVED")
+    iid = _record(gateway, node, "approval.decision", payload, FORGERIES[forgery])
+    job_id = flow.run_queued(app, "approval.decision")
+    _assert_decision_refused(app, person, proposed, iid, job_id)
+    flow.decide(app, owner, node=node, person=person, approval_id=proposed)
+    assert flow.approval_row(app, proposed)["decision"] == "APPROVED"
+    assert len(_issued(app, person)) == 1
+
+
+@pytest.mark.parametrize("decision", ["EXPIRED", "PENDING", "approved", None])
+def test_decision_other_than_approved_or_denied_is_refused(
+    app: Conn, gateway: Conn, person: uuid.UUID, node: uuid.UUID, proposed: uuid.UUID,
+    decision: Any,
+) -> None:  # fmt: skip
+    """R12-34: even signed by the node, a decision that is neither APPROVED nor DENIED is
+    refused through the same audited path; nothing is decided."""
+    payload = _decision_payload(app, proposed, decision)
+    iid = _record(
+        gateway, node, "approval.decision", payload,
+        lambda n, i, k, p: flow.node_envelope(n, i, k, p),
+    )  # fmt: skip
+    _assert_decision_refused(app, person, proposed, iid, flow.run_queued(app, "approval.decision"))
+
+
+def _receipt_refused(app: Conn, node: uuid.UUID, inbound_id: uuid.UUID) -> None:
+    assert flow.outcome_of(app, inbound_id) == "REFUSED"
+    assert flow.receipt_audit(app, inbound_id) == [
+        ("REJECTED", "bad_node_signature", {"node_id": str(node)})
+    ]
+
+
+@pytest.mark.parametrize("forgery", sorted(FORGERIES))
+def test_forged_approved_receipt_is_refused(
+    app: Conn, owner: Conn, gateway: Conn, person: uuid.UUID, node: uuid.UUID,
+    proposed: uuid.UUID, forgery: str,
+) -> None:  # fmt: skip
+    """S-1: a forged RECYCLED receipt for the issued key is refused and audited; the key's one
+    receipt is not taken, the action's item stays open, and the real receipt still counts."""
+    key = _approve(app, owner, person, node, proposed)
+    iid = _record(gateway, node, "action.receipt", flow.delete_receipt(key), FORGERIES[forgery])
+    job_id = flow.run_queued(app, "action.receipt")
+    assert job_id is not None and flow.job_status(app, job_id) == "DONE"
+    _receipt_refused(app, node, iid)
+    assert _action(app, key) == ("ISSUED", None, 0)  # nothing consumed
+    assert flow.task_state(app, proposed) == "IN_PROGRESS"
+    [item] = _issued(app, person)
+    assert item["state"] != "SUPERSEDED"
+    real = _receipt(owner, node, person, key)
+    flow.run(app, "action.receipt", {"inbound_id": str(real)})
+    assert flow.outcome_of(app, real) == "ANSWERED" and _action(app, key)[0] == "RECEIVED"
+
+
+@pytest.mark.parametrize("forgery", sorted(FORGERIES))
+def test_forged_verification_listing_is_refused(
+    app: Conn, owner: Conn, gateway: Conn, person: uuid.UUID, node: uuid.UUID,
+    proposed: uuid.UUID, forgery: str,
+) -> None:  # fmt: skip
+    """S-1: a forged fresh listing without the file can't mark the delete verified; it is
+    refused and audited, and the real listing still verifies."""
+    key = _approve(app, owner, person, node, proposed)
+    receipt = _receipt(owner, node, person, key)
+    flow.run(app, "action.receipt", {"inbound_id": str(receipt)})
+    reply, seq = _verification_listing(app, node)
+    payload = flow.listing_receipt(reply, seq, [B_TXT])
+    iid = _record(gateway, node, "action.receipt", payload, FORGERIES[forgery])
+    job_id = flow.run_queued(app, "action.receipt")
+    assert job_id is not None and flow.job_status(app, job_id) == "DONE"
+    _receipt_refused(app, node, iid)
+    assert flow.task_state(app, proposed) == "IN_PROGRESS"
+    assert _action(app, key) == ("RECEIVED", False, 1)  # not verified, not failed
+    real = _listing(owner, node, person, reply, seq, [B_TXT])
+    flow.run(app, "action.receipt", {"inbound_id": str(real)})
+    assert flow.task_state(app, proposed) == "COMPLETED"
+    assert _action(app, key) == ("VERIFIED", True, 1)
+
+
+@pytest.mark.parametrize("forgery", sorted(FORGERIES))
+def test_forged_proposal_listing_proposes_nothing(
+    app: Conn, owner: Conn, gateway: Conn, person: uuid.UUID, node: uuid.UUID,
+    session: uuid.UUID, forgery: str,
+) -> None:  # fmt: skip
+    """S-1: the listing `propose_delete` waits for must be the node's own signed message; a
+    forged one proposes nothing, and its receipt job refuses it with an audit row."""
+    planted: list[uuid.UUID] = []
+
+    def sleep(_: float) -> None:
+        if planted:
+            return
+        row = app.execute(
+            "SELECT reply_id, seq FROM conv.stream_chunk WHERE target_node_id = %s"
+            " AND type = 'ACTION' ORDER BY created_at DESC LIMIT 1",
+            (node,),
+        ).fetchone()
+        assert row is not None
+        payload = flow.listing_receipt(row[0], row[1], [A_TXT])
+        planted.append(_record(gateway, node, "action.receipt", payload, FORGERIES[forgery]))
+
+    approvals.set_wait(None, sleep)
+    with pytest.raises(approvals.ListingUnavailable):
+        approvals.propose_delete(
+            app, session_id=session, person_id=person, node_id=node, name="a.txt",
+            now=flow.db_now(app),
+        )  # fmt: skip
+    assert app.execute(
+        "SELECT count(*) FROM ledger.approval WHERE requesting_node_id = %s", (node,)
+    ).fetchone() == (0,)
+    assert flow.items(app, person, "approval.requested") == []
+    assert flow.run_queued(app, "action.receipt") is not None
+    _receipt_refused(app, node, planted[0])
+
+
 # --- P2-A1 end to end, over the real gateway -----------------------------------------------
 
 
@@ -967,6 +1172,15 @@ def test_delete_flow_end_to_end(
                                     "card_sig": card["authz"]["sig"]})  # fmt: skip
     desk.sync()
     assert flow.run_queued(app, "approval.decision") is not None
+    # R12-34: the gateway stored the desktop's complete signed envelope with the decision.
+    [(stored,)] = app.execute(
+        "SELECT envelope FROM conv.inbound WHERE kind = 'approval.decision' AND node_id = %s",
+        (desk.node_id,),
+    ).fetchall()
+    assert stored["kind"] == "approval.decision" and stored["node_id"] == str(desk.node_id)
+    assert signing.verify_envelope(
+        signing.Purpose.NODE_MSG, signing.public_bytes(desk.key), desk.key_id, stored
+    )
     got = _until(desk, lambda e: bool(_outbox(e, "action.approved")))
     [item] = _outbox(got, "action.approved")
     action = item["authz"]["object"]
@@ -1027,6 +1241,7 @@ def test_revoked_node_cannot_execute(app: Conn, gw: Gw, owner: Conn, core_key: A
     other.sync()
     assert desk.node_id is not None
     desk.close()
+    flow.node_key(desk.node_id, desk.key)  # the planted listing and decision are desk's own
     session = flow.open_session(app, MANJ)
     approval_id = flow.propose(app, owner, node=desk.node_id, person=MANJ, session=session)
     assert approval_id is not None

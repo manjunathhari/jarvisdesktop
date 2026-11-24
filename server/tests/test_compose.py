@@ -87,6 +87,7 @@ def test_gateway_shares_sidecar_namespace(stack: dict[str, Any]) -> None:
     assert gateway["network_mode"] == "service:gateway-ts"
     assert "networks" not in gateway  # it has only the sidecar's interfaces
     assert gateway["entrypoint"] == ["jarvis-gateway"] and "profiles" not in gateway
+    assert gateway["user"] == "10001:10001"  # the UID the sidecar's rules and the image use (S-2)
     assert _secrets(gateway) == {"pg_gateway_password", "gateway_signing_key"}
     assert gateway["volumes"] == ["ts_socket:/ts-socket:ro"]
     assert gateway["environment"]["JARVIS_TS_SOCKET"] == "/ts-socket/tailscaled.sock"
@@ -129,8 +130,10 @@ def test_sidecar_runs_tailscale_in_kernel_mode(stack: dict[str, Any]) -> None:
         {"source": "gateway_ts_entrypoint", "target": "/etc/jarvis/gateway-ts-entrypoint.sh"}
     ]
     health = " ".join(ts["healthcheck"]["test"])  # healthy only with both rule jumps in place
-    jump = "OUTPUT -m owner --uid-owner 10001 -j JARVIS_GW_OUT"
+    jump = "OUTPUT -m owner --socket-exists ! --uid-owner 0 -j JARVIS_GW_OUT"
     assert f"iptables -C {jump}" in health and f"ip6tables -C {jump}" in health
+    assert "--uid-owner 10001" not in health
+    assert "JARVIS_GATEWAY_UID" not in env  # the rules no longer name one UID (S-2)
 
 
 def test_core_has_no_egress_network(stack: dict[str, Any]) -> None:
@@ -208,7 +211,9 @@ def test_sidecar_entrypoint_blocks_gateway_egress() -> None:
     """§4.2, R12-33: UID 10001 may open only TCP to Postgres's fixed address on 5432, and send
     only established or related packets on tailscale0. Nothing else: no loopback, no DNS, no
     other internal host or port, no new tailnet connection. IPv6 alike, failing closed when it
-    is on and can't be ruled. Then containerboot."""
+    is on and can't be ruled. Then containerboot. Final review S-2: the rules hold for every
+    socket not owned by root (tailscaled), so a gateway run under any other UID is still
+    closed; packets with no owning socket are left as before."""
     script = ENTRYPOINT.read_text()
     subprocess.run(["sh", "-n", str(ENTRYPOINT)], check=True)
     lines = [ln.strip() for ln in script.splitlines()]
@@ -226,9 +231,12 @@ def test_sidecar_entrypoint_blocks_gateway_egress() -> None:
         'ip6tables -A "$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
         'ip6tables -A "$CHAIN" -j DROP',
     ]
+    jump = '-m owner --socket-exists ! --uid-owner 0 -j "$CHAIN"'
     for tool in ("iptables", "ip6tables"):
-        assert f'{tool} -I OUTPUT 1 -m owner --uid-owner "$GW_UID" -j "$CHAIN"' in script
-    assert 'GW_UID="${JARVIS_GATEWAY_UID:-10001}"' in lines
+        assert f"{tool} -I OUTPUT 1 {jump}" in script
+        assert f"{tool} -C OUTPUT {jump}" in script
+    assert "GW_UID" not in script and "--uid-owner 10001" not in script
+    assert not [ln for ln in code if "--uid-owner" in ln and "! --uid-owner 0" not in ln]
     assert 'PG_IP="${JARVIS_POSTGRES_IP:-}"' in lines
     # No name lookups, no loopback: nothing that needs or allows DNS.
     for word in ("getent", "nslookup", " lo ", "-o lo", "127.0.0", "::1", "postgres "):

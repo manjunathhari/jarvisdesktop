@@ -1,9 +1,10 @@
 """Reconnect summary (spec §8.3; P2-E07, P2-E08): built by code from the outbox alone.
 
-Every line comes from a fixed template keyed by the item's kind; no stored body text is
-repeated and no model is called, so the summary works while Claude is down. Only open items
-count (PENDING, DELIVERING, DELIVERED, and not past `expires_at`): acknowledged, superseded and
-expired items are left out. The order is §8.3's:
+A summary is one node's: an item addressed to one node (`target_node_id`, R12-23) appears
+only in that node's summary. Every line comes from a fixed template keyed by the item's kind;
+no stored body text is repeated and no model is called, so the summary works while Claude is
+down. Only open items count (PENDING, DELIVERING, DELIVERED, and not past `expires_at`):
+acknowledged, superseded and expired items are left out. The order is §8.3's:
 
 - URGENT first, one entry per item, oldest first;
 - TODAY grouped by `group_key` (groups in order of their oldest item), one line per item;
@@ -35,14 +36,18 @@ LINE: dict[str, str] = {
     "turn.indeterminate": "A request ended without a clear outcome",
     "turn.completed_after_hold": "A held request has been answered",
     "action.readonly_ok": "Action completed",
+    "action.approved": "Running the approved action",
+    "approval.decision_refused": "A decision could not be applied",
     "brain.config_error": "Claude configuration error",
 }
 GENERIC_LINE = "A notification is waiting"
 DIGEST_LINE = "{label} ({count})"
 
+# One node's summary: an item addressed to one node (R12-23) is offered only on that node.
 QUERY = """
 SELECT id, priority, kind, group_key FROM comm.outbox
 WHERE person_id = %s
+  AND (target_node_id IS NULL OR target_node_id = %s)
   AND state IN ('PENDING', 'DELIVERING', 'DELIVERED')
   AND priority IN ('URGENT', 'TODAY', 'DIGEST')
   AND (expires_at IS NULL OR expires_at > now())
@@ -61,9 +66,12 @@ def _grouped(rows: list[tuple[UUID, str, str]]) -> dict[str, list[tuple[UUID, st
     return groups
 
 
-def reconnect_summary(conn: psycopg.Connection[Any], person_id: UUID) -> list[dict[str, Any]]:
-    """The person's open outbox items as summary entries, in §8.3 order."""
-    return build_summary(conn.execute(QUERY, (person_id,)).fetchall())
+def reconnect_summary(
+    conn: psycopg.Connection[Any], person_id: UUID, node_id: UUID
+) -> list[dict[str, Any]]:
+    """The person's open outbox items for `node_id` (those for every node of the person, and
+    those addressed to this one) as summary entries, in §8.3 order."""
+    return build_summary(conn.execute(QUERY, (person_id, node_id)).fetchall())
 
 
 def build_summary(rows: Iterable[Sequence[Any]]) -> list[dict[str, Any]]:

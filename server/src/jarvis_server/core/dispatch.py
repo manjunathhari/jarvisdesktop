@@ -5,7 +5,8 @@ Transactions (controller ruling 5):
 - Each job runs in its own transaction: the handler's work and `jobs.complete` commit together,
   so a job re-run after a crash finds either everything or nothing.
 - A handler that raises: its transaction is rolled back (nothing it wrote survives), then
-  `jobs.fail` records the failure in a separate transaction, and the error is re-raised.
+  `jobs.fail` records the failure in a separate transaction, and the error is re-raised. Only
+  the exception's class and a fixed code are stored and logged, never its text (S-5).
 - Inside the job transaction, `dbcall.audited_call_in_job` is the way to call an audited
   function (R11-1): dispatch marks the transaction with a context variable for the handler's
   run, and the helper refuses to run anywhere else (`NotInJob`).
@@ -36,7 +37,7 @@ log = logging.getLogger("jarvis.core.dispatch")
 
 Handler = Callable[[psycopg.Connection[Any], jobs.Job], None]
 
-__all__ = ["Handler", "TransactionNotIdle", "UnknownJob", "handle", "register"]
+__all__ = ["Handler", "TransactionNotIdle", "UnknownJob", "failure_code", "handle", "register"]
 
 _HANDLERS: dict[str, Handler] = {}
 
@@ -57,6 +58,15 @@ def register(kind: str) -> Callable[[Handler], Handler]:
     return decorate
 
 
+def failure_code(e: BaseException) -> str:
+    """What is logged and stored about a failure: the exception's class and a fixed code, never
+    its text. A database error's text can carry row content (`DETAIL: Failing row contains
+    (...)`, a parameter's value), and so can a handler's own message (final review S-5)."""
+    sqlstate = e.sqlstate if isinstance(e, psycopg.Error) else None
+    code = f"sqlstate {sqlstate}" if sqlstate else "job failed"
+    return f"{type(e).__name__}: {code}"
+
+
 def handle(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     """Run one claimed job in its own transaction; complete it, or fail it and re-raise."""
     status = conn.info.transaction_status
@@ -74,8 +84,8 @@ def handle(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     except Exception as e:
         # The job transaction (if any) has been rolled back on leaving the block above.
         with conn.transaction():
-            outcome = jobs.fail(conn, job.id, f"{type(e).__name__}: {e}")
-        log.warning("job %s (%s) failed: %s -> %s", job.id, job.kind, e, outcome)
+            outcome = jobs.fail(conn, job.id, failure_code(e))
+        log.warning("job %s (%s) failed: %s -> %s", job.id, job.kind, failure_code(e), outcome)
         raise
 
 

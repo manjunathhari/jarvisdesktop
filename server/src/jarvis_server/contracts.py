@@ -17,6 +17,7 @@ from pydantic import (
     ConfigDict,
     Field,
     RootModel,
+    StrictInt,
     field_validator,
     model_validator,
 )
@@ -376,7 +377,9 @@ class Enrol(_Contract):
 
 class ResumePosition(_Contract):
     reply_id: UUID
-    last_seq: int  # any integer; the gateway validates it (R6-5)
+    # Any integer; the gateway validates it (R6-5). Strict: a JSON number spelled with a
+    # fraction or an exponent (`2.0`, `1e18`) is refused whatever its value (final review M-1).
+    last_seq: StrictInt
 
 
 class Hello(_Contract):

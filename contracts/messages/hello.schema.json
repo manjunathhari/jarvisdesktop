@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/hello.schema.json",
   "title": "Payload of `hello`",
-  "description": "node → gateway: an existing node's reply to `challenge` (§6.1 step 5). The envelope signature (`node-msg`) covers the challenge's `nonce`. `resume` is the node's own record of what it has shown, per reply; `last_seq` is any integer, validated by the gateway (R6-5). `clock_skew_ms` is present only when the node's clock differs from the challenge's `issued_at` by more than 30 s (advisory).",
+  "description": "node → gateway: an existing node's reply to `challenge` (§6.1 step 5). The envelope signature (`node-msg`) covers the challenge's `nonce`. `resume` is the node's own record of what it has shown, per reply; `last_seq` is any integer, validated by the gateway (R6-5), written as an integer literal: a number with a fraction or an exponent (`2.0`, `1e18`) is refused whatever its value. `clock_skew_ms` is present only when the node's clock differs from the challenge's `issued_at` by more than 30 s (advisory).",
   "type": "object",
   "additionalProperties": false,
   "required": [

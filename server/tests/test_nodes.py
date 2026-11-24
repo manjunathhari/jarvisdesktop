@@ -63,7 +63,7 @@ INTERNAL_GW_FUNCTIONS = (
 )
 GATEWAY_FUNCTIONS = GATEWAY_GW_FUNCTIONS | {
     # Migration 0009 (Task 3): the conv and comm connection functions (§4.1).
-    "conv.record_inbound(bigint,uuid,text,jsonb)",
+    "conv.record_inbound(bigint,uuid,text,jsonb,jsonb)",  # R12-34: + envelope
     "comm.record_sent(bigint,uuid)",
     "comm.record_received(bigint,uuid)",
     "comm.acknowledge(bigint,uuid)",

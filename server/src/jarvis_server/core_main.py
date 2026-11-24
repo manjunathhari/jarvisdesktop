@@ -106,7 +106,7 @@ def run_loop(
         try:
             dispatch.handle(conn, job)  # records the failure itself before re-raising
         except Exception as e:
-            log.warning("job %s (%s) not completed: %s: %s", job.id, job.kind, type(e).__name__, e)
+            log.warning("job %s (%s) not completed: %s", job.id, job.kind, dispatch.failure_code(e))
 
 
 API_KEY_SECRET = "anthropic_api_key"  # noqa: S105  the secret file's name, not a secret

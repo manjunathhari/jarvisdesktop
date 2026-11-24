@@ -22,7 +22,9 @@ object and is consumed by the first reply, whatever its outcome.
 envelope gets `error malformed`; neither carries a `seq` the gateway counts. An envelope from
 another node, with a bad `node-msg` signature or a `seq` that isn't the previous + 1 closes the
 connection through `gw.close_connection(conn_id, code)`, which writes its DISCONNECT row.
-`utterance`, `approval.decision` and `action.receipt` go to `conv.record_inbound`; `ping` to
+`utterance`, `approval.decision` and `action.receipt` go to `conv.record_inbound`, with the
+node's complete signed envelope, which core re-verifies before an irreversible step (R12-34);
+`ping` to
 `gw.touch_connection` and `pong`; `received` and `ack` to `comm.record_received`,
 `comm.acknowledge` or `conv.record_chunk_received` (a refusal is sent back as `error`); `pong`
 answers the gateway's heartbeat. Any other database error on an established connection sends
@@ -68,7 +70,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, ValidationError
-from starlette.websockets import WebSocket, WebSocketState
+from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 from jarvis_server import signing
 from jarvis_server.contracts import (
@@ -212,6 +214,8 @@ class Session:
         self._out_seq = 0
         self._in_seq = 0
         self._send_lock = asyncio.Lock()
+        self._close_recorded = False  # gw.close_connection has closed (or found closed) the row
+        self._closing: asyncio.Future[None] | None = None  # the close in flight, if any
         self.keys = ctx.keys  # this connection's keys, for its whole life (R12-6)
 
     # ------------------------------------------------------------------ running
@@ -219,31 +223,56 @@ class Session:
     async def run(self) -> None:
         await self.ws.accept()
         try:
-            if not await self._handshake():
-                return
-            assert self.node_id is not None and self.person_id is not None
-            assert self.conn_id is not None
-            self.link = relay.NodeLink(
-                self.ctx.relay,
-                self,
-                node_id=self.node_id,
-                person_id=self.person_id,
-                conn_id=self.conn_id,
-                connected_at=self.ctx.clock(),
-                gw_key_id=self.keys.gw_key_id,
-            )
-            self.ctx.relay.register(self.link)
-            if self.keys.gw_key_id != self.ctx.keys.gw_key_id:  # rotated during the handshake
-                # Stops the link too, so on_connect delivers nothing under the replaced key.
-                self.link._stop(relay.KEY_ROTATED, relay.KEY_ROTATED)
-            try:
-                await self.link.on_connect(self._resume)
-                await self._established()
-            finally:
-                self.ctx.relay.unregister(self.link)
-                await self.link.close()
+            await self._run()
+        except BaseException as e:
+            if self.conn_id is None:
+                raise  # no row was opened: nothing to record (the handshake's own refusals)
+            # The row is open and the connection is over, whatever ended it: a send to a peer
+            # that has gone, a send timeout, a database failure or a fault here. Its
+            # DISCONNECT is recorded with a reason (final review I-2), and only the exception's
+            # class is logged, never its text.
+            await self._record_close(self._stop_reason or _close_reason(e))
+            if not isinstance(e, Exception):
+                raise  # cancelled (shutdown): recorded, then let it go on
+            log.warning("connection %s ended by %s", self.conn_id, type(e).__name__)
         finally:
+            if self.conn_id is not None:
+                # Every other way out (the receive loop returning, the relay stopping it)
+                # recorded it already; this is a no-op then.
+                await self._record_close(self._stop_reason or "node_closed")
             await self._close_socket(CLOSE_REFUSED, self._socket_reason)
+
+    async def _record_close(self, reason: str) -> None:
+        """Record the close unless it is recorded already, or in flight (then wait for it)."""
+        if self._closing is not None and not self._closing.done():
+            await asyncio.shield(self._closing)
+        if not self._close_recorded:
+            await self._db_close(reason)
+
+    async def _run(self) -> None:
+        if not await self._handshake():
+            return
+        assert self.node_id is not None and self.person_id is not None
+        assert self.conn_id is not None
+        self.link = relay.NodeLink(
+            self.ctx.relay,
+            self,
+            node_id=self.node_id,
+            person_id=self.person_id,
+            conn_id=self.conn_id,
+            connected_at=self.ctx.clock(),
+            gw_key_id=self.keys.gw_key_id,
+        )
+        self.ctx.relay.register(self.link)
+        if self.keys.gw_key_id != self.ctx.keys.gw_key_id:  # rotated during the handshake
+            # Stops the link too, so on_connect delivers nothing under the replaced key.
+            self.link._stop(relay.KEY_ROTATED, relay.KEY_ROTATED)
+        try:
+            await self.link.on_connect(self._resume)
+            await self._established()
+        finally:
+            self.ctx.relay.unregister(self.link)
+            await self.link.close()
 
     async def _established(self) -> None:
         tasks = [
@@ -444,7 +473,9 @@ class Session:
             raise HandshakeRefused("identity_mismatch", node_id)
         self._check_key_state(node_id, str(row[4]))
         await self._open(node_id, public_key, skew)
-        await self.send(MessageKind.WELCOME, await relay.welcome(self.ctx.pool, self.person_id))
+        await self.send(
+            MessageKind.WELCOME, await relay.welcome(self.ctx.pool, self.person_id, node_id)
+        )
 
     def _check_key_state(self, node_id: UUID, key_state: str) -> None:
         """The node's `key_state` decision point (§6.1 step 6, R6-6): CURRENT goes on to
@@ -482,7 +513,7 @@ class Session:
         await self.send(
             MessageKind.WELCOME,
             {
-                **await relay.welcome(self.ctx.pool, self.person_id),
+                **await relay.welcome(self.ctx.pool, self.person_id, node_id),
                 "enrolment": {
                     "node_id": str(node_id),
                     "core_key_id": core_key_id,
@@ -526,11 +557,17 @@ class Session:
                 log.info("connection %s: send timed out", self.conn_id)
                 await self._db_close(relay.SEND_TIMEOUT)
                 return
+            except WebSocketDisconnect:  # a reply to a peer that has gone (I-2)
+                log.info("connection %s: the node has gone", self.conn_id)
+                await self._db_close("node_closed")
+                return
             except psycopg.Error as e:
                 # Any other database failure: its audited transaction rolled back, so nothing
-                # partial remains. Tell the node, then close through gw.close_connection.
+                # partial remains. Tell the node if it can still be told (the reply may fail or
+                # time out: I-2), then close through gw.close_connection.
                 log.warning("database error on connection %s (%s)", self.conn_id, e.sqlstate)
-                await self._error(SERVER_ERROR, "the server could not process the message")
+                with contextlib.suppress(Exception):
+                    await self._error(SERVER_ERROR, "the server could not process the message")
                 await self._db_close(SERVER_ERROR)
                 return
 
@@ -556,9 +593,10 @@ class Session:
         if env.seq != self._in_seq + 1:
             raise CloseConnection("bad_seq")
         self._in_seq = env.seq
-        await self._dispatch(env, raw["payload"])
+        await self._dispatch(env, raw)
 
-    async def _dispatch(self, env: NodeEnvelope, payload: dict[str, Any]) -> None:
+    async def _dispatch(self, env: NodeEnvelope, raw: dict[str, Any]) -> None:
+        payload: dict[str, Any] = raw["payload"]
         kind = env.kind
         if kind in (MessageKind.HELLO, MessageKind.ENROL):
             raise CloseConnection("bad_nonce")  # the nonce was consumed by the first reply
@@ -571,7 +609,7 @@ class Session:
             await self._error("malformed", "the payload does not match its schema")
             return
         if kind in INBOUND_KINDS:
-            await self._record_inbound(env.message_id, kind, payload)
+            await self._record_inbound(env.message_id, kind, payload, raw)
         elif kind is MessageKind.PING:
             await self._db("SELECT gw.touch_connection(%s)", (self.conn_id,))
             await self.send(MessageKind.PONG, {})
@@ -594,13 +632,17 @@ class Session:
         if refusal is not None:
             await self._error(refusal, "the message was refused")
 
-    async def _record_inbound(self, message_id: UUID, kind: MessageKind, payload: Any) -> None:
+    async def _record_inbound(
+        self, message_id: UUID, kind: MessageKind, payload: Any, envelope: dict[str, Any]
+    ) -> None:
+        """`conv.record_inbound`, with the node's complete signed envelope for core to
+        re-verify before an irreversible step (R12-34)."""
         try:
             async with self.ctx.pool.connection() as conn:
                 _, refusal = await audited_call_async(
                     conn,
-                    "SELECT recorded, refusal FROM conv.record_inbound(%s, %s, %s, %s)",
-                    (self.conn_id, message_id, kind.value, Jsonb(payload)),
+                    "SELECT recorded, refusal FROM conv.record_inbound(%s, %s, %s, %s, %s)",
+                    (self.conn_id, message_id, kind.value, Jsonb(payload), Jsonb(envelope)),
                 )
         except psycopg.Error as e:
             if _fenced(e):
@@ -623,7 +665,8 @@ class Session:
         """gw.close_connection: its DISCONNECT row records why (an already closed connection is
         a no-op there). Shielded: once started, it completes even if this connection's tasks
         are cancelled (a shutdown), so the disconnect is still recorded."""
-        await asyncio.shield(self._db_close_now(reason))
+        self._closing = asyncio.ensure_future(self._db_close_now(reason))
+        await asyncio.shield(self._closing)
 
     async def _db_close_now(self, reason: str) -> None:
         try:
@@ -631,8 +674,11 @@ class Session:
                 await audited_call_async(
                     conn, "SELECT gw.close_connection(%s, %s)", (self.conn_id, reason)
                 )
+            self._close_recorded = True
         except psycopg.Error as e:
-            if not _fenced(e):  # the database is unreachable: open_connection supersedes later
+            if _fenced(e):
+                self._close_recorded = True  # closed already (superseded or revoked)
+            else:  # the database is unreachable: open_connection supersedes later
                 log.warning("could not close connection %s (%s)", self.conn_id, e.sqlstate)
 
     async def _recheck(self) -> None:
@@ -646,6 +692,15 @@ class Session:
                 return
             except psycopg.Error:  # the database is unreachable: try again next interval
                 log.warning("revocation re-check failed for connection %s", self.conn_id)
+
+
+def _close_reason(e: BaseException) -> str:
+    """The gw.close_connection reason for an exception that ended an open connection."""
+    if isinstance(e, relay.SendTimeout):
+        return relay.SEND_TIMEOUT
+    if isinstance(e, WebSocketDisconnect | OSError | asyncio.CancelledError):
+        return "node_closed"  # the peer has gone (or the gateway is shutting down)
+    return SERVER_ERROR  # a database failure, or a fault here
 
 
 class _PeerLeft(Exception):

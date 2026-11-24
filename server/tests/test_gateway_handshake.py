@@ -683,6 +683,8 @@ def test_second_hello_on_same_connection_refused(gw_client: Gw) -> None:
 def test_failed_first_reply_consumes_nonce(gw_client: Gw, app_conn: Conn) -> None:
     a = gw_client.enrolled()
     a.close()
+    # a's own close is recorded (final review I-2), after its socket has gone: wait for it.
+    assert _wait_for(lambda: _connections(gw_client.dsns, a.node_id) == [(True, "node_closed")])
     wrong = gw_client.node(node_id=a.node_id, peer_ip=a.peer_ip)
     wrong.pinned_gateway = dict(a.pinned_gateway)
     wrong.connect()
@@ -1042,6 +1044,7 @@ def test_gateway_role_only(gdb: Dsns, tmp_path: Path) -> None:
 
 def test_gateway_never_binds_all_interfaces(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(gateway_app.os, "getuid", lambda: 10001)
     monkeypatch.setattr(gateway_app.uvicorn, "run", lambda app, **kw: calls.append(kw))
     monkeypatch.setenv("JARVIS_TS_SOCKET", "/nonexistent/tailscaled.sock")
     monkeypatch.setattr(gateway_app, "_build_app", lambda socket_path: object())
@@ -1055,6 +1058,23 @@ def test_gateway_never_binds_all_interfaces(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(gateway_app, "tailnet_ipv4", lambda socket_path: "100.101.102.103")
     assert gateway_app.main() == 0
     assert [(c["host"], c["port"]) for c in calls] == [("100.101.102.103", 8443)]
+
+
+@pytest.mark.parametrize("uid", [0, 1000, 10002, 65534])
+def test_gateway_refuses_to_start_under_another_uid(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, uid: int
+) -> None:
+    """Final review S-2: the sidecar's egress rules are installed for the gateway's UID, so
+    `jarvis-gateway` exits at startup unless it runs as UID 10001, before anything else."""
+    calls: list[Any] = []
+    monkeypatch.setattr(gateway_app.os, "getuid", lambda: uid)
+    monkeypatch.setattr(gateway_app.uvicorn, "run", lambda app, **kw: calls.append(kw))
+    monkeypatch.setenv("JARVIS_TS_SOCKET", "/nonexistent/tailscaled.sock")
+    monkeypatch.setattr(gateway_app, "tailnet_ipv4", lambda p: calls.append(p) or "100.64.0.1")
+    monkeypatch.setattr(gateway_app, "_build_app", lambda p: calls.append(p) or object())
+    assert gateway_app.main() != 0
+    assert calls == []
+    assert "UID 10001" in caplog.text
 
 
 # ------------------------------------------------------------------------------ fix round 1 (I-1)

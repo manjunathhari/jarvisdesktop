@@ -32,8 +32,10 @@
   decision trigger writes DECIDE APPLIED (APPROVED, DENIED, EXPIRED); and
   ledger.refuse_decision(approval_id, node_id, code) writes the DECIDE REJECTED row of a decision
   core refused under §9.3 step 6 and changes nothing else. Its codes are fixed, in check order:
-  unknown_approval, bad_card_sig, other_person, node_revoked, not_pending, expired. Any other
-  code is a malformed call. EXECUTE for jarvis_app only.
+  bad_node_signature (R12-34: the node's signed envelope is missing, doesn't verify under the
+  node's key or doesn't match the stored message), unknown_approval, bad_card_sig,
+  other_person, node_revoked, not_pending, expired. Any other code is a malformed call.
+  EXECUTE for jarvis_app only.
 - Receipt audit (R12-24): ledger.refuse_receipt(ref, node_id, code) writes the RECEIPT REJECTED
   row of a receipt core rejected (§9.4), or of a verification listing that never came, and
   changes nothing else. Fixed codes (listed with the function); EXECUTE for jarvis_app only.
@@ -260,8 +262,8 @@ DECLARE
     v_decision text;
 BEGIN
     IF p_approval_id IS NULL OR p_node_id IS NULL OR p_code IS NULL
-       OR p_code NOT IN ('unknown_approval', 'bad_card_sig', 'other_person', 'node_revoked',
-                         'not_pending', 'expired') THEN
+       OR p_code NOT IN ('bad_node_signature', 'unknown_approval', 'bad_card_sig',
+                         'other_person', 'node_revoked', 'not_pending', 'expired') THEN
         RAISE EXCEPTION 'malformed refuse_decision call' USING ERRCODE = 'invalid_parameter_value';
     END IF;
     SELECT a.decision INTO v_decision FROM ledger.approval a WHERE a.id = p_approval_id;
@@ -278,6 +280,8 @@ GRANT EXECUTE ON FUNCTION ledger.refuse_decision(uuid, uuid, text) TO jarvis_app
 -- R12-24, §9.4: a receipt core rejected. Writes one RECEIPT REJECTED row with the code as its
 -- reason and changes nothing else. The codes are fixed:
 --   about one receipt (p_ref is its conv.inbound ID; entity 'inbound'):
+--     bad_node_signature  the node's signed envelope is missing, doesn't verify under the
+--                      node's key, or doesn't match the stored message (R12-34)
 --     unknown_key      no issued action has this execution key, or not for this node
 --     reused_key       the key's one receipt was already accepted
 --     unknown_action   a live receipt for no ACTION chunk of this node and person
@@ -295,9 +299,9 @@ CREATE FUNCTION ledger.refuse_receipt(p_ref uuid, p_node_id uuid, p_code text) R
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
     IF p_ref IS NULL OR p_node_id IS NULL OR p_code IS NULL
-       OR p_code NOT IN ('unknown_key', 'reused_key', 'unknown_action', 'late', 'malformed',
-                         'not_recycled', 'file_mismatch', 'listing_failed', 'still_listed',
-                         'listing_missing') THEN
+       OR p_code NOT IN ('bad_node_signature', 'unknown_key', 'reused_key', 'unknown_action',
+                         'late', 'malformed', 'not_recycled', 'file_mismatch',
+                         'listing_failed', 'still_listed', 'listing_missing') THEN
         RAISE EXCEPTION 'malformed refuse_receipt call' USING ERRCODE = 'invalid_parameter_value';
     END IF;
     PERFORM audit.append('AGENT', 'core',

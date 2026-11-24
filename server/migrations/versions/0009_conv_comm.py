@@ -4,6 +4,9 @@
 - Schema conv: conv.session (one open session per person), conv.inbound, conv.message,
   conv.stream_chunk, conv.stream_cursor and conv.session_ticket.
 - Schema comm: comm.event (append-only, codes and IDs only), comm.outbox and comm.delivery.
+- conv.inbound.envelope keeps the node's complete signed envelope, passed by the gateway to
+  conv.record_inbound (R12-34), so core can re-verify the node's signature before acting on an
+  approval decision, an approved action's receipt or a verification listing.
 - jarvis_gateway may SELECT conv.stream_chunk, conv.stream_cursor, comm.outbox and
   comm.delivery, and the columns id, person_id and closed_at of conv.session (R12-9), and
   EXECUTE conv.record_inbound, comm.record_sent, comm.record_received, comm.acknowledge,
@@ -80,6 +83,10 @@ CREATE TABLE conv.inbound (
     session_id   uuid REFERENCES conv.session(id),
     kind         text NOT NULL CHECK (kind IN ('utterance', 'approval.decision', 'action.receipt')),
     payload      jsonb NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
+    -- The node's complete signed envelope, as the gateway received it (R12-34): core re-verifies
+    -- its node-msg signature before any irreversible step. NULL only if the gateway didn't pass
+    -- one, which core refuses (bad_node_signature).
+    envelope     jsonb CHECK (envelope IS NULL OR jsonb_typeof(envelope) = 'object'),
     received_at  timestamptz NOT NULL DEFAULT now(),
     outcome      text CHECK (outcome IN ('ANSWERED', 'INDETERMINATE', 'REFUSED'))
 );
@@ -289,8 +296,10 @@ $$;
 -- Gateway: one message from a node (§6.2). The node and person come from the connection, never
 -- from the message. A resend of the same message_id by the same node is a no-op, (false, NULL);
 -- one already recorded by a different node is refused, (false, 'id_conflict') (R9-4).
+-- p_envelope is the node's complete signed envelope, stored as it is for core to re-verify
+-- (R12-34); this function doesn't verify it (it holds no key and trusts nothing in it).
 CREATE FUNCTION conv.record_inbound(
-    p_conn_id bigint, p_message_id uuid, p_kind text, p_payload jsonb
+    p_conn_id bigint, p_message_id uuid, p_kind text, p_payload jsonb, p_envelope jsonb
 ) RETURNS TABLE (recorded boolean, refusal text)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 #variable_conflict use_column
@@ -304,7 +313,8 @@ DECLARE
 BEGIN
     v_node := gw.current_node(p_conn_id);  -- the fence, first (R8-1)
     IF p_message_id IS NULL OR p_kind IS NULL OR p_payload IS NULL
-       OR jsonb_typeof(p_payload) <> 'object' THEN
+       OR jsonb_typeof(p_payload) <> 'object'
+       OR (p_envelope IS NOT NULL AND jsonb_typeof(p_envelope) <> 'object') THEN
         RAISE EXCEPTION 'malformed record_inbound call' USING ERRCODE = 'invalid_parameter_value';
     END IF;
     v_job_kind := CASE p_kind
@@ -321,8 +331,8 @@ BEGIN
         RETURN;
     END IF;
     SELECT n.person_id INTO v_person FROM gw.node n WHERE n.id = v_node;
-    INSERT INTO conv.inbound (id, node_id, person_id, kind, payload)
-        VALUES (p_message_id, v_node, v_person, p_kind, p_payload)
+    INSERT INTO conv.inbound (id, node_id, person_id, kind, payload, envelope)
+        VALUES (p_message_id, v_node, v_person, p_kind, p_payload, p_envelope)
         ON CONFLICT (id) DO NOTHING
         RETURNING id INTO v_inserted;
     IF v_inserted IS NULL THEN
@@ -647,7 +657,7 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION conv.record_inbound(bigint, uuid, text, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION conv.record_inbound(bigint, uuid, text, jsonb, jsonb) FROM PUBLIC;
 REVOKE ALL ON FUNCTION comm.record_sent(bigint, uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION comm.record_received(bigint, uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION comm.acknowledge(bigint, uuid) FROM PUBLIC;
@@ -657,7 +667,7 @@ REVOKE ALL ON FUNCTION comm.supersede(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION comm.supersede_for_create(uuid) FROM PUBLIC;
 REVOKE ALL ON FUNCTION comm.expire(uuid) FROM PUBLIC;
 
-GRANT EXECUTE ON FUNCTION conv.record_inbound(bigint, uuid, text, jsonb) TO jarvis_gateway;
+GRANT EXECUTE ON FUNCTION conv.record_inbound(bigint, uuid, text, jsonb, jsonb) TO jarvis_gateway;
 GRANT EXECUTE ON FUNCTION comm.record_sent(bigint, uuid) TO jarvis_gateway;
 GRANT EXECUTE ON FUNCTION comm.record_received(bigint, uuid) TO jarvis_gateway;
 GRANT EXECUTE ON FUNCTION comm.acknowledge(bigint, uuid) TO jarvis_gateway;
@@ -744,7 +754,7 @@ def downgrade() -> None:
     DROP FUNCTION comm.acknowledge(bigint, uuid);
     DROP FUNCTION comm.record_received(bigint, uuid);
     DROP FUNCTION comm.record_sent(bigint, uuid);
-    DROP FUNCTION conv.record_inbound(bigint, uuid, text, jsonb);
+    DROP FUNCTION conv.record_inbound(bigint, uuid, text, jsonb, jsonb);
     DROP TABLE comm.delivery;
     DROP TABLE comm.outbox;
     DROP FUNCTION comm.outbox_guard();

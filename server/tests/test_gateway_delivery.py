@@ -24,6 +24,7 @@ import uuid
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -444,6 +445,32 @@ def test_resume_last_seq_beyond_two_to_the_53_is_refused(gw: Gw, app_conn: Conn,
     assert rows == [("CONNECT_REFUSED", "bad_signature")]
     assert resume_events(app_conn, a.node_id) == []
     assert close_reason(app_conn, a.node_id) == connections  # no connection was opened
+
+
+@pytest.mark.parametrize("last_seq", [1e18, 2.0, 9007199254740993.0])
+def test_resume_last_seq_float_spelling_is_refused(
+    gw: Gw, app_conn: Conn, ddb: Dsns, last_seq: float
+) -> None:
+    """Final review M-1: a `last_seq` spelled as a JSON number that isn't an integer literal
+    (`1e+18`, `2.0`) is refused whatever its value, even when correctly signed: the handshake
+    is refused `malformed`, no connection opens, nothing reaches the resume function."""
+    a, reply = _stored_three_acked_one(gw, app_conn, ddb)
+    connections = close_reason(app_conn, a.node_id)
+    b = reborn(gw, a)
+    b.connect()
+    assert b.challenge is not None
+    since = audit_seq(app_conn)
+    resume = [{"reply_id": str(reply), "last_seq": last_seq}]
+    b.send("hello", {"nonce": b.challenge["nonce"], "resume": resume})  # signed as sent
+    assert f'"last_seq": {json.dumps(last_seq)}' in b.last_sent
+    got = closed(b)
+    assert [e["kind"] for e in got] == []  # no welcome
+    rows = app_conn.execute(
+        "SELECT action::text, reason FROM audit.event WHERE seq > %s ORDER BY seq", (since,)
+    ).fetchall()
+    assert rows == [("CONNECT_REFUSED", "malformed")]
+    assert resume_events(app_conn, a.node_id) == []
+    assert close_reason(app_conn, a.node_id) == connections
 
 
 def test_resume_for_foreign_reply_ignored(gw: Gw, app_conn: Conn) -> None:
@@ -881,26 +908,121 @@ def _e13_trace_line(
     }
 
 
+E13_RUNS = int(os.environ.get("JARVIS_E13_RUNS", "200"))  # JARVIS_E13_RUNS=1000: the spec's count
+OPEN_STATES = ("PENDING", "DELIVERING", "DELIVERED")
+
+
+@dataclass
+class _Connection:
+    """One connection instance of a node in P2-E13: the frames the gateway sent it, and the
+    sweeps that ran while it was connected, with the items unconfirmed by its node then."""
+
+    node: str
+    fake: FakeNode
+    frames: list[dict[str, Any]] = field(default_factory=list)
+    sweeps: list[set[str]] = field(default_factory=list)
+
+
+def _unconfirmed(app: Conn, node: uuid.UUID | None, items: list[str]) -> set[str]:
+    """The items `node` has not confirmed receipt of (no delivery row, or not received)."""
+    confirmed = {
+        str(r[0])
+        for r in app.execute(
+            "SELECT outbox_id FROM comm.delivery WHERE node_id = %s AND received_at IS NOT NULL",
+            (node,),
+        ).fetchall()
+    }
+    return set(items) - confirmed
+
+
+def _assert_e13_gateway_side(
+    app: Conn, connections: list[_Connection], items: list[str], terminal: dict[str, str | None]
+) -> None:
+    """The gateway's own P2-E13 properties (§8.2), over the frames it sent, per connection:
+    nothing after `outbox.cleared`, one outbox_id for an item on every send, at most one send
+    per connection plus one per sweep that found it unconfirmed, and DB state consistent."""
+    payloads: dict[str, dict[str, Any]] = {}
+    cleared: dict[str, set[str]] = {}
+    frames_to: Counter[tuple[str, str]] = Counter()
+    for c in connections:
+        gone = cleared.setdefault(c.node, set())
+        sends: Counter[str] = Counter()
+        for env in c.frames:
+            if env["kind"] == "outbox.cleared":
+                gone.add(env["payload"]["outbox_id"])
+            elif env["kind"] == "outbox.item":
+                oid = env["payload"]["outbox_id"]
+                assert oid in items, oid  # never a new ID for a retry
+                assert oid not in gone, ("sent after outbox.cleared", c.node, oid)
+                # Every send of an item, on every node and retry, is the same item.
+                assert payloads.setdefault(oid, env["payload"]) == env["payload"], oid
+                sends[oid] += 1
+                frames_to[(c.node, oid)] += 1
+        for oid, n in sends.items():
+            allowed = 1 + sum(oid in unconfirmed for unconfirmed in c.sweeps)
+            assert n <= allowed, ("re-sent on one connection without a due sweep", c.node, oid)
+    nodes_by_name = {c.node: c.fake.node_id for c in connections}
+    for oid in items:
+        state = app.execute("SELECT state FROM comm.outbox WHERE id = %s", (oid,)).fetchone()
+        assert state is not None
+        expected = terminal[oid]
+        assert state[0] == expected if expected else state[0] in OPEN_STATES, (oid, state)
+        rows = app.execute(
+            "SELECT action::text, outcome::text, seq, from_state, to_state FROM audit.event"
+            " WHERE entity_type = 'outbox' AND entity_id = %s ORDER BY seq",
+            (oid,),
+        ).fetchall()
+        applied_sends = [seq for action, outcome, seq, _, _ in rows
+                         if action == "SEND" and outcome == "APPLIED"]  # fmt: skip
+        # The one move into a terminal state (a later ack elsewhere is a 'late' no-op).
+        ends = [seq for action, outcome, seq, before, after in rows
+                if outcome == "APPLIED" and before in OPEN_STATES
+                and after in ("ACKNOWLEDGED", "SUPERSEDED", "EXPIRED")]  # fmt: skip
+        assert len(ends) == (1 if expected else 0), (oid, rows)
+        if ends:  # never sent once terminal
+            assert all(seq < ends[0] for seq in applied_sends), (oid, rows)
+        total_attempts = 0
+        for name, node_id in nodes_by_name.items():
+            got = attempts(app, oid, node_id) or 0
+            total_attempts += got
+            assert got >= frames_to[(name, oid)], (name, oid)  # every frame was recorded first
+        assert total_attempts == len(applied_sends), oid
+
+
 def test_display_once_per_node_across_retry_and_reconnect(
     ddb: Dsns, tmp_path: Path, app_conn: Conn
 ) -> None:
-    """P2-E13 (node half): two nodes, 200 randomised runs of re-send sweep, reconnect, ack on
-    either node and supersede, with each node confirming receipt or not at random. For every
-    node and item: displayed at most once, never after its outbox.cleared. With
-    JARVIS_WRITE_TRACES=1 the runs are written to tests/fakes/traces/e13.jsonl (committed) for
-    Plan B to replay against the Rust node: per run the ops and, per node, the outbox frames it
-    received, with IDs made symbolic."""
+    """P2-E13: two nodes, randomised runs (200; `JARVIS_E13_RUNS=1000` for the spec's count)
+    of re-send sweep, reconnect, ack on either node and supersede, with each node confirming
+    receipt or not at random.
+
+    Node half: for every node and item, displayed at most once, never after its
+    outbox.cleared. Gateway half (final review I-3), over the frames the gateway sent and the
+    database, independent of FakeNode's own dedup: no `outbox.item` after `outbox.cleared` for
+    it on that node; the same outbox_id and item on every retry; per connection at most one
+    send plus one per sweep that found it unconfirmed; and each run's final `comm.outbox` state,
+    audit trail and `comm.delivery` attempts consistent with the ops.
+
+    With JARVIS_WRITE_TRACES=1 the runs are written to tests/fakes/traces/e13.jsonl (committed)
+    for Plan B to replay against the Rust node: per run the ops and, per node, the outbox frames
+    it received, with IDs made symbolic."""
     rng = random.Random(13)  # noqa: S311  # a reproducible scenario, not crypto
     trace: list[dict[str, Any]] = []
+    items: list[str] = []
+    terminal: dict[str, str | None] = {}
     with gateway(ddb, tmp_path, tick_interval=3600) as g:  # the sweep runs only when called
         fakes = {"A": enrolled(g), "B": enrolled(g)}
         history: dict[str, list[FakeNode]] = {k: [v] for k, v in fakes.items()}
-        for run in range(200):
+        live = {name: _Connection(name, fake) for name, fake in fakes.items()}
+        connections = list(live.values())
+        for run in range(E13_RUNS):
             # A node that doesn't confirm receipt this run leaves items for the sweep to retry.
             confirms = {name: rng.random() < 0.5 for name in fakes}
             for name, fake in fakes.items():
                 fake.auto_received = confirms[name]
             outbox_id = str(item(app_conn))
+            items.append(outbox_id)
+            terminal[outbox_id] = None
             frames: dict[str, list[dict[str, Any]]] = {"A": [], "B": []}
             ops = rng.choices(
                 ["sweep", "reconnect_A", "reconnect_B", "ack_A", "ack_B", "supersede", "wait"],
@@ -909,25 +1031,44 @@ def test_display_once_per_node_across_retry_and_reconnect(
             for op in ops:
                 if op == "sweep":
                     g.clock.advance(150)
+                    for name, c in live.items():  # what may be re-sent, before it runs
+                        c.sweeps.append(_unconfirmed(app_conn, fakes[name].node_id, items))
                     _sweep(g)
                 elif op.startswith("reconnect_"):
                     name = op[-1]
+                    got = fakes[name].drain(0.005)
+                    frames[name] += got
+                    live[name].frames += got
                     fakes[name].close()
                     fakes[name] = reborn(g, fakes[name])
                     fakes[name].auto_received = confirms[name]
                     history[name].append(fakes[name])
+                    live[name] = _Connection(name, fakes[name])
+                    connections.append(live[name])
                     fakes[name].hello()
                 elif op.startswith("ack_"):
                     fake = fakes[op[-1]]
                     if outbox_id in fake.seen_outbox and outbox_id not in fake.cleared:
                         fake.ack(uuid.UUID(outbox_id))
+                        if terminal[outbox_id] is None:  # the first end wins
+                            terminal[outbox_id] = "ACKNOWLEDGED"
+                            assert _wait_for(
+                                lambda x=outbox_id: state(app_conn, x) == "ACKNOWLEDGED", 5
+                            )
                 elif op == "supersede":
-                    app_conn.execute("SELECT comm.supersede(%s)", (outbox_id,))
+                    row = app_conn.execute("SELECT comm.supersede(%s)", (outbox_id,)).fetchone()
+                    assert row == ("terminal" if terminal[outbox_id] else "applied",)
+                    terminal[outbox_id] = terminal[outbox_id] or "SUPERSEDED"
                 for name, fake in fakes.items():
-                    frames[name] += fake.drain(0.005)
+                    got = fake.drain(0.005)
+                    frames[name] += got
+                    live[name].frames += got
             for name, fake in fakes.items():
-                frames[name] += fake.sync() + fake.drain(0.02)
+                got = fake.sync() + fake.drain(0.02)
+                frames[name] += got
+                live[name].frames += got
             trace.append(_e13_trace_line(run, ops, frames, outbox_id))
+        _assert_e13_gateway_side(app_conn, connections, items, terminal)
         for name, instances in history.items():
             displays: Counter[str] = Counter()
             log: list[tuple[str, str]] = []
@@ -984,6 +1125,30 @@ def test_welcome_summary_order(gw: Gw, app_conn: Conn) -> None:
         {"priority": "DIGEST", "group_key": "brain", "outbox_ids": [str(d1), str(d2)],
          "line": "Claude is available again (2)"},
     ]  # fmt: skip
+
+
+def test_welcome_summary_offers_a_targeted_item_only_on_its_node(gw: Gw, app_conn: Conn) -> None:
+    """Final review I-1, R12-23: an URGENT `action.approved` item addressed to node A is in A's
+    `welcome` summary, never in B's; an untargeted item is in both."""
+    guest = person(app_conn)
+    a = enrolled(gw, guest)
+    b = enrolled(gw, guest)
+    a.close()
+    b.close()
+    targeted = item(
+        app_conn, who=guest, priority=Priority.URGENT, kind="action.approved",
+        group_key="action:x", target=a.node_id,
+    )  # fmt: skip
+    everyone = item(app_conn, who=guest, kind="budget.80", group_key="budget")
+    summary_a = reborn(gw, a).hello()["summary"]
+    summary_b = reborn(gw, b).hello()["summary"]
+    assert summary_a == [
+        {"priority": "URGENT", "group_key": "action:x", "outbox_ids": [str(targeted)],
+         "line": summary.LINE["action.approved"]},
+        {"priority": "TODAY", "group_key": "budget", "outbox_ids": [str(everyone)],
+         "line": summary.LINE["budget.80"]},
+    ]  # fmt: skip
+    assert summary_b == [summary_a[1]]
 
 
 def test_welcome_without_open_session(gw: Gw, app_conn: Conn) -> None:
@@ -1233,6 +1398,177 @@ def test_close_connection_failure_after_missed_heartbeats(
     assert close_reason(app_conn, a.node_id) == ["superseded", None]
     outbox_id = str(item(app_conn))
     assert outbox_id in item_ids(collect(again, lambda e: outbox_id in item_ids(e)))
+
+
+# ------------------------------------------------------------------------------ final review I-2
+#
+# Every way an established connection ends goes through gw.close_connection with a reason:
+# one DISCONNECT row, and no connection row left open (checked from a separate connection).
+
+
+def _open_rows(dsns: Dsns, node: uuid.UUID | None = None) -> int:
+    with psycopg.connect(dsns.app, autocommit=True) as other:
+        row = other.execute(
+            "SELECT count(*) FROM gw.node_connection WHERE closed_at IS NULL"
+            " AND (%s::uuid IS NULL OR node_id = %s::uuid)",
+            (node, node),
+        ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def _disconnects(dsns: Dsns, since: int) -> list[tuple[Any, ...]]:
+    with psycopg.connect(dsns.app, autocommit=True) as other:
+        rows = other.execute(
+            "SELECT details->>'node_id', details->>'reason' FROM audit.event"
+            " WHERE seq > %s AND action::text = 'DISCONNECT' ORDER BY seq",
+            (since,),
+        ).fetchall()
+    return [tuple(r) for r in rows]
+
+
+@contextmanager
+def failing_sends(
+    monkeypatch: pytest.MonkeyPatch, fake: FakeNode, *, kind: str, error: Callable[[], Exception]
+) -> Iterator[None]:
+    """Every send of a `kind` envelope to `fake`'s socket raises `error()` (what Starlette
+    raises once the peer has gone) or, for "stuck", never finishes."""
+    real = WebSocket.send_text
+    marker = f'"kind": "{kind}"'
+
+    async def send_text(self: WebSocket, data: str) -> None:
+        if self.client is not None and self.client.host == fake.peer_ip and marker in data:
+            raise error()
+        await real(self, data)
+
+    monkeypatch.setattr(WebSocket, "send_text", send_text)
+    yield
+
+
+def _stuck_sends_of(monkeypatch: pytest.MonkeyPatch, fake: FakeNode, kind: str) -> None:
+    real = WebSocket.send_text
+    marker = f'"kind": "{kind}"'
+
+    async def send_text(self: WebSocket, data: str) -> None:
+        if self.client is not None and self.client.host == fake.peer_ip and marker in data:
+            await asyncio.Event().wait()  # never set: a peer that stopped reading
+        await real(self, data)
+
+    monkeypatch.setattr(WebSocket, "send_text", send_text)
+
+
+def test_reply_to_a_gone_peer_records_the_disconnect(
+    gw: Gw, app_conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-2 (a): the `pong` to a `ping` fails because the peer has gone (Starlette raises
+    WebSocketDisconnect): closed `node_closed`, nothing left open."""
+    a = enrolled(gw)
+    since = audit_seq(app_conn)
+    with failing_sends(monkeypatch, a, kind="pong", error=lambda: WebSocketDisconnect(1006)):
+        a.send("ping", {})
+        assert _wait_for(lambda: close_reason(app_conn, a.node_id) == ["node_closed"], 5)
+    assert _disconnects(gw.dsns, since) == [(str(a.node_id), "node_closed")]
+    assert _open_rows(gw.dsns, a.node_id) == 0
+
+
+def test_error_reply_timeout_after_a_db_error_records_the_disconnect(
+    ddb: Dsns, tmp_path: Path, app_conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-2 (b): a database error on an inbound message, and the `error server_error` reply
+    to it times out: still closed `server_error`, nothing left open."""
+    with gateway(ddb, tmp_path, send_timeout=0.5) as g:
+        a = enrolled(g)
+        since = audit_seq(app_conn)
+        _stuck_sends_of(monkeypatch, a, "error")
+        # Valid for the Utterance schema, but Postgres jsonb refuses U+0000.
+        a.send("utterance", {"text": "a\u0000b", "screen_summary": None})
+        assert _wait_for(lambda: close_reason(app_conn, a.node_id) == ["server_error"], 5)
+        assert _disconnects(ddb, since) == [(str(a.node_id), "server_error")]
+        assert _open_rows(ddb, a.node_id) == 0
+
+
+def test_unexpected_error_in_the_receive_loop_records_the_disconnect(
+    gw: Gw, app_conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-2 (c): an exception that escapes the receive loop (here, a fault in handling a
+    message) is no longer lost before gw.close_connection: closed `server_error`, the socket
+    closed, nothing left open."""
+    from jarvis_server.gateway import session as gateway_session
+
+    a = enrolled(gw)
+    since = audit_seq(app_conn)
+
+    async def broken(self: Any, text: Any, data: Any) -> None:
+        raise ValueError("a fictional fault")
+
+    monkeypatch.setattr(gateway_session.Session, "_handle", broken)
+    a.send("ping", {})
+    closed(a)
+    assert _wait_for(lambda: close_reason(app_conn, a.node_id) == ["server_error"], 5)
+    assert _disconnects(gw.dsns, since) == [(str(a.node_id), "server_error")]
+    assert _open_rows(gw.dsns, a.node_id) == 0
+
+
+def test_welcome_send_timeout_records_the_disconnect(
+    ddb: Dsns, tmp_path: Path, app_conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-2 (d), path A: the row is open and `welcome` times out: closed `send_timeout`."""
+    with gateway(ddb, tmp_path, send_timeout=0.5) as g:
+        a = enrolled(g)
+        a.close()
+        assert _wait_for(lambda: close_reason(app_conn, a.node_id) == ["node_closed"], 5)
+        b = reborn(g, a)
+        _stuck_sends_of(monkeypatch, b, "welcome")
+        since = audit_seq(app_conn)
+        b.connect()
+        assert b.challenge is not None
+        b.send("hello", {"nonce": b.challenge["nonce"], "resume": []})
+        assert _wait_for(lambda: close_reason(app_conn, a.node_id)[-1:] == ["send_timeout"], 5)
+        assert _disconnects(ddb, since) == [(str(a.node_id), "send_timeout")]
+        assert _open_rows(ddb, a.node_id) == 0
+
+
+def test_welcome_db_failure_records_the_disconnect(
+    gw: Gw, app_conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-2 (d): the row is open and building `welcome` fails in the database: closed
+    `server_error`, nothing left open."""
+    a = enrolled(gw)
+    a.close()
+    assert _wait_for(lambda: close_reason(app_conn, a.node_id) == ["node_closed"], 5)
+    b = reborn(gw, a)
+
+    async def failing(*args: Any) -> Any:
+        raise psycopg.errors.InternalError("injected")
+
+    monkeypatch.setattr(relay, "welcome", failing)
+    since = audit_seq(app_conn)
+    with pytest.raises(WebSocketDisconnect):
+        b.hello()
+    assert _wait_for(lambda: close_reason(app_conn, a.node_id)[-1:] == ["server_error"], 5)
+    assert _disconnects(gw.dsns, since) == [(str(a.node_id), "server_error")]
+    assert _open_rows(gw.dsns, a.node_id) == 0
+
+
+def test_enrolment_welcome_send_timeout_records_the_disconnect(
+    ddb: Dsns, tmp_path: Path, app_conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """I-2 (d), path B: a new node is enrolled and its row opened, and the enrolment
+    `welcome` times out: closed `send_timeout`, nothing left open."""
+    with gateway(ddb, tmp_path, send_timeout=0.5) as g:
+        fake = g.node()
+        _stuck_sends_of(monkeypatch, fake, "welcome")
+        since = audit_seq(app_conn)
+        with pytest.raises((TimeoutError, WebSocketDisconnect)):
+            fake.enrol(g.code())
+
+        def node_closed() -> list[tuple[Any, ...]]:
+            return _disconnects(ddb, since)
+
+        assert _wait_for(lambda: [r[1] for r in node_closed()] == ["send_timeout"], 5)
+        [(node_id, _)] = node_closed()
+        assert close_reason(app_conn, uuid.UUID(node_id)) == ["send_timeout"]
+        assert _open_rows(ddb, uuid.UUID(node_id)) == 0
 
 
 def test_confirmation_is_per_device(ddb: Dsns, tmp_path: Path, app_conn: Conn) -> None:

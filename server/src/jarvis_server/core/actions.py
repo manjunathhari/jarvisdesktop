@@ -27,6 +27,10 @@ Shapes are the shared contracts (R12-25): `pc.list_test_folder.receipt` and
   task (outcome verified, COMPLETED, "Done"). A non-OK or malformed listing, the file still
   listed, a late listing, or none by the timeout: FAILED, and Jarvis says so (v2 §13.3).
 
+Before any of this, a receipt must be the node's own signed message (R12-34,
+`core.node_signature`): the stored envelope verifies under the node's key and matches the row.
+Otherwise it is refused `bad_node_signature`, and nothing is taken, verified or failed.
+
 Every rejected receipt is audited (R12-24): `ledger.refuse_receipt` with a fixed code, through
 `dbcall.audited_call_in_job`, as the handler's last write (R11-1). Task transitions are audited
 calls too, and come before the action and outcome writes: a refused transition is kept and
@@ -49,7 +53,7 @@ from pydantic import ValidationError
 
 from jarvis_server import comm, contracts, jobs, signing
 from jarvis_server.contracts import MemoryCategory, MemoryTag
-from jarvis_server.core import dispatch, identity, keys, rules
+from jarvis_server.core import dispatch, identity, keys, node_signature, rules
 from jarvis_server.dbcall import audited_call_in_job
 from jarvis_server.memory.engine import MemoryEngine
 
@@ -64,8 +68,9 @@ CORE = ("AGENT", "core")
 
 # ledger.refuse_receipt's fixed codes (R12-24), and those that mean "not verified".
 RECEIPT_REFUSALS = (
-    "unknown_key", "reused_key", "unknown_action", "late", "malformed", "not_recycled",
-    "file_mismatch", "listing_failed", "still_listed", "listing_missing",
+    node_signature.BAD_NODE_SIGNATURE, "unknown_key", "reused_key", "unknown_action", "late",
+    "malformed", "not_recycled", "file_mismatch", "listing_failed", "still_listed",
+    "listing_missing",
 )  # fmt: skip
 VERIFY_FAILURES = frozenset({"late", "listing_failed", "still_listed", "listing_missing"})
 
@@ -373,8 +378,8 @@ def on_receipt(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     """Handler of `action.receipt`, payload `{inbound_id}`."""
     inbound_id = UUID(job.payload["inbound_id"])
     row = conn.execute(
-        "SELECT node_id, person_id, kind, payload, outcome, received_at FROM conv.inbound"
-        " WHERE id = %s FOR UPDATE",
+        "SELECT node_id, person_id, kind, payload, outcome, received_at, envelope"
+        " FROM conv.inbound WHERE id = %s FOR UPDATE",
         (inbound_id,),
     ).fetchone()
     if row is None or row[4] is not None:
@@ -384,6 +389,15 @@ def on_receipt(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     )  # fmt: skip
     if kind != "action.receipt":
         raise ValueError(f"inbound {inbound_id} is a {kind}, not an action.receipt")
+    # R12-34: before anything else, the receipt must be the node's own signed message. This
+    # covers an approved action's receipt, the verification listing and the proposal listing.
+    if not node_signature.signed_by_node(
+        conn, inbound_id=inbound_id, node_id=node_id, kind=kind, payload=payload,
+        envelope=row[6],
+    ):  # fmt: skip
+        refuse_receipt(conn, ref=inbound_id, node_id=node_id,
+                       code=node_signature.BAD_NODE_SIGNATURE, inbound_id=inbound_id)  # fmt: skip
+        return
     if "execution_key" in payload:
         _approved_receipt(conn, inbound_id, node_id, payload)
     else:

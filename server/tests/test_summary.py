@@ -57,6 +57,7 @@ def _item(
     *,
     expires_at: datetime | None = None,
     supersedes_id: uuid.UUID | None = None,
+    target: uuid.UUID | None = None,
 ) -> uuid.UUID:
     event_id = comm.record_event(
         app, kind, subject_type="test", subject_id=f"t-{secrets.token_hex(4)}",
@@ -72,20 +73,31 @@ def _item(
         group_key=group_key,
         expires_at=expires_at,
         supersedes_id=supersedes_id,
+        target_node_id=target,
     )
 
 
-def _acknowledge(app: Conn, gateway: Conn, person: uuid.UUID, item: uuid.UUID) -> None:
+def _node(app: Conn, gateway: Conn, person: uuid.UUID) -> uuid.UUID:
     code = nodes.create_enrolment(
         app, person_id=person, kind="DESKTOP", name="pc", core_fp=CFP, gw_fp=GFP
     )
     token, _, _ = nodes.parse_enrolment_code(code)
-    node_id = nodes.enrol(
+    return nodes.enrol(
         gateway,
         token=token,
         public_key=secrets.token_bytes(32),
         tailscale_identity=f"ts:pc-{secrets.token_hex(4)}",
     )
+
+
+@pytest.fixture
+def node(app: Conn, gateway: Conn, person: uuid.UUID) -> uuid.UUID:
+    """The node whose summary is built (every summary is one node's, R12-23)."""
+    return _node(app, gateway, person)
+
+
+def _acknowledge(app: Conn, gateway: Conn, person: uuid.UUID, item: uuid.UUID) -> None:
+    node_id = _node(app, gateway, person)
     row = gateway.execute("SELECT conn_id FROM gw.open_connection(%s)", (node_id,)).fetchone()
     assert row is not None
     assert gateway.execute("SELECT comm.record_sent(%s, %s)", (row[0], item)).fetchone() == (True,)
@@ -93,7 +105,7 @@ def _acknowledge(app: Conn, gateway: Conn, person: uuid.UUID, item: uuid.UUID) -
     assert acked == ("ACKNOWLEDGED",)
 
 
-def test_summary_order(app: Conn, gateway: Conn, person: uuid.UUID) -> None:
+def test_summary_order(app: Conn, gateway: Conn, person: uuid.UUID, node: uuid.UUID) -> None:
     """Mixed items: URGENT first one by one, TODAY grouped by group_key, DIGEST one line per
     group, SILENT absent; acknowledged, superseded and expired items absent (P2-E07)."""
     soon = datetime.now(UTC) + timedelta(minutes=10)
@@ -120,7 +132,7 @@ def test_summary_order(app: Conn, gateway: Conn, person: uuid.UUID) -> None:
         ).fetchall()
     ]
 
-    lines = summary.reconnect_summary(app, person)
+    lines = summary.reconnect_summary(app, person, node)
 
     assert [line["priority"] for line in lines] == [
         "URGENT", "URGENT", "TODAY", "TODAY", "TODAY", "DIGEST", "DIGEST",
@@ -151,15 +163,17 @@ def test_summary_order(app: Conn, gateway: Conn, person: uuid.UUID) -> None:
         assert "Fictional free text" not in repr(line)
 
 
-def test_summary_skips_items_past_expiry(app: Conn, person: uuid.UUID) -> None:
+def test_summary_skips_items_past_expiry(app: Conn, person: uuid.UUID, node: uuid.UUID) -> None:
     past = datetime.now(UTC) - timedelta(seconds=1)
     _item(app, person, Priority.URGENT, "approval.requested", "approval:x", expires_at=past)
-    assert summary.reconnect_summary(app, person) == []
+    assert summary.reconnect_summary(app, person, node) == []
 
 
-def test_summary_unknown_kind_uses_generic_template(app: Conn, person: uuid.UUID) -> None:
+def test_summary_unknown_kind_uses_generic_template(
+    app: Conn, person: uuid.UUID, node: uuid.UUID
+) -> None:
     item = _item(app, person, Priority.URGENT, "test.notice", "test")
-    assert summary.reconnect_summary(app, person) == [
+    assert summary.reconnect_summary(app, person, node) == [
         {
             "priority": "URGENT",
             "group_key": "test",
@@ -170,7 +184,7 @@ def test_summary_unknown_kind_uses_generic_template(app: Conn, person: uuid.UUID
     ]
 
 
-def test_summary_is_per_person(app: Conn, owner: Conn, person: uuid.UUID) -> None:
+def test_summary_is_per_person(app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID) -> None:
     other = uuid.uuid4()
     owner.execute(
         "INSERT INTO ledger.person (id, display_name, organization_id, source_ref)"
@@ -178,7 +192,24 @@ def test_summary_is_per_person(app: Conn, owner: Conn, person: uuid.UUID) -> Non
         (other, HOUSEHOLD),
     )
     _item(app, other, Priority.URGENT, "budget.100", "budget")
-    assert summary.reconnect_summary(app, person) == []
+    assert summary.reconnect_summary(app, person, node) == []
+
+
+def test_summary_is_per_node(app: Conn, gateway: Conn, person: uuid.UUID, node: uuid.UUID) -> None:
+    """Final review I-1, R12-23: an item addressed to one node is in that node's summary only;
+    an item for every node is in each. The two approval-flow kinds have their own lines."""
+    other = _node(app, gateway, person)
+    approved = _item(app, person, Priority.URGENT, "action.approved", "action:a1", target=node)
+    refused = _item(
+        app, person, Priority.URGENT, "approval.decision_refused", "approval:a2", target=other
+    )
+    everyone = _item(app, person, Priority.TODAY, "budget.80", "budget")
+    mine = summary.reconnect_summary(app, person, node)
+    theirs = summary.reconnect_summary(app, person, other)
+    assert [line["outbox_ids"] for line in mine] == [[approved], [everyone]]
+    assert [line["outbox_ids"] for line in theirs] == [[refused], [everyone]]
+    assert mine[0]["text"] == summary.LINE["action.approved"] != summary.GENERIC_LINE
+    assert theirs[0]["text"] == summary.LINE["approval.decision_refused"] != summary.GENERIC_LINE
 
 
 FORBIDDEN_ROOTS = ("anthropic", "httpx", "openai", "requests")

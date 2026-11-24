@@ -186,7 +186,7 @@ def test_unknown_job_kind_fails_job(app: Conn) -> None:
     with pytest.raises(dispatch.UnknownJob, match=r"no\.such\.kind"):
         dispatch.handle(app, _claim(app, job_id))
     status, error = _job(app, job_id)
-    assert status == "QUEUED" and error == "UnknownJob: no handler for job kind 'no.such.kind'"
+    assert status == "QUEUED" and error == "UnknownJob: job failed"  # never its text (S-5)
     with pytest.raises(dispatch.UnknownJob):  # the retry fails the same way, then for good
         dispatch.handle(app, _claim(app, job_id))
     assert _job(app, job_id)[0] == "FAILED"
@@ -206,7 +206,7 @@ def test_handler_that_raises_leaves_nothing_and_fails_job(
         sql = "SELECT count(*) FROM comm.outbox WHERE person_id = %s"
         assert _count(other, sql, (person,)) == 0
         status, error = _job(other, job_id)
-    assert status == "QUEUED" and error == "RuntimeError: fictional handler failure"
+    assert status == "QUEUED" and error == "RuntimeError: job failed"  # never its text (S-5)
     assert app.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
 
 
@@ -331,3 +331,57 @@ def test_loop_survives_a_failing_job(app: Conn, dsns: Dsns, person: uuid.UUID) -
         assert _job(app, bad)[0] == "FAILED"
     finally:
         loop.close(app)
+
+
+# --- final review S-5: no exception text (row content) in logs or ops.job.last_error ----------
+
+SECRET = "Fictional private utterance 7731"
+
+
+@dispatch.register("test.leaks_row_content")
+def _leaks_row_content(conn: Conn, job: jobs.Job) -> None:
+    """A database error whose text carries a value, as a constraint violation's
+    `DETAIL: Failing row contains (...)` carries the row."""
+    conn.execute("SELECT %s::integer", (SECRET,))
+
+
+@dispatch.register("test.raises_with_content")
+def _raises_with_content(conn: Conn, job: jobs.Job) -> None:
+    raise ValueError(f"bad value {SECRET}")
+
+
+@pytest.mark.parametrize(
+    ("kind", "stored"),
+    [
+        ("test.leaks_row_content", "InvalidTextRepresentation: sqlstate 22P02"),
+        ("test.raises_with_content", "ValueError: job failed"),
+    ],
+)
+def test_failure_stores_and_logs_no_exception_text(
+    app: Conn, caplog: pytest.LogCaptureFixture, kind: str, stored: str
+) -> None:
+    """Only the exception's class and a fixed code reach `last_error` and the log."""
+    job_id = jobs.enqueue(app, kind, {}, max_attempts=1)
+    with caplog.at_level("INFO"), pytest.raises(Exception):  # noqa: B017
+        dispatch.handle(app, _claim(app, job_id))
+    assert _job(app, job_id) == ("FAILED", stored)
+    assert SECRET not in caplog.text
+    assert stored in caplog.text
+
+
+def test_loop_logs_no_exception_text(
+    app: Conn, dsns: Dsns, caplog: pytest.LogCaptureFixture
+) -> None:
+    loop = _Loop(dsns, poll_seconds=0.2, listen=False)
+    try:
+        with caplog.at_level("INFO"):
+            bad = jobs.enqueue(app, "test.leaks_row_content", max_attempts=1)
+            deadline = time.monotonic() + 10
+            while _job(app, bad)[0] != "FAILED":
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+            time.sleep(0.2)  # the loop's own log line follows the job's failure
+    finally:
+        loop.close(app)
+    assert "not completed" in caplog.text
+    assert SECRET not in caplog.text
