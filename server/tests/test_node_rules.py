@@ -119,6 +119,12 @@ REQUIRED = {
     "reject-keyset-other-target",
     "accept-keyset-for-this-node",
     "accept-keyset-gateway-role",
+    "reject-keyset-other-target-and-expired",
+    "reject-keyset-other-target-and-payload-mismatch",
+    "reject-keyset-expired-and-payload-mismatch",
+    "reject-keyset-unknown-role",
+    "reject-other-target-and-expired",
+    "reject-card-for-other-target",
 }
 
 

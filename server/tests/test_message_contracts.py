@@ -179,6 +179,18 @@ AUTHZ_CASES = json.loads((CONTRACTS / "signing-vectors" / "authz-cases.json").re
 @pytest.mark.parametrize("case", AUTHZ_CASES, ids=lambda case: case["name"])
 def test_shared_case_inputs_match_the_contracts(case: dict[str, Any]) -> None:
     ok = case["reason"] != "malformed"
+    if case["check"] == "keyset" and not ok and validator(_schema("authz")).is_valid(case["authz"]):
+        # The malformed part is the keyset payload itself (e.g. an unknown role), not its authz:
+        # the message must fail the keyset schema and the model.
+        message = {
+            **case["payload"],
+            "authz": case["authz"],
+            "outbox_id": "6f1c2b9e-3d4a-4e5f-9a8b-7c6d5e4f3a2b",
+        }
+        assert not validator(_schema("keyset")).is_valid(message)
+        with pytest.raises(ValidationError):
+            c.KeysetAnnouncement.model_validate({**case["payload"], "authz": case["authz"]})
+        return
     if "authz" in case:
         assert validator(_schema("authz")).is_valid(case["authz"]) is ok
         if ok:
