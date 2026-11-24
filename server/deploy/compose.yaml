@@ -15,9 +15,10 @@
 #   egress-proxy  squid, allowing only CONNECT api.anthropic.com:443. Core reaches Claude
 #                 through it (HTTPS_PROXY) and has no other way out.
 # Both third-party images are pinned by digest. Their entrypoint and config are inline
-# `configs` below, because this file is the only one the server fetches; the reviewable copies
-# are deploy/gateway-ts/entrypoint.sh and deploy/egress-proxy/squid.conf (tests check they
-# match).
+# (x-gateway-ts-entrypoint, x-egress-proxy-squid below), because this file is the only one the
+# server fetches; each is passed in as an environment value and written to the container's /tmp
+# at start, since both containers are read-only. The reviewable copies are
+# deploy/gateway-ts/entrypoint.sh and deploy/egress-proxy/squid.conf (tests check they match).
 #
 # On every `up`, the one-shot `init` service bootstraps roles, applies migrations and (with
 # JARVIS_SMOKE_ON_INIT=1) prints "SMOKE PASS/FAIL" lines for P0-1 … P0-5, M1-M4 (memory
@@ -37,6 +38,128 @@ x-postgres-ip: &postgres_ip 10.214.14.10
 x-logging: &logging
   driver: json-file
   options: { max-size: "10m", max-file: "3" }
+
+# The sidecar's entrypoint (reviewable copy: deploy/gateway-ts/entrypoint.sh). Passed to the
+# container as JARVIS_TS_ENTRYPOINT and written to /tmp at start: the container is read-only,
+# and Compose can only place `file` configs in a read-only container (first deploy, 24 Nov).
+x-gateway-ts-entrypoint: &gateway_ts_entrypoint |
+  #!/bin/sh
+  # gateway-ts entrypoint (spec §4.2, K2-4, R12-33). The gateway runs in this container's network
+  # namespace (network_mode: service:gateway-ts), so these OUTPUT rules apply to it. The gateway
+  # uses no DNS: it reaches Postgres at a fixed address (JARVIS_POSTGRES_IP). Traffic from the
+  # gateway's UID (10001) may only
+  #   - open TCP connections to the Postgres address on port 5432, and
+  #   - send established or related packets on tailscale0 (replies to nodes).
+  # Everything else from that UID is dropped: no loopback (so no Docker DNS at 127.0.0.11), no
+  # other jarvis_internal host or port (so no egress proxy), and no new connection on tailscale0
+  # (so no quad-100 DNS and no other tailnet device). IPv6 gets the same rules (it has no
+  # Postgres address), and the sidecar refuses to start if IPv6 is on and they can't be
+  # installed. The rules hold for every socket not owned by root, not only UID 10001, so a
+  # gateway run under any other UID is closed too (default closed, final review S-2). Packets
+  # with no owning socket (kernel replies, closing sockets) are not matched, as before: an
+  # inverted UID match alone would catch them and could break tailscaled's own connections.
+  # tailscaled runs as root and is not affected. Then the image's own entrypoint, containerboot,
+  # starts tailscaled.
+  #
+  # compose.yaml carries an inline copy of this file (x-gateway-ts-entrypoint, with $$ written as
+  # $$$$), passed in as JARVIS_TS_ENTRYPOINT and written to /tmp at start, because the container is
+  # read-only and Compose can't place an inline config file in it. tests/test_compose.py checks the
+  # two match. P2-S5 checks it live.
+  set -eu
+
+  PG_IP="$${JARVIS_POSTGRES_IP:-}"
+  CHAIN=JARVIS_GW_OUT
+  fail() { echo "gateway-ts: $$*; refusing to start" >&2; exit 1; }
+
+  case "$$PG_IP" in
+    "" | *[!0-9.]* ) fail "JARVIS_POSTGRES_IP is not an IPv4 address" ;;
+  esac
+
+  # Use the iptables backend this kernel offers: nftables first (Ubuntu 24.04 hosts have no legacy
+  # tables, and the image's plain `iptables` is the legacy one), then legacy. The choice is written
+  # to /tmp/jarvis-iptables for the health check; a backend that can't list OUTPUT is never used.
+  pick() {
+    for b in "$$1-nft" "$$1-legacy" "$$1"; do
+      if command -v "$$b" >/dev/null 2>&1 && "$$b" -t filter -S OUTPUT >/dev/null 2>&1; then
+        echo "$$b"
+        return 0
+      fi
+    done
+    return 1
+  }
+  IPT="$$(pick iptables)" || fail "no working iptables backend (nft or legacy)"
+  IP6T="$$(pick ip6tables)" || IP6T=""
+
+  "$$IPT" -N "$$CHAIN" 2>/dev/null || "$$IPT" -F "$$CHAIN"
+  "$$IPT" -A "$$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  "$$IPT" -A "$$CHAIN" -d "$$PG_IP" -p tcp --dport 5432 -j ACCEPT
+  "$$IPT" -A "$$CHAIN" -j DROP
+  "$$IPT" -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN" 2>/dev/null \
+    || "$$IPT" -I OUTPUT 1 -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN"
+
+  ipv6_on() {
+    [ -e /proc/net/if_inet6 ] && [ "$$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" = 0 ]
+  }
+  if [ -n "$$IP6T" ]; then
+    "$$IP6T" -N "$$CHAIN" 2>/dev/null || "$$IP6T" -F "$$CHAIN"
+    "$$IP6T" -A "$$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    "$$IP6T" -A "$$CHAIN" -j DROP
+    "$$IP6T" -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN" 2>/dev/null \
+      || "$$IP6T" -I OUTPUT 1 -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN"
+    v6="and IPv6"
+  elif ipv6_on; then
+    fail "IPv6 is on but ip6tables does not work"
+  else
+    v6="(IPv6 off)"
+  fi
+  printf '%s %s\n' "$$IPT" "$$IP6T" > /tmp/jarvis-iptables
+  echo "gateway-ts: egress rules for every non-root UID in place ($$IPT): Postgres $$PG_IP:5432, tailscale0 replies; IPv4 $$v6"
+
+  # tailscaled sets up its own firewall rules too: make it use the same backend as ours, so the two
+  # never mix in one table (nftables mode uses its own ts-* tables; iptables mode the image's
+  # legacy iptables).
+  case "$$IPT" in
+    *-nft) TS_DEBUG_FIREWALL_MODE=nftables ;;
+    *) TS_DEBUG_FIREWALL_MODE=iptables ;;
+  esac
+  export TS_DEBUG_FIREWALL_MODE
+
+  # The auth key is read from its secret file here, so it is never in the container's config.
+  # It is used only for the first login (TS_AUTH_ONCE); after that the state volume holds it.
+  TS_AUTHKEY="$$(cat /run/secrets/tailscale_gateway_authkey)"
+  export TS_AUTHKEY
+  exec /usr/local/bin/containerboot
+
+# The proxy's config (reviewable copy: deploy/egress-proxy/squid.conf), passed in as
+# JARVIS_SQUID_CONF and written to /tmp/squid.conf at start, for the same reason.
+x-egress-proxy-squid: &egress_proxy_squid |
+  # JARVIS egress proxy (spec §4.2, P2-S7). Core has no internet route; it reaches Claude through
+  # this proxy (HTTPS_PROXY=http://egress-proxy:3128) and nothing else: only CONNECT to
+  # api.anthropic.com:443. Every other request is refused. No cache.
+  #
+  # The proxy's other network, jarvis_egress, has no other member, so the private ranges below
+  # mean the containers on jarvis_internal.
+  #
+  # compose.yaml carries an inline copy of this file (x-egress-proxy-squid), passed in as
+  # JARVIS_SQUID_CONF and written to /tmp/squid.conf at start, because the container is read-only
+  # and Compose can't place an inline config file in it. tests/test_compose.py checks the two match.
+
+  http_port 3128
+
+  acl jarvis_internal src 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+  acl connect_method method CONNECT
+  acl claude dstdomain -n api.anthropic.com
+  acl tls_port port 443
+
+  http_access allow jarvis_internal connect_method claude tls_port
+  http_access deny all
+
+  cache deny all
+  cache_mem 0 MB
+  via off
+  forwarded_for delete
+  httpd_suppress_version_string on
+  shutdown_lifetime 1 seconds
 
 x-app: &app
   image: ghcr.io/manjunathhari/jarvis-server:${JARVIS_REF:?set JARVIS_REF to a commit of manjunathhari/jarvisdesktop}
@@ -199,11 +322,13 @@ services:
   gateway-ts:
     image: tailscale/tailscale:stable@sha256:ed6480b33c6eb67c9cbd203ed42b9fb57e361986725b6856def71b7a3d9e276c
     restart: unless-stopped
-    entrypoint: ["/bin/sh", "/etc/jarvis/gateway-ts-entrypoint.sh"]
-    configs:
-      - source: gateway_ts_entrypoint
-        target: /etc/jarvis/gateway-ts-entrypoint.sh
+    # Writes the inline entrypoint to /tmp (tmpfs) and runs it; refuses to start without it.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - '[ -n "$${JARVIS_TS_ENTRYPOINT:-}" ] || { echo "gateway-ts: no entrypoint; refusing to start" >&2; exit 1; }; printf "%s" "$$JARVIS_TS_ENTRYPOINT" > /tmp/gateway-ts-entrypoint.sh && exec /bin/sh /tmp/gateway-ts-entrypoint.sh'
     environment:
+      JARVIS_TS_ENTRYPOINT: *gateway_ts_entrypoint
       TS_HOSTNAME: jarvis-gw
       TS_EXTRA_ARGS: --advertise-tags=tag:jarvis-gateway
       TS_AUTH_ONCE: "true"
@@ -215,7 +340,7 @@ services:
       TZ: Asia/Kolkata
     secrets: [tailscale_gateway_authkey]
     devices: ["/dev/net/tun:/dev/net/tun"]
-    # NET_ADMIN for tailscaled and the rules; NET_RAW for iptables (legacy backend).
+    # NET_ADMIN for tailscaled and the rules; NET_RAW for iptables.
     cap_drop: [ALL]
     cap_add: [NET_ADMIN, NET_RAW]
     read_only: true
@@ -229,8 +354,9 @@ services:
     logging: *logging
     healthcheck:
       # Healthy only with the gateway's egress rules in place for every non-root UID (IPv4, and
-      # IPv6 wherever ip6tables works) and a tailnet address.
-      test: ["CMD-SHELL", "iptables -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j JARVIS_GW_OUT && { ! ip6tables -S OUTPUT >/dev/null 2>&1 || ip6tables -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j JARVIS_GW_OUT; } && tailscale --socket=/ts-socket/tailscaled.sock ip -4"]
+      # IPv6 wherever ip6tables works), checked with the backend the entrypoint chose, and a
+      # tailnet address.
+      test: ["CMD-SHELL", "read -r IPT IP6T < /tmp/jarvis-iptables && $$IPT -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j JARVIS_GW_OUT && { [ -z \"$$IP6T\" ] || $$IP6T -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j JARVIS_GW_OUT; } && tailscale --socket=/ts-socket/tailscaled.sock ip -4"]
       interval: 10s
       timeout: 5s
       retries: 30
@@ -240,13 +366,18 @@ services:
   egress-proxy:
     image: ubuntu/squid:6.6-24.04_edge@sha256:d9c34c5ab74c6dd41cf1070d9b4221aac072e67e983527ca2d41512958f77506
     restart: unless-stopped
-    configs:
-      - source: egress_proxy_squid
-        target: /etc/squid/squid.conf
+    # Writes the inline config to /tmp (tmpfs) and runs squid in the foreground with it. The
+    # image's own entrypoint is not used, so nothing outside the tmpfs paths has to be written.
+    # squid starts as root and drops to its own user.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - '[ -n "$${JARVIS_SQUID_CONF:-}" ] || { echo "egress-proxy: no config; refusing to start" >&2; exit 1; }; printf "%s" "$$JARVIS_SQUID_CONF" > /tmp/squid.conf && exec /usr/sbin/squid -f /tmp/squid.conf -NYC'
+    command: []
     environment:
+      JARVIS_SQUID_CONF: *egress_proxy_squid
       TZ: Asia/Kolkata
     networks: [jarvis_internal, jarvis_egress]
-    # squid starts as root and drops to its own user.
     cap_drop: [ALL]
     cap_add: [SETUID, SETGID, CHOWN]
     read_only: true
@@ -255,9 +386,9 @@ services:
     mem_limit: 128m
     logging: *logging
     healthcheck:
-      # Healthy only with our config mounted: a missing mount must not fall back to the
-      # image's default config (fail closed; core waits for this).
-      test: ["CMD-SHELL", "grep -qx 'acl claude dstdomain -n api.anthropic.com' /etc/squid/squid.conf && grep -qx 'http_access deny all' /etc/squid/squid.conf"]
+      # Healthy only with our config in place: a missing config must not fall back to the
+      # image's default (fail closed; core waits for this).
+      test: ["CMD-SHELL", "grep -qx 'acl claude dstdomain -n api.anthropic.com' /tmp/squid.conf && grep -qx 'http_access deny all' /tmp/squid.conf"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -281,97 +412,6 @@ networks:
           ip_range: 10.214.14.128/25   # dynamic addresses; Postgres's fixed one is outside it
   jarvis_ts_egress: {}   # gateway-ts only: Tailscale coordination and DERP relays
   jarvis_egress: {}      # egress-proxy only: api.anthropic.com
-
-configs:
-  gateway_ts_entrypoint:
-    content: |
-      #!/bin/sh
-      # gateway-ts entrypoint (spec §4.2, K2-4, R12-33). The gateway runs in this container's network
-      # namespace (network_mode: service:gateway-ts), so these OUTPUT rules apply to it. The gateway
-      # uses no DNS: it reaches Postgres at a fixed address (JARVIS_POSTGRES_IP). Traffic from the
-      # gateway's UID (10001) may only
-      #   - open TCP connections to the Postgres address on port 5432, and
-      #   - send established or related packets on tailscale0 (replies to nodes).
-      # Everything else from that UID is dropped: no loopback (so no Docker DNS at 127.0.0.11), no
-      # other jarvis_internal host or port (so no egress proxy), and no new connection on tailscale0
-      # (so no quad-100 DNS and no other tailnet device). IPv6 gets the same rules (it has no
-      # Postgres address), and the sidecar refuses to start if IPv6 is on and they can't be
-      # installed. The rules hold for every socket not owned by root, not only UID 10001, so a
-      # gateway run under any other UID is closed too (default closed, final review S-2). Packets
-      # with no owning socket (kernel replies, closing sockets) are not matched, as before: an
-      # inverted UID match alone would catch them and could break tailscaled's own connections.
-      # tailscaled runs as root and is not affected. Then the image's own entrypoint, containerboot,
-      # starts tailscaled.
-      #
-      # compose.yaml carries an inline copy of this file (configs: gateway_ts_entrypoint, with $$
-      # written as $$$$); tests/test_compose.py checks the two match. P2-S5 checks it live.
-      set -eu
-
-      PG_IP="$${JARVIS_POSTGRES_IP:-}"
-      CHAIN=JARVIS_GW_OUT
-      fail() { echo "gateway-ts: $$*; refusing to start" >&2; exit 1; }
-
-      case "$$PG_IP" in
-        "" | *[!0-9.]* ) fail "JARVIS_POSTGRES_IP is not an IPv4 address" ;;
-      esac
-
-      iptables -N "$$CHAIN" 2>/dev/null || iptables -F "$$CHAIN"
-      iptables -A "$$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-      iptables -A "$$CHAIN" -d "$$PG_IP" -p tcp --dport 5432 -j ACCEPT
-      iptables -A "$$CHAIN" -j DROP
-      iptables -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN" 2>/dev/null \
-        || iptables -I OUTPUT 1 -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN"
-
-      ipv6_on() {
-        [ -e /proc/net/if_inet6 ] && [ "$$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" = 0 ]
-      }
-      if ip6tables -S OUTPUT >/dev/null 2>&1; then
-        ip6tables -N "$$CHAIN" 2>/dev/null || ip6tables -F "$$CHAIN"
-        ip6tables -A "$$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-        ip6tables -A "$$CHAIN" -j DROP
-        ip6tables -C OUTPUT -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN" 2>/dev/null \
-          || ip6tables -I OUTPUT 1 -m owner --socket-exists ! --uid-owner 0 -j "$$CHAIN"
-        v6="and IPv6"
-      elif ipv6_on; then
-        fail "IPv6 is on but ip6tables does not work"
-      else
-        v6="(IPv6 off)"
-      fi
-      echo "gateway-ts: egress rules for every non-root UID in place: Postgres $$PG_IP:5432, tailscale0 replies; IPv4 $$v6"
-
-      # The auth key is read from its secret file here, so it is never in the container's config.
-      # It is used only for the first login (TS_AUTH_ONCE); after that the state volume holds it.
-      TS_AUTHKEY="$$(cat /run/secrets/tailscale_gateway_authkey)"
-      export TS_AUTHKEY
-      exec /usr/local/bin/containerboot
-  egress_proxy_squid:
-    content: |
-      # JARVIS egress proxy (spec §4.2, P2-S7). Core has no internet route; it reaches Claude through
-      # this proxy (HTTPS_PROXY=http://egress-proxy:3128) and nothing else: only CONNECT to
-      # api.anthropic.com:443. Every other request is refused. No cache.
-      #
-      # The proxy's other network, jarvis_egress, has no other member, so the private ranges below
-      # mean the containers on jarvis_internal.
-      #
-      # compose.yaml carries an inline copy of this file (configs: egress_proxy_squid);
-      # tests/test_compose.py checks the two match.
-
-      http_port 3128
-
-      acl jarvis_internal src 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
-      acl connect_method method CONNECT
-      acl claude dstdomain -n api.anthropic.com
-      acl tls_port port 443
-
-      http_access allow jarvis_internal connect_method claude tls_port
-      http_access deny all
-
-      cache deny all
-      cache_mem 0 MB
-      via off
-      forwarded_for delete
-      httpd_suppress_version_string on
-      shutdown_lifetime 1 seconds
 
 volumes:
   pgdata:

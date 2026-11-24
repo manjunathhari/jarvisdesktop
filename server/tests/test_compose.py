@@ -1,9 +1,11 @@
 """The deployable stack (plan Task 14; spec §4.2, §4.3; P2-S5 and P2-S7 static checks).
 
 `deploy/compose.yaml` is the only file the server fetches, so the sidecar's entrypoint and the
-proxy's config travel inside it as inline `configs`. Their reviewable copies are
-`deploy/gateway-ts/entrypoint.sh` and `deploy/egress-proxy/squid.conf`; the inline copies must
-match them (compose escapes `$` as `$$`).
+proxy's config travel inside it as inline blocks (x-gateway-ts-entrypoint, x-egress-proxy-squid),
+passed to their read-only containers as environment values and written to /tmp at start: Compose
+can place only `file` configs in a read-only container (first deploy, 24 Nov 2026). Their
+reviewable copies are `deploy/gateway-ts/entrypoint.sh` and `deploy/egress-proxy/squid.conf`;
+the inline copies must match them (compose escapes `$` as `$$`).
 
 The init smoke (`jarvis-core smoke`) runs database-only Phase 2 rows: no node, no gateway
 process, no brain. Everything here is fictional.
@@ -125,13 +127,17 @@ def test_sidecar_runs_tailscale_in_kernel_mode(stack: dict[str, Any]) -> None:
     assert env["TS_EXTRA_ARGS"] == "--advertise-tags=tag:jarvis-gateway"
     assert env["TS_AUTH_ONCE"] == "true"  # a non-reusable key is used once; state keeps it
     assert env["TS_SOCKET"] == "/ts-socket/tailscaled.sock"
-    assert ts["entrypoint"] == ["/bin/sh", "/etc/jarvis/gateway-ts-entrypoint.sh"]
-    assert ts["configs"] == [
-        {"source": "gateway_ts_entrypoint", "target": "/etc/jarvis/gateway-ts-entrypoint.sh"}
-    ]
+    assert ts["entrypoint"][:2] == ["/bin/sh", "-c"]
+    start = ts["entrypoint"][2]
+    assert '[ -n "$${JARVIS_TS_ENTRYPOINT:-}" ] || {' in start and "exit 1; }" in start
+    assert start.endswith("exec /bin/sh /tmp/gateway-ts-entrypoint.sh")
+    assert env["JARVIS_TS_ENTRYPOINT"] == stack["x-gateway-ts-entrypoint"]
+    assert "configs" not in ts
     health = " ".join(ts["healthcheck"]["test"])  # healthy only with both rule jumps in place
     jump = "OUTPUT -m owner --socket-exists ! --uid-owner 0 -j JARVIS_GW_OUT"
-    assert f"iptables -C {jump}" in health and f"ip6tables -C {jump}" in health
+    assert "read -r IPT IP6T < /tmp/jarvis-iptables && " in health  # the chosen backend
+    assert f"$$IPT -C {jump}" in health and f"$$IP6T -C {jump}" in health
+    assert '[ -z "$$IP6T" ] ||' in health  # no IPv6 backend: only when IPv6 is off
     assert "--uid-owner 10001" not in health
     assert "JARVIS_GATEWAY_UID" not in env  # the rules no longer name one UID (S-2)
 
@@ -146,13 +152,19 @@ def test_core_has_no_egress_network(stack: dict[str, Any]) -> None:
     assert core["depends_on"]["egress-proxy"] == {"condition": "service_healthy"}
     proxy = services["egress-proxy"]
     assert _networks(proxy) == ["jarvis_egress", "jarvis_internal"]
-    assert proxy["configs"] == [{"source": "egress_proxy_squid", "target": "/etc/squid/squid.conf"}]
+    assert "configs" not in proxy
+    assert proxy["entrypoint"][:2] == ["/bin/sh", "-c"] and proxy["command"] == []
+    start = proxy["entrypoint"][2]
+    assert '[ -n "$${JARVIS_SQUID_CONF:-}" ] || {' in start and "exit 1; }" in start
+    assert start.endswith("exec /usr/sbin/squid -f /tmp/squid.conf -NYC")
+    assert proxy["environment"]["JARVIS_SQUID_CONF"] == stack["x-egress-proxy-squid"]
+    assert "/tmp" in proxy["tmpfs"]  # noqa: S108 (a container path, not ours)
     assert proxy["cap_drop"] == ["ALL"] and proxy["cap_add"] == ["SETUID", "SETGID", "CHOWN"]
     assert proxy["read_only"] is True
     # Healthy only with our config mounted, so a lost mount can't fall back to the default.
     health = " ".join(proxy["healthcheck"]["test"])
-    assert "acl claude dstdomain -n api.anthropic.com" in health
-    assert "http_access deny all" in health
+    assert "acl claude dstdomain -n api.anthropic.com' /tmp/squid.conf" in health
+    assert "http_access deny all' /tmp/squid.conf" in health
     egress = {"jarvis_egress", "jarvis_ts_egress"}
     for name, service in services.items():  # only the sidecar and the proxy reach the internet
         if name not in ("gateway-ts", "egress-proxy", "backup", "postgres"):
@@ -196,13 +208,22 @@ def test_all_third_party_images_pinned(stack: dict[str, Any]) -> None:
 # --- the sidecar entrypoint and the proxy config -----------------------------------------------
 
 
+def test_no_inline_configs_in_read_only_services(stack: dict[str, Any]) -> None:
+    """Compose refuses an inline (`content`) config in a read-only service: only `file` configs
+    can be placed there. The first deploy failed on exactly this (24 Nov 2026)."""
+    assert "configs" not in stack
+    for name, service in _services(stack).items():
+        assert "configs" not in service, name
+
+
 @pytest.mark.parametrize(
-    ("config_name", "path"), [("gateway_ts_entrypoint", ENTRYPOINT), ("egress_proxy_squid", SQUID)]
+    ("block", "path"),
+    [("x-gateway-ts-entrypoint", ENTRYPOINT), ("x-egress-proxy-squid", SQUID)],
 )
-def test_inline_configs_match_their_files(
-    stack: dict[str, Any], config_name: str, path: Path
-) -> None:
-    inline = stack["configs"][config_name]["content"]
+def test_inline_copies_match_their_files(stack: dict[str, Any], block: str, path: Path) -> None:
+    raw = COMPOSE.read_text()  # yaml loads the escaped text; compose turns $$ into $
+    inline = stack[block]
+    assert f"\n{block}: &" in raw
     assert inline.replace("$$", "$") == path.read_text()
     assert "$" not in re.sub(r"\$\$", "", inline)  # every $ escaped from compose
 
@@ -220,21 +241,35 @@ def test_sidecar_entrypoint_blocks_gateway_egress() -> None:
     code = [ln for ln in lines if ln and not ln.startswith("#")]
     assert "set -eu" in lines
     assert lines[-1] == "exec /usr/local/bin/containerboot"
-    rules = [ln for ln in lines if ln.startswith('iptables -A "$CHAIN"')]
+    rules = [ln for ln in lines if ln.startswith('"$IPT" -A "$CHAIN"')]
     assert rules == [
-        'iptables -A "$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
-        'iptables -A "$CHAIN" -d "$PG_IP" -p tcp --dport 5432 -j ACCEPT',
-        'iptables -A "$CHAIN" -j DROP',
+        '"$IPT" -A "$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
+        '"$IPT" -A "$CHAIN" -d "$PG_IP" -p tcp --dport 5432 -j ACCEPT',
+        '"$IPT" -A "$CHAIN" -j DROP',
     ]
-    v6 = [ln for ln in lines if ln.startswith('ip6tables -A "$CHAIN"')]
+    v6 = [ln for ln in lines if ln.startswith('"$IP6T" -A "$CHAIN"')]
     assert v6 == [
-        'ip6tables -A "$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
-        'ip6tables -A "$CHAIN" -j DROP',
+        '"$IP6T" -A "$CHAIN" -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT',
+        '"$IP6T" -A "$CHAIN" -j DROP',
     ]
     jump = '-m owner --socket-exists ! --uid-owner 0 -j "$CHAIN"'
-    for tool in ("iptables", "ip6tables"):
+    for tool in ('"$IPT"', '"$IP6T"'):
         assert f"{tool} -I OUTPUT 1 {jump}" in script
         assert f"{tool} -C OUTPUT {jump}" in script
+    # The backend is the one the kernel offers, nftables first (24 Nov 2026: Ubuntu 24.04 has
+    # no legacy tables), and the health check reads the same choice.
+    assert 'for b in "$1-nft" "$1-legacy" "$1"; do' in lines
+    assert 'IPT="$(pick iptables)" || fail "no working iptables backend (nft or legacy)"' in lines
+    assert 'IP6T="$(pick ip6tables)" || IP6T=""' in lines
+    assert 'printf \'%s %s\\n\' "$IPT" "$IP6T" > /tmp/jarvis-iptables' in lines
+    assert not [ln for ln in code if ln.startswith(("iptables ", "ip6tables "))]
+    # tailscaled's own rules use the same backend (re-review I-1).
+    assert "*-nft) TS_DEBUG_FIREWALL_MODE=nftables ;;" in lines
+    assert "*) TS_DEBUG_FIREWALL_MODE=iptables ;;" in lines
+    assert "export TS_DEBUG_FIREWALL_MODE" in lines
+    assert code.index("export TS_DEBUG_FIREWALL_MODE") < code.index(
+        "exec /usr/local/bin/containerboot"
+    )
     assert "GW_UID" not in script and "--uid-owner 10001" not in script
     assert not [ln for ln in code if "--uid-owner" in ln and "! --uid-owner 0" not in ln]
     assert 'PG_IP="${JARVIS_POSTGRES_IP:-}"' in lines
