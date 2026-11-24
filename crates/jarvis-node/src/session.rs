@@ -25,11 +25,13 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::code::EnrolmentCode;
-use crate::rules::{check_challenge, check_enrolment_welcome, GatewayKeys, SeqChecker};
+use crate::rules::{
+    check_challenge, check_enrolment_welcome, check_keyset, GatewayKeys, Rejected, SeqChecker,
+};
 use crate::sign::{b64url, b64url_decode, fingerprint, sign_envelope, verify_envelope, Purpose};
 use crate::state::NodeState;
 use crate::trust::{PinnedKey, Trust};
-use crate::wire::{parse_envelope, parse_welcome, NIL_UUID};
+use crate::wire::{has_exactly, parse_envelope, parse_welcome, NIL_UUID};
 
 /// The close code that means "re-enrol" (a STALE node, R6-6).
 pub const REENROL_CLOSE: u16 = 4409;
@@ -61,6 +63,11 @@ pub enum Output {
     Frame { kind: String, payload: Value },
     /// The gateway's clock differs from this device's by this many milliseconds (display only).
     ClockOff(i64),
+    /// A keyset changed the pins: the driver must save this state before writing any later
+    /// `Send` (the keyset's `received` and `ack` come after it, R12-26).
+    TrustChanged(NodeState),
+    /// A gateway message was refused (logged; nothing is sent back for it).
+    Refused { kind: String, reason: &'static str },
 }
 
 /// The connection must close. Nothing more is sent on it.
@@ -378,11 +385,67 @@ impl Session {
                 }
             }
             "pong" => Ok(vec![]),
+            "keyset" => self.on_keyset(&envelope.payload, now),
             _ => Ok(vec![Output::Frame {
                 kind: kind.to_owned(),
                 payload: Value::Object(envelope.payload),
             }]),
         }
+    }
+
+    /// A `keyset` (R6-2, R12-26 to R12-28): checked under the trusted core keys, applied to the
+    /// pin set its role names, then `received` and `ack` for its `outbox_id`, never before it
+    /// verifies. A keyset signed under a core key this node doesn't trust asks for
+    /// re-enrolment (R12-29); any other refusal is logged and not acked.
+    fn on_keyset(
+        &mut self,
+        payload: &serde_json::Map<String, Value>,
+        now: DateTime<FixedOffset>,
+    ) -> Result<Vec<Output>, Stop> {
+        let refused = |reason| {
+            Ok(vec![Output::Refused {
+                kind: "keyset".into(),
+                reason,
+            }])
+        };
+        let outbox_id = payload
+            .get("outbox_id")
+            .and_then(|v| v.as_str())
+            .and_then(|v| Uuid::parse_str(v).ok());
+        let (true, Some(outbox_id)) = (
+            has_exactly(
+                payload,
+                &["outbox_id", "role", "key_id", "public_key", "authz"],
+            ),
+            outbox_id,
+        ) else {
+            return refused("malformed");
+        };
+        let me = self.state.node_id.expect("ready means enrolled");
+        // The check gets the payload without its unsigned outbox_id and its authz (R12-26).
+        let signed = json!({
+            "role": payload["role"],
+            "key_id": payload["key_id"],
+            "public_key": payload["public_key"],
+        });
+        let core = self.state.trust.core_keys(now);
+        let obj = match check_keyset(&signed, &payload["authz"], &core, me, now) {
+            Ok(obj) => obj,
+            Err(Rejected("untrusted_key_id")) => return Err(self.stop("untrusted_key_id", true)),
+            Err(Rejected(reason)) => return refused(reason),
+        };
+        let (_, changed) = self.state.trust.apply_keyset(&obj);
+        let mut out = Vec::new();
+        if changed {
+            out.push(Output::TrustChanged(self.state.clone()));
+        }
+        for kind in ["received", "ack"] {
+            match self.envelope(kind, json!({"outbox_id": outbox_id}), me, now) {
+                Ok(frame) => out.push(Output::Send(frame)),
+                Err(_) => return Err(self.stop("unsignable", false)),
+            }
+        }
+        Ok(out)
     }
 
     /// A signed message for the gateway, once the handshake is complete.

@@ -17,6 +17,7 @@ base64.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 zeroize.workspace = true
+tracing.workspace = true
 tokio-tungstenite = "0.30.0"
 futures-util = "0.3.34"
 getrandom = "0.3"

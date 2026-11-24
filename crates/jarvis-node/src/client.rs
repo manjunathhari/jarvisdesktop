@@ -110,6 +110,9 @@ enum Cmd {
         code: String,
         reply: oneshot::Sender<Result<(), EnrolError>>,
     },
+    /// A core-authz signature under a key this node doesn't trust (R12-29): close and wait for
+    /// a new enrolment code.
+    RequireReenrol,
 }
 
 /// The handle the app holds. Cheap to clone.
@@ -117,6 +120,7 @@ enum Cmd {
 pub struct Client {
     cmds: mpsc::UnboundedSender<Cmd>,
     status: watch::Receiver<LinkStatus>,
+    state: watch::Receiver<NodeState>,
 }
 
 impl Client {
@@ -148,6 +152,16 @@ impl Client {
     pub fn status(&self) -> watch::Receiver<LinkStatus> {
         self.status.clone()
     }
+
+    /// The node's current state (node ID and pins), as of the last handshake or keyset.
+    pub fn state(&self) -> watch::Receiver<NodeState> {
+        self.state.clone()
+    }
+
+    /// Close the link and wait for a new enrolment code (R12-29).
+    pub fn require_reenrol(&self) {
+        let _ = self.cmds.send(Cmd::RequireReenrol);
+    }
 }
 
 /// Start the driver on the current tokio runtime. `frames` gets `Ready`, `Frame` and
@@ -159,8 +173,13 @@ pub fn spawn(
 ) -> Client {
     let (cmds, cmd_rx) = mpsc::unbounded_channel();
     let (status_tx, status) = watch::channel(LinkStatus::Connecting);
-    tokio::spawn(run(cfg, keystore, frames, cmd_rx, status_tx));
-    Client { cmds, status }
+    let (state_tx, state) = watch::channel(NodeState::default());
+    tokio::spawn(run(cfg, keystore, frames, cmd_rx, status_tx, state_tx));
+    Client {
+        cmds,
+        status,
+        state,
+    }
 }
 
 /// A new key from the operating system's random source.
@@ -244,6 +263,7 @@ async fn run(
     frames: mpsc::UnboundedSender<Output>,
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
     status: watch::Sender<LinkStatus>,
+    published: watch::Sender<NodeState>,
 ) {
     let state_path = cfg.data_dir.join(STATE_FILE);
     let url = format!("ws://{}{ROUTE}", cfg.gateway);
@@ -281,6 +301,7 @@ async fn run(
                         Some(Cmd::Enrol { code, reply }) => {
                             start_enrolment(&code, reply, &mut enrolling, &mut attempt);
                         }
+                        Some(Cmd::RequireReenrol) => {}
                     },
                     _ = sleep(cfg.recheck) => {}
                 }
@@ -313,6 +334,7 @@ async fn run(
                     &mut enrolling,
                     &mut ready_at,
                     reenrol.is_some(),
+                    &published,
                 )
                 .await
             }
@@ -374,6 +396,10 @@ async fn run(
                 cmd = cmds.recv() => match cmd {
                     None => return,
                     Some(Cmd::Send { reply, .. }) => { let _ = reply.send(Err(NotConnected)); }
+                    Some(Cmd::RequireReenrol) => {
+                        reenrol = Some(Reenrol::Final);
+                        break;
+                    }
                     Some(Cmd::Enrol { code, reply }) => {
                         if reenrol.is_some() {
                             // A new code is exactly what NeedsReenrol asks for.
@@ -431,6 +457,7 @@ async fn connection<S>(
     enrolling: &mut Option<Enrolling>,
     ready_at: &mut Option<Instant>,
     retrying: bool,
+    published: &watch::Sender<NodeState>,
 ) -> End
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
@@ -491,8 +518,21 @@ where
                                 e.answer(Ok(()));
                             }
                             *ready_at = Some(Instant::now());
+                            let _ = published.send(session.state().clone());
                             let _ = status.send(LinkStatus::Connected);
                             let _ = frames.send(output);
+                        }
+                        Output::TrustChanged(st) => {
+                            // Saved before the keyset's received/ack (the next outputs) go out.
+                            if let Err(e) = state::save(state_path, &st) {
+                                tracing::warn!(error = %e, "couldn't save the new keyset; not acked");
+                                let _ = sink.close().await;
+                                return End::Stopped { stop: Stop { reason: "save_failed", reenrol: false }, ready: true };
+                            }
+                            let _ = published.send(st);
+                        }
+                        Output::Refused { kind, reason } => {
+                            tracing::warn!(%kind, reason, "refused a gateway message");
                         }
                         other => {
                             let _ = frames.send(other);
@@ -517,6 +557,13 @@ where
                         }
                         Err(_) => { let _ = reply.send(Err(NotConnected)); }
                     }
+                }
+                Some(Cmd::RequireReenrol) => {
+                    let _ = sink.close().await;
+                    return End::Stopped {
+                        stop: Stop { reason: "untrusted_core_key", reenrol: true },
+                        ready: true,
+                    };
                 }
                 Some(Cmd::Enrol { code, reply }) => {
                     if enrolling.is_some() {

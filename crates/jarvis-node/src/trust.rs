@@ -2,8 +2,8 @@
 //! only carry transport. They are two separate maps, so a key pinned for one role is never
 //! found when the other is asked for (R6-3).
 //!
-//! This module only stores, prunes and looks up. Pinning at enrolment (Task 4) and keyset
-//! rotation (Task 5) build on it.
+//! Keys change only through enrolment (the session pins from the code's fingerprints) and
+//! through a core-signed `keyset` (`apply_keyset`, after `rules::check_keyset` accepted it).
 
 use std::collections::BTreeMap;
 
@@ -11,6 +11,18 @@ use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 
 use crate::rules::CoreKeys;
+use crate::sign::b64url_decode;
+use crate::wire::AuthzObject;
+
+/// How long old keys stay trusted after a keyset's signed `issued_at` (R12-27).
+pub const KEYSET_OVERLAP: chrono::Duration = chrono::Duration::hours(24);
+
+/// Which pin set a keyset's key joined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRole {
+    Core,
+    Gateway,
+}
 
 /// A pinned public key. `expires_at` is set while the key is in a rotation overlap: it is
 /// trusted until then, and dropped after.
@@ -59,6 +71,47 @@ impl Trust {
             .filter(|(_, k)| k.live(now))
             .map(|(id, k)| (id.clone(), k.public_key))
             .collect()
+    }
+
+    /// Pin the key of a keyset object that `rules::check_keyset` accepted, as the Python
+    /// reference `apply_keyset` does. `args.role` alone picks the pin set, so a `gateway` key
+    /// never enters core trust (R6-3). Every other key of that set expires at the signed
+    /// `issued_at` + 24 h, unless it is already in an earlier overlap, which this ends. A
+    /// re-send of the same key changes nothing. Returns the role and whether anything changed.
+    pub fn apply_keyset(&mut self, obj: &AuthzObject) -> (KeyRole, bool) {
+        let role = match obj.args.get("role").and_then(|r| r.as_str()) {
+            Some("core") => KeyRole::Core,
+            _ => KeyRole::Gateway, // never core unless it says core
+        };
+        let Some(new_id) = obj.args.get("key_id").and_then(|k| k.as_str()) else {
+            return (role, false);
+        };
+        let Some(raw) = obj
+            .args
+            .get("public_key")
+            .and_then(|k| k.as_str())
+            .and_then(|k| b64url_decode(k, 32))
+            .and_then(|k| <[u8; 32]>::try_from(k).ok())
+        else {
+            return (role, false); // check_keyset validated it; never pin a bad key
+        };
+        let pins = match role {
+            KeyRole::Core => &mut self.core,
+            KeyRole::Gateway => &mut self.gateway,
+        };
+        let current = pins.get(new_id);
+        if current.is_some_and(|k| k.public_key == raw && k.expires_at.is_none()) {
+            return (role, false);
+        }
+        let until = obj.issued_at + KEYSET_OVERLAP;
+        pins.retain(|id, k| id == new_id || k.expires_at.is_none()); // end earlier overlaps
+        for (id, k) in pins.iter_mut() {
+            if id != new_id {
+                k.expires_at = Some(until);
+            }
+        }
+        pins.insert(new_id.to_owned(), PinnedKey::new(raw));
+        (role, true)
     }
 
     /// The GATEWAY key pinned under `key_id` and trusted at `now`. Never a core key.

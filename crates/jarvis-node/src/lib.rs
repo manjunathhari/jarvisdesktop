@@ -10,8 +10,10 @@
 
 pub mod client;
 pub mod code;
+pub mod delivery;
 pub mod journal;
 pub mod keystore;
+pub mod node;
 pub mod rules;
 pub mod session;
 pub mod sign;

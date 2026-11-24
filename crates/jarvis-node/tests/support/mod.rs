@@ -1,7 +1,9 @@
 //! Shared test helpers: the committed contracts and signing vectors, read-only.
 #![allow(dead_code)] // each test crate uses a different subset
 
+pub mod authz;
 pub mod gateway;
+pub mod net;
 
 use std::path::PathBuf;
 
