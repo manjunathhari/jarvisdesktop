@@ -68,11 +68,23 @@ struct Node {
 }
 
 async fn start(heartbeat: Duration) -> (TcpListener, Node) {
+    start_with(
+        heartbeat,
+        Arc::new(MemoryKeyStore::default()),
+        tempfile::tempdir().unwrap(),
+    )
+    .await
+}
+
+async fn start_with(
+    heartbeat: Duration,
+    keystore: Arc<MemoryKeyStore>,
+    dir: tempfile::TempDir,
+) -> (TcpListener, Node) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dir = tempfile::tempdir().unwrap();
     let mut cfg = ClientConfig::new(listener.local_addr().unwrap().to_string(), dir.path());
     cfg.heartbeat_timeout = heartbeat;
-    let keystore = Arc::new(MemoryKeyStore::default());
+    cfg.reenrol_retry = Duration::from_millis(300);
     let (tx, frames) = mpsc::unbounded_channel();
     let client = client::spawn(cfg, keystore.clone(), tx);
     (
@@ -306,4 +318,107 @@ async fn a_bad_signature_reconnects_and_frames_reach_the_app() {
     let mut ws = accept(&listener).await;
     send(&mut ws, gw2.challenge(now())).await;
     assert_eq!(recv(&mut ws).await["kind"], "hello");
+}
+
+#[tokio::test]
+async fn a_key_that_does_not_match_the_state_never_connects() {
+    // The state names another key (a crash between saving a new key and its state).
+    let dir = tempfile::tempdir().unwrap();
+    let keystore = Arc::new(MemoryKeyStore::default());
+    keystore
+        .save(&ed25519_dalek::SigningKey::from_bytes(&[5; 32]))
+        .unwrap();
+    let saved = jarvis_node::state::NodeState {
+        node_id: Some(Uuid::new_v4()),
+        node_key_id: Some(jarvis_node::sign::fingerprint(&[6; 32])),
+        ..Default::default()
+    };
+    state::save(&dir.path().join(client::STATE_FILE), &saved).unwrap();
+    let (listener, node) = start_with(Duration::from_secs(95), keystore, dir).await;
+    let mut status = node.client.status();
+    assert!(
+        wait_for(
+            &mut status,
+            |s| *s == LinkStatus::NeedsReenrol,
+            Duration::from_secs(2)
+        )
+        .await
+    );
+    let attempt = tokio::time::timeout(Duration::from_millis(1500), listener.accept()).await;
+    assert!(
+        attempt.is_err(),
+        "never connects with a mismatched identity"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_challenge_key_keeps_retrying_hello() {
+    // M-1: one unauthenticated challenge with an unpinned key must not cost the node its link.
+    let (listener, node) = start(Duration::from_secs(95)).await;
+    let mut gw = Gw::new("gw-1", "gw-1");
+    let (mut ws, node_id) = enrol(&listener, &node, &mut gw).await;
+    close(&mut ws, 4401).await;
+    // A stray peer answers with a key the node never pinned.
+    let mut stray = Gw::new("unknown-1", "gw-x");
+    let mut ws = accept(&listener).await;
+    send(&mut ws, stray.challenge(now())).await;
+    let mut status = node.client.status();
+    assert!(
+        wait_for(
+            &mut status,
+            |s| *s == LinkStatus::NeedsReenrol,
+            Duration::from_secs(2)
+        )
+        .await
+    );
+    // It tries hello again after the retry wait, and the real gateway restores the link.
+    let mut real = Gw::new("gw-1", "gw-1");
+    let mut ws = accept(&listener).await;
+    send(&mut ws, real.challenge(now())).await;
+    let hello = recv(&mut ws).await;
+    assert_eq!(
+        (hello["kind"].as_str(), hello["node_id"].as_str()),
+        (Some("hello"), Some(node_id.to_string().as_str()))
+    );
+    send(&mut ws, real.welcome(node_id, None, now())).await;
+    assert!(
+        wait_for(
+            &mut status,
+            |s| *s == LinkStatus::Connected,
+            Duration::from_secs(2)
+        )
+        .await
+    );
+}
+
+#[tokio::test]
+async fn needs_reenrol_accepts_a_new_code() {
+    let (listener, node) = start(Duration::from_secs(95)).await;
+    let mut gw = Gw::new("gw-1", "gw-1");
+    let (mut ws, old_id) = enrol(&listener, &node, &mut gw).await;
+    close(&mut ws, 4409).await;
+    let mut status = node.client.status();
+    assert!(
+        wait_for(
+            &mut status,
+            |s| *s == LinkStatus::NeedsReenrol,
+            Duration::from_secs(2)
+        )
+        .await
+    );
+    let mut gw2 = Gw::new("gw-1", "gw-1");
+    let (_ws, new_id) = enrol(&listener, &node, &mut gw2).await;
+    assert_ne!(old_id, new_id);
+    let saved = state::load(&node.dir.path().join(client::STATE_FILE))
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.node_id, Some(new_id));
+    assert!(
+        wait_for(
+            &mut status,
+            |s| *s == LinkStatus::Connected,
+            Duration::from_secs(2)
+        )
+        .await
+    );
 }

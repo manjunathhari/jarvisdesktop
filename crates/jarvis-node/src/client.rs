@@ -25,6 +25,7 @@ use zeroize::Zeroizing;
 use crate::code::EnrolmentCode;
 use crate::keystore::KeyStore;
 use crate::session::{after_close, backoff, AfterClose, Output, Session, Start, Stop};
+use crate::sign::fingerprint;
 use crate::state::{self, NodeState};
 
 /// The gateway's WebSocket path.
@@ -33,6 +34,10 @@ pub const ROUTE: &str = "/v1/node";
 pub const STATE_FILE: &str = "node-state.json";
 /// 3 missed 30 s heartbeats, plus a little slack.
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(95);
+/// While a challenge's key is unknown, `hello` is retried this often (see `Reenrol::Retry`).
+pub const REENROL_RETRY: Duration = Duration::from_secs(30);
+/// A link must stay up this long before the backoff starts again from 1 s.
+const STABLE_LINK: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
@@ -42,6 +47,7 @@ pub struct ClientConfig {
     /// The app's data folder: holds `node-state.json`.
     pub data_dir: PathBuf,
     pub heartbeat_timeout: Duration,
+    pub reenrol_retry: Duration,
 }
 
 impl ClientConfig {
@@ -50,6 +56,7 @@ impl ClientConfig {
             gateway: gateway.into(),
             data_dir: data_dir.into(),
             heartbeat_timeout: HEARTBEAT_TIMEOUT,
+            reenrol_retry: REENROL_RETRY,
         }
     }
 }
@@ -77,6 +84,8 @@ pub enum EnrolError {
     BadCode,
     #[error("this device is already enrolled")]
     AlreadyEnrolled,
+    #[error("an enrolment is already in progress")]
+    Busy,
     #[error("enrolment failed: {0}")]
     Refused(&'static str),
     #[error("couldn't reach the Jarvis server")]
@@ -175,13 +184,51 @@ impl Enrolling {
 enum End {
     /// The gateway closed (or the link died) with this code.
     Closed(u16),
-    Stopped(Stop),
+    /// The session stopped; `ready` says whether the handshake had completed.
+    Stopped { stop: Stop, ready: bool },
     /// The app dropped its handle.
     Shutdown,
 }
 
 /// The local code for a link that went silent or broke without a close frame.
 const LINK_LOST: u16 = 1006;
+
+/// Why the node isn't connecting as itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reenrol {
+    /// The server said so (4409), or the node's own pins rule it out (an expired gateway key
+    /// mid-connection, no core key, a key that doesn't match the state). Only a new
+    /// enrolment helps, so nothing is retried.
+    Final,
+    /// A challenge came with a gateway key this node never pinned. That is what a rotated
+    /// gateway key looks like, but it is unauthenticated, so one stray frame must not cost the
+    /// node its link: it shows `NeedsReenrol` and keeps retrying `hello` every
+    /// `reenrol_retry`, until a pinned key answers or a new enrolment replaces the identity.
+    Retry,
+}
+
+/// The identity to connect as, or the status to show instead.
+fn identity(
+    state_path: &std::path::Path,
+    keystore: &dyn KeyStore,
+) -> Result<(SigningKey, NodeState), LinkStatus> {
+    let st = state::load(state_path).map_err(|e| LinkStatus::Failed(e.to_string()))?;
+    let key = keystore
+        .load()
+        .map_err(|e| LinkStatus::Failed(e.to_string()))?;
+    match (st, key) {
+        (Some(st), Some(key)) if st.node_id.is_some() => {
+            let key_id = fingerprint(&key.verifying_key().to_bytes());
+            if st.node_key_id.as_deref() == Some(key_id.as_str()) {
+                Ok((key, st))
+            } else {
+                // The key and the state belong to different enrolments.
+                Err(LinkStatus::NeedsReenrol)
+            }
+        }
+        _ => Err(LinkStatus::NotEnrolled),
+    }
+}
 
 async fn run(
     cfg: ClientConfig,
@@ -193,67 +240,46 @@ async fn run(
     let state_path = cfg.data_dir.join(STATE_FILE);
     let url = format!("ws://{}{ROUTE}", cfg.gateway);
     let mut attempt = 0u32;
-    let mut reenrol = false;
+    let mut reenrol: Option<Reenrol> = None;
     let mut enrolling: Option<Enrolling> = None;
 
     loop {
         // What to connect as: an enrolment in progress, or the saved identity.
-        let start = match &enrolling {
-            Some(e) => Some((
+        let start = match (&enrolling, reenrol) {
+            (Some(e), _) => Ok((
                 e.key.clone(),
                 NodeState::default(),
                 Start::Enrol(e.code.clone()),
             )),
-            None if reenrol => None,
-            None => match (state::load(&state_path), keystore.load()) {
-                (Ok(Some(st)), Ok(Some(key))) if st.node_id.is_some() => {
-                    Some((key, st, Start::Hello { resume: vec![] }))
-                }
-                (Err(e), _) => {
-                    let _ = status.send(LinkStatus::Failed(e.to_string()));
-                    None
-                }
-                (_, Err(e)) => {
-                    let _ = status.send(LinkStatus::Failed(e.to_string()));
-                    None
-                }
-                _ => None,
-            },
+            (None, Some(Reenrol::Final)) => Err(LinkStatus::NeedsReenrol),
+            (None, _) => identity(&state_path, keystore.as_ref())
+                .map(|(key, st)| (key, st, Start::Hello { resume: vec![] })),
         };
-        let Some((key, st, start)) = start else {
-            if !matches!(*status.borrow(), LinkStatus::Failed(_)) {
-                let _ = status.send(if reenrol {
-                    LinkStatus::NeedsReenrol
-                } else {
-                    LinkStatus::NotEnrolled
-                });
-            }
-            // Wait for an enrolment code; everything else is refused meanwhile.
-            match cmds.recv().await {
-                None => return,
-                Some(Cmd::Send { reply, .. }) => {
-                    let _ = reply.send(Err(NotConnected));
+        let (key, st, start) = match start {
+            Ok(start) => start,
+            Err(show) => {
+                if matches!(show, LinkStatus::NeedsReenrol) {
+                    reenrol = Some(Reenrol::Final);
                 }
-                Some(Cmd::Enrol { code, reply }) => match EnrolmentCode::parse(&code) {
-                    Err(_) => {
-                        let _ = reply.send(Err(EnrolError::BadCode));
+                let _ = status.send(show);
+                // Wait for an enrolment code; everything else is refused meanwhile.
+                match cmds.recv().await {
+                    None => return,
+                    Some(Cmd::Send { reply, .. }) => {
+                        let _ = reply.send(Err(NotConnected));
                     }
-                    Ok(code) => {
-                        // A new enrolment replaces the old identity, re-enrol request included.
-                        reenrol = false;
-                        enrolling = Some(Enrolling {
-                            code,
-                            key: new_key(),
-                            reply: Some(reply),
-                        });
-                        attempt = 0;
+                    Some(Cmd::Enrol { code, reply }) => {
+                        start_enrolment(&code, reply, &mut enrolling, &mut reenrol, &mut attempt);
                     }
-                },
+                }
+                continue;
             }
-            continue;
         };
 
-        let _ = status.send(LinkStatus::Connecting);
+        if reenrol.is_none() {
+            let _ = status.send(LinkStatus::Connecting);
+        }
+        let mut ready_at = None;
         let end = match timeout(
             CONNECT_TIMEOUT,
             tokio_tungstenite::connect_async(url.as_str()),
@@ -273,13 +299,21 @@ async fn run(
                     &mut cmds,
                     &status,
                     &mut enrolling,
-                    &mut attempt,
+                    &mut ready_at,
                 )
                 .await
             }
             _ => End::Closed(LINK_LOST),
         };
+        if ready_at.is_some() {
+            reenrol = None; // a pinned gateway key answered after all
+        }
+        // Only a link that stayed up a while resets the backoff, so a flapping link slows down.
+        if ready_at.is_some_and(|t| t.elapsed() >= STABLE_LINK) {
+            attempt = 0;
+        }
 
+        let mut wait = backoff(attempt);
         match end {
             End::Shutdown => return,
             End::Closed(code) => {
@@ -293,23 +327,29 @@ async fn run(
                     continue;
                 }
                 if after_close(code) == AfterClose::Reenrol {
-                    reenrol = true;
+                    reenrol = Some(Reenrol::Final);
                     continue;
                 }
             }
-            End::Stopped(stop) => {
+            End::Stopped { stop, ready } => {
                 if let Some(mut e) = enrolling.take() {
                     e.answer(Err(EnrolError::Refused(stop.reason)));
                     continue;
                 }
                 if stop.reenrol {
-                    reenrol = true;
-                    continue;
+                    if !ready && stop.reason == "unpinned_key" {
+                        reenrol = Some(Reenrol::Retry);
+                        let _ = status.send(LinkStatus::NeedsReenrol);
+                        wait = cfg.reenrol_retry;
+                    } else {
+                        reenrol = Some(Reenrol::Final);
+                        continue;
+                    }
                 }
             }
         }
         // Reconnect after a pause; app commands are still answered while waiting.
-        let wake = Instant::now() + backoff(attempt);
+        let wake = Instant::now() + wait;
         attempt = attempt.saturating_add(1);
         loop {
             tokio::select! {
@@ -317,9 +357,44 @@ async fn run(
                 cmd = cmds.recv() => match cmd {
                     None => return,
                     Some(Cmd::Send { reply, .. }) => { let _ = reply.send(Err(NotConnected)); }
-                    Some(Cmd::Enrol { reply, .. }) => { let _ = reply.send(Err(EnrolError::AlreadyEnrolled)); }
+                    Some(Cmd::Enrol { code, reply }) => {
+                        if reenrol.is_some() {
+                            // A new code is exactly what NeedsReenrol asks for.
+                            start_enrolment(&code, reply, &mut enrolling, &mut reenrol, &mut attempt);
+                            if enrolling.is_some() {
+                                break;
+                            }
+                        } else {
+                            let _ = reply.send(Err(EnrolError::AlreadyEnrolled));
+                        }
+                    }
                 },
             }
+        }
+    }
+}
+
+/// Begin an enrolment with `code`, or answer that the code is bad.
+fn start_enrolment(
+    code: &str,
+    reply: oneshot::Sender<Result<(), EnrolError>>,
+    enrolling: &mut Option<Enrolling>,
+    reenrol: &mut Option<Reenrol>,
+    attempt: &mut u32,
+) {
+    match EnrolmentCode::parse(code) {
+        Err(_) => {
+            let _ = reply.send(Err(EnrolError::BadCode));
+        }
+        Ok(code) => {
+            // A new enrolment replaces the old identity, re-enrol request included.
+            *reenrol = None;
+            *attempt = 0;
+            *enrolling = Some(Enrolling {
+                code,
+                key: new_key(),
+                reply: Some(reply),
+            });
         }
     }
 }
@@ -336,7 +411,7 @@ async fn connection<S>(
     cmds: &mut mpsc::UnboundedReceiver<Cmd>,
     status: &watch::Sender<LinkStatus>,
     enrolling: &mut Option<Enrolling>,
-    attempt: &mut u32,
+    ready_at: &mut Option<Instant>,
 ) -> End
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
@@ -357,7 +432,8 @@ where
                     Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
                     Some(Ok(Message::Binary(_))) => {
                         let _ = sink.close().await;
-                        return End::Stopped(Stop { reason: "malformed", reenrol: false });
+                        let ready = session.is_ready();
+                        return End::Stopped { stop: Stop { reason: "malformed", reenrol: false }, ready };
                     }
                     Some(Err(_)) | None => return End::Closed(LINK_LOST),
                 };
@@ -366,7 +442,8 @@ where
                     Ok(outputs) => outputs,
                     Err(stop) => {
                         let _ = sink.close().await;
-                        return End::Stopped(stop);
+                        // `on_frame` stopped the session, so read the phase it reached before.
+                        return End::Stopped { stop, ready: ready_at.is_some() };
                     }
                 };
                 for output in outputs {
@@ -390,11 +467,11 @@ where
                                 if let Err(err) = saved {
                                     e.answer(Err(EnrolError::Save(err)));
                                     let _ = sink.close().await;
-                                    return End::Stopped(Stop { reason: "save_failed", reenrol: false });
+                                    return End::Stopped { stop: Stop { reason: "save_failed", reenrol: false }, ready: false };
                                 }
                                 e.answer(Ok(()));
                             }
-                            *attempt = 0;
+                            *ready_at = Some(Instant::now());
                             let _ = status.send(LinkStatus::Connected);
                             let _ = frames.send(output);
                         }
@@ -423,7 +500,8 @@ where
                     }
                 }
                 Some(Cmd::Enrol { reply, .. }) => {
-                    let _ = reply.send(Err(EnrolError::AlreadyEnrolled));
+                    let busy = enrolling.is_some();
+                    let _ = reply.send(Err(if busy { EnrolError::Busy } else { EnrolError::AlreadyEnrolled }));
                 }
             },
             _ = tokio::time::sleep_until(deadline) => {

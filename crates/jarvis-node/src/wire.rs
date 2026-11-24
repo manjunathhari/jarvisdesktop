@@ -223,11 +223,9 @@ pub fn parse_envelope(v: &Value) -> Option<Envelope> {
         "payload",
         "sig",
     ];
-    let extra = map.len() - required.len();
-    if !required.iter().all(|f| map.contains_key(*f))
-        || extra > 1
-        || (extra == 1 && !map.contains_key("session_id"))
-    {
+    // Exactly the required fields, plus `session_id` at most.
+    let allowed = required.len() + usize::from(map.contains_key("session_id"));
+    if map.len() != allowed || !required.iter().all(|f| map.contains_key(*f)) {
         return None;
     }
     if map["version"].as_u64() != Some(1) {

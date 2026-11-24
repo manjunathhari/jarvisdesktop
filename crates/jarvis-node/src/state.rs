@@ -28,6 +28,10 @@ use crate::trust::Trust;
 pub struct NodeState {
     /// Set once enrolment has succeeded (§7.2 step 5).
     pub node_id: Option<Uuid>,
+    /// The fingerprint of the key this node enrolled with. The driver connects only when the
+    /// stored key has this fingerprint, so a crash between saving the key and saving the state
+    /// can never pair a new key with an old node ID.
+    pub node_key_id: Option<String>,
     pub trust: Trust,
 }
 
@@ -40,6 +44,8 @@ struct StateFile {
     /// Required (null when not enrolled): a missing key is a corrupt file, not "not enrolled".
     #[serde(deserialize_with = "Option::deserialize")]
     node_id: Option<Uuid>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    node_key_id: Option<String>,
     trust: Trust,
 }
 
@@ -65,6 +71,7 @@ pub fn load(path: &Path) -> Result<Option<NodeState>, StateError> {
     }
     Ok(Some(NodeState {
         node_id: file.node_id,
+        node_key_id: file.node_key_id,
         trust: file.trust,
     }))
 }
@@ -74,6 +81,7 @@ pub fn save(path: &Path, state: &NodeState) -> Result<(), StateError> {
     let file = StateFile {
         v: VERSION,
         node_id: state.node_id,
+        node_key_id: state.node_key_id.clone(),
         trust: state.trust.clone(),
     };
     let bytes = serde_json::to_vec_pretty(&file).expect("node state always serialises");
@@ -160,6 +168,7 @@ mod tests {
         trust.gateway.insert("gw-1".into(), PinnedKey::new([8; 32]));
         NodeState {
             node_id: Some(Uuid::new_v4()),
+            node_key_id: Some("abcdefghijklmnop".into()),
             trust,
         }
     }
@@ -216,10 +225,11 @@ mod tests {
         let path = dir.path().join("node-state.json");
         for bad in [
             &b"not json"[..],
-            br#"{"v":2,"node_id":null,"trust":{"core":{},"gateway":{}}}"#,
-            br#"{"v":1,"node_id":null,"trust":{"core":{},"gateway":{}},"extra":1}"#,
-            br#"{"v":1,"node_id":null}"#,
-            br#"{"v":1,"trust":{"core":{},"gateway":{}}}"#,
+            br#"{"v":2,"node_id":null,"node_key_id":null,"trust":{"core":{},"gateway":{}}}"#,
+            br#"{"v":1,"node_id":null,"node_key_id":null,"trust":{"core":{},"gateway":{}},"extra":1}"#,
+            br#"{"v":1,"node_id":null,"node_key_id":null}"#,
+            br#"{"v":1,"node_key_id":null,"trust":{"core":{},"gateway":{}}}"#,
+            br#"{"v":1,"node_id":null,"trust":{"core":{},"gateway":{}}}"#,
             b"",
         ] {
             std::fs::write(&path, bad).unwrap();

@@ -311,6 +311,7 @@ impl Session {
                     .insert(gw_key_id.to_owned(), PinnedKey::new(*gw_public));
                 self.state = NodeState {
                     node_id: Some(node_id),
+                    node_key_id: Some(self.key_id.clone()),
                     trust,
                 };
                 true

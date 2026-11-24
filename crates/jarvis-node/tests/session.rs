@@ -59,6 +59,7 @@ fn enrolled_state(gw: &Gw, node_id: Uuid) -> NodeState {
         .insert(gw.key_id.clone(), PinnedKey::new(gw.public()));
     NodeState {
         node_id: Some(node_id),
+        node_key_id: Some(fingerprint(&node_key().verifying_key().to_bytes())),
         trust,
     }
 }
@@ -112,6 +113,11 @@ fn enrol_pins_keys_from_code() {
     assert_eq!(s.state().node_id, Some(node_id));
     assert_eq!(s.state().trust.core["core-1"].public_key, core_public());
     assert_eq!(s.state().trust.gateway["gw-1"].public_key, gw.public());
+    assert_eq!(
+        s.state().node_key_id.as_deref(),
+        Some(fingerprint(&node_key().verifying_key().to_bytes()).as_str()),
+        "the state names the key it enrolled with"
+    );
     assert!(
         !s.state().trust.core.contains_key("gw-1"),
         "the gateway key is never a core key"
@@ -265,6 +271,9 @@ fn anything_but_a_valid_challenge_first_closes_silently() {
     let node_id = Uuid::new_v4();
     let cases: Vec<FirstFrame> = vec![
         Box::new(|_| "not json".to_owned()),
+        Box::new(|_| "{}".to_owned()),
+        Box::new(|_| r#"{"seq":1}"#.to_owned()),
+        Box::new(|_| "[]".to_owned()),
         Box::new(move |gw| gw.frame("ping", node_id, json!({}), now())),
         Box::new(|gw| {
             let mut c: Value = serde_json::from_str(&gw.challenge(now())).unwrap();
@@ -496,4 +505,19 @@ fn send_before_ready_is_refused() {
     assert_eq!(s.send("ping", json!({}), now()), Err(SendError::NotReady));
     s.on_frame(&gw.challenge(now()), now()).unwrap();
     assert_eq!(s.send("ping", json!({}), now()), Err(SendError::NotReady));
+}
+
+#[test]
+fn an_expired_challenge_is_still_answered() {
+    // Server time is advisory (§6.1 step 4): the gateway judges expiry on its own clock.
+    let mut gw = Gw::new("gw-1", "gw-1");
+    let node_id = Uuid::new_v4();
+    let mut s = Session::new(
+        node_key(),
+        enrolled_state(&gw, node_id),
+        Start::Hello { resume: vec![] },
+    );
+    let old = now() - Duration::minutes(5); // issued 5 min ago, expired 4.5 min ago
+    let env = sent(&s.on_frame(&gw.challenge(old), now()).unwrap());
+    assert_eq!(env["kind"], "hello");
 }
