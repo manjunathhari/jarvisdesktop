@@ -34,8 +34,10 @@ node (`superseded`), and gets its pending items and unacknowledged chunks. The r
 the connection (`stop`): fenced, superseded, a database failure or three missed heartbeats.
 
 **Keys.** A connection keeps the gateway keys it started with (`ctx.keys` at the time), so
-every envelope is signed under the key its challenge announced (R12-6), even if the keys are
-re-read meanwhile.
+every envelope is signed under the key its challenge announced (R12-6). When a re-read finds a
+new ACTIVE gateway key, the relay closes the connections still on the old key (`key_rotated`,
+through `gw.close_connection`), and the node reconnects under a challenge with the new key
+(fix round 1, I-1).
 
 **Sends are bounded** by `send_timeout` (10 s in service): a send that doesn't finish in time
 closes the connection through `gw.close_connection(conn_id, 'send_timeout')`.
@@ -228,8 +230,11 @@ class Session:
                 person_id=self.person_id,
                 conn_id=self.conn_id,
                 connected_at=self.ctx.clock(),
+                gw_key_id=self.keys.gw_key_id,
             )
             self.ctx.relay.register(self.link)
+            if self.keys.gw_key_id != self.ctx.keys.gw_key_id:  # rotated during the handshake
+                self.stop(relay.KEY_ROTATED, relay.KEY_ROTATED)
             try:
                 await self.link.on_connect(self._resume)
                 await self._established()

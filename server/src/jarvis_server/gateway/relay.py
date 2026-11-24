@@ -78,6 +78,7 @@ HEARTBEAT_REASON = "heartbeat"
 SEND_TIMEOUT = "send_timeout"
 SEND_TIMEOUT_S = 10.0  # real seconds one socket send may take (fix round 1, I-1)
 KEYSET_KIND = "keys.keyset"  # core.keys.KEYSET_KIND: sent as a `keyset` message
+KEY_ROTATED = "key_rotated"  # the close reason of a connection on a replaced gateway key
 
 Pool = AsyncConnectionPool[psycopg.AsyncConnection[Any]]
 
@@ -256,8 +257,10 @@ class NodeLink:
         person_id: UUID,
         conn_id: int,
         connected_at: datetime,
+        gw_key_id: str = "",
     ) -> None:
         self.relay = relay
+        self.gw_key_id = gw_key_id  # the gateway key this connection signs under (R12-6)
         self.endpoint = endpoint
         self.node_id = node_id
         self.person_id = person_id
@@ -596,6 +599,15 @@ class Relay:
     def unregister(self, link: NodeLink) -> None:
         if self._links.get(link.node_id) is link:
             del self._links[link.node_id]
+
+    def close_rotated(self, active_gw_key_id: str) -> int:
+        """Stop every connection that signs under a gateway key other than the ACTIVE one
+        (`key_rotated`), so it reconnects under a challenge with the new key (Task 12 fix
+        round 1, I-1). Returns how many were stopped."""
+        stale = [k for k in self._links.values() if k.gw_key_id != active_gw_key_id]
+        for link in stale:
+            link._stop(KEY_ROTATED, KEY_ROTATED)
+        return len(stale)
 
     def _of(self, person_id: UUID) -> list[NodeLink]:
         return [k for k in self._links.values() if k.person_id == person_id]

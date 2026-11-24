@@ -24,7 +24,8 @@ legacy secret `core_signing_key` when its fingerprint is the ACTIVE key_id
   acknowledged item STALE (R5-1). This includes a node enrolled after the announcement: it
   never learned the new key. The job `keys.activate` runs it (the scheduler queues it every
   minute, Task 13).
-- `retire` ends a retired-pending key, or withdraws a NEXT key (superseding its items).
+- `retire` ends a retired-pending key's overlap. A NEXT key is never withdrawn (I-2), and only
+  one key is announced at a time, for either role (M-4).
 
 Every change takes one transaction-level advisory lock, so announcements, activations,
 retirements and the bootstrap never interleave.
@@ -53,7 +54,6 @@ SECRET_NAMES: dict[Role, str] = {"CORE": "core_signing_key", "GATEWAY": "gateway
 OVERLAP = timedelta(hours=24)  # the keyset's validity and the longest wait for acknowledgements
 KEYSET_KIND = "keys.keyset"
 ACTIVATE_JOB = "keys.activate"
-_OPEN = ("PENDING", "DELIVERING", "DELIVERED")
 # One lock for every change to the trusted keys (announce, activate, retire, init).
 _LOCK = "SELECT pg_advisory_xact_lock(hashtextextended('gw.trusted_key', 0))"
 
@@ -218,8 +218,10 @@ def announce(conn: psycopg.Connection[Any], *, role: Role, public_key: bytes) ->
     """Insert a NEXT key and one `keys.keyset` item per active node; return its key_id.
 
     Refuses (`KeyRefused`, nothing written): `known_key` if the key is already a trusted key
-    (any state, any role), `next_pending` if the role already has a NEXT key. Every item's
-    authz is signed by the ACTIVE core key; `RuntimeError` if it can't be loaded.
+    (any state, any role); `next_pending` if the role already has a NEXT key;
+    `rotation_pending` if the other role has one. A GATEWAY keyset still queued when a CORE
+    key activates would otherwise be signed by a core key nodes drop at the overlap's end.
+    Every item's authz is signed by the ACTIVE core key; `RuntimeError` if it can't be loaded.
     """
     role = _role(role)
     public_key = _public(public_key)
@@ -231,10 +233,11 @@ def announce(conn: psycopg.Connection[Any], *, role: Role, public_key: bytes) ->
             (key_id, public_key),
         ).fetchone():
             raise KeyRefused("known_key")
-        if conn.execute(
-            "SELECT 1 FROM gw.trusted_key WHERE role = %s AND state = 'NEXT'", (role,)
-        ).fetchone():
-            raise KeyRefused("next_pending")
+        pending = conn.execute(
+            "SELECT role FROM gw.trusted_key WHERE state = 'NEXT' ORDER BY role LIMIT 1"
+        ).fetchone()
+        if pending is not None:  # one rotation at a time (fix round 1, M-4)
+            raise KeyRefused("next_pending" if pending[0] == role else "rotation_pending")
         signer, signer_id = active_core_key(conn)
         row = conn.execute(
             "INSERT INTO gw.trusted_key (key_id, role, public_key, state) VALUES (%s, %s, %s,"
@@ -335,31 +338,25 @@ def _activate_job(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
 
 
 def retire(conn: psycopg.Connection[Any], key_id: str) -> None:
-    """End a key: a retired-pending key gets `retired_at`; a NEXT key is withdrawn (RETIRED
-    now, its open keyset items superseded). Refuses (`KeyRefused`): `unknown_key`, `active`
-    (announce and activate a successor first), `already_retired`."""
+    """End a retired-pending key's overlap: it gets `retired_at`, and core stops verifying
+    with it. Refuses (`KeyRefused`, nothing changed): `unknown_key`; `active` (announce and
+    activate a successor first); `next_pending` (a NEXT key is never withdrawn: nodes that
+    accepted it would keep trusting it and drop the ACTIVE key; fix round 1, I-2);
+    `already_retired`."""
     with conn.transaction():
         conn.execute(_LOCK)
         row = conn.execute(
-            "SELECT state, retired_at, announced_outbox_ids FROM gw.trusted_key"
-            " WHERE key_id = %s FOR UPDATE",
+            "SELECT state, retired_at FROM gw.trusted_key WHERE key_id = %s FOR UPDATE",
             (key_id,),
         ).fetchone()
         if row is None:
             raise KeyRefused("unknown_key")
-        state, retired_at, items = row
+        state, retired_at = row
         if state == "ACTIVE":
             raise KeyRefused("active")
+        if state == "NEXT":
+            raise KeyRefused("next_pending")
         if retired_at is not None:
             raise KeyRefused("already_retired")
-        conn.execute(
-            "UPDATE gw.trusted_key SET state = 'RETIRED', retired_at = now() WHERE key_id = %s",
-            (key_id,),
-        )
-        if state == "NEXT":
-            for (item,) in conn.execute(
-                "SELECT id FROM comm.outbox WHERE id = ANY(%s) AND state = ANY(%s)",
-                (items, list(_OPEN)),
-            ).fetchall():
-                conn.execute("SELECT comm.supersede(%s)", (item,))
+        conn.execute("UPDATE gw.trusted_key SET retired_at = now() WHERE key_id = %s", (key_id,))
     log.info("retired key %s", key_id)

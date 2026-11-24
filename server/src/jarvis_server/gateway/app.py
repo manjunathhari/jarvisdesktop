@@ -7,7 +7,9 @@ a psycopg `AsyncConnectionPool`.
 Keys (Task 12): at startup the gateway loads its ACTIVE key and core's ACTIVE public key from
 `gw.trusted_key` and its secret, and refuses to start if that fails. It re-reads them every
 `key_refresh_interval` (60 s). A failed re-read keeps the keys it has. A new key applies to new
-connections only, since each connection signs under the key its challenge announced (R12-6).
+connections, since each connection signs under the key its challenge announced (R12-6). A new
+ACTIVE gateway key also closes the connections still on the old one (`key_rotated`), so they
+reconnect under it (fix round 1, I-1).
 
 `main` asks the Tailscale sidecar for its tailnet IPv4 address and binds uvicorn only to that
 address, port 8443. It exits non-zero if the address is unknown or isn't a tailnet address, so
@@ -79,7 +81,11 @@ async def _refresh_keys(
             continue
         if keys.ids != ctx.keys.ids:
             log.info("trusted keys reloaded: gateway key %s, core key %s", *keys.ids)
+        rotated = keys.gw_key_id != ctx.keys.gw_key_id
         ctx.keys = keys
+        if rotated:  # connections still on the old key reconnect under the new one (I-1)
+            closed = ctx.relay.close_rotated(keys.gw_key_id)
+            log.info("closed %d connections on the replaced gateway key", closed)
 
 
 def create_app(

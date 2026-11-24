@@ -106,13 +106,15 @@ def ks(dsns: Dsns, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Keys:
 
 @contextmanager
 def gateway(
-    dsns: Dsns, ks: Keys, tmp: Path, clock: FakeClock, *, as_key: Ed25519PrivateKey | None = None
-) -> Iterator[Gw]:
-    """A gateway that loads its keys from gw.trusted_key and the secrets directory. `as_key`
-    is only what the test signs injected gateway frames with (the gateway's own ACTIVE key)."""
+    dsns: Dsns, ks: Keys, tmp: Path, clock: FakeClock, *,
+    as_key: Ed25519PrivateKey | None = None, refresh: float = 0.05,
+) -> Iterator[Gw]:  # fmt: skip
+    """A gateway that loads its keys from gw.trusted_key and the secrets directory, re-reading
+    them every `refresh` real seconds. `as_key` is only what the test signs injected gateway
+    frames with (the gateway's own ACTIVE key)."""
     with running_gateway(
         dsns, tmp, gw_key=as_key or ks.gw, core_key=ks.core, install_keys=False,
-        secrets_dir=ks.secrets, clock=clock, key_refresh_interval=0.05,
+        secrets_dir=ks.secrets, clock=clock, key_refresh_interval=refresh,
     ) as gw:  # fmt: skip
         yield gw
 
@@ -470,16 +472,39 @@ def test_retire_rules(app: Conn, owner: Conn, ks: Keys) -> None:
     with pytest.raises(keys.KeyRefused) as e:
         keys.retire(app, "a" * 16)
     assert e.value.reason == "unknown_key"
-    # Retiring a NEXT key withdraws its announcement.
+    # A NEXT key is never withdrawn (fix round 1, I-2): refused, and nothing changes.
     key_id = keys.announce(app, role="CORE", public_key=public_bytes(Ed25519PrivateKey.generate()))
-    keys.retire(app, key_id)
-    row = _row(app, key_id)
-    assert row["state"] == "RETIRED" and row["retired_at"] is not None
-    assert _item_of(app, key_id, node)["state"] == "SUPERSEDED"
-    assert keys.activate_ready(app, _created(app, key_id) + DAY * 2) == []
+    before = (_row(app, key_id), _item_of(app, key_id, node))
     with pytest.raises(keys.KeyRefused) as e:
         keys.retire(app, key_id)
+    assert e.value.reason == "next_pending"
+    assert (_row(app, key_id), _item_of(app, key_id, node)) == before
+    # A retired-pending key is ended once.
+    assert keys.activate_ready(app, _created(app, key_id) + DAY) == [key_id]
+    keys.retire(app, _id(ks.core))
+    assert _row(app, _id(ks.core))["retired_at"] is not None
+    with pytest.raises(keys.KeyRefused) as e:
+        keys.retire(app, _id(ks.core))
     assert e.value.reason == "already_retired"
+
+
+def test_one_rotation_at_a_time(app: Conn, owner: Conn, ks: Keys) -> None:
+    """Fix round 1, M-4: while either role has a NEXT key, the other can't be announced."""
+    flow.new_node(owner, MANJ)
+    gw_key = keys.announce(
+        app, role="GATEWAY", public_key=public_bytes(Ed25519PrivateKey.generate())
+    )
+    count = app.execute("SELECT count(*) FROM gw.trusted_key").fetchone()
+    items = app.execute("SELECT count(*) FROM comm.outbox WHERE kind = 'keys.keyset'").fetchone()
+    with pytest.raises(keys.KeyRefused) as e:
+        keys.announce(app, role="CORE", public_key=public_bytes(Ed25519PrivateKey.generate()))
+    assert e.value.reason == "rotation_pending"
+    assert app.execute("SELECT count(*) FROM gw.trusted_key").fetchone() == count
+    assert app.execute(
+        "SELECT count(*) FROM comm.outbox WHERE kind = 'keys.keyset'"
+    ).fetchone() == items  # fmt: skip
+    assert keys.activate_ready(app, _created(app, gw_key) + DAY) == [gw_key]
+    assert keys.announce(app, role="CORE", public_key=public_bytes(Ed25519PrivateKey.generate()))
 
 
 def test_keys_activate_job_runs_activate_ready(app: Conn, owner: Conn, ks: Keys) -> None:
@@ -961,3 +986,98 @@ def test_0011_downgrade_refuses_once_keys_exist() -> None:
                 " AND attname = 'key_state'"
             ).fetchone() == (0,)
         migrate.upgrade(d.owner)
+
+
+# ------------------------------------------------------------------------------ fix round 1
+
+
+def test_connection_spanning_gateway_activation_moves_to_the_new_key(
+    app: Conn, dsns: Dsns, ks: Keys, tmp_path: Path
+) -> None:
+    """I-1: a connection opened before a GATEWAY activation is closed (`key_rotated`) once the
+    gateway re-reads its keys, and the node reconnects under the new key. It is never asked
+    to re-enrol, before or after the overlap ends."""
+    clock = _clock(app)
+    with gateway(dsns, ks, tmp_path, clock) as gw:
+        fake = _enrolled(gw, app)
+        new = Ed25519PrivateKey.generate()
+        key_id = keys.announce(app, role="GATEWAY", public_key=public_bytes(new))
+        assert _wait_for(lambda: _acked(app, key_id, fake))
+        ks.place(f"gateway_signing_key_{key_id}", new)
+        old_conn = app.execute(
+            "SELECT id FROM gw.node_connection WHERE node_id = %s AND closed_at IS NULL",
+            (fake.node_id,),
+        ).fetchone()
+        assert old_conn is not None
+        fake.sync()  # the old-key connection works until the re-read
+        assert keys.activate_ready(app, clock()) == [key_id]
+
+        def closed() -> bool:
+            try:
+                fake.drain(0.02)
+            except WebSocketDisconnect:
+                return True
+            return not fake.connected
+
+        assert _wait_for(closed)
+        row = app.execute(
+            "SELECT close_reason FROM gw.node_connection WHERE id = %s", (old_conn[0],)
+        ).fetchone()
+        assert row == ("key_rotated",)
+        assert fake.prompt is None
+        again = _again(gw, fake)
+        assert again.connect()["key_id"] == key_id  # the new key, pinned from the keyset
+        again.hello()
+        clock.advance((DAY + timedelta(minutes=5)).total_seconds())  # the overlap ends
+        again.sync()
+        assert _id(ks.gw) not in again.pinned_gateway
+        assert again.prompt is None and again.rejected == [] and again.connected
+
+
+def test_node_rejects_transport_on_a_key_past_its_overlap(
+    app: Conn, dsns: Dsns, ks: Keys, tmp_path: Path
+) -> None:
+    """I-1, the node's side: if a connection were left on the old gateway key past the
+    overlap, the node refuses its next frame and asks to re-enrol."""
+    clock = _clock(app)
+    with gateway(dsns, ks, tmp_path, clock, refresh=3600) as gw:  # never re-read here
+        fake = _enrolled(gw, app)
+        new = Ed25519PrivateKey.generate()
+        key_id = keys.announce(app, role="GATEWAY", public_key=public_bytes(new))
+        assert _wait_for(lambda: _acked(app, key_id, fake))
+        fake.sync()
+        clock.advance((DAY + timedelta(minutes=5)).total_seconds())
+        with pytest.raises(Rejected) as e:
+            fake.inject(gw.gw_envelope(fake, "ping", {}))
+        assert e.value.reason == "unpinned_key"
+        assert fake.prompt == "reenrol" and not fake.connected
+
+
+def test_transport_signed_under_an_unknown_key_prompts_reenrol(
+    app: Conn, dsns: Dsns, ks: Keys, tmp_path: Path
+) -> None:
+    """M-1: a gw-transport envelope signed under a key the node never pinned: it runs nothing,
+    closes and asks to re-enrol. One signed by another pinned gateway key is refused without
+    the prompt."""
+    clock = _clock(app)
+    with gateway(dsns, ks, tmp_path, clock) as gw:
+        fake = _enrolled(gw, app)
+        assert fake.node_id is not None
+        stranger = Ed25519PrivateKey.generate()
+        gw.gw_key = stranger  # gw_envelope signs with this key
+        action = {"authz": _action(ks.core, _id(ks.core), fake.node_id, clock())}
+        with pytest.raises(Rejected) as e:
+            fake.inject(gw.gw_envelope(fake, "node.action", action))
+        assert e.value.reason == "unknown_key_id"
+        assert fake.prompt == "reenrol" and fake.actions == [] and not fake.connected
+        assert fake.state_path.exists()  # the journal is kept
+        # Another pinned gateway key on this connection: refused, but not a key change.
+        other = Ed25519PrivateKey.generate()
+        again = _again(gw, fake)
+        again.prompt = None
+        again.pinned_gateway[_id(other)] = public_bytes(other)
+        again.hello()
+        gw.gw_key = other
+        with pytest.raises(Rejected) as e:
+            again.inject(gw.gw_envelope(again, "node.action", action))
+        assert e.value.reason == "bad_signature" and again.prompt is None and again.actions == []

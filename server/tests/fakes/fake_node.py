@@ -32,7 +32,9 @@ node (R12-27). Only then does the node send ``received`` and ``ack`` for it. The
 added to the CORE or GATEWAY pins by role, and the role's existing keys stay trusted until
 24 h after the keyset's ``issued_at`` (``key_expiry``). A key still waiting out an earlier
 overlap is dropped when a later keyset arrives. On close code 4409, an unpinned gateway key in
-a challenge, or a core signature under an unknown ``key_id``, the node runs nothing, keeps its
+a challenge, a ``gw-transport`` envelope on a connection whose gateway key is no longer pinned
+or signed under a key it never pinned, or a core signature under an unknown ``key_id``, the
+node runs nothing, keeps its
 journal (the state file), closes and sets ``prompt = "reenrol"`` (R5-1).
 
 Also here: ``FakeWhoIs`` (dict-backed ``whois``) and ``PeerFromHeader``, a test-only ASGI
@@ -181,6 +183,7 @@ class FakeNode:
         self._peer_seq = SeqChecker()
         self._gw_key_id: str | None = None
         self._gw_public: bytes | None = None
+        self._gw_from_code = False
         self._authorised = False
 
     # ------------------------------------------------------------------ state file
@@ -238,6 +241,7 @@ class FakeNode:
         self._seq = 0
         self._peer_seq = SeqChecker()
         self._authorised = False
+        self._gw_from_code = enrol_gateway_fingerprint is not None  # not pinned yet (§7.2)
         self._prune()
         env = self._receive(2.0)
         try:
@@ -337,6 +341,7 @@ class FakeNode:
             self._refuse("welcome", e.reason)
         assert self._gw_key_id is not None and self._gw_public is not None
         self.pinned_gateway = {self._gw_key_id: self._gw_public}
+        self._gw_from_code = False
         self.trusted_core = {core_key_id: core_public}
         self.node_id = node_id
         self._authorised = True
@@ -474,14 +479,25 @@ class FakeNode:
         except Rejected as e:
             self._refuse(str(env.get("kind")), e.reason)
         assert self._gw_key_id is not None and self._gw_public is not None
+        self._prune()
+        what = str(env.get("kind"))
+        if not self._gw_from_code and self.pinned_gateway.get(self._gw_key_id) != self._gw_public:
+            # The connection's gateway key is no longer pinned (its overlap ended).
+            self.prompt = "reenrol"
+            self._refuse(what, "unpinned_key")
         if not verify_envelope(Purpose.GW_TRANSPORT, self._gw_public, self._gw_key_id, env):
-            self._refuse(str(env.get("kind")), "bad_signature")
+            known = any(
+                verify_envelope(Purpose.GW_TRANSPORT, public, key_id, env)
+                for key_id, public in self.pinned_gateway.items()
+            )
+            if not known:  # signed under a key_id it never pinned (spec §7.1, R5-1)
+                self.prompt = "reenrol"
+            self._refuse(what, "bad_signature" if known else "unknown_key_id")
         self.received_envelopes.append(env)
         kind, payload = env["kind"], env["payload"]
         if kind in CORE_CONTENT and not self._authorised:
             self.rejected.append((kind, "unauthorised"))
             return
-        self._prune()
         try:
             if kind == "node.action":
                 assert self.node_id is not None

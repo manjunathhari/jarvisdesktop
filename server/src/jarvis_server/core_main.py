@@ -17,7 +17,7 @@ jarvis-core keys init   record the current core and gateway keys as ACTIVE (boot
 jarvis-core keys announce --role CORE|GATEWAY --public-key-file <path>
                         announce a new key (raw 32-byte public key) to every active node
 jarvis-core keys retire <key_id>
-                        end a retired key's overlap, or withdraw a NEXT key
+                        end a retired key's overlap (never a NEXT or ACTIVE key)
 jarvis-core keys list   the trusted keys and the STALE nodes that need `node reenrol`
 """
 
