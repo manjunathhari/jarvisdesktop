@@ -105,6 +105,16 @@ def network() -> Iterator[str]:
     _docker("network", "rm", name, check=False)
 
 
+@pytest.fixture
+def internal_network() -> Iterator[str]:
+    """No internet: Tailscale's login with the dummy key stalls instead of failing and exiting,
+    so the sidecar stays up while the test reads its rules."""
+    name = f"jarvis-live-int-{uuid.uuid4().hex[:8]}"
+    _docker("network", "create", "--internal", name)
+    yield name
+    _docker("network", "rm", name, check=False)
+
+
 def _wait_running(name: str, seconds: float = 20) -> None:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -152,7 +162,7 @@ def test_egress_proxy_starts_read_only_and_allows_only_claude(
 
 @live
 def test_gateway_sidecar_starts_read_only_and_installs_rules(
-    rendered: dict[str, Any], network: str, tmp_path: Path
+    rendered: dict[str, Any], internal_network: str, tmp_path: Path
 ) -> None:
     """The sidecar runs its entrypoint from /tmp and installs the gateway's egress rules with a
     backend this kernel offers. The auth key is a dummy, so Tailscale never logs in; the rules
@@ -162,7 +172,9 @@ def test_gateway_sidecar_starts_read_only_and_installs_rules(
     key = tmp_path / "tailscale_gateway_authkey"
     key.write_text("tskey-auth-dummy-not-a-real-key\n")
     key.chmod(0o444)
-    args = _run_args(ts, name, network)
+    args = _run_args(ts, name, internal_network)
+    # The service's two volumes, as tmpfs here: tailscaled needs both writable on a read-only root.
+    args += ["--tmpfs", "/var/lib/tailscale", "--tmpfs", "/ts-socket"]
     args += ["--device", "/dev/net/tun:/dev/net/tun"]
     args += ["-v", f"{key}:/run/secrets/tailscale_gateway_authkey:ro"]
     try:
@@ -177,18 +189,24 @@ def test_gateway_sidecar_starts_read_only_and_installs_rules(
         logs = _docker("logs", name, check=False)
         assert chosen.strip(), f"no rules installed:\n{logs.stdout}\n{logs.stderr}"
         ipt, *ip6t = chosen.split()
-        rules = _docker("exec", name, ipt, "-S", "JARVIS_GW_OUT").stdout
+        # Everything read in one exec, so a container that stops later can't split the reads.
+        both = _docker(
+            "exec", name, "/bin/sh", "-c",
+            f"{ipt} -S JARVIS_GW_OUT; echo ===; {ipt} -S OUTPUT"
+            + "".join(f"; echo ===; {t} -S JARVIS_GW_OUT" for t in ip6t),
+            check=False,
+        ).stdout  # fmt: skip
+        rules, jump, *v6_rules = both.split("===\n")
         pg_ip = ts["environment"]["JARVIS_POSTGRES_IP"]
-        assert rules.splitlines()[1:] == [
+        assert rules.splitlines()[1:] == [  # line 0 is "-N JARVIS_GW_OUT"
             "-A JARVIS_GW_OUT -o tailscale0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT",
             f"-A JARVIS_GW_OUT -d {pg_ip}/32 -p tcp -m tcp --dport 5432 -j ACCEPT",
             "-A JARVIS_GW_OUT -j DROP",
         ], rules
         assert "egress rules for every non-root UID in place" in logs.stdout + logs.stderr
-        jump = _docker("exec", name, ipt, "-S", "OUTPUT").stdout
         assert "--socket-exists" in jump and "! --uid-owner 0 -j JARVIS_GW_OUT" in jump
-        for tool in ip6t:  # IPv6 rules too, wherever ip6tables works
-            v6 = _docker("exec", name, tool, "-S", "JARVIS_GW_OUT").stdout
+        assert len(v6_rules) == len(ip6t)
+        for v6 in v6_rules:  # IPv6 rules too, wherever ip6tables works
             assert v6.splitlines()[-1] == "-A JARVIS_GW_OUT -j DROP", v6
     finally:
         _docker("rm", "-f", name, check=False)
