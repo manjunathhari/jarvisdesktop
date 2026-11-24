@@ -17,6 +17,10 @@ base64.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 zeroize.workspace = true
+tokio-tungstenite = "0.30.0"
+futures-util = "0.3.34"
+getrandom = "0.3"
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "sync", "time"] }
 
 # DPAPI key storage and write-through renames (Windows only).
 [target.'cfg(windows)'.dependencies]

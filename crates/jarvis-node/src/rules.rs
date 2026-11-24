@@ -124,3 +124,100 @@ pub fn check_keyset(
     }
     Ok(obj)
 }
+
+// ---------------------------------------------------------------- handshake rules (§6.1, §7.2)
+
+use crate::sign::{b64url_decode, fingerprint, verify_envelope};
+use crate::wire::{parse_challenge, parse_envelope, parse_welcome, Challenge};
+
+/// Pinned GATEWAY keys: `key_id` → raw public key.
+pub type GatewayKeys = BTreeMap<String, [u8; 32]>;
+
+/// The raw key, or `malformed_key` unless it is strictly canonical base64url.
+fn raw_key(text: &str) -> Result<[u8; 32], Rejected> {
+    b64url_decode(text, 32)
+        .and_then(|raw| raw.try_into().ok())
+        .ok_or(Rejected("malformed_key"))
+}
+
+/// The gateway's first message on a connection (§6.1 step 3, R6-1).
+///
+/// An enrolled node passes its pinned GATEWAY keys; a device enrolling passes `None` and the
+/// gateway fingerprint from its enrolment code. That this is the first message (`seq` = 1) is
+/// `SeqChecker`'s job; server time is advisory, so expiry isn't checked here.
+///
+/// Reasons, in order: `malformed` (including any kind other than `challenge`),
+/// `malformed_key`, `unpinned_key`, `fingerprint_mismatch`, `bad_signature`.
+pub fn check_challenge(
+    env: &Value,
+    pinned: Option<&GatewayKeys>,
+    enrol_fingerprint: Option<&str>,
+) -> Result<Challenge, Rejected> {
+    let envelope = parse_envelope(env).ok_or(Rejected("malformed"))?;
+    if envelope.kind != "challenge" {
+        return Err(Rejected("malformed"));
+    }
+    let challenge = parse_challenge(&env["payload"]).ok_or(Rejected("malformed"))?;
+    let public = raw_key(&challenge.public_key)?;
+    match (pinned, enrol_fingerprint) {
+        (Some(pins), _) => {
+            if pins.get(&challenge.key_id) != Some(&public) {
+                return Err(Rejected("unpinned_key"));
+            }
+        }
+        (None, Some(fp)) => {
+            if fingerprint(&public) != fp {
+                return Err(Rejected("fingerprint_mismatch"));
+            }
+        }
+        (None, None) => return Err(Rejected("unpinned_key")),
+    }
+    if !verify_envelope(&public, Purpose::GwTransport, &challenge.key_id, env) {
+        return Err(Rejected("bad_signature"));
+    }
+    Ok(challenge)
+}
+
+/// `(node_id, core_key_id, core_public_key)` to pin after an enrolment (§7.2 step 5, R6-6).
+///
+/// Reasons, in order: `malformed`, `enrolment_missing`, `malformed_key`,
+/// `core_fingerprint_mismatch`. On any rejection the device discards its new key and stores
+/// nothing.
+pub fn check_enrolment_welcome(
+    welcome: &Value,
+    core_fingerprint: &str,
+) -> Result<(Uuid, String, [u8; 32]), Rejected> {
+    let welcome = parse_welcome(welcome).ok_or(Rejected("malformed"))?;
+    let block = welcome.enrolment.ok_or(Rejected("enrolment_missing"))?;
+    let public = raw_key(&block.core_public_key)?;
+    if fingerprint(&public) != core_fingerprint {
+        return Err(Rejected("core_fingerprint_mismatch"));
+    }
+    Ok((block.node_id, block.core_key_id, public))
+}
+
+/// The peer's `seq` on one connection: 1, then exactly +1 each message (R6-8). After a
+/// failure the connection is closed, so every later call fails too.
+#[derive(Debug, Default)]
+pub struct SeqChecker {
+    next: i64,
+    failed: bool,
+}
+
+impl SeqChecker {
+    pub fn new() -> Self {
+        Self {
+            next: 1,
+            failed: false,
+        }
+    }
+
+    pub fn expect(&mut self, peer_seq: i64) -> Result<(), Rejected> {
+        if self.failed || peer_seq != self.next {
+            self.failed = true;
+            return Err(Rejected("bad_seq"));
+        }
+        self.next += 1;
+        Ok(())
+    }
+}

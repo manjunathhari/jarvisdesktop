@@ -164,3 +164,213 @@ pub fn parse_authz(v: &Value) -> Option<Authz> {
         sig,
     })
 }
+
+// ---------------------------------------------------------------- envelopes (§7.1)
+
+/// The nil UUID: the envelope `node_id` before the node is known (`challenge`, `enrol`).
+pub const NIL_UUID: Uuid = Uuid::nil();
+
+/// Every message kind `contracts/node-envelope.schema.json` allows.
+pub const MESSAGE_KINDS: [&str; 17] = [
+    "challenge",
+    "enrol",
+    "hello",
+    "welcome",
+    "utterance",
+    "reply.chunk",
+    "outbox.item",
+    "outbox.cleared",
+    "received",
+    "ack",
+    "approval.decision",
+    "node.action",
+    "action.receipt",
+    "keyset",
+    "ping",
+    "pong",
+    "error",
+];
+
+/// A parsed envelope. Its signature is checked separately, over the raw JSON.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Envelope {
+    pub message_id: Uuid,
+    pub node_id: Uuid,
+    pub session_id: Option<Uuid>,
+    pub seq: i64,
+    pub sent_at: DateTime<FixedOffset>,
+    pub kind: String,
+    pub payload: Map<String, Value>,
+    pub sig: String,
+}
+
+fn uuid(v: &Value) -> Option<Uuid> {
+    Uuid::parse_str(v.as_str()?).ok()
+}
+
+/// The envelope, or `None` if it is malformed: every field present (`session_id` may be left
+/// out), no extras, `version` 1, `seq` ≥ 1, a known `kind`, and the nil `node_id` only on
+/// `challenge` and `enrol`.
+pub fn parse_envelope(v: &Value) -> Option<Envelope> {
+    let map = v.as_object()?;
+    let required = [
+        "version",
+        "message_id",
+        "node_id",
+        "seq",
+        "sent_at",
+        "kind",
+        "payload",
+        "sig",
+    ];
+    let extra = map.len() - required.len();
+    if !required.iter().all(|f| map.contains_key(*f))
+        || extra > 1
+        || (extra == 1 && !map.contains_key("session_id"))
+    {
+        return None;
+    }
+    if map["version"].as_u64() != Some(1) {
+        return None;
+    }
+    let session_id = match map.get("session_id") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(uuid(v)?),
+    };
+    let seq = map["seq"].as_i64().filter(|s| *s >= 1)?;
+    let kind = map["kind"].as_str().filter(|k| MESSAGE_KINDS.contains(k))?;
+    let node_id = uuid(&map["node_id"])?;
+    if node_id == NIL_UUID && !matches!(kind, "challenge" | "enrol") {
+        return None;
+    }
+    Some(Envelope {
+        message_id: uuid(&map["message_id"])?,
+        node_id,
+        session_id,
+        seq,
+        sent_at: time(&map["sent_at"])?,
+        kind: kind.to_owned(),
+        payload: map["payload"].as_object()?.clone(),
+        sig: map["sig"]
+            .as_str()
+            .filter(|s| is_b64url_text(s, 86))?
+            .to_owned(),
+    })
+}
+
+/// The `challenge` payload (§6.1 step 2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Challenge {
+    pub nonce: String,
+    pub issued_at: DateTime<FixedOffset>,
+    pub expires_at: DateTime<FixedOffset>,
+    pub key_id: String,
+    pub public_key: String,
+}
+
+pub fn parse_challenge(payload: &Value) -> Option<Challenge> {
+    let map = payload.as_object()?;
+    if !has_exactly(
+        map,
+        &["nonce", "issued_at", "expires_at", "key_id", "public_key"],
+    ) {
+        return None;
+    }
+    Some(Challenge {
+        nonce: map["nonce"]
+            .as_str()
+            .filter(|s| is_b64url_text(s, 43))?
+            .to_owned(),
+        issued_at: time(&map["issued_at"])?,
+        expires_at: time(&map["expires_at"])?,
+        key_id: map["key_id"].as_str().filter(|s| is_key_id(s))?.to_owned(),
+        public_key: map["public_key"]
+            .as_str()
+            .filter(|s| is_b64url_text(s, 43))?
+            .to_owned(),
+    })
+}
+
+/// The `enrolment` block of a `welcome` after an enrolment (§6.1 step 7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnrolmentBlock {
+    pub node_id: Uuid,
+    pub core_key_id: String,
+    pub core_public_key: String,
+}
+
+/// The `welcome` payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Welcome {
+    pub session_id: Option<Uuid>,
+    /// The reconnect summary groups (§8.3), as received.
+    pub summary: Vec<Value>,
+    pub enrolment: Option<EnrolmentBlock>,
+}
+
+fn text_between(v: &Value, min: usize, max: usize) -> bool {
+    v.as_str()
+        .is_some_and(|s| (min..=max).contains(&s.chars().count()))
+}
+
+fn summary_group_ok(v: &Value) -> bool {
+    let Some(map) = v.as_object() else {
+        return false;
+    };
+    has_exactly(map, &["priority", "group_key", "outbox_ids", "line"])
+        && matches!(
+            map["priority"].as_str(),
+            Some("URGENT" | "TODAY" | "DIGEST")
+        )
+        && (map["group_key"].is_null() || text_between(&map["group_key"], 1, 200))
+        && map["outbox_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().all(|id| uuid(id).is_some()))
+        && (map["line"].is_null() || text_between(&map["line"], 1, 500))
+}
+
+pub fn parse_welcome(payload: &Value) -> Option<Welcome> {
+    let map = payload.as_object()?;
+    let with_block = map.contains_key("enrolment");
+    let fields: &[&str] = if with_block {
+        &["session_id", "summary", "enrolment"]
+    } else {
+        &["session_id", "summary"]
+    };
+    if !has_exactly(map, fields) {
+        return None;
+    }
+    let session_id = match &map["session_id"] {
+        Value::Null => None,
+        v => Some(uuid(v)?),
+    };
+    let summary = map["summary"].as_array()?;
+    if !summary.iter().all(summary_group_ok) {
+        return None;
+    }
+    let enrolment = if with_block {
+        // May be left out, but never sent as null.
+        let block = map["enrolment"].as_object()?;
+        if !has_exactly(block, &["node_id", "core_key_id", "core_public_key"]) {
+            return None;
+        }
+        Some(EnrolmentBlock {
+            node_id: uuid(&block["node_id"])?,
+            core_key_id: block["core_key_id"]
+                .as_str()
+                .filter(|s| is_key_id(s))?
+                .to_owned(),
+            core_public_key: block["core_public_key"]
+                .as_str()
+                .filter(|s| is_b64url_text(s, 43))?
+                .to_owned(),
+        })
+    } else {
+        None
+    };
+    Some(Welcome {
+        session_id,
+        summary: summary.clone(),
+        enrolment,
+    })
+}

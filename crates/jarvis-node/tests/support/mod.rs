@@ -1,6 +1,8 @@
 //! Shared test helpers: the committed contracts and signing vectors, read-only.
 #![allow(dead_code)] // each test crate uses a different subset
 
+pub mod gateway;
+
 use std::path::PathBuf;
 
 use ed25519_dalek::SigningKey;
@@ -40,15 +42,14 @@ pub fn case(name: &str) -> Value {
         .unwrap_or_else(|| panic!("no shared case {name}"))
 }
 
-/// A test key from the vectors' fixed seeds, by its vector `key_id` (e.g. `core-1`).
+/// A test key by its generator label (`core-1`, `core-2`, `gw-1`, `gw-2`, `node-1`,
+/// `unknown-1`): the seed is SHA-256 of `jarvis-signing-vectors test seed: <label>`, the rule
+/// `contracts/signing-vectors/generate.mjs` publishes. `test_keys_match_the_vectors` checks it.
 pub fn test_key(label: &str) -> SigningKey {
-    let seed = vectors()
-        .into_iter()
-        .find(|v| v["key_id"] == label)
-        .and_then(|v| v["seed_hex"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| panic!("no vector with key_id {label}"));
-    let raw: [u8; 32] = hex::decode(seed).unwrap().try_into().unwrap();
-    SigningKey::from_bytes(&raw)
+    use sha2::{Digest, Sha256};
+    let seed: [u8; 32] =
+        Sha256::digest(format!("jarvis-signing-vectors test seed: {label}")).into();
+    SigningKey::from_bytes(&seed)
 }
 
 /// A JSON message example from `contracts/examples/messages/`.
@@ -89,4 +90,19 @@ pub fn assert_conforms(kind: &str, payload: &Value) {
 /// Whether `payload` matches the schema, for negative checks.
 pub fn conforms(kind: &str, payload: &Value) -> bool {
     std::panic::catch_unwind(|| assert_conforms(kind, payload)).is_ok()
+}
+
+/// Panics unless `env` matches `contracts/node-envelope.schema.json`.
+pub fn assert_envelope_conforms(env: &Value) {
+    let schema = read_json(contracts().join("node-envelope.schema.json"));
+    let validator = jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .should_validate_formats(true)
+        .build(&schema)
+        .unwrap();
+    let errors: Vec<String> = validator.iter_errors(env).map(|e| e.to_string()).collect();
+    assert!(
+        errors.is_empty(),
+        "envelope does not conform: {errors:?}\n{env}"
+    );
 }

@@ -32,3 +32,14 @@ base64 = "0.22"
 uuid = { version = "1", features = ["serde", "v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 zeroize = "1"
+
+# Signature checks in debug builds are ~50x slower without optimisation, slow enough to delay
+# heartbeat replies under load (R12-10). Optimise just the crypto crates in dev builds.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3

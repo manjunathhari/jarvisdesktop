@@ -8,9 +8,12 @@
 //! Local durability: the append-only `journal`, the node's `state` (node ID and pinned keys,
 //! in `trust`), and the `keystore` for its private key (DPAPI on Windows).
 
+pub mod client;
+pub mod code;
 pub mod journal;
 pub mod keystore;
 pub mod rules;
+pub mod session;
 pub mod sign;
 pub mod state;
 pub mod trust;

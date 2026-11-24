@@ -224,3 +224,23 @@ fn integers_beyond_the_jcs_range_never_sign_or_verify() {
         br#"{"x":1e+30}"#.to_vec()
     );
 }
+
+#[test]
+fn test_keys_match_the_vectors() {
+    // Every vector's seed is the test key of the label that signed it.
+    for (label, name) in [
+        ("core-1", "rfc8785-appendix"),
+        ("node-1", "ascii-simple"),
+        ("gw-1", "nested-keys-unsorted"),
+    ] {
+        let v = support::vectors()
+            .into_iter()
+            .find(|v| v["name"] == name)
+            .unwrap();
+        assert_eq!(
+            hex::encode(support::test_key(label).to_bytes()),
+            v["seed_hex"].as_str().unwrap(),
+            "{label}"
+        );
+    }
+}
