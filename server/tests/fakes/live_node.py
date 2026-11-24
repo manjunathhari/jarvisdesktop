@@ -5,12 +5,13 @@ From `server/`, on one of Manj's devices on the tailnet, with a fresh enrolment 
     uv run python -m tests.fakes.live_node --gateway <jarvis-gw tailnet address> --code <code>
 
 It enrols a new node with the code (§7.2: the gateway key is pinned by the code's fingerprint,
-the core key by `welcome.enrolment`), then sends one fictional utterance per turn (`--repeat`,
-default 1), and prints for each the time from sending `utterance` to the first SPEECH
-`reply.chunk` and to the final chunk, against the 3 s target (§6.2). Every gateway message goes
-through `FakeNode`'s node-side checks (`node_rules`: challenge, welcome, seq, signatures, node
-actions). Each reply chunk is acknowledged (`received`, as the desktop does); outbox items are
-not acknowledged, so a real device still sees them. Then it closes and exits.
+the core key by `welcome.enrolment`), then reconnects with `hello`, the path-A handshake a
+deployed desktop makes every time it connects (§6.1). Then it sends one fictional utterance per
+turn (`--repeat`, default 1), and prints for each the time from sending `utterance` to the
+first SPEECH `reply.chunk` and to the final chunk, against the 3 s target (§6.2). Every gateway
+message goes through `FakeNode`'s node-side checks (`node_rules`: challenge, welcome, seq,
+signatures, node actions). Each reply chunk is acknowledged (`received`, as the desktop does);
+outbox items are not acknowledged, so a real device still sees them. Then it closes and exits.
 
 It prints the node ID and timings, never a key or the code. The node's key exists only in
 memory, so the node can't be used again: revoke it afterwards (`jarvis-core node revoke`).
@@ -133,10 +134,13 @@ def run(
     timeout: float = 30.0,
     out: Callable[[str], None] = print,
 ) -> list[Timing]:
-    """Enrol `node` with `code`, run one turn per phrase, close. Prints progress via `out`."""
+    """Enrol `node` with `code`, reconnect with `hello` (path A), run one turn per phrase,
+    close. Prints progress via `out`."""
     try:
         node_id = node.enrol(code)
         out(f"enrolled node {node_id}")
+        node.reconnect()  # a new connection: challenge, hello, welcome
+        out("connected again with hello (path A)")
         node.sync()
         timings: list[Timing] = []
         for i, phrase in enumerate(phrases, 1):

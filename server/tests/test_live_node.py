@@ -124,8 +124,14 @@ def test_runner_against_the_in_process_gateway(
             core.stop()
     _check(timings, 2)
     assert core.ran == 2 and not node.connected and node.rejected == []
+    # The real path-A handshake: enrol, then a new connection with hello, then the utterances.
+    sent = node.sent_kinds()
+    assert sent[0] == "enrol" and sent.count("hello") == 1
+    assert sent.index("enrol") < sent.index("hello") < sent.index("utterance")
+    assert sent.count("utterance") == 2
     assert lines[0] == f"enrolled node {node.node_id}"
-    assert lines[1].startswith("turn 1: first reply.chunk ") and lines[-1].startswith("worst")
+    assert lines[1] == "connected again with hello (path A)"
+    assert lines[2].startswith("turn 1: first reply.chunk ") and lines[-1].startswith("worst")
     with psycopg.connect(dsns.app, autocommit=True) as conn:  # every chunk acknowledged
         row = conn.execute(
             "SELECT count(*) FROM conv.stream_cursor WHERE node_id = %s", (node.node_id,)
@@ -181,9 +187,10 @@ def test_runner_cli_over_a_real_websocket(
     assert status == 0, captured.err
     lines = captured.out.splitlines()
     assert lines[0].startswith("enrolled node ")
-    assert [ln.split(":")[0] for ln in lines[1:4]] == ["turn 1", "turn 2", "turn 3"]
-    assert all("(target 3 s: " in ln for ln in lines[1:4])
-    assert lines[4].startswith("worst first reply.chunk ") and len(lines) == 5
+    assert lines[1] == "connected again with hello (path A)"
+    assert [ln.split(":")[0] for ln in lines[2:5]] == ["turn 1", "turn 2", "turn 3"]
+    assert all("(target 3 s: " in ln for ln in lines[2:5])
+    assert lines[5].startswith("worst first reply.chunk ") and len(lines) == 6
     token = code.split(".")[0]
     assert token not in captured.out + captured.err
     assert "PRIVATE KEY" not in captured.out + captured.err

@@ -344,9 +344,10 @@ def record_bootstrap_keys() -> None:
     """init, on every deploy: record `core_signing_key.pub` and `gateway_signing_key.pub` (raw
     public keys written by harden.sh; init never holds a private key) as the ACTIVE trusted
     keys. The first deploy records them, so the gateway can start; later deploys change
-    nothing. After a rotation a role's ACTIVE key differs, `keys.init_keys` refuses
-    (`active_key_differs`, nothing written), and that is logged, not a failed deploy. A missing
-    public key file stops init."""
+    nothing. When a role's ACTIVE key differs, `keys.init_keys` refuses (`active_key_differs`,
+    nothing written): after a rotation that is expected, but it can also mean a database
+    restored onto a re-hardened server (new key files). It is logged at WARNING naming the
+    role, and does not fail the deploy. A missing public key file stops init."""
     core = _read_public(config.SECRETS_DIR / "core_signing_key.pub")
     gateway = _read_public(config.SECRETS_DIR / "gateway_signing_key.pub")
     with psycopg.connect(config.app_dsn(), autocommit=True) as conn:
@@ -355,7 +356,17 @@ def record_bootstrap_keys() -> None:
         except keys.KeyRefused as e:
             if e.reason != "active_key_differs":
                 raise
-            log.info("trusted keys left as they are (active_key_differs: a key has been rotated)")
+            given = {"CORE": core, "GATEWAY": gateway}
+            for role in keys.ROLES:
+                active = keys.active_key(conn, role)
+                if active.public_key != given[role]:
+                    log.warning(
+                        "trusted keys left as they are (active_key_differs): the ACTIVE %s key"
+                        " %s is not %s_signing_key.pub. Expected after a key rotation; otherwise"
+                        " a database restored onto a re-hardened server: check with"
+                        " `jarvis-core keys list` (runbook §8.2, §8.5)",
+                        role, active.key_id, role.lower(),
+                    )  # fmt: skip
             return
     if added:
         log.info("trusted keys recorded: %s", ", ".join(added))

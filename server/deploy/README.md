@@ -165,7 +165,7 @@ Commands below run on the server as root (over `tailscale ssh`). `docker exec ja
 
 ### 8.2 First deploy: the trusted keys
 
-`init` records them on every deploy, from `core_signing_key.pub` and `gateway_signing_key.pub` (init holds no private key). The first deploy makes them the ACTIVE CORE and GATEWAY keys, so the gateway starts at once; every later deploy changes nothing. After a rotation (§8.5) a role's ACTIVE key differs: init logs `trusted keys left as they are (active_key_differs …)` and goes on. A missing `.pub` file stops init. Check:
+`init` records them on every deploy, from `core_signing_key.pub` and `gateway_signing_key.pub` (init holds no private key). The first deploy makes them the ACTIVE CORE and GATEWAY keys, so the gateway starts at once; every later deploy changes nothing. After a rotation (§8.5) a role's ACTIVE key differs: init logs a WARNING, `trusted keys left as they are (active_key_differs): the ACTIVE <ROLE> key … is not <role>_signing_key.pub`, and goes on. Outside a rotation the same warning means a database restored onto a re-hardened server (new key files): then the ACTIVE keys in the database win, and the new key files must be replaced by the old ones, or the keys rotated (§8.5). A missing `.pub` file stops init. Check:
 ```bash
 docker logs jarvis-init-1 2>&1 | grep 'trusted keys'
 docker exec jarvis-core-1 jarvis-core keys list     # CORE <id> ACTIVE, GATEWAY <id> ACTIVE
@@ -177,7 +177,7 @@ docker exec jarvis-core-1 jarvis-core keys list     # CORE <id> ACTIVE, GATEWAY 
 | Check | Command | Expect |
 |---|---|---|
 | Bound to its tailnet address only | `docker logs jarvis-gateway-1 2>&1 \| grep -i 'running on'` | `http://100.x.y.z:8443`, never `0.0.0.0` |
-| Sidecar on the tailnet | `docker exec jarvis-gateway-ts-1 tailscale --socket=/var/run/tailscale/tailscaled.sock status` | `jarvis-gw`, tagged, online |
+| Sidecar on the tailnet | `docker exec jarvis-gateway-ts-1 tailscale --socket=/ts-socket/tailscaled.sock status` | `jarvis-gw`, tagged, online |
 | Gateway egress rules | `docker exec jarvis-gateway-ts-1 iptables -S JARVIS_GW_OUT` and `ip6tables -S JARVIS_GW_OUT` | IPv4: ACCEPT `-o tailscale0` with `--ctstate RELATED,ESTABLISHED`, ACCEPT `-d 10.214.14.10/32 -p tcp --dport 5432`, then DROP. IPv6: the tailscale0 rule, then DROP. Nothing for `lo` |
 | Trusted keys loaded | `docker logs jarvis-gateway-1 2>&1 \| grep 'trusted keys'` | no ERROR lines (an ERROR names a missing secret, §8.5) |
 | Proxy refuses other hosts | `docker logs jarvis-egress-proxy-1` | starts without config errors |
@@ -228,7 +228,7 @@ Scripted, fictional test phrases only (§5.7): what is said is stored on the sha
    ```bash
    uv run python -m tests.fakes.live_node --gateway <jarvis-gw tailnet address> --code <code> --repeat 5
    ```
-   It enrols a throwaway node (its key only in memory), then for each of five fictional phrases sends `utterance`, checks every gateway message with the fake node's node-side rules, and acknowledges each reply chunk. It prints no key and not the code, and exits 1 with the reason if anything is refused. Afterwards revoke the node it printed (`jarvis-core node revoke <node_id>`).
+   It enrols a throwaway node (its key only in memory), reconnects with `hello` as a deployed desktop does (path A), then for each of five fictional phrases sends `utterance`, checks every gateway message with the fake node's node-side rules, and acknowledges each reply chunk. It prints no key and not the code, and exits 1 with the reason if anything is refused. Afterwards revoke the node it printed (`jarvis-core node revoke <node_id>`).
 3. **Latency (§6.2, target: the first spoken sentence within 3 s of the end of speech):** the same run prints, per phrase, the time from sending `utterance` to the first `reply.chunk` and to the final one, each against 3 s, and the worst. These timings include the tailnet round trip, but not the desktop's speech recognition or speech output. Core writes each speech piece when the next one arrives and keeps the last piece back to write as the final chunk after the call is settled (Task 10), so the first chunk lags Claude's first text by one streaming delta, and a reply that arrives as a single delta appears only when the call ends. If a turn misses 3 s, the `core` and `gateway` timing logs show where (§15).
 4. **Gateway bound to the tailnet only:** §8.3, first row.
 5. **P2-S5 (gateway egress exactly per R12-33):** over Tailscale SSH on the server, as the gateway's own user (UID 10001). The first line must succeed; every other must fail (timeout, refused, or `Operation not permitted`):

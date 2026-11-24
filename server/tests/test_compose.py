@@ -469,7 +469,11 @@ def test_init_records_the_bootstrap_keys_once(
             rotated = _trusted(owner)
         with caplog.at_level(logging.INFO, logger="jarvis.core"):
             core_main.record_bootstrap_keys()  # refused, and not a failure
-        assert "active_key_differs" in caplog.text
+        warned = [r for r in caplog.records if "active_key_differs" in r.getMessage()]
+        assert [r.levelno for r in warned] == [logging.WARNING]  # one line: the CORE key only
+        message = warned[0].getMessage()
+        assert f"ACTIVE CORE key {fingerprint(new)} is not core_signing_key.pub" in message
+        assert "key rotation" in message and "restored onto a re-hardened server" in message
         with psycopg.connect(d.app, autocommit=True) as conn:
             assert _trusted(conn) == rotated
 
