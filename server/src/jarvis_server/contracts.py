@@ -513,6 +513,7 @@ class ApprovalDecisionMessage(_Contract):
 
 class NodeAction(_Contract):
     authz: Authz
+    seq: Seq  # unsigned: the chunk's seq, for the live receipt (R12-36)
 
 
 ResultCode = Annotated[str, Field(pattern=r"^[A-Z][A-Z_]{0,39}$")]

@@ -13,8 +13,10 @@
 //! - `reply.chunk` (SPEECH): `received` with its `seq`, then broadcast to `subscribe_replies`.
 //!   Live actions arrive as `node.action` frames, never as ACTION chunks (Phase 2 ruling G4.2),
 //!   so an ACTION chunk is refused.
-//! - `node.action`: rules 2 to 4 of §7.1 (`check_node_action` under the trusted core keys);
-//!   accepted ones are broadcast. A core signature under a key this node doesn't trust asks
+//! - `node.action {authz, seq}`: rules 2 to 4 of §7.1 (`check_node_action` under the trusted
+//!   core keys), and it must be a live action (a `reply_id`, no `execution_key`: approved
+//!   actions come in outbox items). `seq` is the chunk's, unsigned (R12-36), and only names
+//!   the action in its live receipt. Accepted ones are broadcast. A core signature under a key this node doesn't trust asks
 //!   for re-enrolment (R12-29). Rule 5 and execution are Task 8's.
 //! - `welcome` summary: shown as lines, display only, so a summary line never marks an
 //!   approval card seen. The gateway sends the summary (every open item) and then, as
@@ -77,8 +79,9 @@ pub enum ReplyEvent {
         text: String,
         final_: bool,
     },
-    /// A live action that passed §7.1 rules 2 to 4.
-    Action(AuthzObject),
+    /// A live action that passed §7.1 rules 2 to 4; `seq` (unsigned, R12-36) is what its
+    /// `action.receipt` names, with `authz.reply_id`.
+    Action { seq: i64, authz: AuthzObject },
 }
 
 pub struct NodeDeps {
@@ -318,15 +321,22 @@ impl Router {
     }
 
     async fn on_action(&self, p: &Map<String, Value>) {
-        let (Some(authz), 1) = (p.get("authz"), p.len()) else {
+        let (Some(authz), Some(seq), 2) = (
+            p.get("authz"),
+            p.get("seq").and_then(Value::as_i64).filter(|s| *s >= 1),
+            p.len(),
+        ) else {
             return Self::refused("node.action", "malformed");
         };
         let state = self.client.state().borrow().clone();
         let Some(me) = state.node_id else { return };
         let now = chrono::Utc::now().fixed_offset();
         match check_node_action(authz, &state.trust.core_keys(now), me, now) {
+            Ok(obj) if obj.reply_id.is_none() || obj.execution_key.is_some() => {
+                Self::refused("node.action", "not_live");
+            }
             Ok(obj) => {
-                let _ = self.replies.send(ReplyEvent::Action(obj));
+                let _ = self.replies.send(ReplyEvent::Action { seq, authz: obj });
             }
             Err(Rejected("untrusted_key_id")) => {
                 // A core key_id this node never pinned or no longer trusts (R12-29).

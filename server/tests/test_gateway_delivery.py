@@ -559,8 +559,9 @@ def test_core_restart_mid_stream(gw: Gw, app_conn: Conn) -> None:
 
 
 def test_action_chunk_only_to_target_and_before_valid_until(gw: Gw, app_conn: Conn) -> None:
-    """G4.2: a live ACTION chunk goes as `node.action {authz}` to its target only, and only
-    while now() <= valid_until. Never as `reply.chunk` type ACTION."""
+    """G4.2: a live ACTION chunk goes as `node.action {authz, seq}` to its target only, and
+    only while now() <= valid_until. Never as `reply.chunk` type ACTION. `seq` is the chunk's,
+    unsigned, for the node's live receipt (R12-36)."""
     a = enrolled(gw)
     b = enrolled(gw)
     reply = uuid.uuid4()
@@ -578,10 +579,10 @@ def test_action_chunk_only_to_target_and_before_valid_until(gw: Gw, app_conn: Co
     relevant = [e for e in envs_a if e["kind"] in ("reply.chunk", "node.action")]
     assert [(e["kind"], e["payload"].get("seq")) for e in relevant] == [
         ("reply.chunk", 1),
-        ("node.action", None),
+        ("node.action", 2),
         ("reply.chunk", 4),
     ]
-    assert relevant[1]["payload"] == {"authz": live}
+    assert relevant[1]["payload"] == {"authz": live, "seq": 2}
     assert a.actions == [live["object"]] and a.rejected == []
     assert [e["kind"] for e in envs_b if e["kind"] in ("reply.chunk", "node.action")] == [
         "reply.chunk",

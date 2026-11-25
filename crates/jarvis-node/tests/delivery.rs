@@ -382,27 +382,76 @@ async fn live_actions_are_checked_before_broadcast() {
         "core-1",
         live_action(Uuid::new_v4(), Uuid::new_v4(), now()),
     );
-    r.push("node.action", json!({"authz": other})).await;
+    r.push("node.action", json!({"authz": other, "seq": 2}))
+        .await;
     let gateway_only = signed(
         "gw-1",
         "core-1",
         live_action(r.node_id, Uuid::new_v4(), now()),
     );
-    r.push("node.action", json!({"authz": gateway_only})).await;
+    r.push("node.action", json!({"authz": gateway_only, "seq": 2}))
+        .await;
     // A valid one: broadcast.
     let reply_id = Uuid::new_v4();
     let good = signed("core-1", "core-1", live_action(r.node_id, reply_id, now()));
-    r.push("node.action", json!({"authz": good})).await;
+    r.push("node.action", json!({"authz": good, "seq": 2}))
+        .await;
     let got = tokio::time::timeout(Duration::from_secs(2), replies.recv())
         .await
         .unwrap()
         .unwrap();
     match got {
-        ReplyEvent::Action(obj) => assert_eq!(
-            obj.reply_id,
-            Some(reply_id),
+        ReplyEvent::Action { seq, authz } => assert_eq!(
+            (seq, authz.reply_id),
+            (2, Some(reply_id)),
             "the first broadcast is the valid one"
         ),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_node_action_needs_a_seq_and_a_live_authz() {
+    // R12-36: `{authz, seq}`, seq >= 1, nothing else; approved actions come in outbox items.
+    let mut r = rig().await;
+    let mut replies = r.node.subscribe_replies();
+    let me = r.node_id;
+    let good = || signed("core-1", "core-1", live_action(me, Uuid::new_v4(), now()));
+    r.push("node.action", json!({"authz": good()})).await;
+    r.push("node.action", json!({"authz": good(), "seq": 0}))
+        .await;
+    r.push("node.action", json!({"authz": good(), "seq": "2"}))
+        .await;
+    r.push(
+        "node.action",
+        json!({"authz": good(), "seq": 2, "extra": 1}),
+    )
+    .await;
+    let mut approved = live_action(r.node_id, Uuid::new_v4(), now());
+    approved["reply_id"] = Value::Null;
+    approved["execution_key"] = json!(Uuid::new_v4());
+    approved["approval_id"] = json!(Uuid::new_v4());
+    r.push(
+        "node.action",
+        json!({"authz": signed("core-1", "core-1", approved), "seq": 2}),
+    )
+    .await;
+    let reply_id = Uuid::new_v4();
+    let last = signed("core-1", "core-1", live_action(r.node_id, reply_id, now()));
+    r.push("node.action", json!({"authz": last, "seq": 7}))
+        .await;
+    let got = tokio::time::timeout(Duration::from_secs(2), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match got {
+        ReplyEvent::Action { seq, authz } => {
+            assert_eq!(
+                (seq, authz.reply_id),
+                (7, Some(reply_id)),
+                "only the last one"
+            )
+        }
         other => panic!("{other:?}"),
     }
 }
@@ -415,7 +464,8 @@ async fn an_action_under_an_untrusted_core_key_asks_reenrol() {
         "core-9",
         live_action(r.node_id, Uuid::new_v4(), now()),
     );
-    r.push("node.action", json!({"authz": rogue})).await;
+    r.push("node.action", json!({"authz": rogue, "seq": 2}))
+        .await;
     let mut status = r.node.status();
     assert!(
         wait_for(

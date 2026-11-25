@@ -2,15 +2,21 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/node.action.schema.json",
   "title": "Payload of `node.action`",
-  "description": "gateway → node: an action to run, authorised only by the core-signed `authz` (§7.1).",
+  "description": "gateway → node: an action to run, authorised only by the core-signed `authz` (§7.1). `seq` is the stream chunk's sequence number, unsigned, so the node's live `action.receipt` can name it (R12-36); a wrong `seq` only makes core refuse the receipt.",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "authz"
+    "authz",
+    "seq"
   ],
   "properties": {
     "authz": {
       "$ref": "authz.schema.json"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The ACTION chunk's `seq` in its reply (unsigned, R12-36)."
     }
   }
 }

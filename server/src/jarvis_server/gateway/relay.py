@@ -24,7 +24,8 @@ chunks after `conv.stream_cursor.acked_seq` for `(reply, node)`. A reply's recip
 connected nodes of the person whose session it is (`stream_chunk.session_id` →
 `conv.session.person_id`, R12-9). The in-memory "sent up to" mark only avoids re-sending on
 every wake-up; correctness rests on the cursor. A SPEECH chunk is a `reply.chunk`; a live ACTION
-chunk is a `node.action {authz}` to its `target_node_id` only, while `now() <= valid_until`, and
+chunk is a `node.action {authz, seq}` to its `target_node_id` only (`seq` unsigned, so the
+node's live receipt can name the chunk, R12-36), while `now() <= valid_until`, and
 is never re-sent on (re)connect (§6.2 step 8).
 
 **Reconnect (R9-1).** Candidate replies are those of the node's own person's sessions with a
@@ -460,7 +461,7 @@ class NodeLink:
                     }
                     frames.append((MessageKind.REPLY_CHUNK, payload))
                 elif live and target == self.node_id and now <= valid_until:
-                    frames.append((MessageKind.NODE_ACTION, {"authz": authz}))
+                    frames.append((MessageKind.NODE_ACTION, {"authz": authz, "seq": seq}))
             if frames:
                 await self._fence(conn)
         if chunks:
