@@ -125,8 +125,9 @@ async fn a_cleared_item_is_never_shown_afterwards() {
 }
 
 #[tokio::test]
-async fn an_item_with_authz_is_not_received_until_it_can_be_handled() {
-    // No `received`, so the gateway's sweep keeps offering it (Tasks 7 and 8 handle it).
+async fn an_item_whose_authz_is_no_approved_action_is_received_and_nothing_runs() {
+    // Task 8: an item's node.action must carry an approval and an execution_key; a live
+    // action in an item is confirmed (so it isn't offered again) and never run or shown.
     let mut r = rig().await;
     let id = Uuid::new_v4();
     let mut card = item(id, "URGENT");
@@ -136,10 +137,11 @@ async fn an_item_with_authz_is_not_received_until_it_can_be_handled() {
         live_action(r.node_id, Uuid::new_v4(), now()),
     );
     r.push("outbox.item", card).await;
+    assert_eq!(recv(&mut r.ws).await["payload"], json!({"outbox_id": id}));
     assert_eq!(
         recv_within(&mut r.ws, Duration::from_millis(500)).await,
         None,
-        "nothing sent back"
+        "no receipt, no ack"
     );
     assert_eq!(r.ui_event(Duration::from_millis(100)).await, None);
     let journal = std::fs::read_to_string(r.dir.path().join(node::JOURNAL_FILE)).unwrap();

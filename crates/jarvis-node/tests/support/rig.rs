@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jarvis_node::client::ClientConfig;
+use jarvis_node::folder::memory::MemoryFolder;
 use jarvis_node::keystore::MemoryKeyStore;
 use jarvis_node::node::{self, NodeDeps, NodeHandle, UiEvent};
 use serde_json::Value;
@@ -22,6 +23,7 @@ pub struct Rig {
     pub ws: Ws,
     pub node_id: Uuid,
     pub dir: tempfile::TempDir,
+    pub folder: Arc<MemoryFolder>,
 }
 
 pub fn core_public() -> [u8; 32] {
@@ -34,9 +36,11 @@ pub async fn rig() -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let cfg = ClientConfig::new(listener.local_addr().unwrap().to_string(), dir.path());
     let (ui_tx, ui) = mpsc::channel(64);
+    let folder = Arc::new(MemoryFolder::new());
     let deps = NodeDeps {
         keystore: Arc::new(MemoryKeyStore::default()),
         ui: ui_tx,
+        folder: folder.clone(),
     };
     let node = node::start(cfg, deps).unwrap();
     let mut gw = Gw::new("gw-1", "gw-1");
@@ -61,6 +65,7 @@ pub async fn rig() -> Rig {
         ws,
         node_id,
         dir,
+        folder,
     }
 }
 

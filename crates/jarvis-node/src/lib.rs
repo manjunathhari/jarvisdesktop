@@ -12,6 +12,7 @@ pub mod approval;
 pub mod client;
 pub mod code;
 pub mod delivery;
+pub mod folder;
 pub mod journal;
 pub mod keystore;
 pub mod node;

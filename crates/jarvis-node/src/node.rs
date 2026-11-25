@@ -41,6 +41,7 @@ use uuid::Uuid;
 use crate::approval::{ApprovalCard, CardStore, Decision, CARDS_FILE};
 use crate::client::{self, Client, ClientConfig, EnrolError, LinkStatus, NotConnected};
 use crate::delivery::{Inbox, ItemFate};
+use crate::folder::{Executor, FolderOps, Recovered, LISTING};
 use crate::journal::{Journal, JournalError};
 use crate::keystore::KeyStore;
 use crate::rules::{check_node_action, Rejected};
@@ -115,6 +116,9 @@ pub enum ReplyEvent {
 pub struct NodeDeps {
     pub keystore: Arc<dyn KeyStore>,
     pub ui: mpsc::Sender<UiEvent>,
+    /// The test folder (Task 8): `folder::windows` on the desktop, `folder::NoFolder` if none
+    /// is configured.
+    pub folder: Arc<dyn FolderOps>,
 }
 
 /// The app's handle on the node. Cheap to clone.
@@ -211,9 +215,12 @@ impl NodeHandle {
 
 /// Open the journal and start the node on the current tokio runtime.
 pub fn start(cfg: ClientConfig, deps: NodeDeps) -> Result<NodeHandle, JournalError> {
-    let journal = Journal::open(&cfg.data_dir.join(JOURNAL_FILE))?;
+    let journal = Arc::new(Mutex::new(Journal::open(&cfg.data_dir.join(JOURNAL_FILE))?));
     let cfg_cards = cfg.data_dir.join(CARDS_FILE);
-    let inbox = Inbox::new(Arc::new(Mutex::new(journal)));
+    let inbox = Inbox::new(journal.clone());
+    // Before the first connection: finish or report whatever a crash interrupted (§9.4).
+    let executor = Arc::new(Executor::new(deps.folder, journal));
+    let recovered = executor.recover();
     let (frames_tx, frames) = mpsc::unbounded_channel();
     let client = client::spawn(cfg, deps.keystore, frames_tx);
     let (replies, _) = broadcast::channel(256);
@@ -224,9 +231,10 @@ pub fn start(cfg: ClientConfig, deps: NodeDeps) -> Result<NodeHandle, JournalErr
         replies: replies.clone(),
         ui: deps.ui,
         cards: cards.clone(),
+        executor,
     };
     tokio::spawn(forward_status(client.status(), router.ui.clone()));
-    tokio::spawn(router.run(frames));
+    tokio::spawn(router.run(frames, recovered));
     Ok(NodeHandle {
         client,
         replies,
@@ -250,6 +258,7 @@ struct Router {
     replies: broadcast::Sender<ReplyEvent>,
     ui: mpsc::Sender<UiEvent>,
     cards: Arc<CardStore>,
+    executor: Arc<Executor>,
 }
 
 /// `in_reply_to` (R12-37): must be present, a UUID or null. `Some(None)` is null.
@@ -266,8 +275,9 @@ fn uuid_field(map: &Map<String, Value>, key: &str) -> Option<Uuid> {
 }
 
 impl Router {
-    async fn run(self, mut frames: mpsc::UnboundedReceiver<Output>) {
+    async fn run(self, mut frames: mpsc::UnboundedReceiver<Output>, recovered: Vec<Recovered>) {
         let mut cards_loaded = false;
+        let mut recovered = Some(recovered);
         while let Some(output) = frames.recv().await {
             match output {
                 Output::Ready { summary, .. } => {
@@ -282,7 +292,16 @@ impl Router {
                             }
                         }
                     }
-                    // Owed acks first: the gateway won't re-send those items.
+                    // Receipts first: those recovered at start, then any not yet known to have
+                    // arrived (the gateway won't re-send an item it has a `received` for).
+                    let owed = match recovered.take() {
+                        Some(at_start) => at_start,
+                        None => self.executor.owed_receipts(),
+                    };
+                    for r in owed {
+                        send_receipt(&self.client, &self.inbox, r.receipt, r.outbox_id).await;
+                    }
+                    // Owed acks next: the gateway won't re-send those items.
                     let now = chrono::Utc::now().fixed_offset();
                     for outbox_id in self.inbox.owed_acks(now) {
                         let _ = self
@@ -332,9 +351,7 @@ impl Router {
             if p["authz"]["object"]["kind"] == "approval.card" {
                 return self.on_card(p, outbox_id).await;
             }
-            // Approved actions: Task 8. No `received`, so the gateway keeps offering them;
-            // not marked seen.
-            return Self::refused("outbox.item", "authz_not_handled_yet");
+            return self.on_approved_action(p, outbox_id).await;
         }
         // The transport confirmation comes first, whatever happens next (§8.2).
         let _ = self
@@ -374,6 +391,52 @@ impl Router {
             Ok(ItemFate::AlreadySeen | ItemFate::Cleared) => {}
             Err(e) => tracing::error!(error = %e, "journal write failed; the item is not shown"),
         }
+    }
+
+    /// An approved action item (Task 8): checked, run off the routing path, then `received`,
+    /// the receipt and the ack. `received` comes after STARTED is journalled, so a crash before
+    /// it leaves the gateway offering the item again, and the journal keeps it from running
+    /// twice.
+    async fn on_approved_action(&self, p: &Map<String, Value>, outbox_id: Uuid) {
+        let state = self.client.state().borrow().clone();
+        let Some(me) = state.node_id else { return };
+        let now = chrono::Utc::now().fixed_offset();
+        let obj = match check_node_action(&p["authz"], &state.trust.core_keys(now), me, now) {
+            Err(Rejected("untrusted_key_id")) => {
+                // R12-29: no `received`, so it is offered again after re-enrolment.
+                Self::refused("outbox.item", "untrusted_key_id");
+                return self.client.require_reenrol();
+            }
+            Err(Rejected(reason)) => {
+                // Never runnable here: confirm transport so it isn't offered again.
+                let _ = self
+                    .client
+                    .send("received", json!({"outbox_id": outbox_id}))
+                    .await;
+                return Self::refused("action.approved", reason);
+            }
+            Ok(obj) => obj,
+        };
+        let (client, inbox, executor) = (
+            self.client.clone(),
+            self.inbox.clone(),
+            self.executor.clone(),
+        );
+        tokio::spawn(async move {
+            let receipt =
+                tokio::task::spawn_blocking(move || executor.delete(&obj, Some(outbox_id)))
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::error!(error = %e, "the delete task failed");
+                        None
+                    });
+            let _ = client
+                .send("received", json!({"outbox_id": outbox_id}))
+                .await;
+            if let Some(receipt) = receipt {
+                send_receipt(&client, &inbox, receipt, Some(outbox_id)).await;
+            }
+        });
     }
 
     /// An approval card item (Task 7).
@@ -505,6 +568,32 @@ impl Router {
             Ok(obj) if obj.reply_id.is_none() || obj.execution_key.is_some() => {
                 Self::refused("node.action", "not_live");
             }
+            Ok(obj) if obj.action_kind == LISTING => {
+                // The live listing core asked for (§9.3 step 2), off the routing path.
+                let reply_id = obj.reply_id.expect("checked live above");
+                let (client, executor) = (self.client.clone(), self.executor.clone());
+                tokio::spawn(async move {
+                    let receipt =
+                        tokio::task::spawn_blocking(move || executor.list_receipt(reply_id, seq))
+                            .await;
+                    match receipt {
+                        Ok(receipt) => {
+                            if client.send("action.receipt", receipt).await.is_err() {
+                                tracing::warn!(%reply_id, "listing receipt not sent: not connected");
+                            }
+                        }
+                        Err(e) => tracing::error!(error = %e, "the listing task failed"),
+                    }
+                });
+            }
+            Ok(obj) if obj.action_kind.starts_with("pc.") => {
+                // No other live pc.* action exists: answer it, run nothing.
+                let receipt = json!({
+                    "reply_id": obj.reply_id, "seq": seq, "result": "REFUSED",
+                    "evidence": {"check": "unknown_action_kind"},
+                });
+                let _ = self.client.send("action.receipt", receipt).await;
+            }
             Ok(obj) => {
                 let _ = self.replies.send(ReplyEvent::Action {
                     seq,
@@ -519,5 +608,20 @@ impl Router {
             }
             Err(Rejected(reason)) => Self::refused("node.action", reason),
         }
+    }
+}
+
+/// Send a delete receipt, then ack its item (journalled first, like `shown`).
+async fn send_receipt(client: &Client, inbox: &Inbox, receipt: Value, outbox_id: Option<Uuid>) {
+    if client.send("action.receipt", receipt).await.is_err() {
+        tracing::warn!("receipt not sent: not connected; it is re-sent after reconnecting");
+        return;
+    }
+    if let Some(outbox_id) = outbox_id {
+        let now = chrono::Utc::now().fixed_offset();
+        if let Err(e) = inbox.mark_acked(outbox_id, now) {
+            tracing::error!(error = %e, "couldn't journal the ack; sending it once");
+        }
+        let _ = client.send("ack", json!({"outbox_id": outbox_id})).await;
     }
 }

@@ -53,11 +53,15 @@ pub enum Record {
         outbox_id: Uuid,
         at: DateTime<FixedOffset>,
     },
-    /// Written before step 1 of §9.4.
+    /// Written before step 1 of §9.4. `outbox_id` is the approved-action item that carried
+    /// it, acked once its receipt is sent (and, once the server clears it, the receipt is no
+    /// longer re-sent on restart).
     Started {
         execution_key: Uuid,
         args: FileFacts,
         at: DateTime<FixedOffset>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outbox_id: Option<Uuid>,
     },
     /// The file was moved into `.jarvis-pending\<execution_key>`.
     Staged { execution_key: Uuid },
@@ -81,6 +85,8 @@ pub struct JournalState {
     /// When each ack intent was recorded.
     pub acked: HashMap<Uuid, DateTime<FixedOffset>>,
     pub executions: HashMap<Uuid, Stage>,
+    /// The approved-action item that carried each execution, when known.
+    pub outbox_of: HashMap<Uuid, Uuid>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -151,10 +157,14 @@ impl JournalState {
             Record::Started {
                 execution_key,
                 args,
+                outbox_id,
                 ..
             } => {
                 self.executions
                     .insert(*execution_key, Stage::Started(args.clone()));
+                if let Some(outbox_id) = outbox_id {
+                    self.outbox_of.insert(*execution_key, *outbox_id);
+                }
             }
             Record::Staged { execution_key } => {
                 if let Some(Stage::Started(args)) = self.executions.remove(execution_key) {
@@ -324,6 +334,7 @@ mod tests {
                 execution_key: key,
                 args: facts(),
                 at: at(),
+                outbox_id: None,
             })
             .unwrap();
             j.append(&Record::Staged { execution_key: key }).unwrap();
@@ -436,6 +447,7 @@ mod tests {
             execution_key: key,
             args: facts(),
             at: at(),
+            outbox_id: None,
         };
         let done = Record::Done {
             execution_key: key,
@@ -470,6 +482,7 @@ mod tests {
             execution_key: other,
             args: facts(),
             at: at(),
+            outbox_id: None,
         })
         .unwrap();
         j.append(&Record::Done {

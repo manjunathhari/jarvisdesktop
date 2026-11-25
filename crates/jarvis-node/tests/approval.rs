@@ -371,19 +371,3 @@ async fn a_bad_card_is_received_but_never_shown() {
         Err(DecideError::Gone)
     );
 }
-
-#[tokio::test]
-async fn an_approved_action_item_still_waits_for_task_8() {
-    // Items whose authz is a node.action (action.approved) get no `received` yet.
-    let mut r = rig().await;
-    let mut obj = card_object(r.node_id, Uuid::new_v4(), now(), now() + Span::minutes(2));
-    obj["kind"] = json!("node.action");
-    obj["execution_key"] = json!(Uuid::new_v4());
-    let item = card_item(Uuid::new_v4(), &signed("core-1", "core-1", obj));
-    r.push("outbox.item", item).await;
-    assert_eq!(
-        recv_within(&mut r.ws, Duration::from_millis(400)).await,
-        None
-    );
-    assert_eq!(r.ui_event(Duration::from_millis(100)).await, None);
-}
