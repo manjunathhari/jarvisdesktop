@@ -110,7 +110,7 @@ def test_proposal_stores_the_listed_file_and_signs_the_card(
     row = flow.approval_row(app, proposed)
     assert row["action_args"] == A_TXT and row["tier"] == "IRREVERSIBLE"
     assert row["action_kind"] == "pc.delete_test_file" and row["decision"] == "PENDING"
-    assert row["summary"] == "Delete test file `a.txt`?"
+    assert row["summary"] == 'Delete test file "a.txt"?'
     assert row["expires_at"] - flow.db_now(app) <= timedelta(minutes=10)
     key_id = signing.fingerprint(signing.public_bytes(core_key))
     card = signing.check_authz(row["card_authz"], {key_id: signing.public_bytes(core_key)})

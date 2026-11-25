@@ -411,6 +411,23 @@ def test_reply_without_speech_gets_the_fallback_text(
     assert final == [(turn.NO_SPEECH_TEXT,)]
 
 
+def test_a_reply_that_only_acts_is_not_told_it_cannot(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine,
+    core_key: Any,
+) -> None:  # fmt: skip
+    """Live check, 25 Nov: "show me the news" answered with only the news panel must not end
+    with "I can't do that from here yet"; the panel is the answer."""
+    turn.set_brain(Brains([ToolCall("show_news", {"region": "india"})]))
+    tid = _turn(app, owner, node, person)
+    rows = app.execute(
+        "SELECT type, text, final FROM conv.stream_chunk WHERE session_id = %s ORDER BY seq",
+        (_session(app, tid),),
+    ).fetchall()
+    assert rows == [("ACTION", None, False), ("SPEECH", turn.ACTION_ONLY_TEXT, True)]
+    assert _messages(app, tid)[-1] == ("JARVIS", turn.ACTION_ONLY_TEXT)
+    assert _outcome(app, tid) == "ANSWERED"
+
+
 # --- sessions (P2-E09) ----------------------------------------------------------------------
 
 

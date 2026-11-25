@@ -183,8 +183,8 @@ async fn speech_streams_in_order_until_final() {
     utterance(&mut r).await;
     let id = Uuid::new_v4();
     emit(&r, speech(id, 1, "Here are the headlines.", false));
-    emit(&r, speech(id, 2, "Rain is expected.", false));
-    emit(&r, speech(id, 3, "That's all.", true));
+    emit(&r, speech(id, 2, " Rain is expected.", false));
+    emit(&r, speech(id, 3, " That's all.", true));
     done.await.unwrap().unwrap();
     assert_eq!(
         drain(rx).await,
@@ -197,12 +197,64 @@ async fn speech_streams_in_order_until_final() {
 }
 
 #[tokio::test]
+async fn half_word_pieces_are_spoken_as_whole_sentences() {
+    // Live check, 25 Nov: the server streams Claude's text in pieces, often parts of words;
+    // each spoken on its own sounded like gibberish.
+    let mut r = rig(true);
+    let (rx, done) = think(&r, req("tell me about the moon"));
+    utterance(&mut r).await;
+    let id = Uuid::new_v4();
+    for (seq, piece) in [
+        "The mo",
+        "on is about 3.",
+        "5 times smal",
+        "ler than Earth. It ",
+        "has no air.",
+    ]
+    .iter()
+    .enumerate()
+    {
+        emit(&r, speech(id, seq as i64 + 1, piece, seq == 4));
+    }
+    done.await.unwrap().unwrap();
+    assert_eq!(
+        drain(rx).await,
+        vec![
+            say("The moon is about 3.5 times smaller than Earth."),
+            say("It has no air.")
+        ]
+    );
+}
+
+#[tokio::test]
+async fn words_before_an_action_are_said_before_it() {
+    let mut r = rig(true);
+    let (rx, done) = think(&r, req("show me the news"));
+    utterance(&mut r).await;
+    let id = Uuid::new_v4();
+    emit(&r, speech(id, 1, "Here you", false));
+    emit(&r, speech(id, 2, " go", false));
+    emit(&r, action(id, 3, "module.news", "show_news", json!({})));
+    assert_eq!(next_send(&mut r).await.0, "action.receipt");
+    emit(&r, speech(id, 4, "Okay.", true));
+    done.await.unwrap().unwrap();
+    assert_eq!(
+        drain(rx).await,
+        vec![
+            say("Here you go"),
+            BrainEvent::Action(Action::new("show_news", json!({}))),
+            say("Okay.")
+        ]
+    );
+}
+
+#[tokio::test]
 async fn first_speech_forwarded_before_final() {
     let mut r = rig(true);
     let (mut rx, done) = think(&r, req("hello"));
     utterance(&mut r).await;
     let id = Uuid::new_v4();
-    emit(&r, speech(id, 1, "Hello.", false));
+    emit(&r, speech(id, 1, "Hello. ", false));
     let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
         .unwrap();
@@ -380,7 +432,7 @@ async fn other_replies_are_ignored() {
     emit(&r, speech(mine, 1, "Hi.", false));
     // A second reply naming the same utterance once one is followed: ignored.
     emit(&r, speech(twin, 1, "a duplicate turn", false));
-    emit(&r, speech(mine, 2, "Bye.", true));
+    emit(&r, speech(mine, 2, " Bye.", true));
     done.await.unwrap().unwrap();
     assert_eq!(drain(rx).await, vec![say("Hi."), say("Bye.")]);
     assert!(r
@@ -447,7 +499,7 @@ async fn silence_times_out() {
     let (rx, done) = think(&r, req("hello"));
     utterance(&mut r).await;
     let id = Uuid::new_v4();
-    emit(&r, speech(id, 1, "Thinking.", false));
+    emit(&r, speech(id, 1, "Thinking. ", false));
     // Ignored events don't count as an answer.
     tokio::time::sleep(SILENCE - Duration::from_secs(1)).await;
     emit(
@@ -576,7 +628,7 @@ async fn re_sent_events_of_the_reply_are_dropped() {
     emit(&r, news());
     emit(&r, speech(id, 2, "A.", false));
     emit(&r, speech(id, 2, "A.", false));
-    emit(&r, speech(id, 3, "B.", true));
+    emit(&r, speech(id, 3, " B.", true));
     done.await.unwrap().unwrap();
     assert_eq!(
         drain(rx).await,

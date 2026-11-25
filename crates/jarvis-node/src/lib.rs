@@ -20,6 +20,7 @@ pub mod rules;
 pub mod server_brain;
 pub mod session;
 pub mod sign;
+pub mod speech;
 pub mod state;
 pub mod trust;
 pub mod wire;

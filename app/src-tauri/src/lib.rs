@@ -1,5 +1,6 @@
 //! The JARVIS window: wires the Rust parts together and relays events to the UI.
 
+mod announce;
 mod approvals;
 mod key;
 mod node_config;
@@ -38,6 +39,7 @@ struct TauriUi {
     voice: VoiceSlot,
     ears: EarsSlot,
     clock: server_mode::TurnClock,
+    announcer: Arc<announce::Announcer>,
 }
 
 impl Ui for TauriUi {
@@ -76,7 +78,12 @@ impl Ui for TauriUi {
                     l.mic.set_active(on);
                     l.ears.set_listening(on);
                 }
-                app.emit("jarvis://status", m)
+                let r = app.emit("jarvis://status", m);
+                // Results Jarvis reported on its own, held until JARVIS was free.
+                for line in self.announcer.mode(m) {
+                    speak_locally(app, &self.voice, &line);
+                }
+                r
             }
             UiEvent::Mic(on) => app.emit("jarvis://mic", on),
             UiEvent::Quit => {
@@ -455,11 +462,21 @@ pub fn run() {
             app.manage(mode);
             let voice: VoiceSlot = Arc::new(Mutex::new(None));
             let ears: EarsSlot = Arc::new(Mutex::new(None));
+            let announcer = Arc::new(announce::Announcer::default());
+            if let Some(n) = node.lock().ok().and_then(|n| n.clone()) {
+                let (app, voice) = (app.handle().clone(), voice.clone());
+                tauri::async_runtime::spawn(announce::run(
+                    n.subscribe_replies(),
+                    announcer.clone(),
+                    move |line| speak_locally(&app, &voice, line),
+                ));
+            }
             let ui = Arc::new(TauriUi {
                 app: app.handle().clone(),
                 voice: voice.clone(),
                 ears: ears.clone(),
                 clock: server_mode::TurnClock::default(),
+                announcer: announcer.clone(),
             });
             let (handle, fut) = runtime(USER_NAME, brain, Arc::new(registry), ui);
             app.manage(node.clone());
