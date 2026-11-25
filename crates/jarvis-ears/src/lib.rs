@@ -37,8 +37,11 @@ pub mod models {
     pub const KWS_JOINER: &str = "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx";
     pub const KWS_TOKENS: &str = "tokens.txt";
     pub const KWS_FILES: &[&str] = &[KWS_ENCODER, KWS_DECODER, KWS_JOINER, KWS_TOKENS];
-    /// "HEY JARVIS" in the model's BPE tokens (from its bpe.model), then the keyword's name.
-    pub const WAKE_KEYWORDS: &str = "▁HE Y ▁JA R VI S @HEY_JARVIS";
+    /// The wake phrases in the model's BPE tokens (from its bpe.model), one per line, each with
+    /// its name: "Hey Jarvis" and plain "Jarvis" (Manj, 25 Nov). With "Hey Jarvis" alone the
+    /// spotter caught 8 of 20 synthetic tries; with both, 20 of 20 and no false wakes on 32
+    /// look-alikes ("Hey Siri", "jars of jam", "Travis", "service").
+    pub const WAKE_KEYWORDS: &str = "▁HE Y ▁JA R VI S @HEY_JARVIS\n▁JA R VI S @JARVIS";
 }
 
 #[cfg(windows)]

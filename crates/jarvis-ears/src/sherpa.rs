@@ -116,10 +116,11 @@ impl Transcriber for Whisper {
     }
 }
 
-/// How sure the spotter must be before it wakes (sherpa-onnx's defaults; tune on Manj's PC:
-/// raise the threshold for fewer false wakes, lower it for fewer misses).
-pub const WAKE_THRESHOLD: f32 = 0.25;
-pub const WAKE_SCORE: f32 = 1.0;
+/// How sure the spotter must be before it wakes. Tuned 25 Nov on synthetic speech (two voices,
+/// two speeds, quiet and noisy) after "Hey Jarvis" proved weak at the defaults (0.25 / 1.0):
+/// raise the threshold for fewer false wakes, lower it for fewer misses.
+pub const WAKE_THRESHOLD: f32 = 0.15;
+pub const WAKE_SCORE: f32 = 1.5;
 
 /// "Hey Jarvis" via sherpa-onnx's streaming keyword spotter (design 2026-11-25, approach A).
 pub struct KeywordWake {
