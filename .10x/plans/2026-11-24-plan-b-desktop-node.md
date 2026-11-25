@@ -338,16 +338,17 @@ As in the Phase 2 plan, shared interfaces belong to the spec and the contracts. 
   - `#[async_trait] trait Link: Send + Sync { fn connected(&self) -> bool; fn subscribe(&self) -> broadcast::Receiver<ReplyChunk>; async fn send(&self, kind: &'static str, payload: Value) -> Result<(), NotConnected>; }`, implemented for `NodeHandle`
   - `ServerBrain::new(Arc<dyn Link>)` and `impl Brain for ServerBrain`
   - `const SERVER_TOOLS: &[(&str, &str)]`: the seven desktop tool → action-kind pairs from `server/src/jarvis_server/core/prompt.py` `TOOL_ACTIONS`, which are `show_news`, `open_story` and `summarise_story` → `module.news`; `play_live_tv` and `next_channel` → `module.live_tv`; `close_panel` → `screen.close_panel`; and `clear_screen` → `screen.clear`.
-- Behaviour of `think`:
-  - If not connected, return `Unavailable("I can't reach the Jarvis server")` at once.
-  - Otherwise subscribe first, then send `utterance {text, screen_summary}`. History and tools are not sent, because the server owns them.
-  - Follow the first `reply_id` whose chunk arrives after the send; ignore other `reply_id`s.
-  - Each SPEECH chunk becomes `BrainEvent::Speech` immediately.
-  - Each ACTION chunk whose `action_kind` is `module.*` or `screen.*` is handled with the args `{tool, input}`:
-    - if `SERVER_TOOLS` maps `tool` to that `action_kind`, it becomes `BrainEvent::Action(Action::new(tool, input))`, followed by the receipt `{reply_id, seq, result: "OK", evidence: {}}` (D-2);
-    - otherwise the receipt is REFUSED with `{check: "unknown_tool"}`.
-  - `pc.*` actions never reach `ServerBrain`; Task 8's executor answers them.
-  - `think` returns on `final`. 20 s with no chunk gives `Unavailable("the Jarvis server didn't answer")`.
+- Behaviour of `think` (corrected 25 Nov: live actions arrive as `node.action {authz, seq}`, i.e. `ReplyEvent::Action { seq, authz }`, never as ACTION reply chunks, per ruling G4.2; `seq` is R12-36):
+  - If not connected, return `Unavailable("I can't reach the Jarvis server")` at once. A blank utterance is a `Protocol` error and sends nothing.
+  - Otherwise subscribe first, then send `utterance {text, screen_summary}`. `text` is clipped to 4000 characters and `screen_summary` to 2000, and a blank `screen_summary` is sent as null. History and tools are not sent, because the server owns them.
+  - Follow the first reply whose first event after the send has `seq` 1 and that this `ServerBrain` has never followed before; ignore all other `reply_id`s.
+    - Known gap: replies go to every device of the person (R12-9), and `reply_id` isn't tied to the utterance, so a reply to another device that starts in the same moment could be followed.
+  - Each SPEECH chunk becomes `BrainEvent::Speech` immediately; empty text is skipped.
+  - Each live action of the followed reply:
+    - `pc.*` actions are left to Task 8's executor, with no receipt;
+    - `module.*` / `screen.*` actions with args exactly `{tool, input?}`, where `SERVER_TOOLS` maps `tool` to that `action_kind`, become `BrainEvent::Action(Action::new(tool, input))`, followed by the receipt `{reply_id, seq, result: "OK", evidence: {}}` (D-2: verified and handed to the coordinator, not rendered);
+    - otherwise the receipt is REFUSED, with `{check}` = `unknown_tool`, `malformed_args`, `unknown_action_kind`, or `not_delivered` (the caller has gone).
+  - `think` returns on `final`. 20 s (`SILENCE`) with no event of the followed reply gives `Unavailable("the Jarvis server didn't answer")`. A broadcast `Lagged` gives `Unavailable("lost part of the Jarvis server's reply")`.
 
 - [ ] **Step 1: Write the failing tests** (with a fake `Link`; paused tokio time where timing matters).
   - `speech_streams_in_order_until_final`.

@@ -15,6 +15,7 @@ pub mod journal;
 pub mod keystore;
 pub mod node;
 pub mod rules;
+pub mod server_brain;
 pub mod session;
 pub mod sign;
 pub mod state;

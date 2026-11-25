@@ -519,3 +519,65 @@ async fn a_keyset_that_cannot_be_saved_is_not_acked() {
         "closed without received or ack"
     );
 }
+
+#[tokio::test]
+async fn server_brain_over_the_real_node() {
+    // Task 6 end to end on the wire: utterance out; speech, node.action and receipt through
+    // the real NodeHandle (the fictional phrases only).
+    use jarvis_core::action::Action;
+    use jarvis_core::brain::{Brain, BrainEvent, BrainRequest};
+    use jarvis_node::server_brain::ServerBrain;
+    let mut r = rig().await;
+    let brain = ServerBrain::new(Arc::new(r.node.clone()));
+    let (tx, mut events) = mpsc::channel(16);
+    let request = BrainRequest {
+        utterance: "show me the fictional news".into(),
+        screen_summary: String::new(),
+        history: vec![],
+        tools: vec![],
+    };
+    let done = tokio::spawn(async move { brain.think(request, tx).await });
+    let utterance = recv(&mut r.ws).await;
+    support::assert_envelope_conforms(&utterance);
+    assert_eq!(
+        (utterance["kind"].as_str(), &utterance["payload"]),
+        (
+            Some("utterance"),
+            &json!({"text": "show me the fictional news", "screen_summary": null})
+        )
+    );
+    let reply_id = Uuid::new_v4();
+    let chunk = |seq: i64, text: &str, last: bool| json!({"reply_id": reply_id, "seq": seq, "type": "SPEECH", "text": text, "authz": null, "final": last});
+    r.push("reply.chunk", chunk(1, "Opening the news.", false))
+        .await;
+    assert_eq!(recv(&mut r.ws).await["kind"], "received");
+    let mut obj = live_action(r.node_id, reply_id, now());
+    obj["args"] = json!({"tool": "show_news", "input": {"channel": "headlines"}});
+    r.push(
+        "node.action",
+        json!({"authz": signed("core-1", "core-1", obj), "seq": 2}),
+    )
+    .await;
+    let receipt = recv(&mut r.ws).await;
+    support::assert_envelope_conforms(&receipt);
+    assert_eq!(receipt["kind"], "action.receipt");
+    assert_eq!(
+        receipt["payload"],
+        json!({"reply_id": reply_id, "seq": 2, "result": "OK", "evidence": {}})
+    );
+    r.push("reply.chunk", chunk(3, "There it is.", true)).await;
+    assert_eq!(recv(&mut r.ws).await["kind"], "received");
+    done.await.unwrap().unwrap();
+    let mut got = Vec::new();
+    while let Some(ev) = events.recv().await {
+        got.push(ev);
+    }
+    assert_eq!(
+        got,
+        vec![
+            BrainEvent::Speech("Opening the news.".into()),
+            BrainEvent::Action(Action::new("show_news", json!({"channel": "headlines"}))),
+            BrainEvent::Speech("There it is.".into()),
+        ]
+    );
+}

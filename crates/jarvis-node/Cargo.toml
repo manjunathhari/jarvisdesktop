@@ -6,6 +6,8 @@ license.workspace = true
 description = "The JARVIS desktop node: the Phase 2 protocol, journal and actions (Plan B)."
 
 [dependencies]
+jarvis-core.workspace = true
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -40,3 +42,4 @@ jarvis-node = { path = ".", features = ["test-support"] }
 tempfile = "3"
 hex = "0.4"
 jsonschema = { version = "0.30", default-features = false }
+tokio = { workspace = true, features = ["test-util"] }
