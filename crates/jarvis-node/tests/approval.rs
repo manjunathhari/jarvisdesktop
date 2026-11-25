@@ -482,7 +482,9 @@ fn the_normalise_copy_matches_jarvis_core() {
     let body = |path: &str| {
         let src =
             std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
-                .unwrap();
+                .unwrap()
+                // A Windows checkout may have CRLF line endings.
+                .replace("\r\n", "\n");
         let start = src
             .find("fn normalise(text: &str) -> String {")
             .expect(path);

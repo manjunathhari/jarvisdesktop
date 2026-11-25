@@ -44,15 +44,29 @@ fn rig() -> Rig {
 impl Rig {
     /// The same journal and folder after a restart.
     fn restart(self) -> Rig {
-        let journal = Arc::new(Mutex::new(
-            Journal::open(&self.dir.path().join("journal.jsonl")).unwrap(),
-        ));
-        let exec = Executor::new(self.folder.clone() as Arc<dyn FolderOps>, journal.clone());
-        Rig {
-            folder: self.folder,
+        let Rig {
+            folder,
             journal,
             exec,
-            dir: self.dir,
+            dir,
+        } = self;
+        // Close the old journal first, as a restart would: on Windows it allows one writer.
+        drop(exec);
+        assert_eq!(
+            Arc::strong_count(&journal),
+            1,
+            "nothing else holds the old journal"
+        );
+        drop(journal);
+        let journal = Arc::new(Mutex::new(
+            Journal::open(&dir.path().join("journal.jsonl")).unwrap(),
+        ));
+        let exec = Executor::new(folder.clone() as Arc<dyn FolderOps>, journal.clone());
+        Rig {
+            folder,
+            journal,
+            exec,
+            dir,
         }
     }
 
