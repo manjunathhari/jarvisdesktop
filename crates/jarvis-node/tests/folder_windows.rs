@@ -173,6 +173,33 @@ fn refuses_file_symlink() {
 }
 
 #[test]
+fn refuses_file_junction() {
+    // A junction (to a folder) standing where the approved file was: refused, not an error.
+    let p = place();
+    put(&p.folder, "a.txt", b"fictional");
+    let ops = WindowsFolder::new(p.folder.clone());
+    let f = facts(&ops, "a.txt");
+    std::fs::remove_file(p.folder.join("a.txt")).unwrap();
+    junction(&p.folder.join("a.txt"), &p.root);
+    assert_eq!(
+        ops.stage(&f, Uuid::new_v4()),
+        Err(Outcome::Refused("not_regular_file"))
+    );
+    assert!(p.root.exists());
+}
+
+#[test]
+fn hard_links_are_left_out_of_the_listing() {
+    let p = place();
+    put(&p.folder, "a.txt", b"fictional");
+    std::fs::hard_link(p.folder.join("a.txt"), p.folder.join("b.txt")).unwrap();
+    put(&p.folder, "c.txt", b"other");
+    let ops = WindowsFolder::new(p.folder.clone());
+    let names: Vec<String> = ops.list().unwrap().into_iter().map(|f| f.name).collect();
+    assert_eq!(names, ["c.txt"]);
+}
+
+#[test]
 fn refuses_non_ntfs_or_missing_folder() {
     let p = place();
     let missing = WindowsFolder::new(p.root.join("nope"));
@@ -227,7 +254,7 @@ fn swapped_file_is_mismatch() {
 // ------------------------------------------------------------------ P2-A10: tampered staging
 
 /// Stage `a.txt`, tamper, then step 4: refused, and the file is not recycled.
-fn staged_then(tamper: impl FnOnce(&Path, &Path), check: &str) {
+fn staged_then(tamper: impl FnOnce(&Path, &Path), check: &'static str) {
     let p = place();
     put(&p.folder, "a.txt", b"fictional");
     let ops = WindowsFolder::new(p.folder.clone());
@@ -237,10 +264,7 @@ fn staged_then(tamper: impl FnOnce(&Path, &Path), check: &str) {
     let sub = p.folder.join(STAGING).join(key.to_string());
     assert!(sub.join("a.txt").exists());
     tamper(&sub, &p.root);
-    assert_eq!(
-        ops.recycle_staged(&f, key),
-        Err(Outcome::Refused(check.leak()))
-    );
+    assert_eq!(ops.recycle_staged(&f, key), Err(Outcome::Refused(check)));
     assert_ne!(ops.locate(&f, key), Located::InRecycleBin);
 }
 

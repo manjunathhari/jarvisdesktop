@@ -436,7 +436,13 @@ As in the Phase 2 plan, shared interfaces belong to the spec and the contracts. 
   - `Executor::list_receipt(&self, reply_id, seq) -> Value`, whose files are capped at 1000
   - `Executor::delete(&self, obj: &AuthzObject) -> Value`, which does rule 5, then journals Started → `stage` → Staged → `recycle_staged` → Done
   - `Executor::recover(&self) -> Vec<Value>`, the receipts to send. It follows the Recovery table under Decisions exactly. `recycle_staged` re-reads size and SHA-256 through its handle, so the Started + Staged row checks identity before any recycle.
-  - Receipts follow `contracts/messages/pc.*.receipt.schema.json`. The delete receipt carries `{execution_key, result, evidence: {file_id, before_sha256, recycled_at, check}}`, sent as `action.receipt`. After sending it, the node acks the item's `outbox_id`.
+  - Receipts follow `contracts/messages/pc.*.receipt.schema.json`. The delete receipt carries `{execution_key, result, evidence: {file_id, before_sha256, recycled_at, check}}`, sent as `action.receipt`.
+  - *As built (25 Nov, after the Task 8 review; flagged for Manj):*
+    - `delete(&obj, outbox_id: Option<Uuid>) -> Option<Value>`: None when there is nothing to send (no `execution_key`, the key is in progress, or the journal failed; only a journalled receipt is ever sent).
+    - `recover() -> Vec<Recovered { outbox_id, receipt }>`, and `unsettled()` for later reconnects.
+    - **The node does not ack `action.approved` items** (the plan said it would). The gateway never sends `outbox.cleared` to a node that acked, so an ack would leave the node unable to tell whether its receipt arrived. Instead, core supersedes the item when the receipt arrives, or the item expires at `valid_until`; the resulting `outbox.cleared` settles it. Until then, the DONE receipt is re-sent after each reconnect, for at most 24 h from STARTED (`RESEND_WINDOW`). `recover()` and `unsettled()` use the same rule.
+    - A re-send of a finished key whose action has since expired still gets its stored receipt.
+    - The recycle cancels, through an `IFileOperationProgressSink`, any delete the shell would not recycle (Recycle Bin off, or the file too large). The result is REFUSED `recycle_bin_unavailable`, with the file left in staging.
 - `windows.rs` implements §9.4 step for step:
   - `check_folder`: the folder opened with `FILE_FLAG_OPEN_REPARSE_POINT` isn't a reparse point; `GetVolumeInformationByHandleW` gives `NTFS`; `GetDriveTypeW` gives `DRIVE_FIXED`.
   - `file_id`: `GetFileInformationByHandleEx(FileIdInfo)`, as 16 hex digits `:` 32 hex digits.

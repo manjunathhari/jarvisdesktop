@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::gateway::{code_for, now, Gw};
-use super::net::{accept, recv, send, Ws};
+use super::net::{accept, recv, recv_within, send, Ws};
 
 pub struct Rig {
     pub listener: TcpListener,
@@ -85,5 +85,24 @@ impl Rig {
                 Err(_) => return None,
             }
         }
+    }
+}
+
+impl Rig {
+    /// The gateway closes (4401) and the node reconnects through a new welcome; the frames
+    /// the node sent after the welcome, within `within`.
+    pub async fn reconnect(&mut self, within: Duration) -> Vec<Value> {
+        super::net::close(&mut self.ws, 4401).await;
+        self.gw = Gw::new("gw-1", "gw-1");
+        self.ws = accept(&self.listener).await;
+        send(&mut self.ws, self.gw.challenge(now())).await;
+        assert_eq!(recv(&mut self.ws).await["kind"], "hello");
+        let welcome = self.gw.welcome(self.node_id, None, now());
+        send(&mut self.ws, welcome).await;
+        let mut got = Vec::new();
+        while let Some(frame) = recv_within(&mut self.ws, within).await {
+            got.push(frame);
+        }
+        got
     }
 }

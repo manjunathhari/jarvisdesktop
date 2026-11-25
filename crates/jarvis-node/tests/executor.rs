@@ -562,7 +562,7 @@ mod wire {
     }
 
     #[tokio::test]
-    async fn an_approved_delete_runs_once_then_received_receipt_ack() {
+    async fn an_approved_delete_runs_once_then_received_and_receipt() {
         let mut r = rig().await;
         let f = r.folder.put("a.txt", b"fictional");
         let (key, item) = (Uuid::new_v4(), Uuid::new_v4());
@@ -581,10 +581,11 @@ mod wire {
         assert_eq!(receipt["kind"], "action.receipt");
         assert_eq!(receipt["payload"]["result"], "RECYCLED");
         assert_conforms("pc.delete_test_file.receipt", &receipt["payload"]);
-        let ack = recv(&mut r.ws).await;
+        // No ack: core supersedes the item when the receipt arrives, and that clear is
+        // what tells the node (the gateway never clears an item for the node that acked).
         assert_eq!(
-            (ack["kind"].as_str(), &ack["payload"]),
-            (Some("ack"), &json!({"outbox_id": item}))
+            recv_within(&mut r.ws, Duration::from_millis(300)).await,
+            None
         );
         assert!(r.folder.in_bin(&f.file_id));
         // A re-send of the item: the stored receipt again, nothing run twice.
@@ -651,4 +652,200 @@ mod wire {
         assert_eq!(receipt["payload"]["evidence"]["files"][0]["name"], "a.txt");
         assert_conforms("pc.list_test_folder.receipt", &receipt["payload"]);
     }
+}
+
+mod receipts {
+    use super::*;
+    use std::time::Duration;
+    use support::authz::signed;
+    use support::net::recv;
+    use support::rig::rig;
+
+    fn item(
+        node: Uuid,
+        facts: &FileFacts,
+        key: Uuid,
+        outbox_id: Uuid,
+        key_id: &str,
+        label: &str,
+        life: Span,
+    ) -> Value {
+        let at = now().with_nanosecond(0).unwrap();
+        let obj = json!({
+            "v": 1, "kind": "node.action", "action_kind": "pc.delete_test_file",
+            "args": {"name": facts.name, "size": facts.size, "sha256": facts.sha256, "file_id": facts.file_id},
+            "target_node_id": node, "person_id": Uuid::new_v4(),
+            "approval_id": Uuid::new_v4(), "execution_key": key, "reply_id": null, "summary": null,
+            "issued_at": at.to_rfc3339(), "valid_until": (at + life).to_rfc3339(),
+        });
+        json!({
+            "outbox_id": outbox_id, "priority": "URGENT", "kind": "action.approved",
+            "body": "Deleting a.txt", "expires_at": obj["valid_until"],
+            "authz": signed(label, key_id, obj),
+        })
+    }
+
+    fn receipts(frames: &[Value]) -> Vec<Value> {
+        frames
+            .iter()
+            .filter(|f| f["kind"] == "action.receipt")
+            .map(|f| f["payload"].clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_receipt_is_re_sent_after_reconnects_until_the_item_is_cleared() {
+        let mut r = rig().await;
+        let f = r.folder.put("a.txt", b"fictional");
+        let (key, outbox_id) = (Uuid::new_v4(), Uuid::new_v4());
+        r.push(
+            "outbox.item",
+            item(
+                r.node_id,
+                &f,
+                key,
+                outbox_id,
+                "core-1",
+                "core-1",
+                Span::minutes(10),
+            ),
+        )
+        .await;
+        recv(&mut r.ws).await; // received
+        let first = recv(&mut r.ws).await["payload"].clone(); // the receipt (pretend it was lost)
+        let got = r.reconnect(Duration::from_millis(500)).await;
+        assert_eq!(
+            receipts(&got),
+            vec![first.clone()],
+            "re-sent after the reconnect"
+        );
+        assert_eq!(r.folder.recycle_calls(), 1, "never run again");
+        // Core got it and superseded the item: the node stops re-sending.
+        r.push(
+            "outbox.cleared",
+            json!({"outbox_id": outbox_id, "reason": "SUPERSEDED"}),
+        )
+        .await;
+        r.ui_event(Duration::from_secs(1)).await;
+        let got = r.reconnect(Duration::from_millis(500)).await;
+        assert!(receipts(&got).is_empty(), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn an_approved_action_under_an_untrusted_key_asks_reenrolment_and_is_not_received() {
+        use jarvis_node::client::{wait_for, LinkStatus};
+        let mut r = rig().await;
+        let f = r.folder.put("a.txt", b"fictional");
+        r.push(
+            "outbox.item",
+            item(
+                r.node_id,
+                &f,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "core-9",
+                "core-2",
+                Span::minutes(10),
+            ),
+        )
+        .await;
+        let mut status = r.node.status();
+        assert!(
+            wait_for(
+                &mut status,
+                |s| *s == LinkStatus::NeedsReenrol,
+                Duration::from_secs(3)
+            )
+            .await
+        );
+        assert!(r.folder.in_folder("a.txt"));
+    }
+
+    #[tokio::test]
+    async fn an_expired_resend_of_a_finished_key_gets_its_stored_receipt() {
+        let mut r = rig().await;
+        let f = r.folder.put("a.txt", b"fictional");
+        let (key, outbox_id) = (Uuid::new_v4(), Uuid::new_v4());
+        r.push(
+            "outbox.item",
+            item(
+                r.node_id,
+                &f,
+                key,
+                outbox_id,
+                "core-1",
+                "core-1",
+                Span::minutes(10),
+            ),
+        )
+        .await;
+        recv(&mut r.ws).await;
+        let stored = recv(&mut r.ws).await["payload"].clone();
+        // The same key again, now long expired (issued an hour ago).
+        let mut old = item(
+            r.node_id,
+            &f,
+            key,
+            outbox_id,
+            "core-1",
+            "core-1",
+            Span::minutes(10),
+        );
+        let mut obj = old["authz"]["object"].clone();
+        let past = (now() - Span::hours(1)).with_nanosecond(0).unwrap();
+        obj["issued_at"] = json!(past.to_rfc3339());
+        obj["valid_until"] = json!((past + Span::minutes(10)).to_rfc3339());
+        old["authz"] = signed("core-1", "core-1", obj);
+        r.push("outbox.item", old).await;
+        assert_eq!(recv(&mut r.ws).await["kind"], "received");
+        assert_eq!(recv(&mut r.ws).await["payload"], stored);
+        assert_eq!(r.folder.recycle_calls(), 1);
+    }
+}
+
+#[test]
+fn done_receipts_stop_being_re_sent_after_a_day() {
+    let r = rig();
+    let f = r.folder.put("a.txt", b"fictional");
+    let key = Uuid::new_v4();
+    r.append(Record::Started {
+        execution_key: key,
+        args: f.clone(),
+        at: now() - Span::hours(25),
+        outbox_id: Some(Uuid::new_v4()),
+    });
+    r.append(Record::Done {
+        execution_key: key,
+        receipt: json!({"execution_key": key, "result": "RECYCLED", "evidence": {}}),
+    });
+    assert!(r.exec.unsettled().is_empty());
+    assert!(r.restart().exec.recover().is_empty());
+}
+
+#[test]
+fn unsettled_and_recover_agree() {
+    // The same rule for both: Done, item not cleared, within the window.
+    let r = rig();
+    let f = r.folder.put("a.txt", b"fictional");
+    let (key, item) = (Uuid::new_v4(), Uuid::new_v4());
+    let receipt = r.exec.delete(&approved(&f, key), Some(item)).unwrap();
+    assert_eq!(
+        r.exec
+            .unsettled()
+            .into_iter()
+            .map(|x| x.receipt)
+            .collect::<Vec<_>>(),
+        vec![receipt.clone()]
+    );
+    let r = r.restart();
+    assert_eq!(
+        r.exec
+            .recover()
+            .into_iter()
+            .map(|x| x.receipt)
+            .collect::<Vec<_>>(),
+        vec![receipt]
+    );
+    r.append(Record::Cleared { outbox_id: item });
+    assert!(r.exec.unsettled().is_empty() && r.exec.recover().is_empty());
 }

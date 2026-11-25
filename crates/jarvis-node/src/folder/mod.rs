@@ -140,12 +140,27 @@ pub fn sddl_is_protected_for(sddl: &str, user_sid: &str) -> bool {
         }
         match sid {
             "SY" | "S-1-5-18" => {}
-            s if s == user_sid => has_user = true,
+            s if s == user_sid || sddl_alias(user_sid) == Some(s) => has_user = true,
             _ => return false,
         }
     }
     has_user
 }
+
+/// The SDDL alias Windows writes for a few local accounts instead of their SID.
+fn sddl_alias(user_sid: &str) -> Option<&'static str> {
+    if !user_sid.starts_with("S-1-5-21-") {
+        return None;
+    }
+    match user_sid.rsplit('-').next() {
+        Some("500") => Some("LA"), // the built-in Administrator
+        Some("501") => Some("LG"), // the built-in Guest
+        _ => None,
+    }
+}
+
+/// How long a DONE receipt is re-sent after reconnects while its item isn't cleared.
+pub const RESEND_WINDOW: chrono::Duration = chrono::Duration::hours(24);
 
 /// A receipt to (re)send after a restart, and the item to ack once it is sent.
 #[derive(Debug, Clone, PartialEq)]
@@ -229,14 +244,10 @@ impl Executor {
                 outbox_id,
             };
             if let Err(e) = journal.append(&started) {
+                // Nothing done and nothing receipted: a receipt not in the journal could be
+                // contradicted later. Core's verify timeout ends the task.
                 tracing::error!(error = %e, %key, "couldn't journal STARTED; nothing done");
-                return Some(receipt(
-                    key,
-                    "REFUSED",
-                    None,
-                    None,
-                    Some("journal_unavailable"),
-                ));
+                return None;
             }
         }
         if let Err(o) = self.ops.check_folder() {
@@ -256,9 +267,10 @@ impl Executor {
 
     /// After a restart: every execution's receipt, following the Recovery table exactly.
     /// Each is journalled as DONE first, so a second call returns the same receipts and does
-    /// nothing more. DONE receipts whose item the server has cleared are not re-sent.
+    /// nothing more. DONE receipts are re-sent only while unsettled (see `unsettled`).
     pub fn recover(&self) -> Vec<Recovered> {
-        let (mut work, cleared, outbox_of) = {
+        let now = chrono::Utc::now().fixed_offset();
+        let (mut work, settled, outbox_of) = {
             let journal = self.journal.lock().expect("journal lock");
             let state = journal.state();
             let work: Vec<(Uuid, Stage)> = state
@@ -266,7 +278,13 @@ impl Executor {
                 .iter()
                 .map(|(k, s)| (*k, s.clone()))
                 .collect();
-            (work, state.cleared.clone(), state.outbox_of.clone())
+            let settled: std::collections::HashSet<Uuid> = state
+                .executions
+                .keys()
+                .filter(|k| !is_unsettled(state, **k, now))
+                .copied()
+                .collect();
+            (work, settled, state.outbox_of.clone())
         };
         work.sort_by_key(|(k, _)| *k);
         let mut out = Vec::new();
@@ -274,8 +292,8 @@ impl Executor {
             let outbox_id = outbox_of.get(&key).copied();
             let receipt = match stage {
                 Stage::Done(stored) => {
-                    if outbox_id.is_some_and(|o| cleared.contains(&o)) {
-                        continue; // the server has it: answered, never re-sent
+                    if settled.contains(&key) {
+                        continue;
                     }
                     Some(stored)
                 }
@@ -320,29 +338,48 @@ impl Executor {
         out
     }
 
-    /// DONE receipts not yet known to have arrived: their item is neither cleared by the
-    /// server nor acked here (the ack follows a sent receipt). Re-sent after each reconnect.
-    pub fn owed_receipts(&self) -> Vec<Recovered> {
+    /// DONE receipts not known to have arrived, to re-send after each reconnect: the item is
+    /// not cleared here (core supersedes an `action.approved` item when its receipt arrives,
+    /// and it expires at `valid_until`; either way `outbox.cleared` follows, since this node
+    /// never acks these items) and the execution started within `RESEND_WINDOW`.
+    pub fn unsettled(&self) -> Vec<Recovered> {
+        let now = chrono::Utc::now().fixed_offset();
         let journal = self.journal.lock().expect("journal lock");
         let state = journal.state();
-        let mut owed: Vec<Recovered> = state
+        let mut owed: Vec<(Uuid, Recovered)> = state
             .executions
             .iter()
             .filter_map(|(key, stage)| {
                 let Stage::Done(receipt) = stage else {
                     return None;
                 };
-                let outbox_id = *state.outbox_of.get(key)?;
-                (!state.cleared.contains(&outbox_id) && !state.acked.contains_key(&outbox_id)).then(
-                    || Recovered {
-                        outbox_id: Some(outbox_id),
+                is_unsettled(state, *key, now).then(|| {
+                    let r = Recovered {
+                        outbox_id: state.outbox_of.get(key).copied(),
                         receipt: receipt.clone(),
-                    },
-                )
+                    };
+                    (*key, r)
+                })
             })
             .collect();
-        owed.sort_by_key(|r| r.outbox_id);
-        owed
+        owed.sort_by_key(|(k, _)| *k);
+        owed.into_iter().map(|(_, r)| r).collect()
+    }
+
+    /// The stored receipt for a finished key, if any (a re-send of a finished, now expired
+    /// action still gets it, §9.4).
+    pub fn stored(&self, key: Uuid) -> Option<Value> {
+        match self
+            .journal
+            .lock()
+            .expect("journal lock")
+            .state()
+            .executions
+            .get(&key)
+        {
+            Some(Stage::Done(r)) => Some(r.clone()),
+            _ => None,
+        }
     }
 
     fn step_4(&self, key: Uuid, facts: &FileFacts) -> Option<Value> {
@@ -358,15 +395,17 @@ impl Executor {
         self.finish(key, r)
     }
 
-    /// Journal DONE with the receipt, then return it. If DONE can't be written the receipt is
-    /// still right, so it is returned; a restart reaches the same outcome from the file.
+    /// Journal DONE with the receipt, then return it; nothing if DONE can't be written.
     fn finish(&self, key: Uuid, receipt: Value) -> Option<Value> {
         let done = Record::Done {
             execution_key: key,
             receipt: receipt.clone(),
         };
         if let Err(e) = self.append(done) {
-            tracing::error!(error = %e, %key, "couldn't journal DONE");
+            // Only a journalled receipt is ever sent, so every send of a key carries the same
+            // one; recovery reaches the outcome from the file next start.
+            tracing::error!(error = %e, %key, "couldn't journal DONE; recovery will send it");
+            return None;
         }
         tracing::info!(%key, result = %receipt["result"], "delete finished");
         Some(receipt)
@@ -375,6 +414,24 @@ impl Executor {
     fn append(&self, r: Record) -> Result<(), crate::journal::JournalError> {
         self.journal.lock().expect("journal lock").append(&r)
     }
+}
+
+/// A DONE receipt is unsettled while its item isn't cleared and it started within
+/// `RESEND_WINDOW`.
+fn is_unsettled(
+    state: &crate::journal::JournalState,
+    key: Uuid,
+    now: DateTime<FixedOffset>,
+) -> bool {
+    let cleared = state
+        .outbox_of
+        .get(&key)
+        .is_some_and(|o| state.cleared.contains(o));
+    let recent = state
+        .started_at
+        .get(&key)
+        .is_some_and(|at| now - *at <= RESEND_WINDOW);
+    !cleared && recent
 }
 
 fn step_1_to_3(key: Uuid, o: Outcome) -> Value {
@@ -453,6 +510,16 @@ mod tests {
         ] {
             assert!(sddl_is_protected_for(ok, ME), "{ok}");
         }
+        // The built-in Administrator is written as LA, not its SID; another account's LA isn't it.
+        let admin = "S-1-5-21-1-2-3-500";
+        assert!(sddl_is_protected_for(
+            "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;LA)",
+            admin
+        ));
+        assert!(!sddl_is_protected_for(
+            "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;LA)",
+            ME
+        ));
         for bad in [
             // Not protected: inheritance from above is on.
             "D:AI(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)",

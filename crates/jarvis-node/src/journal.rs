@@ -87,6 +87,8 @@ pub struct JournalState {
     pub executions: HashMap<Uuid, Stage>,
     /// The approved-action item that carried each execution, when known.
     pub outbox_of: HashMap<Uuid, Uuid>,
+    /// When each execution was STARTED.
+    pub started_at: HashMap<Uuid, DateTime<FixedOffset>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -158,13 +160,14 @@ impl JournalState {
                 execution_key,
                 args,
                 outbox_id,
-                ..
+                at,
             } => {
                 self.executions
                     .insert(*execution_key, Stage::Started(args.clone()));
                 if let Some(outbox_id) = outbox_id {
                     self.outbox_of.insert(*execution_key, *outbox_id);
                 }
+                self.started_at.insert(*execution_key, *at);
             }
             Record::Staged { execution_key } => {
                 if let Some(Stage::Started(args)) = self.executions.remove(execution_key) {

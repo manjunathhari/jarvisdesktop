@@ -13,7 +13,10 @@
 //!   checked again before the recycle.
 //! - The recycle is `IFileOperation` with `FOFX_RECYCLEONDELETE`, never a permanent delete,
 //!   while this node holds the file open with `FILE_SHARE_DELETE` only; afterwards the same
-//!   handle must show the file under `$Recycle.Bin`.
+//!   handle must show the file under `$Recycle.Bin`. `FOF_NO_UI` answers "yes" to the shell's
+//!   "delete permanently?" question (Recycle Bin off for the volume, or the file too large),
+//!   so a progress sink cancels any delete the shell is not going to recycle: the file then
+//!   stays in staging and the receipt is REFUSED `recycle_bin_unavailable`.
 
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
@@ -21,12 +24,14 @@ use std::io::{self, Read};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Component, Path, PathBuf, Prefix};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use chrono::{DateTime, FixedOffset};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-use windows::core::{HSTRING, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+use windows::core::{implement, Ref, HSTRING, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, LocalFree, E_ABORT, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SetSecurityInfo,
@@ -49,8 +54,9 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::{
-    FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName, FOFX_RECYCLEONDELETE,
-    FOF_ALLOWUNDO, FOF_NO_UI,
+    FileOperation, IFileOperation, IFileOperationProgressSink, IFileOperationProgressSink_Impl,
+    IShellItem, SHCreateItemFromParsingName, FOFX_RECYCLEONDELETE, FOF_ALLOWUNDO, FOF_NO_UI,
+    TSF_DELETE_RECYCLE_IF_POSSIBLE,
 };
 
 use super::{sddl_is_protected_for, valid_name, FolderOps, Located, Outcome};
@@ -184,6 +190,13 @@ impl FolderOps for WindowsFolder {
                 files.push(facts);
             }
         }
+        // Hard links: one file under two names. Neither name is listed (core needs file IDs
+        // to be unique in a listing, and deleting one name wouldn't remove the file).
+        let mut seen = std::collections::HashMap::new();
+        for f in &files {
+            *seen.entry(f.file_id.clone()).or_insert(0) += 1;
+        }
+        files.retain(|f| seen[&f.file_id] == 1);
         Ok(files)
     }
 
@@ -209,7 +222,7 @@ impl FolderOps for WindowsFolder {
         // Step 2, through that handle.
         let folder_path = final_path(&folder).map_err(|_| Outcome::Error("final_path"))?;
         let file_path = final_path(&file).map_err(|_| Outcome::Error("final_path"))?;
-        if file_path != format!("{folder_path}\\{}", want.name) {
+        if file_path != child(&folder_path, &want.name) {
             return Err(Outcome::Mismatch("path"));
         }
         let have = facts_of(&file, &want.name).map_err(|_| Outcome::Error("read_failed"))?;
@@ -244,7 +257,7 @@ impl FolderOps for WindowsFolder {
         }
         // Step 3: rename by handle into the staging subfolder, same volume, atomic.
         let sub_path = final_path(&sub_dir).map_err(|_| Outcome::Error("final_path"))?;
-        rename_by_handle(&file, &format!("{sub_path}\\{}", want.name))
+        rename_by_handle(&file, &child(&sub_path, &want.name))
             .map_err(|_| Outcome::Error("stage_rename_failed"))?;
         Ok(())
     }
@@ -269,18 +282,29 @@ impl FolderOps for WindowsFolder {
         }
         // Re-open the staged file, sharing only DELETE, and check it through that handle.
         let staged = self.staging_dir(key).join(&want.name);
-        let file = open_file(&staged, GENERIC_READ, FILE_SHARE_DELETE).map_err(|e| {
-            match e.raw_os_error() {
-                Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => Outcome::NotFound,
-                _ => Outcome::Refused("staged_unopenable"),
+        // A scanner (antivirus, the indexer) may hold it briefly: a short, bounded retry.
+        let mut tries = 0;
+        let file = loop {
+            match open_file(&staged, GENERIC_READ, FILE_SHARE_DELETE) {
+                Ok(f) => break f,
+                Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) && tries < 10 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => {
+                    return Err(match e.raw_os_error() {
+                        Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => Outcome::NotFound,
+                        _ => Outcome::Refused("staged_unopenable"),
+                    })
+                }
             }
-        })?;
+        };
         if !regular(&file)? {
             return Err(Outcome::Refused("not_regular_file"));
         }
         let sub_path = final_path(&sub).map_err(|_| Outcome::Refused("staged_path"))?;
         let file_path = final_path(&file).map_err(|_| Outcome::Refused("staged_path"))?;
-        if file_path != format!("{sub_path}\\{}", want.name) {
+        if file_path != child(&sub_path, &want.name) {
             return Err(Outcome::Refused("staged_path"));
         }
         let have =
@@ -292,7 +316,11 @@ impl FolderOps for WindowsFolder {
             return Err(Outcome::Refused("sha256"));
         }
         // Recycle, still holding the handle; then check where the handle's object is.
-        recycle(&staged).map_err(|_| Outcome::Error("recycle_failed"))?;
+        match recycle(&staged) {
+            Ok(()) => {}
+            Err(Recycle::WouldDestroy) => return Err(Outcome::Refused("recycle_bin_unavailable")),
+            Err(Recycle::Failed) => return Err(Outcome::Error("recycle_failed")),
+        }
         let after = final_path(&file).map_err(|_| Outcome::Error("not_in_recycle_bin"))?;
         if !in_recycle_bin(&after) {
             return Err(Outcome::Error("not_in_recycle_bin"));
@@ -316,7 +344,7 @@ impl FolderOps for WindowsFolder {
         let (Ok(folder_path), Ok(path)) = (final_path(&folder), final_path(&found)) else {
             return Located::Unknown;
         };
-        if path == format!("{folder_path}\\{}", want.name) {
+        if path == child(&folder_path, &want.name) {
             Located::InFolder
         } else if in_recycle_bin(&path) {
             Located::InRecycleBin
@@ -340,12 +368,25 @@ fn open_dir(path: &Path, access: u32) -> io::Result<File> {
         .open(path)
 }
 
+/// Opened as itself (`FILE_FLAG_OPEN_REPARSE_POINT`); `FILE_FLAG_BACKUP_SEMANTICS` lets a
+/// folder or junction standing where a file should be open too, so it is refused as
+/// `not_regular_file` rather than failing to open.
 fn open_file(path: &Path, access: u32, share: FILE_SHARE_MODE) -> io::Result<File> {
     OpenOptions::new()
         .access_mode(access)
         .share_mode(share.0)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .custom_flags((FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS).0)
         .open(path)
+}
+
+/// `dir` joined with `name`, for a final path that may itself end in a separator (a
+/// drive root).
+fn child(dir: &str, name: &str) -> String {
+    if dir.ends_with('\\') {
+        format!("{dir}{name}")
+    } else {
+        format!("{dir}\\{name}")
+    }
 }
 
 fn attributes(f: &File) -> io::Result<u32> {
@@ -454,8 +495,17 @@ fn final_path(f: &File) -> io::Result<String> {
     }
 }
 
+/// `\\?\X:\$Recycle.Bin\…`: directly under the volume root's Recycle Bin.
 fn in_recycle_bin(path: &str) -> bool {
-    path.to_ascii_lowercase().contains("\\$recycle.bin\\")
+    let p = path
+        .strip_prefix("\\\\?\\")
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    let b = p.as_bytes();
+    b.len() > 3
+        && b[0].is_ascii_alphabetic()
+        && &p[1..3] == ":\\"
+        && p[3..].starts_with("$recycle.bin\\")
 }
 
 /// The volume's file system name (`NTFS`).
@@ -494,27 +544,159 @@ fn rename_by_handle(f: &File, target: &str) -> io::Result<()> {
     .map_err(io::Error::other)
 }
 
-/// `IFileOperation` with `FOFX_RECYCLEONDELETE`: to the Recycle Bin, never a permanent delete.
-fn recycle(path: &Path) -> windows::core::Result<()> {
-    unsafe {
+enum Recycle {
+    /// The shell would have deleted it permanently; cancelled, the file is untouched.
+    WouldDestroy,
+    Failed,
+}
+
+/// Cancels any delete the shell won't send to the Recycle Bin.
+#[implement(IFileOperationProgressSink)]
+struct RecycleOnly {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl IFileOperationProgressSink_Impl for RecycleOnly_Impl {
+    fn StartOperations(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn FinishOperations(&self, _: windows::core::HRESULT) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreRenameItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostRenameItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: &PCWSTR,
+        _: windows::core::HRESULT,
+        _: Ref<'_, IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreMoveItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: Ref<'_, IShellItem>,
+        _: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostMoveItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: Ref<'_, IShellItem>,
+        _: &PCWSTR,
+        _: windows::core::HRESULT,
+        _: Ref<'_, IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreCopyItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: Ref<'_, IShellItem>,
+        _: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostCopyItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: Ref<'_, IShellItem>,
+        _: &PCWSTR,
+        _: windows::core::HRESULT,
+        _: Ref<'_, IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreDeleteItem(&self, dwflags: u32, _: Ref<'_, IShellItem>) -> windows::core::Result<()> {
+        if dwflags & TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32 == 0 {
+            // It would be destroyed, not recycled: cancel this delete.
+            self.cancelled.store(true, Ordering::SeqCst);
+            return Err(windows::core::Error::from_hresult(E_ABORT));
+        }
+        Ok(())
+    }
+    fn PostDeleteItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: windows::core::HRESULT,
+        _: Ref<'_, IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreNewItem(&self, _: u32, _: Ref<'_, IShellItem>, _: &PCWSTR) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PostNewItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: &PCWSTR,
+        _: &PCWSTR,
+        _: u32,
+        _: windows::core::HRESULT,
+        _: Ref<'_, IShellItem>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn UpdateProgress(&self, _: u32, _: u32) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn ResetTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PauseTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn ResumeTimer(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+/// `IFileOperation` with `FOFX_RECYCLEONDELETE`: to the Recycle Bin, never a permanent delete
+/// (the sink cancels one that would be).
+fn recycle(path: &Path) -> Result<(), Recycle> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let sink: IFileOperationProgressSink = RecycleOnly {
+        cancelled: cancelled.clone(),
+    }
+    .into();
+    let result = unsafe {
         let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let result = (|| {
+        let result = (|| -> windows::core::Result<bool> {
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
             op.SetOperationFlags(FOF_NO_UI | FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE)?;
             let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(path), None)?;
-            op.DeleteItem(&item, None)?;
-            op.PerformOperations()?;
-            if op.GetAnyOperationsAborted()?.as_bool() {
-                return Err(windows::core::Error::from_hresult(windows::core::HRESULT(
-                    0x8000_4004_u32 as i32, // E_ABORT
-                )));
-            }
-            Ok(())
+            op.DeleteItem(&item, &sink)?;
+            let performed = op.PerformOperations();
+            let aborted = op.GetAnyOperationsAborted()?.as_bool();
+            Ok(performed.is_ok() && !aborted)
         })();
         if init.is_ok() {
             CoUninitialize();
         }
         result
+    };
+    if cancelled.load(Ordering::SeqCst) {
+        return Err(Recycle::WouldDestroy);
+    }
+    match result {
+        Ok(true) => Ok(()),
+        _ => Err(Recycle::Failed),
     }
 }
 
