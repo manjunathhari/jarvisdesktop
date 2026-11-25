@@ -446,6 +446,15 @@ async fn prepare_voice(_app: AppHandle, _slot: VoiceSlot, _models_dir: PathBuf) 
     };
 }
 
+/// The installer's build number, set by the Windows installer workflow (`JARVIS_BUILD`).
+#[tauri::command]
+fn build_label() -> String {
+    match option_env!("JARVIS_BUILD") {
+        Some(n) if !n.is_empty() => format!("build {n}"),
+        _ => "dev build".into(),
+    }
+}
+
 /// Show, restore and focus the main window.
 fn bring_to_front(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -604,7 +613,8 @@ pub fn run() {
             approvals::decide_approval,
             server_mode::node_status,
             server_mode::enrol,
-            server_mode::forget_claude_key
+            server_mode::forget_claude_key,
+            build_label
         ])
         .run(tauri::generate_context!())
         .expect("error while running JARVIS");

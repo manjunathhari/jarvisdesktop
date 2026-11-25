@@ -26,6 +26,8 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Shown in the app's corner ("build N"), matching the release name.
+          JARVIS_BUILD: ${{ github.run_number }}
         with:
           projectPath: app
           tagName: jarvis-v__VERSION__-build.${{ github.run_number }}

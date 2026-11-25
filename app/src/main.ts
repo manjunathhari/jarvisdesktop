@@ -156,8 +156,27 @@ function setTvVolume(volume: number) {
 const TV_DUCKED = 8;
 const TV_NORMAL = 100;
 
+// The orb's state line under it.
+const ORB_WORDS: Record<string, [string, string]> = {
+  idle: ["Standby", "Not listening"],
+  listening: ["Listening", "Listening for your voice"],
+  follow_up: ["Listening", "Listening for your voice"],
+  thinking: ["Thinking", "Working on it"],
+  mic_off: ["Mic off", "Tap the orb to listen"],
+};
+function showOrbState(mode: string) {
+  const [word, hint] = ORB_WORDS[mode] ?? ORB_WORDS.idle;
+  $("orbword").textContent = word;
+  $("orbhint").textContent = hint;
+}
+showOrbState(document.body.dataset.mode ?? "idle");
+
+// Which build this is, bottom left (from the installer's build number).
+invoke<string>("build_label").then((b) => ($("build").textContent = b));
+
 listen<string>("jarvis://status", (e) => {
   document.body.dataset.mode = e.payload;
+  showOrbState(e.payload);
   setTvVolume(["listening", "thinking", "follow_up"].includes(e.payload) ? TV_DUCKED : TV_NORMAL);
   if (e.payload === "listening" && !heard.textContent) heard.textContent = "Listening…";
   if (e.payload === "idle") heard.textContent = "";
