@@ -53,3 +53,30 @@ pub fn keyset_payload(outbox_id: Uuid, authz: &Value) -> Value {
         "public_key": args["public_key"], "authz": authz,
     })
 }
+
+/// An approval card object for `target`, expiring at `valid_until`.
+pub fn card_object(
+    target: Uuid,
+    approval_id: Uuid,
+    now: DateTime<FixedOffset>,
+    valid_until: DateTime<FixedOffset>,
+) -> Value {
+    json!({
+        "v": 1, "kind": "approval.card", "action_kind": "pc.delete_test_file",
+        "args": {"name": "fictional.txt", "file_id": format!("{}:{}", "a".repeat(16), "b".repeat(32)),
+                 "before_sha256": "c".repeat(64), "size": 12},
+        "target_node_id": target, "person_id": Uuid::new_v4(),
+        "approval_id": approval_id, "execution_key": null, "reply_id": null,
+        "summary": "Delete test file `fictional.txt`?",
+        "issued_at": ts(now), "valid_until": ts(valid_until),
+    })
+}
+
+/// The `outbox.item` payload for a signed card.
+pub fn card_item(outbox_id: Uuid, authz: &Value) -> Value {
+    json!({
+        "outbox_id": outbox_id, "priority": "URGENT", "kind": "approval.requested",
+        "body": "Delete test file `fictional.txt`?", "expires_at": authz["object"]["valid_until"],
+        "authz": authz,
+    })
+}

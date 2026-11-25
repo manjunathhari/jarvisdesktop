@@ -1,5 +1,6 @@
 //! The JARVIS window: wires the Rust parts together and relays events to the UI.
 
+mod approvals;
 mod key;
 
 use chrono::Timelike;
@@ -94,10 +95,32 @@ fn tap(jarvis: State<'_, Handle>) {
 }
 
 #[tauri::command]
-fn say(text: String, jarvis: State<'_, Handle>) {
+fn say(
+    text: String,
+    jarvis: State<'_, Handle>,
+    node: State<'_, approvals::NodeSlot>,
+    voice: State<'_, VoiceSlot>,
+    app: AppHandle,
+) {
     // Typed stand-in for the microphone until Milestone B; length-capped.
     let text: String = text.chars().take(500).collect();
+    let (app, voice) = (app.clone(), voice.inner().clone());
+    if approvals::take_spoken_decision(&node, &text, move |line| speak_locally(&app, &voice, line))
+    {
+        return;
+    }
     jarvis.send(Event::Utterance(text));
+}
+
+/// Say a line in George's voice (or the stand-in), outside the coordinator.
+fn speak_locally(app: &AppHandle, voice: &VoiceSlot, text: &str) {
+    let _ = app.emit("jarvis://caption", text);
+    match voice.lock().ok().as_deref().and_then(Option::as_ref) {
+        Some(v) => v.speak(text),
+        None => {
+            let _ = app.emit("jarvis://speak", text);
+        }
+    }
 }
 
 /// The live player said this channel won't play here; try the next one.
@@ -208,7 +231,10 @@ async fn prepare_ears(
     voice: VoiceSlot,
     models_dir: PathBuf,
     jarvis: Handle,
+    node: approvals::NodeSlot,
 ) {
+    // For a spoken "approve" / "deny" answered here, not by the coordinator (Task 7).
+    let (decision_app, decision_voice) = (app.clone(), voice.clone());
     use jarvis_ears::models::*;
     use jarvis_ears::sherpa::{SileroVad, Whisper};
     use jarvis_ears::{capture::start_microphone, Ears};
@@ -291,6 +317,12 @@ async fn prepare_ears(
         speaking,
         Box::new(move |text| {
             tracing::info!(%text, "heard");
+            let (app, voice) = (decision_app.clone(), decision_voice.clone());
+            if approvals::take_spoken_decision(&node, &text, move |line| {
+                speak_locally(&app, &voice, line)
+            }) {
+                return;
+            }
             jarvis.send(Event::Utterance(text));
         }),
     );
@@ -317,6 +349,7 @@ async fn prepare_ears(
     _voice: VoiceSlot,
     _models_dir: PathBuf,
     _jarvis: Handle,
+    _node: approvals::NodeSlot,
 ) {
     let _: Option<Listening> = None;
 }
@@ -362,15 +395,20 @@ pub fn run() {
                 ears: ears.clone(),
             });
             let (handle, fut) = runtime(USER_NAME, brain, Arc::new(registry), ui);
+            // The server node: started by the ServerBrain cutover (Task 9); empty until then.
+            let node: approvals::NodeSlot = Arc::default();
+            app.manage(node.clone());
+            app.manage(voice.clone());
             tauri::async_runtime::spawn(fut);
             match app.path().app_local_data_dir() {
                 Ok(dir) => {
-                    let (app_handle, jarvis) = (app.handle().clone(), handle.clone());
+                    let (app_handle, jarvis, node) =
+                        (app.handle().clone(), handle.clone(), node.clone());
                     let models = dir.join("models");
                     tauri::async_runtime::spawn(async move {
                         // Voice first (George), then hearing; one download at a time.
                         prepare_voice(app_handle.clone(), voice.clone(), models.clone()).await;
-                        prepare_ears(app_handle, ears, voice, models, jarvis).await;
+                        prepare_ears(app_handle, ears, voice, models, jarvis, node).await;
                     });
                 }
                 Err(e) => tracing::warn!(error = %e, "no data folder; using the stand-in voice"),
@@ -397,7 +435,8 @@ pub fn run() {
             toggle_fullscreen,
             typed_input_enabled,
             needs_key,
-            save_key
+            save_key,
+            approvals::decide_approval
         ])
         .run(tauri::generate_context!())
         .expect("error while running JARVIS");

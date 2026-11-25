@@ -38,6 +38,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{broadcast, mpsc, watch};
 use uuid::Uuid;
 
+use crate::approval::{ApprovalCard, CardStore, Decision, CARDS_FILE};
 use crate::client::{self, Client, ClientConfig, EnrolError, LinkStatus, NotConnected};
 use crate::delivery::{Inbox, ItemFate};
 use crate::journal::{Journal, JournalError};
@@ -70,6 +71,25 @@ pub enum UiEvent {
     Link(LinkStatus),
     /// This device's clock differs from the server's by this many milliseconds.
     ClockOff(i64),
+    /// Show this approval card (Task 7). Decide with `NodeHandle::decide`; it stays until
+    /// `ApprovalCleared` for its `outbox_id`.
+    ApprovalCard(ApprovalCard),
+    /// The server cleared this card (decided, superseded or expired).
+    ApprovalCleared {
+        outbox_id: Uuid,
+        reason: String,
+    },
+}
+
+/// Why `NodeHandle::decide` sent nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DecideError {
+    #[error("the card has expired")]
+    Expired,
+    #[error("no such open card (cleared, already decided, or never shown)")]
+    Gone,
+    #[error("not connected to the Jarvis server")]
+    NotConnected,
 }
 
 /// A verified piece of a reply, for `ServerBrain`.
@@ -103,6 +123,7 @@ pub struct NodeHandle {
     client: Client,
     replies: broadcast::Sender<ReplyEvent>,
     inbox: Inbox,
+    cards: Arc<CardStore>,
 }
 
 impl NodeHandle {
@@ -127,6 +148,48 @@ impl NodeHandle {
         self.client.enrol(code).await
     }
 
+    /// Send the person's decision on an open card (Task 7): `approval.decision`, then `ack`
+    /// (journalled, like `shown`). Sent once: the card then waits for the server to clear it,
+    /// and the server's answer is what shows next (P2-E11). Nothing is sent once
+    /// `valid_until` has passed.
+    pub async fn decide(&self, outbox_id: Uuid, d: Decision) -> Result<(), DecideError> {
+        let card = self
+            .cards
+            .begin_decide(outbox_id)
+            .ok_or(DecideError::Gone)?;
+        let now = chrono::Utc::now().fixed_offset();
+        let body = match card.decision(d, now) {
+            Ok(body) => body,
+            Err(_) => {
+                self.cards.undo_decide(outbox_id);
+                return Err(DecideError::Expired);
+            }
+        };
+        if self.client.send("approval.decision", body).await.is_err() {
+            self.cards.undo_decide(outbox_id);
+            return Err(DecideError::NotConnected);
+        }
+        tracing::info!(%outbox_id, approval_id = %card.approval_id, ?d, "approval decision sent");
+        if let Err(e) = self.inbox.mark_acked(outbox_id, now) {
+            tracing::error!(error = %e, "couldn't journal the ack; sending it once");
+        }
+        let _ = self
+            .client
+            .send("ack", json!({"outbox_id": outbox_id}))
+            .await;
+        Ok(())
+    }
+
+    /// Open cards not yet decided.
+    pub fn pending_cards(&self) -> usize {
+        self.cards.pending()
+    }
+
+    /// The only undecided card, for a spoken "approve" or "deny".
+    pub fn only_pending_card(&self) -> Option<Uuid> {
+        self.cards.only_pending()
+    }
+
     /// The app showed (or spoke) this item: acknowledge it (§8.2). The ack is journalled
     /// first, so it is re-sent after a reconnect if it doesn't reach the server now; a
     /// `NotConnected` here therefore loses nothing.
@@ -149,15 +212,18 @@ impl NodeHandle {
 /// Open the journal and start the node on the current tokio runtime.
 pub fn start(cfg: ClientConfig, deps: NodeDeps) -> Result<NodeHandle, JournalError> {
     let journal = Journal::open(&cfg.data_dir.join(JOURNAL_FILE))?;
+    let cfg_cards = cfg.data_dir.join(CARDS_FILE);
     let inbox = Inbox::new(Arc::new(Mutex::new(journal)));
     let (frames_tx, frames) = mpsc::unbounded_channel();
     let client = client::spawn(cfg, deps.keystore, frames_tx);
     let (replies, _) = broadcast::channel(256);
+    let cards = Arc::new(CardStore::open(&cfg_cards));
     let router = Router {
         inbox: inbox.clone(),
         client: client.clone(),
         replies: replies.clone(),
         ui: deps.ui,
+        cards: cards.clone(),
     };
     tokio::spawn(forward_status(client.status(), router.ui.clone()));
     tokio::spawn(router.run(frames));
@@ -165,6 +231,7 @@ pub fn start(cfg: ClientConfig, deps: NodeDeps) -> Result<NodeHandle, JournalErr
         client,
         replies,
         inbox,
+        cards,
     })
 }
 
@@ -182,6 +249,7 @@ struct Router {
     client: Client,
     replies: broadcast::Sender<ReplyEvent>,
     ui: mpsc::Sender<UiEvent>,
+    cards: Arc<CardStore>,
 }
 
 /// `in_reply_to` (R12-37): must be present, a UUID or null. `Some(None)` is null.
@@ -199,9 +267,21 @@ fn uuid_field(map: &Map<String, Value>, key: &str) -> Option<Uuid> {
 
 impl Router {
     async fn run(self, mut frames: mpsc::UnboundedReceiver<Output>) {
+        let mut cards_loaded = false;
         while let Some(output) = frames.recv().await {
             match output {
                 Output::Ready { summary, .. } => {
+                    if !cards_loaded {
+                        // Cards kept from before a restart, re-verified under today's keys.
+                        cards_loaded = true;
+                        let state = self.client.state().borrow().clone();
+                        if let Some(me) = state.node_id {
+                            let now = chrono::Utc::now().fixed_offset();
+                            for card in self.cards.load(&state.trust.core_keys(now), me, now) {
+                                let _ = self.ui.send(UiEvent::ApprovalCard(card)).await;
+                            }
+                        }
+                    }
                     // Owed acks first: the gateway won't re-send those items.
                     let now = chrono::Utc::now().fixed_offset();
                     for outbox_id in self.inbox.owed_acks(now) {
@@ -249,8 +329,11 @@ impl Router {
             return Self::refused("outbox.item", "malformed");
         };
         if p.get("authz").is_some_and(|a| !a.is_null()) {
-            // Approval cards and approved actions: Tasks 7 and 8. No `received`, so the
-            // gateway keeps offering them; not marked seen.
+            if p["authz"]["object"]["kind"] == "approval.card" {
+                return self.on_card(p, outbox_id).await;
+            }
+            // Approved actions: Task 8. No `received`, so the gateway keeps offering them;
+            // not marked seen.
             return Self::refused("outbox.item", "authz_not_handled_yet");
         }
         // The transport confirmation comes first, whatever happens next (§8.2).
@@ -293,6 +376,53 @@ impl Router {
         }
     }
 
+    /// An approval card item (Task 7).
+    async fn on_card(&self, p: &Map<String, Value>, outbox_id: Uuid) {
+        let state = self.client.state().borrow().clone();
+        let Some(me) = state.node_id else { return };
+        let now = chrono::Utc::now().fixed_offset();
+        let item = Value::Object(p.clone());
+        let checked = ApprovalCard::from_item(&item, &state.trust.core_keys(now), me, now);
+        if let Err(Rejected("untrusted_key_id")) = checked {
+            // A core key this node doesn't trust (R12-29): no `received`, so it is offered
+            // again once the node has re-enrolled.
+            Self::refused("outbox.item", "untrusted_key_id");
+            return self.client.require_reenrol();
+        }
+        let _ = self
+            .client
+            .send("received", json!({"outbox_id": outbox_id}))
+            .await;
+        let card = match checked {
+            Ok(card) => card,
+            Err(Rejected(reason)) => return Self::refused("approval.card", reason),
+        };
+        // Stored before the seen-list, so a crash between the two can't lose the card.
+        let was_stored = self.cards.contains(outbox_id);
+        if let Err(e) = self.cards.add(card.clone()) {
+            tracing::error!(error = %e, "couldn't keep the approval card; it won't survive a restart");
+        }
+        match self.inbox.on_item(outbox_id) {
+            Ok(ItemFate::Show) => {
+                let _ = self.ui.send(UiEvent::ApprovalCard(card)).await;
+            }
+            Ok(ItemFate::AlreadySeen) if was_stored => {} // a re-send; still on screen
+            Ok(ItemFate::AlreadySeen | ItemFate::Cleared) => {
+                let _ = self.cards.remove(outbox_id);
+                if self.inbox.ack_owed(outbox_id, now) {
+                    let _ = self
+                        .client
+                        .send("ack", json!({"outbox_id": outbox_id}))
+                        .await;
+                }
+            }
+            Err(e) => {
+                let _ = self.cards.remove(outbox_id);
+                tracing::error!(error = %e, "journal write failed; the card is not shown");
+            }
+        }
+    }
+
     async fn on_cleared(&self, p: &Map<String, Value>) {
         let (Some(outbox_id), Some(reason)) = (
             uuid_field(p, "outbox_id"),
@@ -300,7 +430,23 @@ impl Router {
         ) else {
             return Self::refused("outbox.cleared", "malformed");
         };
+        let was_card = match self.cards.remove(outbox_id) {
+            Ok(was) => was,
+            Err(e) => {
+                tracing::error!(error = %e, "couldn't update the card store");
+                true
+            }
+        };
         match self.inbox.on_cleared(outbox_id) {
+            Ok(_) if was_card => {
+                let _ = self
+                    .ui
+                    .send(UiEvent::ApprovalCleared {
+                        outbox_id,
+                        reason: reason.to_owned(),
+                    })
+                    .await;
+            }
             Ok(_) => {
                 let _ = self
                     .ui

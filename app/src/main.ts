@@ -184,7 +184,7 @@ if (await invoke<boolean>("needs_key")) {
 
 // Tapping anywhere wakes JARVIS (except inside the video, which keeps its own controls).
 document.addEventListener("pointerdown", (e) => {
-  if ((e.target as HTMLElement).closest("#devtype, #setup")) return;
+  if ((e.target as HTMLElement).closest("#devtype, #setup, #approvals, #notices")) return;
   invoke("tap");
 });
 // Esc always closes JARVIS; F11 switches between window and full screen.
@@ -211,3 +211,101 @@ if (import.meta.env.DEV || (await invoke<boolean>("typed_input_enabled"))) {
     input.value = "";
   });
 }
+
+// ── Approval cards and server notices (Plan B Task 7) ──────────────────────
+// What the card says next is always the server's answer: a decision is sent once, the card
+// then waits until the server clears it (P2-E11). Buttons are off once time is up.
+type CardView = { outbox_id: string; approval_id: string; summary: string; valid_until: string };
+type Cleared = { outbox_id: string; reason: string };
+type NoticeView = { outbox_id: string; priority: string; kind: string; body: string };
+type OpenCard = {
+  root: HTMLElement;
+  until: number;
+  sent: boolean;
+  clock: HTMLElement;
+  note: HTMLElement;
+  buttons: HTMLButtonElement[];
+};
+
+const approvals = el("section");
+approvals.id = "approvals";
+approvals.setAttribute("aria-live", "assertive");
+const notices = el("ul");
+notices.id = "notices";
+document.body.append(approvals, notices);
+const cards = new Map<string, OpenCard>();
+const MAX_NOTICES = 5;
+
+function clockText(left: number) {
+  if (left <= 0) return "Expired";
+  const m = Math.floor(left / 60);
+  const s = String(left % 60).padStart(2, "0");
+  return `${m}:${s} left`;
+}
+
+function tick() {
+  for (const c of cards.values()) {
+    const left = Math.max(0, Math.ceil((c.until - Date.now()) / 1000));
+    c.clock.textContent = clockText(left);
+    for (const b of c.buttons) b.disabled = c.sent || left === 0;
+  }
+}
+setInterval(tick, 250);
+
+async function decide(id: string, approve: boolean) {
+  const c = cards.get(id);
+  if (!c || c.sent) return;
+  c.sent = true;
+  c.note.textContent = "Sending…";
+  tick();
+  try {
+    await invoke("decide_approval", { outboxId: id, approve });
+    c.note.textContent = "Sent — waiting for Jarvis";
+  } catch (msg) {
+    c.sent = false;
+    c.note.textContent = String(msg);
+  }
+  tick();
+}
+
+listen<CardView>("jarvis://approval-card", ({ payload }) => {
+  cards.get(payload.outbox_id)?.root.remove();
+  const root = el("article", "card");
+  const clock = el("p", "clock");
+  const note = el("p", "note");
+  const approve = el("button", "approve", "Approve");
+  const deny = el("button", "deny", "Deny");
+  approve.addEventListener("click", () => decide(payload.outbox_id, true));
+  deny.addEventListener("click", () => decide(payload.outbox_id, false));
+  const row = el("div", "buttons");
+  row.append(approve, deny);
+  root.append(el("h2", undefined, "Approval needed"), el("p", "summary", payload.summary), clock, row, note);
+  approvals.append(root);
+  cards.set(payload.outbox_id, {
+    root,
+    until: Date.parse(payload.valid_until),
+    sent: false,
+    clock,
+    note,
+    buttons: [approve, deny],
+  });
+  tick();
+});
+
+listen<Cleared>("jarvis://approval-cleared", ({ payload }) => {
+  cards.get(payload.outbox_id)?.root.remove();
+  cards.delete(payload.outbox_id);
+});
+
+listen<NoticeView>("jarvis://notice", ({ payload }) => {
+  const li = el("li", payload.priority.toLowerCase(), payload.body);
+  li.dataset.id = payload.outbox_id;
+  notices.prepend(li);
+  while (notices.children.length > MAX_NOTICES) notices.lastElementChild?.remove();
+});
+
+listen<Cleared>("jarvis://notice-cleared", ({ payload }) => {
+  for (const li of notices.querySelectorAll<HTMLElement>("li")) {
+    if (li.dataset.id === payload.outbox_id) li.remove();
+  }
+});

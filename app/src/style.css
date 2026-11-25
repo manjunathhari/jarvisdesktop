@@ -246,3 +246,59 @@ body[data-mode="mic_off"] #orb span { opacity: 0.4; border-color: var(--ash); bo
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ── approval cards and notices (Plan B Task 7) ─────────── */
+
+#approvals {
+  position: fixed;
+  top: var(--gap);
+  right: var(--gap);
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  width: min(34rem, 90vw);
+  z-index: 20;
+}
+#approvals .card {
+  background: #0b0b0a;
+  border: 1px solid var(--arc);
+  border-radius: 0.6rem;
+  padding: 1.1rem 1.3rem;
+  animation: arrive 320ms ease-out both;
+}
+#approvals h2 { font: 600 var(--s1) / 1.2 var(--display); margin: 0 0 0.4em; color: var(--arc); }
+#approvals .summary { font-size: var(--s1); margin: 0 0 0.5em; }
+#approvals .clock { color: var(--ash); font-variant-numeric: tabular-nums; margin: 0 0 0.8em; }
+#approvals .buttons { display: flex; gap: 0.8rem; }
+#approvals button {
+  font: 600 var(--s0) var(--text);
+  padding: 0.55em 1.4em;
+  border-radius: 0.4rem;
+  border: 1px solid var(--line);
+  background: var(--ink);
+  color: var(--void);
+  cursor: pointer;
+}
+#approvals button.deny { background: transparent; color: var(--ink); border-color: var(--ash); }
+#approvals button:disabled { opacity: 0.35; cursor: default; }
+#approvals .note { color: var(--ash); font-size: var(--s-1); margin: 0.7em 0 0; min-height: 1.2em; }
+
+#notices {
+  position: fixed;
+  left: var(--gap);
+  top: var(--gap);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  width: min(30rem, 80vw);
+  z-index: 15;
+}
+#notices li {
+  font-size: var(--s-1);
+  color: var(--ink);
+  border-left: 2px solid var(--line);
+  padding: 0.3em 0.8em;
+  margin: 0 0 0.4em;
+}
+#notices li.urgent { border-left-color: var(--live); }
+#notices li.today { border-left-color: var(--arc); }

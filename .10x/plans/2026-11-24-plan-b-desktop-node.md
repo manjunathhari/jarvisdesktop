@@ -376,7 +376,8 @@ As in the Phase 2 plan, shared interfaces belong to the spec and the contracts. 
 - Create: `crates/jarvis-node/src/approval.rs`
 - Modify: `crates/jarvis-node/src/node.rs`: route `approval.card` items, add `NodeHandle::decide`, and add `UiEvent::ApprovalCard` and `ApprovalCleared`
 - Modify: `app/src-tauri/src/lib.rs`: the Tauri events `approval-card` and `approval-cleared`, the command `decide_approval(outbox_id, approve)`, and voice approve/deny before an utterance reaches the coordinator
-- Modify: `crates/jarvis-core/src/coordinator.rs`: make `normalise` `pub` (no behaviour change)
+- ~~Modify: `crates/jarvis-core/src/coordinator.rs`: make `normalise` `pub`~~ (25 Nov: not done; `jarvis-core` stays unchanged. `approval.rs` keeps a copy of `normalise`, pinned by a unit test.)
+- Create: `app/src-tauri/src/approvals.rs` (the app glue: `NodeSlot`, `forward`, `decide_approval`, the spoken-decision check). Cards are kept in `cards.json` (`CardStore`) so a card survives an app restart; the gateway never re-sends an item it has a `received` for.
 - Modify: `app/src/main.ts` and `app/src/style.css`: the card overlay and the notice strip
 - Test: `tests/approval.rs`; app tests in `app/src-tauri/src/lib.rs` `#[cfg(test)]`
 

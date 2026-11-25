@@ -4,6 +4,7 @@
 pub mod authz;
 pub mod gateway;
 pub mod net;
+pub mod rig;
 
 use std::path::PathBuf;
 
