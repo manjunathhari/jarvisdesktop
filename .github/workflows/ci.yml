@@ -18,6 +18,18 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # sherpa-onnx-sys downloads its native libraries into target/sherpa-onnx-prebuilt,
+          # which rust-cache does not keep by default. Keep it with the cache.
+          cache-directories: target/sherpa-onnx-prebuilt
+      - name: Re-run the sherpa-onnx build script if its libraries are missing
+        # A restored cache can hold the build script's old output (a link path) without the
+        # libraries it points at; linking then fails with "could not find native static
+        # library sherpa-onnx-c-api". Cleaning the crate makes the build script download them.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path target/sherpa-onnx-prebuilt)) { cargo clean -p sherpa-onnx-sys }
       - name: Linux deps for Tauri
         if: runner.os == 'Linux'
         run: |
