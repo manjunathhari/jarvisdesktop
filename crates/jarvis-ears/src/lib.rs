@@ -1,6 +1,9 @@
 //! JARVIS's ears (ADR-005): microphone → 16 kHz mono → gate (never listen to
 //! George) → voice-activity detection → Whisper → text.
 //!
+//! While JARVIS is idle and the wake word is on, the same audio goes instead to a
+//! [`WakeDetector`], which only listens for "Hey Jarvis" (design 2026-11-25).
+//!
 //! The detector and transcriber are traits so the gating and segment logic is
 //! tested without a microphone or model files.
 
@@ -23,6 +26,19 @@ pub mod models {
     pub const VAD_URL: &str =
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
     pub const VAD_FILE: &str = "silero_vad.onnx";
+
+    /// The keyword spotter for "Hey Jarvis" (sherpa-onnx's small English streaming model),
+    /// shipped as one archive.
+    pub const KWS_DIR: &str = "kws-zipformer-gigaspeech-3.3M";
+    pub const KWS_ARCHIVE_DIR: &str = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01";
+    pub const KWS_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2";
+    pub const KWS_ENCODER: &str = "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx";
+    pub const KWS_DECODER: &str = "decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx";
+    pub const KWS_JOINER: &str = "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx";
+    pub const KWS_TOKENS: &str = "tokens.txt";
+    pub const KWS_FILES: &[&str] = &[KWS_ENCODER, KWS_DECODER, KWS_JOINER, KWS_TOKENS];
+    /// "HEY JARVIS" in the model's BPE tokens (from its bpe.model), then the keyword's name.
+    pub const WAKE_KEYWORDS: &str = "▁HE Y ▁JA R VI S @HEY_JARVIS";
 }
 
 #[cfg(windows)]
@@ -52,6 +68,16 @@ pub trait Transcriber: Send + 'static {
     fn transcribe(&mut self, samples: &[f32]) -> Result<String, String>;
 }
 
+/// Listens for the wake phrase in a stream of 16 kHz mono audio.
+pub trait WakeDetector: Send + 'static {
+    /// Feed audio; true when the phrase was just heard.
+    fn accept(&mut self, samples: &[f32]) -> bool;
+    fn reset(&mut self);
+}
+
+/// A wake detector and what to do when it fires.
+pub type Wake = (Box<dyn WakeDetector>, Box<dyn FnMut() + Send>);
+
 /// Whisper's placeholders for non-speech; never treated as a command.
 pub fn is_noise(text: &str) -> bool {
     let t = text.trim();
@@ -64,6 +90,7 @@ pub fn is_noise(text: &str) -> bool {
 enum Msg {
     Audio(Vec<f32>),
     Listen(bool),
+    Wake(bool),
 }
 
 /// Handle to the ears thread. Feed it 16 kHz mono audio; it calls `on_text`.
@@ -81,14 +108,28 @@ impl Ears {
         speaking: Arc<dyn Fn() -> bool + Send + Sync>,
         on_text: Box<dyn FnMut(String) + Send>,
     ) -> Self {
+        Self::start_with_wake(detector, transcriber, speaking, on_text, None)
+    }
+
+    /// As [`Ears::start`], with a wake detector and what to do when it fires. It hears audio
+    /// only while the wake word is on ([`Ears::set_wake`]) and JARVIS isn't listening.
+    pub fn start_with_wake(
+        detector: Box<dyn SpeechDetector>,
+        transcriber: Box<dyn Transcriber>,
+        speaking: Arc<dyn Fn() -> bool + Send + Sync>,
+        on_text: Box<dyn FnMut(String) + Send>,
+        wake: Option<Wake>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<Msg>();
         let listening = Arc::new(AtomicBool::new(false));
         let flag = listening.clone();
         let (mut detector, mut transcriber, mut on_text) = (detector, transcriber, on_text);
+        let mut wake = wake;
         thread::Builder::new()
             .name("jarvis-ears".into())
             .spawn(move || {
                 let mut on = false;
+                let mut wake_on = false;
                 let mut last_spoke: Option<Instant> = None;
                 for msg in rx {
                     match msg {
@@ -99,16 +140,36 @@ impl Ears {
                                 detector.reset();
                             }
                         }
+                        Msg::Wake(v) => {
+                            wake_on = v;
+                            if let Some((w, _)) = wake.as_mut() {
+                                w.reset();
+                            }
+                        }
                         Msg::Audio(samples) => {
-                            if !on {
+                            let waking = !on && wake_on && wake.is_some();
+                            if !on && !waking {
                                 continue;
                             }
+                            // Never listen to George, for commands or for the wake word.
                             if speaking() {
                                 last_spoke = Some(Instant::now());
                                 detector.reset();
+                                if let Some((w, _)) = wake.as_mut() {
+                                    w.reset();
+                                }
                                 continue;
                             }
                             if last_spoke.is_some_and(|t| t.elapsed() < SPEAKING_TAIL) {
+                                continue;
+                            }
+                            if waking {
+                                if let Some((w, fire)) = wake.as_mut() {
+                                    if w.accept(&samples) {
+                                        w.reset();
+                                        fire();
+                                    }
+                                }
                                 continue;
                             }
                             detector.accept(&samples);
@@ -143,6 +204,11 @@ impl Ears {
 
     pub fn is_listening(&self) -> bool {
         self.listening.load(Ordering::SeqCst)
+    }
+
+    /// Listen for the wake phrase while not listening for a command.
+    pub fn set_wake(&self, on: bool) {
+        let _ = self.tx.send(Msg::Wake(on));
     }
 }
 
@@ -320,6 +386,102 @@ mod tests {
         assert!(r.heard.lock().unwrap().is_empty());
         assert!(*r.resets.lock().unwrap() >= 1);
         assert!(!r.ears.is_listening());
+    }
+
+    /// Fires on any chunk whose first sample is above 0.5.
+    struct FakeWake {
+        heard: Arc<Mutex<Vec<usize>>>,
+    }
+    impl WakeDetector for FakeWake {
+        fn accept(&mut self, samples: &[f32]) -> bool {
+            self.heard.lock().unwrap().push(samples.len());
+            samples.first().copied().unwrap_or(0.0) > 0.5
+        }
+        fn reset(&mut self) {}
+    }
+
+    struct WakeRig {
+        ears: Ears,
+        woke: Arc<Mutex<usize>>,
+        fed: Arc<Mutex<Vec<usize>>>,
+        heard: Arc<Mutex<Vec<String>>>,
+        speaking: Arc<AtomicBool>,
+    }
+
+    fn wake_rig() -> WakeRig {
+        let (woke, fed, heard) = (
+            Arc::new(Mutex::new(0)),
+            Arc::new(Mutex::new(vec![])),
+            Arc::new(Mutex::new(vec![])),
+        );
+        let speaking = Arc::new(AtomicBool::new(false));
+        let (w, h, s) = (woke.clone(), heard.clone(), speaking.clone());
+        let ears = Ears::start_with_wake(
+            Box::new(FakeVad::default()),
+            Box::new(FakeWhisper { reply: None }),
+            Arc::new(move || s.load(Ordering::SeqCst)),
+            Box::new(move |t| h.lock().unwrap().push(t)),
+            Some((
+                Box::new(FakeWake { heard: fed.clone() }),
+                Box::new(move || *w.lock().unwrap() += 1),
+            )),
+        );
+        WakeRig {
+            ears,
+            woke,
+            fed,
+            heard,
+            speaking,
+        }
+    }
+
+    #[test]
+    fn the_wake_word_fires_only_when_on_and_not_listening() {
+        let r = wake_rig();
+        r.ears.push_audio(speech(500)); // wake word off: nothing
+        settle();
+        assert_eq!(*r.woke.lock().unwrap(), 0);
+        assert!(r.fed.lock().unwrap().is_empty());
+        r.ears.set_wake(true);
+        r.ears.push_audio(speech(500));
+        settle();
+        assert_eq!(*r.woke.lock().unwrap(), 1);
+        assert!(
+            r.heard.lock().unwrap().is_empty(),
+            "the phrase is not a command"
+        );
+        // While listening for a command, audio goes to Whisper, not the wake detector.
+        r.ears.set_listening(true);
+        let fed_before = r.fed.lock().unwrap().len();
+        r.ears.push_audio(speech(500));
+        r.ears.push_audio(silence());
+        settle();
+        assert_eq!(r.fed.lock().unwrap().len(), fed_before);
+        assert_eq!(*r.woke.lock().unwrap(), 1);
+        assert_eq!(r.heard.lock().unwrap().len(), 1);
+        r.ears.set_listening(false);
+        r.ears.set_wake(false);
+        r.ears.push_audio(speech(500));
+        settle();
+        assert_eq!(*r.woke.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn george_cannot_wake_himself() {
+        let r = wake_rig();
+        r.ears.set_wake(true);
+        r.speaking.store(true, Ordering::SeqCst);
+        r.ears.push_audio(speech(500));
+        settle();
+        r.speaking.store(false, Ordering::SeqCst);
+        r.ears.push_audio(speech(200)); // the echo tail
+        settle();
+        assert_eq!(*r.woke.lock().unwrap(), 0);
+        assert!(r.fed.lock().unwrap().is_empty());
+        thread::sleep(SPEAKING_TAIL);
+        r.ears.push_audio(speech(500));
+        settle();
+        assert_eq!(*r.woke.lock().unwrap(), 1);
     }
 
     #[test]

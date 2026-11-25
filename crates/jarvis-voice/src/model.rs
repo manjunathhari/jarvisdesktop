@@ -52,12 +52,31 @@ pub async fn ensure(
     dl: &dyn Download,
     percent: &(dyn Fn(u8) + Send + Sync),
 ) -> Result<KokoroFiles, String> {
-    let dir = models_dir.join(KOKORO_DIR);
-    if is_ready(models_dir) {
-        return Ok(KokoroFiles::in_dir(&dir));
+    let dir = ensure_archive(
+        models_dir, KOKORO_DIR, url, KOKORO_DIR, REQUIRED, dl, percent,
+    )
+    .await?;
+    Ok(KokoroFiles::in_dir(&dir))
+}
+
+/// Make sure a model shipped as a `.tar.bz2` archive is installed in `models_dir/dir_name`:
+/// download it, unpack it, check that `inner` (the archive's top folder) holds every
+/// `required` entry, and mark it complete. Returns the folder.
+pub async fn ensure_archive(
+    models_dir: &Path,
+    dir_name: &str,
+    url: &str,
+    inner: &str,
+    required: &[&str],
+    dl: &dyn Download,
+    percent: &(dyn Fn(u8) + Send + Sync),
+) -> Result<PathBuf, String> {
+    let dir = models_dir.join(dir_name);
+    if dir.join(COMPLETE_MARKER).is_file() {
+        return Ok(dir);
     }
     std::fs::create_dir_all(models_dir).map_err(|e| e.to_string())?;
-    let archive = models_dir.join(format!("{KOKORO_DIR}.tar.bz2.part"));
+    let archive = models_dir.join(format!("{dir_name}.tar.bz2.part"));
     let report = |done: u64, total: Option<u64>| {
         if let Some(t) = total.filter(|t| *t > 0) {
             percent(((done.min(t) * 100) / t) as u8);
@@ -69,7 +88,7 @@ pub async fn ensure(
         return Err(e);
     }
 
-    let staging = models_dir.join(".unpacking");
+    let staging = models_dir.join(format!(".unpacking-{dir_name}"));
     let (arch, stage) = (archive.clone(), staging.clone());
     let unpacked = tokio::task::spawn_blocking(move || unpack(&arch, &stage))
         .await
@@ -77,10 +96,10 @@ pub async fn ensure(
         .and_then(|r| r);
     let _ = std::fs::remove_file(&archive);
     let result = unpacked.and_then(|()| {
-        let src = staging.join(KOKORO_DIR);
-        for name in REQUIRED {
+        let src = staging.join(inner);
+        for name in required {
             if !src.join(name).exists() {
-                return Err(format!("the voice download is missing {name}"));
+                return Err(format!("the {dir_name} download is missing {name}"));
             }
         }
         if dir.exists() {
@@ -90,7 +109,7 @@ pub async fn ensure(
         std::fs::write(dir.join(COMPLETE_MARKER), b"ok").map_err(|e| e.to_string())
     });
     let _ = std::fs::remove_dir_all(&staging);
-    result.map(|()| KokoroFiles::in_dir(&dir))
+    result.map(|()| dir)
 }
 
 fn unpack(archive: &Path, into: &Path) -> Result<(), String> {
@@ -101,7 +120,7 @@ fn unpack(archive: &Path, into: &Path) -> Result<(), String> {
     // `unpack` refuses paths that escape the target folder.
     tar::Archive::new(bz)
         .unpack(into)
-        .map_err(|e| format!("couldn't unpack the voice: {e}"))
+        .map_err(|e| format!("couldn't unpack {}: {e}", archive.display()))
 }
 
 /// One file of a model fetched individually (e.g. from Hugging Face).
