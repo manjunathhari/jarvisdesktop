@@ -531,6 +531,8 @@ As in the Phase 2 plan, shared interfaces belong to the spec and the contracts. 
   Expected: FAIL.
 - [ ] **Step 3: Implement the probe, `node_config.rs`, the app wiring, the enrolment screen, `forget_claude_key` and the CI step.**
 - [ ] **Step 4: Add the timing log.** Log `turn_timing heard_ms=… first_speech_ms=…` per turn. Measure from the end of speech, using the VAD segment end in `jarvis-ears` (log only, no behaviour change), to the start of the first `Speak` audio.
+  - *As built (25 Nov):* `turn_timing transcript_to_speak_ms=…`, from the coordinator receiving the transcript to the first `Speak` event (disarmed on Idle). It leaves out the recogniser's time and the voice's audio time, so it reads low against the 3 s target. The full measure needs timestamps from `jarvis-ears` and `jarvis-voice`, which stay unchanged; that is Manj's call.
+  - *D-3 note:* the probe also replaces the key store (a test-only file), since DPAPI is Windows-only and a restarted probe must be the same node.
 - [ ] **Step 5: Run everything.**
   Run: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd app && npm run build)`, then the pytest from Step 2.
   Expected: PASS.

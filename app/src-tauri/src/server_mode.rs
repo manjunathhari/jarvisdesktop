@@ -140,14 +140,25 @@ impl TurnClock {
         }
     }
 
-    /// The first sentence of the answer starts now: log once per turn.
+    /// The first sentence of the answer is handed to the voice now: log once per turn.
+    ///
+    /// `transcript_to_speak_ms` runs from the coordinator receiving the transcript to the
+    /// first `Speak` event. It leaves out two things the §6.2 target (3 s from the end of
+    /// speech to the first audio) includes: the recogniser's time (end of speech to
+    /// transcript) and the voice's time to make the first sentence's audio. Measuring those
+    /// needs timestamps from jarvis-ears and jarvis-voice, which stay unchanged.
     pub fn speaking(&self) {
         let started = self.0.lock().ok().and_then(|mut t| t.take());
         if let Some(t) = started {
             let ms = t.elapsed().as_millis();
-            // From the transcript to the first spoken sentence; the recogniser's own time
-            // (end of speech to transcript) isn't visible here without changing jarvis-ears.
-            tracing::info!(first_speech_ms = ms as u64, "turn_timing");
+            tracing::info!(transcript_to_speak_ms = ms as u64, "turn_timing");
+        }
+    }
+
+    /// Back to idle with nothing said (a silent local command): no turn to time.
+    pub fn cancel(&self) {
+        if let Ok(mut t) = self.0.lock() {
+            *t = None;
         }
     }
 }
@@ -164,6 +175,12 @@ mod tests {
         assert!(c.0.lock().unwrap().is_some());
         c.speaking();
         assert!(c.0.lock().unwrap().is_none(), "taken by the first sentence");
+        c.heard();
+        c.cancel();
+        assert!(
+            c.0.lock().unwrap().is_none(),
+            "a silent turn isn't timed later"
+        );
     }
 
     #[test]

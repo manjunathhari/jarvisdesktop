@@ -185,6 +185,11 @@ def test_rust_node_turn(
     assert kinds(events)[-1] == "done", events
     spoken = "".join(e["text"] for e in events if e["event"] == "speech")
     assert spoken == REPLY
+    chunks = [e for e in events if e["event"] == "reply"]
+    assert [c["seq"] for c in chunks] == list(range(1, len(chunks) + 1)), "in order"
+    assert not any(c["final"] for c in chunks[:-1]), "final only on the last"
+    # ServerBrain ends a turn only on the final chunk (the probe's separate reply printer may
+    # be stopped before it prints that last line).
     assert "turn_done" in kinds(events)
     assert "conv.turn" in core.ran
     # A second run of the same node: hello (no enrolment), another turn.
@@ -233,15 +238,18 @@ def test_rust_node_approval_flow(
 def test_rust_node_reconnects_and_never_reshows(
     dsns: Dsns, core_key: Any, served: dict[str, Any], tmp_path: Path,
 ) -> None:  # fmt: skip
-    """Kill the probe once it has shown an item, restart it: the item is not shown again."""
+    """Kill the probe once it has shown an item, make the gateway offer it again, restart the
+    probe: only the node's seen-list keeps it from being shown twice."""
     state, _ = _enrolled(dsns, core_key, served, tmp_path)
     with psycopg.connect(dsns.app, autocommit=True) as conn:
         outbox_id = item(conn)
         conn.execute("SELECT pg_notify('jarvis_outbox', %s)", (str(MANJ),))
     p = Probe(served["port"], state, "--wait", "30")
     p.wait_for(lambda e: e["event"] == "notice" and e["outbox_id"] == str(outbox_id))
-    time.sleep(0.5)  # its `received` goes out
     p.kill()
+    with psycopg.connect(dsns.owner, autocommit=True) as conn:
+        # As if the `received` never arrived: the gateway's sweep offers the item again.
+        conn.execute("DELETE FROM comm.delivery WHERE outbox_id = %s", (outbox_id,))
     p = Probe(served["port"], state, "--wait", "3")
     events = p.finish()
     assert {"event": "link", "status": "connected"} in events

@@ -45,7 +45,7 @@ Then start JARVIS. It shows **Connect to the Jarvis server** the first time:
 1. On the server, run `jarvis-core node enrol --person <you> --kind DESKTOP --name "<this PC>"`. It prints a one-time code.
 2. Type the code into the screen and press **Connect**. The code works once and expires soon; it is never stored or logged.
 
-The status line at the bottom right shows the link. In server mode the Anthropic key is never read; once you have accepted Phase 2, the `forget_claude_key` command removes it from Credential Manager. Delete `node.toml` to go back to the desktop's own brain.
+The status line at the bottom right shows the link. In server mode the Anthropic key is never read. Once you have accepted Phase 2, remove it: in Windows **Credential Manager → Windows Credentials**, delete the entry "JARVIS Desktop" (the app's `forget_claude_key` command does the same). Delete `node.toml` to go back to the desktop's own brain.
 
 Deletes only ever go to the Recycle Bin, only from `test_folder`, and only after you approve the card (tap, or say "approve" when one card is showing).
 

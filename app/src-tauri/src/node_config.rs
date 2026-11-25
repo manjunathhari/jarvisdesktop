@@ -148,11 +148,13 @@ mod tests {
             "brain = \"server\"\ngateway = \"gw.example\"",
             "brain = \"server\"\ngateway = \"gw.example:0\"",
             "brain = \"server\"\ngateway = \"gw.example:99999\"",
+            "brain = \"server\"\ngateway = \"[fd00::1:443\"",
             "brian = \"server\"",
             "not toml",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
         assert_eq!(parse("").unwrap(), NodeConfig::default());
+        assert!(parse("brain = \"server\"\ngateway = \"[fd00::1]:443\"").is_ok());
     }
 }

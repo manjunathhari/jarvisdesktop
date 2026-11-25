@@ -67,6 +67,9 @@ impl Ui for TauriUi {
                 app.emit("jarvis://heard", s)
             }
             UiEvent::Status(m) => {
+                if m == Mode::Idle {
+                    self.clock.cancel();
+                }
                 // The mic is on only while JARVIS is waiting for you to speak.
                 let on = matches!(m, Mode::Listening | Mode::FollowUp);
                 if let Some(l) = self.ears.lock().ok().as_deref().and_then(Option::as_ref) {

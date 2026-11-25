@@ -184,7 +184,7 @@ if (await invoke<boolean>("needs_key")) {
 
 // Tapping anywhere wakes JARVIS (except inside the video, which keeps its own controls).
 document.addEventListener("pointerdown", (e) => {
-if ((e.target as HTMLElement).closest("#devtype, #setup, #enrolment, #approvals, #notices")) return;
+  if ((e.target as HTMLElement).closest("#devtype, #setup, #enrolment, #approvals, #notices")) return;
   invoke("tap");
 });
 // Esc always closes JARVIS; F11 switches between window and full screen.

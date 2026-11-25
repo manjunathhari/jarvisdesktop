@@ -273,7 +273,10 @@ fn main() {
         }
     };
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
-    match rt.block_on(run(args)) {
+    let result = rt.block_on(run(args));
+    // Stop the printers first, so `done` (or `error`) is always the last line.
+    rt.shutdown_timeout(Duration::from_secs(2));
+    match result {
         Ok(()) => say(json!({"event": "done"})),
         Err(e) => {
             say(json!({"event": "error", "error": e}));
