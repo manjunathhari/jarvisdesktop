@@ -46,7 +46,7 @@ from jarvis_server import retention as _retention_jobs  # noqa: F401  registers 
 from jarvis_server.bootstrap import bootstrap
 from jarvis_server.brain import budget as _budget_jobs  # noqa: F401  registers job kinds
 from jarvis_server.brain import health, prices
-from jarvis_server.brain.claude import ClaudeBrain
+from jarvis_server.brain.claude import ClaudeBrain, shared_client
 from jarvis_server.core import dispatch, keys, turn
 from jarvis_server.dbcall import Refused
 from jarvis_server.memory import checks as memory_checks
@@ -114,17 +114,14 @@ API_KEY_SECRET = "anthropic_api_key"  # noqa: S105  the secret file's name, not 
 
 def _per_job_brains(api_key: str, proxy: str) -> Callable[[], tuple[ClaudeBrain, str]]:
     """A brain factory: a new `ClaudeBrain` for each job (Task 8 carry-over b), on the default
-    model (R12-12). Core runs one job at a time, so building the next job's brain closes the
-    previous one's HTTP client."""
-    previous: list[ClaudeBrain] = []
+    model (R12-12). The brains share one HTTP client, so a turn reuses the previous turn's
+    connection to Claude instead of opening a new one through the proxy (live check, 25 Nov).
+    The client lives as long as the process."""
+    client = shared_client(proxy)
 
     def build() -> tuple[ClaudeBrain, str]:
-        while previous:
-            previous.pop().close()
         model = prices.default_model()
-        brain = ClaudeBrain(api_key, model, proxy=proxy)
-        previous.append(brain)
-        return brain, model
+        return ClaudeBrain(api_key, model, proxy=proxy, client=client), model
 
     return build
 

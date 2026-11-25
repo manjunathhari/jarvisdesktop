@@ -62,6 +62,21 @@ ANTHROPIC_VERSION = "2023-06-01"
 
 # Bounded on every axis. `read` is the longest silence allowed between two stream chunks.
 TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0)
+# Idle connections are kept this long and reused by the next call, saving the proxy CONNECT and
+# the TLS handshake on each turn (live check, 25 Nov).
+KEEPALIVE_EXPIRY = 60.0
+
+
+def shared_client(proxy: str) -> httpx.Client:
+    """One client for many `ClaudeBrain`s (pass it as `client`), so turns reuse a connection.
+    The caller owns it and closes it."""
+    return httpx.Client(
+        proxy=proxy,
+        timeout=TIMEOUT,
+        trust_env=False,
+        limits=httpx.Limits(keepalive_expiry=KEEPALIVE_EXPIRY),
+    )
+
 
 # Ceiling parameters for `count_input_tokens`.
 BYTES_PER_TOKEN_FLOOR = 2
