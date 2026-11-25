@@ -4,19 +4,27 @@
 //! - `think` sends `utterance {text, screen_summary}` and nothing else: the server owns the
 //!   history and the tools.
 //! - It follows one reply: the first whose first event after the send has `seq` 1, and never
-//!   one it followed before. A reply resumed after a reconnect starts past 1, and a late chunk
-//!   of an earlier reply is already known, so neither can hijack this turn. Replies stream to
-//!   every device of the person (R12-9) and `reply_id` is not tied to the utterance, so a
-//!   reply to another of the person's devices that starts in the same moment could still be
-//!   followed; that needs a server-side link from utterance to reply.
+//!   one it followed before; within it, an event at or below the last `seq` seen is a re-send
+//!   (lost `received`, a gateway resync) and is dropped: never spoken or run twice.
+//!   **Interim rule, known to fail** (`reply_id` is not tied to the utterance): the real reply
+//!   is missed if its seq-1 event never arrives (an ACTION chunk usually takes seq 1, and the
+//!   gateway drops it after `valid_until` or never re-sends it), and a different reply that
+//!   starts at seq 1 during the turn is followed instead: a reply to another of the person's
+//!   devices (R12-9), core's own one-chunk `speak()` replies, a held turn released now, or a
+//!   reply this node never received being sent from seq 1 after a reconnect. The fix needs
+//!   the server to say which utterance each chunk answers (pending an owner ruling).
 //! - SPEECH becomes `BrainEvent::Speech` at once; `final` ends the turn.
 //! - A live `module.*` / `screen.*` action (args `{tool, input}`) whose tool `SERVER_TOOLS`
 //!   maps to that kind becomes `BrainEvent::Action`, then the receipt `OK` (D-2: OK means the
 //!   action was verified and handed to the coordinator, **not** that the panel rendered).
 //!   Anything else gets `REFUSED` with the failed check. `pc.*` actions are the executor's
-//!   (Task 8), so they get nothing here.
+//!   (Task 8), so they get nothing here. Actions of a reply that isn't followed are never run
+//!   and get no receipt (they are read-only; core expires them). A receipt that can't be sent
+//!   because the link is down is logged, not retried.
 //! - No event of the followed reply for `SILENCE` fails the turn, as does losing events to a
-//!   lagging broadcast (they can't be recovered).
+//!   lagging broadcast (they can't be recovered), even when the lost ones were another reply's.
+//! - The desktop runtime (`jarvis-core` `BRAIN_TIMEOUT`, 8 s) caps the whole `think`, so in
+//!   the app a reply whose `final` comes later than 8 s after the send is cut there.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -132,7 +140,8 @@ impl ServerBrain {
             Ok(action) => {
                 let tool = action.name.clone();
                 if tx.send(BrainEvent::Action(action)).await.is_ok() {
-                    tracing::info!(%reply_id, seq, %tool, "live action OK: verified and handed to the coordinator (not proof the panel rendered)");
+                    // D-2: OK = verified and handed to the coordinator, not that the panel rendered.
+                    tracing::info!(%reply_id, seq, %tool, "readonly_action handed_to_coordinator");
                     ("OK", json!({}))
                 } else {
                     ("REFUSED", json!({"check": "not_delivered"}))
@@ -199,7 +208,7 @@ impl Brain for ServerBrain {
             return Err(BrainError::Unavailable(UNREACHABLE.into()));
         }
 
-        let mut following: Option<Uuid> = None;
+        let mut following: Option<(Uuid, i64)> = None; // the reply, and its last seq seen
         let mut deadline = Instant::now() + SILENCE;
         loop {
             let ev = match timeout_at(deadline, rx.recv()).await {
@@ -220,8 +229,14 @@ impl Brain for ServerBrain {
                     None => continue, // the node only broadcasts live actions
                 },
             };
-            match following {
-                Some(id) if id == reply_id => {}
+            match &mut following {
+                Some((id, last)) if *id == reply_id => {
+                    if seq <= *last {
+                        tracing::debug!(%reply_id, seq, "re-sent reply event dropped");
+                        continue;
+                    }
+                    *last = seq;
+                }
                 Some(_) => continue,
                 None => {
                     let mut followed = self.followed.lock().expect("followed lock");
@@ -229,7 +244,7 @@ impl Brain for ServerBrain {
                         continue;
                     }
                     followed.add(reply_id);
-                    following = Some(reply_id);
+                    following = Some((reply_id, seq));
                 }
             }
             deadline = Instant::now() + SILENCE;

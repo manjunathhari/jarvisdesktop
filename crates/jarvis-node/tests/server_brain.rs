@@ -490,3 +490,83 @@ fn tool_table_matches_server() {
     assert_eq!(ours, server);
     assert_eq!(ours.len(), 7);
 }
+
+#[tokio::test]
+async fn re_sent_events_of_the_reply_are_dropped() {
+    // A lost `received` or a gateway resync re-sends chunks: never spoken or run twice.
+    let mut r = rig(true);
+    let (rx, done) = think(&r, req("show me the news"));
+    utterance(&mut r).await;
+    let id = Uuid::new_v4();
+    let news = || action(id, 1, "module.news", "show_news", json!({}));
+    emit(&r, news());
+    assert_eq!(next_send(&mut r).await.0, "action.receipt");
+    emit(&r, news());
+    emit(&r, speech(id, 2, "A.", false));
+    emit(&r, speech(id, 2, "A.", false));
+    emit(&r, speech(id, 3, "B.", true));
+    done.await.unwrap().unwrap();
+    assert_eq!(
+        drain(rx).await,
+        vec![
+            BrainEvent::Action(Action::new("show_news", json!({}))),
+            say("A."),
+            say("B.")
+        ]
+    );
+    let receipts = r
+        .link
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(k, _)| k == "action.receipt")
+        .count();
+    assert_eq!(receipts, 1, "one receipt per action");
+}
+
+#[tokio::test]
+async fn an_action_after_the_caller_left_is_refused_not_delivered() {
+    let mut r = rig(true);
+    let (rx, done) = think(&r, req("show me the news"));
+    utterance(&mut r).await;
+    drop(rx);
+    let id = Uuid::new_v4();
+    emit(&r, action(id, 1, "module.news", "show_news", json!({})));
+    let (kind, receipt) = next_send(&mut r).await;
+    assert_eq!(kind, "action.receipt");
+    assert_eq!(
+        receipt,
+        json!({"reply_id": id, "seq": 1, "result": "REFUSED", "evidence": {"check": "not_delivered"}})
+    );
+    assert_conforms("action.receipt", &receipt);
+    emit(&r, speech(id, 2, "Done.", true));
+    done.await.unwrap().unwrap();
+}
+
+/// A link whose reply broadcast has closed (the node has stopped).
+struct ClosedLink;
+
+#[async_trait]
+impl Link for ClosedLink {
+    fn connected(&self) -> bool {
+        true
+    }
+    fn subscribe(&self) -> broadcast::Receiver<ReplyEvent> {
+        broadcast::channel(1).1
+    }
+    async fn send(&self, _: &'static str, _: Value) -> Result<(), NotConnected> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_closed_reply_stream_fails_the_turn() {
+    let brain = ServerBrain::new(Arc::new(ClosedLink));
+    let (tx, _rx) = mpsc::channel(4);
+    let err = brain.think(req("hello"), tx).await.unwrap_err();
+    assert!(
+        matches!(&err, BrainError::Unavailable(m) if m == "I can't reach the Jarvis server"),
+        "{err}"
+    );
+}

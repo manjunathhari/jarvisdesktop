@@ -548,14 +548,12 @@ async fn server_brain_over_the_real_node() {
     );
     let reply_id = Uuid::new_v4();
     let chunk = |seq: i64, text: &str, last: bool| json!({"reply_id": reply_id, "seq": seq, "type": "SPEECH", "text": text, "authz": null, "final": last});
-    r.push("reply.chunk", chunk(1, "Opening the news.", false))
-        .await;
-    assert_eq!(recv(&mut r.ws).await["kind"], "received");
+    // The server's usual order: the ACTION chunk takes seq 1, the held-back speech follows.
     let mut obj = live_action(r.node_id, reply_id, now());
     obj["args"] = json!({"tool": "show_news", "input": {"channel": "headlines"}});
     r.push(
         "node.action",
-        json!({"authz": signed("core-1", "core-1", obj), "seq": 2}),
+        json!({"authz": signed("core-1", "core-1", obj), "seq": 1}),
     )
     .await;
     let receipt = recv(&mut r.ws).await;
@@ -563,8 +561,11 @@ async fn server_brain_over_the_real_node() {
     assert_eq!(receipt["kind"], "action.receipt");
     assert_eq!(
         receipt["payload"],
-        json!({"reply_id": reply_id, "seq": 2, "result": "OK", "evidence": {}})
+        json!({"reply_id": reply_id, "seq": 1, "result": "OK", "evidence": {}})
     );
+    r.push("reply.chunk", chunk(2, "Opening the news.", false))
+        .await;
+    assert_eq!(recv(&mut r.ws).await["kind"], "received");
     r.push("reply.chunk", chunk(3, "There it is.", true)).await;
     assert_eq!(recv(&mut r.ws).await["kind"], "received");
     done.await.unwrap().unwrap();
@@ -575,8 +576,8 @@ async fn server_brain_over_the_real_node() {
     assert_eq!(
         got,
         vec![
-            BrainEvent::Speech("Opening the news.".into()),
             BrainEvent::Action(Action::new("show_news", json!({"channel": "headlines"}))),
+            BrainEvent::Speech("Opening the news.".into()),
             BrainEvent::Speech("There it is.".into()),
         ]
     );
