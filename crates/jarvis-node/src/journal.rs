@@ -400,6 +400,8 @@ mod tests {
             good,
             "cut back to the good line"
         );
+        // The journal shares its file for reading only (one writer), so close it first.
+        drop(j);
         // A NUL in an earlier line is not a torn write: that is corruption.
         std::fs::write(&path, format!("{torn}{good}")).unwrap();
         assert!(matches!(

@@ -49,4 +49,5 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        # --no-fail-fast: run every test binary, so one failure doesn't hide the others.
+        run: cargo test --workspace --no-fail-fast
