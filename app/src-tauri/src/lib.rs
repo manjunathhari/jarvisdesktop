@@ -31,8 +31,25 @@ type VoiceSlot = Arc<Mutex<Option<Voice>>>;
 struct Listening {
     ears: jarvis_ears::Ears,
     mic: jarvis_ears::capture::Mic,
+    /// The "Hey Jarvis" spotter loaded (design 2026-11-25).
+    wake: bool,
+}
+
+impl Listening {
+    /// Point the mic and ears at what JARVIS is doing now. The mic is on while JARVIS waits for
+    /// a command, and while it is idle with the wake word available (sound is checked on this
+    /// PC only); off while thinking and when the mic was turned off ("stop listening").
+    fn follow(&self, m: Mode) {
+        let command = matches!(m, Mode::Listening | Mode::FollowUp);
+        let wake = self.wake && m == Mode::Idle;
+        self.mic.set_active(command || wake);
+        self.ears.set_listening(command);
+        self.ears.set_wake(wake);
+    }
 }
 type EarsSlot = Arc<Mutex<Option<Listening>>>;
+/// JARVIS's latest mode, for ears that become ready after it changed.
+type ModeCell = Arc<Mutex<Mode>>;
 
 struct TauriUi {
     app: AppHandle,
@@ -40,6 +57,7 @@ struct TauriUi {
     ears: EarsSlot,
     clock: server_mode::TurnClock,
     announcer: Arc<announce::Announcer>,
+    mode: ModeCell,
 }
 
 impl Ui for TauriUi {
@@ -72,11 +90,11 @@ impl Ui for TauriUi {
                 if m == Mode::Idle {
                     self.clock.cancel();
                 }
-                // The mic is on only while JARVIS is waiting for you to speak.
-                let on = matches!(m, Mode::Listening | Mode::FollowUp);
+                if let Ok(mut cell) = self.mode.lock() {
+                    *cell = m;
+                }
                 if let Some(l) = self.ears.lock().ok().as_deref().and_then(Option::as_ref) {
-                    l.mic.set_active(on);
-                    l.ears.set_listening(on);
+                    l.follow(m);
                 }
                 let r = app.emit("jarvis://status", m);
                 // Results Jarvis reported on its own, held until JARVIS was free.
@@ -250,13 +268,14 @@ async fn prepare_ears(
     models_dir: PathBuf,
     jarvis: Handle,
     node: approvals::NodeSlot,
+    mode: ModeCell,
 ) {
     // For a spoken "approve" / "deny" answered here, not by the coordinator (Task 7).
     let (decision_app, decision_voice) = (app.clone(), voice.clone());
     use jarvis_ears::models::*;
-    use jarvis_ears::sherpa::{SileroVad, Whisper};
-    use jarvis_ears::{capture::start_microphone, Ears};
-    use jarvis_voice::model::{ensure_files, HttpDownload, ModelFile};
+    use jarvis_ears::sherpa::{KeywordWake, SileroVad, Whisper};
+    use jarvis_ears::{capture::start_microphone, Ears, WakeDetector};
+    use jarvis_voice::model::{ensure_archive, ensure_files, HttpDownload, ModelFile};
 
     let status = |state: &'static str, percent: u8| {
         let _ = app.emit("jarvis://ears_status", VoiceStatus { state, percent });
@@ -329,7 +348,44 @@ async fn prepare_ears(
             .and_then(|v| v.as_ref().map(|v| v.is_speaking()))
             .unwrap_or(false)
     });
-    let ears = Ears::start(
+    // "Hey Jarvis": optional. Without it, tapping and typing work as before.
+    let wake_dir = ensure_archive(
+        &models_dir,
+        KWS_DIR,
+        KWS_URL,
+        KWS_ARCHIVE_DIR,
+        KWS_FILES,
+        &dl,
+        &|_| {},
+    )
+    .await;
+    let wake_detector = match wake_dir {
+        Ok(dir) => match tokio::task::spawn_blocking(move || KeywordWake::load(&dir)).await {
+            Ok(Ok(w)) => Some(Box::new(w) as Box<dyn WakeDetector>),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "couldn't load the wake word; tap or type instead");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "wake-word loader crashed");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "wake-word model unavailable; tap or type instead");
+            None
+        }
+    };
+    let has_wake = wake_detector.is_some();
+    let (wake_app, wake_jarvis) = (app.clone(), jarvis.clone());
+    let wake = wake_detector.map(|w| {
+        let fire: Box<dyn FnMut() + Send> = Box::new(move || {
+            bring_to_front(&wake_app);
+            wake_jarvis.send(Event::Wake { hour: local_hour() });
+        });
+        (w, fire)
+    });
+    let ears = Ears::start_with_wake(
         Box::new(vad),
         Box::new(whisper),
         speaking,
@@ -343,14 +399,22 @@ async fn prepare_ears(
             }
             jarvis.send(Event::Utterance(text));
         }),
+        wake,
     );
     let feed = ears.clone();
     match start_microphone(move |chunk| feed.push_audio(chunk)) {
         Ok(mic) => {
+            let l = Listening {
+                ears,
+                mic,
+                wake: has_wake,
+            };
+            // Catch up with whatever JARVIS is doing now (idle: start listening for the phrase).
+            l.follow(mode.lock().map(|m| *m).unwrap_or(Mode::Idle));
             if let Ok(mut s) = slot.lock() {
-                *s = Some(Listening { ears, mic });
+                *s = Some(l);
             }
-            tracing::info!("listening is ready");
+            tracing::info!(wake_word = has_wake, "listening is ready");
             status("ready", 100);
         }
         Err(e) => {
@@ -368,6 +432,7 @@ async fn prepare_ears(
     _models_dir: PathBuf,
     _jarvis: Handle,
     _node: approvals::NodeSlot,
+    _mode: ModeCell,
 ) {
     let _: Option<Listening> = None;
 }
@@ -478,6 +543,7 @@ pub fn run() {
             app.manage(mode);
             let voice: VoiceSlot = Arc::new(Mutex::new(None));
             let ears: EarsSlot = Arc::new(Mutex::new(None));
+            let mode: ModeCell = Arc::new(Mutex::new(Mode::Idle));
             let announcer = Arc::new(announce::Announcer::default());
             if let Some(n) = node.lock().ok().and_then(|n| n.clone()) {
                 let (app, voice) = (app.handle().clone(), voice.clone());
@@ -493,6 +559,7 @@ pub fn run() {
                 ears: ears.clone(),
                 clock: server_mode::TurnClock::default(),
                 announcer: announcer.clone(),
+                mode: mode.clone(),
             });
             let (handle, fut) = runtime(USER_NAME, brain, Arc::new(registry), ui);
             app.manage(node.clone());
@@ -506,7 +573,7 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         // Voice first (George), then hearing; one download at a time.
                         prepare_voice(app_handle.clone(), voice.clone(), models.clone()).await;
-                        prepare_ears(app_handle, ears, voice, models, jarvis, node).await;
+                        prepare_ears(app_handle, ears, voice, models, jarvis, node, mode).await;
                     });
                 }
                 Err(e) => tracing::warn!(error = %e, "no data folder; using the stand-in voice"),

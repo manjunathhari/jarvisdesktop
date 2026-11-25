@@ -1,9 +1,11 @@
-//! Silero VAD and Whisper via sherpa-onnx (Windows build).
+//! Silero VAD, Whisper and the "Hey Jarvis" keyword spotter via sherpa-onnx (Windows build).
 
-use crate::{SpeechDetector, Transcriber, SAMPLE_RATE};
+use crate::models::{KWS_DECODER, KWS_ENCODER, KWS_JOINER, KWS_TOKENS, WAKE_KEYWORDS};
+use crate::{SpeechDetector, Transcriber, WakeDetector, SAMPLE_RATE};
 use sherpa_onnx::{
-    OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineWhisperModelConfig,
-    SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
+    KeywordSpotter, KeywordSpotterConfig, OfflineModelConfig, OfflineRecognizer,
+    OfflineRecognizerConfig, OfflineWhisperModelConfig, OnlineModelConfig, OnlineStream,
+    OnlineTransducerModelConfig, SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
 };
 use std::path::Path;
 
@@ -111,5 +113,62 @@ impl Transcriber for Whisper {
             .get_result()
             .map(|r| r.text)
             .ok_or_else(|| "no transcription".into())
+    }
+}
+
+/// How sure the spotter must be before it wakes (sherpa-onnx's defaults; tune on Manj's PC:
+/// raise the threshold for fewer false wakes, lower it for fewer misses).
+pub const WAKE_THRESHOLD: f32 = 0.25;
+pub const WAKE_SCORE: f32 = 1.0;
+
+/// "Hey Jarvis" via sherpa-onnx's streaming keyword spotter (design 2026-11-25, approach A).
+pub struct KeywordWake {
+    // Dropped before the spotter that created it (fields drop in order).
+    stream: OnlineStream,
+    kws: KeywordSpotter,
+}
+
+impl KeywordWake {
+    /// `dir` holds the spotter's model files (`models::KWS_FILES`).
+    pub fn load(dir: &Path) -> Result<Self, String> {
+        let mut config = KeywordSpotterConfig::default();
+        config.model_config = OnlineModelConfig {
+            transducer: OnlineTransducerModelConfig {
+                encoder: s(&dir.join(KWS_ENCODER)),
+                decoder: s(&dir.join(KWS_DECODER)),
+                joiner: s(&dir.join(KWS_JOINER)),
+            },
+            tokens: s(&dir.join(KWS_TOKENS)),
+            num_threads: 1,
+            provider: Some("cpu".into()),
+            ..Default::default()
+        };
+        config.keywords_threshold = WAKE_THRESHOLD;
+        config.keywords_score = WAKE_SCORE;
+        config.keywords_buf = Some(format!("{WAKE_KEYWORDS}\n"));
+        let kws = KeywordSpotter::create(&config).ok_or("couldn't load the wake-word spotter")?;
+        let stream = kws.create_stream();
+        Ok(Self { stream, kws })
+    }
+}
+
+impl WakeDetector for KeywordWake {
+    fn accept(&mut self, samples: &[f32]) -> bool {
+        self.stream.accept_waveform(SAMPLE_RATE as i32, samples);
+        while self.kws.is_ready(&self.stream) {
+            self.kws.decode(&self.stream);
+            if let Some(r) = self.kws.get_result(&self.stream) {
+                if !r.keyword.is_empty() {
+                    tracing::info!(keyword = %r.keyword, "wake word heard");
+                    self.kws.reset(&self.stream);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn reset(&mut self) {
+        self.kws.reset(&self.stream);
     }
 }
