@@ -8,9 +8,9 @@
 # (UnknownModelPrice) until tier support is added. A model missing here is never called.
 # Prices and the rate change only by editing this file, with the source and date noted above.
 
-# The brain model Jarvis uses (Task 10 reads it). Sonnet since 25 Nov (owner): voice turns need
-# speed more than depth; Opus stays in the table for later use.
-default_model = "claude-sonnet-5-5"
+# The brain model Jarvis uses (Task 10 reads it). Opus (owner, 25 Nov evening: after trying
+# Sonnet, "Opus was better"). Sonnet stays in the table.
+default_model = "claude-opus-5-5"
 
 [models.claude-opus-5-5]
 input = 40000
