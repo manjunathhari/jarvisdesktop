@@ -147,6 +147,28 @@ pub fn sddl_is_protected_for(sddl: &str, user_sid: &str) -> bool {
     has_user
 }
 
+/// `\\?\X:\$Recycle.Bin\…`: a final path directly under a volume root's Recycle Bin.
+pub fn in_recycle_bin(path: &str) -> bool {
+    let p = path
+        .strip_prefix("\\\\?\\")
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    let b = p.as_bytes();
+    b.len() > 3
+        && b[0].is_ascii_alphabetic()
+        && &p[1..3] == ":\\"
+        && p[3..].starts_with("$recycle.bin\\")
+}
+
+/// A final path `dir` joined with `name`; `dir` may end in a separator (a drive root).
+pub fn child(dir: &str, name: &str) -> String {
+    if dir.ends_with('\\') {
+        format!("{dir}{name}")
+    } else {
+        format!("{dir}\\{name}")
+    }
+}
+
 /// The SDDL alias Windows writes for a few local accounts instead of their SID.
 fn sddl_alias(user_sid: &str) -> Option<&'static str> {
     if !user_sid.starts_with("S-1-5-21-") {
@@ -160,7 +182,10 @@ fn sddl_alias(user_sid: &str) -> Option<&'static str> {
 }
 
 /// How long a DONE receipt is re-sent after reconnects while its item isn't cleared.
-pub const RESEND_WINDOW: chrono::Duration = chrono::Duration::hours(24);
+/// (An approved action is valid for minutes; 2 h covers a long offline spell without
+/// re-sending for a day: clears aren't replayed on reconnect, so each re-send after the item
+/// ended is one harmless `reused_key` refusal on the server.)
+pub const RESEND_WINDOW: chrono::Duration = chrono::Duration::hours(2);
 
 /// A receipt to (re)send after a restart, and the item to ack once it is sent.
 #[derive(Debug, Clone, PartialEq)]
@@ -245,7 +270,8 @@ impl Executor {
             };
             if let Err(e) = journal.append(&started) {
                 // Nothing done and nothing receipted: a receipt not in the journal could be
-                // contradicted later. Core's verify timeout ends the task.
+                // contradicted later. The node then withholds `received`, so the gateway offers
+                // the item again while it is valid.
                 tracing::error!(error = %e, %key, "couldn't journal STARTED; nothing done");
                 return None;
             }
@@ -497,7 +523,80 @@ fn crash_point(_: &str) {}
 
 #[cfg(test)]
 mod tests {
-    use super::sddl_is_protected_for;
+    use super::{child, in_recycle_bin, sddl_is_protected_for};
+    use super::{memory::MemoryFolder, Executor, FolderOps};
+    use crate::journal::{Journal, Record};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn recycle_bin_paths_are_anchored_at_a_volume_root() {
+        assert!(in_recycle_bin(r"\\?\C:\$Recycle.Bin\S-1-5-21-1\$RAB12.txt"));
+        assert!(in_recycle_bin(r"D:\$RECYCLE.BIN\x"));
+        assert!(
+            !in_recycle_bin(r"\\?\C:\Users\m\$Recycle.Bin\x"),
+            "a folder named like it"
+        );
+        assert!(!in_recycle_bin(r"\\?\C:\test\a.txt"));
+        assert!(!in_recycle_bin(r"\\?\C:\$Recycle.Bin"));
+    }
+
+    #[test]
+    fn paths_join_at_a_drive_root_too() {
+        assert_eq!(child(r"\\?\D:\", "a.txt"), r"\\?\D:\a.txt");
+        assert_eq!(child(r"\\?\D:\tests", "a.txt"), r"\\?\D:\tests\a.txt");
+    }
+
+    fn executor(dir: &std::path::Path) -> (Executor, Arc<Mutex<Journal>>, Arc<MemoryFolder>) {
+        let journal = Arc::new(Mutex::new(
+            Journal::open(&dir.join("journal.jsonl")).unwrap(),
+        ));
+        let folder = Arc::new(MemoryFolder::new());
+        let exec = Executor::new(folder.clone() as Arc<dyn FolderOps>, journal.clone());
+        (exec, journal, folder)
+    }
+
+    #[test]
+    fn started_not_journalled_means_nothing_done_and_nothing_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (exec, journal, folder) = executor(dir.path());
+        let f = folder.put("a.txt", b"fictional");
+        journal.lock().unwrap().fail_after = Some(5);
+        let obj = crate::wire::parse_authz_object(&serde_json::json!({
+            "v": 1, "kind": "node.action", "action_kind": "pc.delete_test_file",
+            "args": {"name": f.name, "size": f.size, "sha256": f.sha256, "file_id": f.file_id},
+            "target_node_id": uuid::Uuid::new_v4(), "person_id": uuid::Uuid::new_v4(),
+            "approval_id": uuid::Uuid::new_v4(), "execution_key": uuid::Uuid::new_v4(),
+            "reply_id": null, "summary": null,
+            "issued_at": "2026-11-25T06:00:00Z", "valid_until": "2026-11-25T06:10:00Z",
+        }))
+        .unwrap();
+        assert_eq!(exec.delete(&obj, None), None);
+        assert!(folder.in_folder("a.txt") && folder.recycle_calls() == 0);
+    }
+
+    #[test]
+    fn a_receipt_that_could_not_be_journalled_is_never_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (exec, journal, folder) = executor(dir.path());
+        let f = folder.put("a.txt", b"fictional");
+        let key = uuid::Uuid::new_v4();
+        journal
+            .lock()
+            .unwrap()
+            .append(&Record::Started {
+                execution_key: key,
+                args: f,
+                at: chrono::Utc::now().fixed_offset(),
+                outbox_id: None,
+            })
+            .unwrap();
+        journal.lock().unwrap().fail_after = Some(5); // DONE won't be written
+        assert!(
+            exec.recover().is_empty(),
+            "no receipt without its DONE record"
+        );
+        assert!(folder.in_folder("a.txt"), "D-1: still untouched");
+    }
 
     const ME: &str = "S-1-5-21-1-2-3-1001";
 

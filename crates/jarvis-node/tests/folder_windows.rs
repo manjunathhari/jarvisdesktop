@@ -193,6 +193,8 @@ fn hard_links_are_left_out_of_the_listing() {
     let p = place();
     put(&p.folder, "a.txt", b"fictional");
     std::fs::hard_link(p.folder.join("a.txt"), p.folder.join("b.txt")).unwrap();
+    put(&p.root, "outside.txt", b"linked from outside");
+    std::fs::hard_link(p.root.join("outside.txt"), p.folder.join("d.txt")).unwrap();
     put(&p.folder, "c.txt", b"other");
     let ops = WindowsFolder::new(p.folder.clone());
     let names: Vec<String> = ops.list().unwrap().into_iter().map(|f| f.name).collect();

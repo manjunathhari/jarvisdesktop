@@ -42,12 +42,12 @@ use windows::Win32::Security::{
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    ExtendedFileIdType, FileIdInfo, FileRenameInfoEx, GetDriveTypeW, GetFileInformationByHandleEx,
-    GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, OpenFileById,
-    SetFileInformationByHandle, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
-    FILE_ID_INFO, FILE_NAME_NORMALIZED, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE,
+    ExtendedFileIdType, FileIdInfo, FileRenameInfoEx, GetDriveTypeW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
+    OpenFileById, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_ID_INFO, FILE_NAME_NORMALIZED,
+    FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
@@ -59,7 +59,9 @@ use windows::Win32::UI::Shell::{
     TSF_DELETE_RECYCLE_IF_POSSIBLE,
 };
 
-use super::{sddl_is_protected_for, valid_name, FolderOps, Located, Outcome};
+use super::{
+    child, in_recycle_bin, sddl_is_protected_for, valid_name, FolderOps, Located, Outcome,
+};
 use crate::journal::FileFacts;
 
 /// The staging folder's name, inside the test folder (never listed: it starts with a dot).
@@ -182,21 +184,14 @@ impl FolderOps for WindowsFolder {
             let Ok(file) = open_file(&self.path.join(&name), GENERIC_READ, share) else {
                 continue;
             };
-            match regular(&file) {
-                Ok(true) => {}
+            match (regular(&file), link_count(&file)) {
+                (Ok(true), Ok(1)) => {}
                 _ => continue,
             }
             if let Ok(facts) = facts_of(&file, &name) {
                 files.push(facts);
             }
         }
-        // Hard links: one file under two names. Neither name is listed (core needs file IDs
-        // to be unique in a listing, and deleting one name wouldn't remove the file).
-        let mut seen = std::collections::HashMap::new();
-        for f in &files {
-            *seen.entry(f.file_id.clone()).or_insert(0) += 1;
-        }
-        files.retain(|f| seen[&f.file_id] == 1);
         Ok(files)
     }
 
@@ -218,6 +213,9 @@ impl FolderOps for WindowsFolder {
         })?;
         if !regular(&file)? {
             return Err(Outcome::Refused("not_regular_file"));
+        }
+        if link_count(&file)? != 1 {
+            return Err(Outcome::Refused("hard_linked"));
         }
         // Step 2, through that handle.
         let folder_path = final_path(&folder).map_err(|_| Outcome::Error("final_path"))?;
@@ -302,6 +300,9 @@ impl FolderOps for WindowsFolder {
         if !regular(&file)? {
             return Err(Outcome::Refused("not_regular_file"));
         }
+        if link_count(&file)? != 1 {
+            return Err(Outcome::Refused("hard_linked"));
+        }
         let sub_path = final_path(&sub).map_err(|_| Outcome::Refused("staged_path"))?;
         let file_path = final_path(&file).map_err(|_| Outcome::Refused("staged_path"))?;
         if file_path != child(&sub_path, &want.name) {
@@ -379,16 +380,6 @@ fn open_file(path: &Path, access: u32, share: FILE_SHARE_MODE) -> io::Result<Fil
         .open(path)
 }
 
-/// `dir` joined with `name`, for a final path that may itself end in a separator (a
-/// drive root).
-fn child(dir: &str, name: &str) -> String {
-    if dir.ends_with('\\') {
-        format!("{dir}{name}")
-    } else {
-        format!("{dir}\\{name}")
-    }
-}
-
 fn attributes(f: &File) -> io::Result<u32> {
     Ok(f.metadata()?.file_attributes())
 }
@@ -403,6 +394,15 @@ fn is_reparse(f: &File) -> Result<bool, Outcome> {
 fn regular(f: &File) -> Result<bool, Outcome> {
     let a = attributes(f).map_err(|_| Outcome::Refused("attributes_unreadable"))?;
     Ok(a & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0)
+}
+
+/// How many names the file has. More than one (a hard link, perhaps outside the folder):
+/// "deleting" this name wouldn't remove the file, so it is never listed or deleted.
+fn link_count(f: &File) -> Result<u32, Outcome> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle(f), &mut info) }
+        .map_err(|_| Outcome::Refused("attributes_unreadable"))?;
+    Ok(info.nNumberOfLinks)
 }
 
 /// Name, size, SHA-256 and file ID, all read through `f` (from its start).
@@ -493,19 +493,6 @@ fn final_path(f: &File) -> io::Result<String> {
         }
         buf.resize(n + 1, 0);
     }
-}
-
-/// `\\?\X:\$Recycle.Bin\…`: directly under the volume root's Recycle Bin.
-fn in_recycle_bin(path: &str) -> bool {
-    let p = path
-        .strip_prefix("\\\\?\\")
-        .unwrap_or(path)
-        .to_ascii_lowercase();
-    let b = p.as_bytes();
-    b.len() > 3
-        && b[0].is_ascii_alphabetic()
-        && &p[1..3] == ":\\"
-        && p[3..].starts_with("$recycle.bin\\")
 }
 
 /// The volume's file system name (`NTFS`).

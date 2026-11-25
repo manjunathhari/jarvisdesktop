@@ -27,6 +27,8 @@ tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "syn
 
 # DPAPI key storage and write-through renames (Windows only).
 [target.'cfg(windows)'.dependencies]
+# Named directly: `#[implement]` (the Recycle Bin progress sink) expands to `::windows_core` paths.
+windows-core = "0.61"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

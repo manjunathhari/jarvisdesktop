@@ -449,6 +449,15 @@ impl Router {
                     .await;
                 return Self::refused("action.approved", reason);
             }
+            Ok(obj) if obj.execution_key.is_none() => {
+                // Never runnable (nothing to receipt): confirm transport so it isn't offered
+                // again.
+                let _ = self
+                    .client
+                    .send("received", json!({"outbox_id": outbox_id}))
+                    .await;
+                return Self::refused("action.approved", "no_execution_key");
+            }
             Ok(obj) => obj,
         };
         let (client, executor) = (self.client.clone(), self.executor.clone());
@@ -460,12 +469,13 @@ impl Router {
                         tracing::error!(error = %e, "the delete task failed");
                         None
                     });
+            // Nothing to send (the journal failed, or this key is already running): withhold
+            // `received`, so the gateway offers the item again while it is valid.
+            let Some(receipt) = receipt else { return };
             let _ = client
                 .send("received", json!({"outbox_id": outbox_id}))
                 .await;
-            if let Some(receipt) = receipt {
-                send_receipt(&client, receipt).await;
-            }
+            send_receipt(&client, receipt).await;
         });
     }
 

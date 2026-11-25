@@ -196,7 +196,7 @@ pub struct Journal {
     poisoned: bool,
     /// Test hook: the next write puts this many bytes on disk, then fails.
     #[cfg(test)]
-    fail_after: Option<usize>,
+    pub(crate) fail_after: Option<usize>,
 }
 
 impl Journal {
