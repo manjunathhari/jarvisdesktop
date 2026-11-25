@@ -2,7 +2,8 @@
 
 `core_main.wire_brain()` reads the secret `anthropic_api_key` and `HTTPS_PROXY`, and gives the
 conversation turn (`turn.set_brain`) and the health probe (`health.set_probe_brain`) each a
-factory that builds a new `ClaudeBrain(api_key, model=prices.default_model(), proxy)` per job.
+factory that builds a new `ClaudeBrain(api_key, model=prices.default_model(), proxy)` per job,
+all of a factory's brains sharing one HTTP client (connection reuse, live check 25 Nov).
 Core refuses to start without either value, before it touches the database. The key is never
 logged. Nothing here touches the network: socket connects fail the test.
 """
@@ -15,6 +16,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from jarvis_server import config, core_main
@@ -53,9 +55,11 @@ def test_turn_and_probe_get_a_claude_brain_per_job(
     built: list[dict[str, Any]] = []
 
     class Recording(ClaudeBrain):
-        def __init__(self, api_key: str, model: str, *, proxy: str) -> None:
+        def __init__(
+            self, api_key: str, model: str, *, proxy: str, client: httpx.Client | None = None
+        ) -> None:
             built.append({"api_key": api_key, "model": model, "proxy": proxy})
-            super().__init__(api_key, model, proxy=proxy)
+            super().__init__(api_key, model, proxy=proxy, client=client)
 
     monkeypatch.setattr(core_main, "ClaudeBrain", Recording)
     _configure(_isolated, monkeypatch)
@@ -71,20 +75,22 @@ def test_turn_and_probe_get_a_claude_brain_per_job(
     assert built == [{"api_key": KEY, "model": model, "proxy": PROXY}] * 4
 
 
-def test_the_previous_brain_is_closed_when_the_next_job_gets_one(
+def test_brains_of_one_factory_share_a_client_through_the_proxy(
     _isolated: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each brain owns an httpx client; jobs run one at a time, so the factory closes the last
-    job's brain when it builds the next one, and nothing leaks."""
-    closed: list[ClaudeBrain] = []
-    monkeypatch.setattr(ClaudeBrain, "close", lambda self: closed.append(self))
+    """Live check, 25 Nov: a new client per turn paid the proxy CONNECT and TLS handshake every
+    time. The brains of one factory share one client (kept-alive connections), which a brain
+    never closes; the turn and the probe each have their own."""
     _configure(_isolated, monkeypatch)
     core_main.wire_brain()
-    assert turn._brain is not None
+    assert turn._brain is not None and health._probe_brain is not None
     first, _ = turn._brain()
-    assert closed == []
     second, _ = turn._brain()
-    assert closed == [first] and second is not first
+    probe, _ = health._probe_brain()
+    assert first._client is second._client
+    assert probe._client is not first._client
+    first.close()
+    assert not second._client.is_closed  # shared: a brain's close() leaves it open
 
 
 def test_core_refuses_to_start_without_the_api_key(

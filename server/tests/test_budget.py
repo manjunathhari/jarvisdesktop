@@ -253,7 +253,7 @@ def test_unknown_model_price_fails_closed() -> None:  # [Review Focus 2]
 
 
 def test_price_table_and_rounding() -> None:
-    assert prices.default_model() == "claude-opus-5-5"
+    assert prices.default_model() == "claude-sonnet-5-5"
     # 40 000 / 200 000 paise per million tokens.
     assert prices.cost_paise("claude-opus-5-5", 1_000_000, 0) == 40_000
     assert prices.cost_paise("claude-opus-5-5", 0, 1_000_000) == 200_000

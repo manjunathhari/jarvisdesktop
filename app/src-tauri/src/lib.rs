@@ -381,6 +381,15 @@ async fn prepare_voice(_app: AppHandle, _slot: VoiceSlot, _models_dir: PathBuf) 
     };
 }
 
+/// Show, restore and focus the main window.
+fn bring_to_front(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -389,6 +398,13 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
+        // One JARVIS at a time (live check, 25 Nov): a second copy can't open the node's
+        // journal, so it had no brain and blamed a missing key. Starting JARVIS again now
+        // brings the running window to the front instead. Registered first, as the plugin
+        // requires.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            bring_to_front(app);
+        }))
         .setup(|app| {
             let cfg = SourcesConfig::default_config();
             let news = Arc::new(NewsModule::new(
