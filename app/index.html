@@ -29,11 +29,35 @@
     </form>
 
     <p id="link" hidden></p>
+    <p id="build" aria-label="JARVIS version"></p>
 
     <footer id="presence">
       <p id="heard"></p>
       <p id="said"></p>
-      <button id="orb" aria-label="Tap to talk to JARVIS"><span></span></button>
+      <button id="orb" aria-label="Tap to talk to JARVIS">
+        <span class="arc arc-l" aria-hidden="true"></span>
+        <span class="sphere" aria-hidden="true">
+          <svg class="wave" viewBox="0 0 200 60" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="wavegrad" x1="0" x2="1">
+                <stop offset="0" stop-color="#5aa9ff" stop-opacity="0" />
+                <stop offset="0.45" stop-color="#9b7bff" />
+                <stop offset="0.55" stop-color="#e6ecff" />
+                <stop offset="1" stop-color="#5aa9ff" stop-opacity="0" />
+              </linearGradient>
+            </defs>
+            <g class="wave-move">
+              <path d="M0 30 C25 10 50 10 75 30 S125 50 150 30 S175 10 200 30 S225 50 250 30 S275 10 300 30 S325 50 350 30 S375 10 400 30" />
+              <path class="wave-2" d="M0 34 C25 46 50 46 75 30 S125 14 150 32 S175 46 200 34 S225 18 250 30 S275 46 300 34 S325 18 350 30 S375 46 400 34" />
+            </g>
+          </svg>
+          <span class="bars"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+        </span>
+        <span class="arc arc-r" aria-hidden="true"></span>
+      </button>
+      <p id="wordmark" aria-hidden="true">JARVIS</p>
+      <p id="orbstate"><span class="dot"></span><span id="orbword">Standby</span></p>
+      <p id="orbhint">Not listening</p>
       <p id="voicestatus" hidden></p>
       <form id="devtype" hidden>
         <input id="devinput" autocomplete="off" placeholder="Type what you'd say, then Enter" />
