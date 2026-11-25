@@ -181,7 +181,7 @@ def propose_delete(
         return None
     approval_id = uuid.uuid4()
     expires_at = now + APPROVAL_EXPIRY
-    summary = f"Delete test file `{name}`?"
+    summary = f'Delete test file "{name}"?'  # plain text: the card shows it as is
     card = actions.sign(
         conn,
         actions.authz_object(

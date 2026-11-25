@@ -12,7 +12,9 @@
 //!   node at another reply of the same person (its speech and its core-signed actions for this
 //!   node); nothing unsigned authorises an action. Replies that answer no current utterance
 //!   (null: core's `speak()` results) are not voiced here.
-//! - SPEECH becomes `BrainEvent::Speech` at once; `final` ends the turn.
+//! - SPEECH text is joined into whole sentences ([`Sentences`]), each becoming one
+//!   `BrainEvent::Speech`; what is left goes out before an action and at `final`, which ends
+//!   the turn.
 //! - A live `module.*` / `screen.*` action (args `{tool, input}`) whose tool `SERVER_TOOLS`
 //!   maps to that kind becomes `BrainEvent::Action`, then the receipt `OK` (D-2: OK means the
 //!   action was verified and handed to the coordinator, **not** that the panel rendered).
@@ -38,6 +40,7 @@ use uuid::Uuid;
 
 use crate::client::{LinkStatus, NotConnected};
 use crate::node::{NodeHandle, ReplyEvent};
+use crate::speech::Sentences;
 use crate::wire::AuthzObject;
 
 /// The desktop tools the server may call, and the action kind each must arrive under:
@@ -183,6 +186,7 @@ impl Brain for ServerBrain {
         };
 
         let mut following: Option<(Uuid, i64)> = None; // the reply, and its last seq seen
+        let mut sentences = Sentences::default();
         let mut deadline = Instant::now() + SILENCE;
         loop {
             let ev = match timeout_at(deadline, rx.recv()).await {
@@ -227,14 +231,26 @@ impl Brain for ServerBrain {
             deadline = Instant::now() + SILENCE;
             match ev {
                 ReplyEvent::Speech { text, final_, .. } => {
-                    if !text.is_empty() && tx.send(BrainEvent::Speech(text)).await.is_err() {
-                        return Ok(()); // the caller has gone
+                    let mut say = sentences.push(&text);
+                    if final_ {
+                        say.extend(sentences.finish());
+                    }
+                    for s in say {
+                        if tx.send(BrainEvent::Speech(s)).await.is_err() {
+                            return Ok(()); // the caller has gone
+                        }
                     }
                     if final_ {
                         return Ok(());
                     }
                 }
                 ReplyEvent::Action { seq, authz, .. } => {
+                    // Words before the action are said before it, as they came.
+                    if let Some(s) = sentences.finish() {
+                        if tx.send(BrainEvent::Speech(s)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
                     self.on_action(reply_id, seq, authz, &tx).await;
                 }
             }

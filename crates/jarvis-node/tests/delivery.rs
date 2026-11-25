@@ -551,7 +551,7 @@ async fn server_brain_over_the_real_node() {
     r.push("reply.chunk", chunk(2, "Opening the news.", false))
         .await;
     assert_eq!(recv(&mut r.ws).await["kind"], "received");
-    r.push("reply.chunk", chunk(3, "There it is.", true)).await;
+    r.push("reply.chunk", chunk(3, " There it is.", true)).await;
     assert_eq!(recv(&mut r.ws).await["kind"], "received");
     done.await.unwrap().unwrap();
     let mut got = Vec::new();

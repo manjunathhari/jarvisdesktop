@@ -114,6 +114,9 @@ MESSAGE_MAX = 20000  # conv.message.text
 # The reply when the brain answered with no speech (only tool calls, or nothing): a turn always
 # ends with a final chunk and a JARVIS message.
 NO_SPEECH_TEXT = "I can't do that from here yet."
+# The reply when the brain only ran actions on the node (a panel, say) and said nothing: the
+# action is the answer, and the node's module speaks its own result (live check, 25 Nov).
+ACTION_ONLY_TEXT = "Okay."
 # What Jarvis says about a tool call (§9.2: a refusal is explained in the reply).
 REFUSED_TEXT = "I'm not allowed to do that."
 APPROVAL_TEXT = "That needs your approval."
@@ -412,6 +415,7 @@ class _Stream:
         self.reply_id = uuid.uuid4()
         self.seq = 0
         self.pieces: list[str] = []
+        self.acted = False  # a live action was issued in this reply
         self._pending: str | None = None
         self._space_next = False  # after Jarvis's own words, the brain's next piece is spaced
 
@@ -438,8 +442,8 @@ class _Stream:
         """Write the final chunk (inside the caller's transaction); return the whole reply."""
         reply = "".join(self.pieces)
         if not reply.strip():
-            reply = NO_SPEECH_TEXT
-            self._pending = NO_SPEECH_TEXT if self._pending is None else self._pending
+            reply = ACTION_ONLY_TEXT if self.acted else NO_SPEECH_TEXT
+            self._pending = reply if self._pending is None else self._pending
         assert self._pending is not None
         self._write(self._pending, final=True)
         self._pending = None
@@ -460,6 +464,7 @@ class _Stream:
             person_id=person_id, action_kind=kind, args=args, now=now,
             in_reply_to=self.in_reply_to,
         )  # fmt: skip
+        self.acted = True
 
     def _write(self, text: str, *, final: bool) -> None:
         self.seq += 1
