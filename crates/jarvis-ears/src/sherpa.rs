@@ -131,21 +131,23 @@ pub struct KeywordWake {
 impl KeywordWake {
     /// `dir` holds the spotter's model files (`models::KWS_FILES`).
     pub fn load(dir: &Path) -> Result<Self, String> {
-        let mut config = KeywordSpotterConfig::default();
-        config.model_config = OnlineModelConfig {
-            transducer: OnlineTransducerModelConfig {
-                encoder: s(&dir.join(KWS_ENCODER)),
-                decoder: s(&dir.join(KWS_DECODER)),
-                joiner: s(&dir.join(KWS_JOINER)),
+        let config = KeywordSpotterConfig {
+            model_config: OnlineModelConfig {
+                transducer: OnlineTransducerModelConfig {
+                    encoder: s(&dir.join(KWS_ENCODER)),
+                    decoder: s(&dir.join(KWS_DECODER)),
+                    joiner: s(&dir.join(KWS_JOINER)),
+                },
+                tokens: s(&dir.join(KWS_TOKENS)),
+                num_threads: 1,
+                provider: Some("cpu".into()),
+                ..Default::default()
             },
-            tokens: s(&dir.join(KWS_TOKENS)),
-            num_threads: 1,
-            provider: Some("cpu".into()),
+            keywords_threshold: WAKE_THRESHOLD,
+            keywords_score: WAKE_SCORE,
+            keywords_buf: Some(format!("{WAKE_KEYWORDS}\n")),
             ..Default::default()
         };
-        config.keywords_threshold = WAKE_THRESHOLD;
-        config.keywords_score = WAKE_SCORE;
-        config.keywords_buf = Some(format!("{WAKE_KEYWORDS}\n"));
         let kws = KeywordSpotter::create(&config).ok_or("couldn't load the wake-word spotter")?;
         let stream = kws.create_stream();
         Ok(Self { stream, kws })
