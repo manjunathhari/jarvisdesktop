@@ -222,6 +222,8 @@ type OpenCard = {
   root: HTMLElement;
   until: number;
   sent: boolean;
+  // The node said this card's decision went out (by tap or by voice).
+  confirmed: boolean;
   clock: HTMLElement;
   note: HTMLElement;
   buttons: HTMLButtonElement[];
@@ -262,6 +264,7 @@ async function decide(id: string, approve: boolean) {
     await invoke("decide_approval", { outboxId: id, approve });
     c.note.textContent = "Sent — waiting for Jarvis";
   } catch (msg) {
+    if (c.confirmed) return; // already sent (by voice, or the other button)
     c.sent = false;
     c.note.textContent = String(msg);
   }
@@ -285,6 +288,7 @@ listen<CardView>("jarvis://approval-card", ({ payload }) => {
     root,
     until: Date.parse(payload.valid_until),
     sent: false,
+    confirmed: false,
     clock,
     note,
     buttons: [approve, deny],
@@ -292,8 +296,23 @@ listen<CardView>("jarvis://approval-card", ({ payload }) => {
   tick();
 });
 
+const SENT_SHOWN_MS = 4000;
+
 listen<Cleared>("jarvis://approval-cleared", ({ payload }) => {
-  cards.get(payload.outbox_id)?.root.remove();
+  const c = cards.get(payload.outbox_id);
+  if (!c) return;
+  if (payload.reason === "SENT") {
+    // The decision went out; what Jarvis says next is the server's answer.
+    c.sent = c.confirmed = true;
+    c.note.textContent = "Sent — waiting for Jarvis";
+    tick();
+    setTimeout(() => {
+      c.root.remove();
+      if (cards.get(payload.outbox_id) === c) cards.delete(payload.outbox_id);
+    }, SENT_SHOWN_MS);
+    return;
+  }
+  c.root.remove();
   cards.delete(payload.outbox_id);
 });
 

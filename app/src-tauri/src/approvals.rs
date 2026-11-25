@@ -6,7 +6,11 @@
 //!   `jarvis://approval-cleared`, `jarvis://notice`, `jarvis://notice-cleared`.
 //! - `decide_approval` is the Approve / Deny buttons' command.
 //! - `intercept` takes a spoken "approve" or "deny" before it reaches the coordinator, when
-//!   exactly one card is open; with two or more it asks the person to tap.
+//!   exactly one card can still be decided; with two or more it asks the person to tap. The
+//!   swallowed phrase leaves the coordinator listening until its own timer ends, as silence
+//!   would.
+//! - A card ends in the window on `jarvis://approval-cleared`: reason `SENT` (this node's
+//!   decision went out, by tap or voice) shows "Sent" briefly; any other reason removes it.
 
 use std::sync::{Arc, Mutex};
 
@@ -101,7 +105,8 @@ pub fn take_spoken_decision(
     let Some(node) = node(slot) else {
         return false;
     };
-    match intercept(text, node.pending_cards(), node.only_pending_card()) {
+    let (pending, only) = node.voice_target();
+    match intercept(text, pending, only) {
         Intercept::Pass => false,
         Intercept::AskToTap => {
             say(ASK_TO_TAP);

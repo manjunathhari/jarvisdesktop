@@ -3,12 +3,16 @@
 //! - A card arrives as an `outbox.item` whose `authz` is a core-signed `approval.card` for this
 //!   node. `ApprovalCard::from_item` checks it (§7.1 rules 2 to 4, plus an `approval_id`).
 //! - The person decides by tapping or by voice ("approve", "deny"). The decision carries the
-//!   card's `authz.sig` byte for byte and is sent only while `now < valid_until`; after that the
-//!   buttons are off. The server decides what happens: the card stays as "Sent — waiting for
-//!   Jarvis" until the server clears it, and what shows next is the server's answer (P2-E11).
-//! - `CardStore` keeps open cards in `cards.json` (the signed items, nothing secret), so a card
-//!   received before a restart is shown again after it: the gateway never re-sends an item it
-//!   has a `received` for. Each stored card is re-verified against the trusted keys on load.
+//!   card's `authz.sig` byte for byte and is sent only until 1 s before `valid_until`; after
+//!   that the buttons are off. Once the decision and its ack are sent the card ends here
+//!   (`ApprovalCleared` with reason `SENT`): the gateway never sends `outbox.cleared` to the
+//!   node that acked (§8.2), and what shows next is the server's answer, a notice or the spoken
+//!   result (P2-E11). A decision that was lost on the way leaves the approval PENDING, and the
+//!   server re-surfaces it as a new card 2 minutes before expiry.
+//! - `CardStore` keeps open cards in `cards.json` (the signed items, nothing secret), one per
+//!   approval (a re-surfaced card replaces the older one), so a card received before a restart
+//!   is shown again after it: the gateway never re-sends an item it has a `received` for. It is
+//!   written before `received` goes out, and each stored card is re-verified on load.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,6 +28,8 @@ use crate::wire::AuthzKind;
 
 /// The file in the node's data folder that keeps open cards.
 pub const CARDS_FILE: &str = "cards.json";
+/// No decision is sent in the last second, so it can't reach the server after expiry.
+pub const DECISION_MARGIN: chrono::Duration = chrono::Duration::seconds(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -49,8 +55,9 @@ pub struct ApprovalCard {
 
 impl ApprovalCard {
     /// Check a card item. Reasons, in order: `malformed`, `untrusted_key_id`,
-    /// `bad_signature`, `wrong_kind`, `wrong_target`, `malformed` (no `approval_id`),
-    /// `expired` (`now` > `valid_until` + 30 s).
+    /// `bad_signature`, `wrong_kind`, `wrong_target`, `malformed` (no `approval_id`, no signed
+    /// `summary`, or an `execution_key`), `expired` (`now` > `valid_until` + 30 s). What the
+    /// card says is only ever the signed summary, never the gateway's item body.
     pub fn from_item(
         item: &Value,
         trusted: &CoreKeys,
@@ -71,6 +78,10 @@ impl ApprovalCard {
             return Err(Rejected("wrong_target"));
         }
         let approval_id = obj.approval_id.ok_or(Rejected("malformed"))?;
+        let summary = obj.summary.clone().ok_or(Rejected("malformed"))?;
+        if obj.execution_key.is_some() {
+            return Err(Rejected("malformed"));
+        }
         if now > obj.valid_until + CLOCK_TOLERANCE {
             return Err(Rejected("expired"));
         }
@@ -78,11 +89,6 @@ impl ApprovalCard {
             .as_str()
             .ok_or(Rejected("malformed"))?
             .to_owned();
-        let summary = obj
-            .summary
-            .clone()
-            .or_else(|| item.get("body").and_then(Value::as_str).map(str::to_owned))
-            .unwrap_or_default();
         Ok(Self {
             outbox_id,
             approval_id,
@@ -104,9 +110,9 @@ impl ApprovalCard {
         (ms + 999) / 1000
     }
 
-    /// The `approval.decision` payload, only while `now < valid_until`.
+    /// The `approval.decision` payload, only while `now < valid_until - DECISION_MARGIN`.
     pub fn decision(&self, d: Decision, now: DateTime<FixedOffset>) -> Result<Value, Expired> {
-        if now >= self.valid_until {
+        if now >= self.valid_until - DECISION_MARGIN {
             return Err(Expired);
         }
         let word = match d {
@@ -174,10 +180,22 @@ fn normalise(text: &str) -> String {
 #[derive(Debug, Clone)]
 struct Entry {
     card: ApprovalCard,
-    decided: bool,
+    /// A decision is being sent (in memory only: after a restart the card can be decided
+    /// again, and the server's answer is what counts).
+    deciding: bool,
 }
 
-/// Open cards, kept on disk until the server clears them.
+/// What `CardStore::add` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Added {
+    New,
+    /// The same item again: kept as it was.
+    Already,
+    /// A newer card for the same approval: it replaced this older item.
+    Replaced(Uuid),
+}
+
+/// Open cards, kept on disk until they are decided, cleared or expire.
 pub struct CardStore {
     path: PathBuf,
     entries: Mutex<Vec<Entry>>,
@@ -193,29 +211,43 @@ impl CardStore {
     }
 
     /// The stored cards that still verify under `trusted` for `me` at `now`; the others are
-    /// dropped from the file. A missing or unreadable file means no cards.
+    /// dropped from the file. A missing file means no cards; an unreadable one is kept aside
+    /// as `cards.json.corrupt`.
     pub fn load(
         &self,
         trusted: &CoreKeys,
         me: Uuid,
         now: DateTime<FixedOffset>,
     ) -> Vec<ApprovalCard> {
-        let stored: Vec<(Value, bool)> = std::fs::read(&self.path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .and_then(|v| v.get("cards").and_then(Value::as_array).cloned())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|e| Some((e.get("item")?.clone(), e.get("decided")?.as_bool()?)))
-            .collect();
+        let items: Vec<Value> = match std::fs::read(&self.path) {
+            Err(_) => vec![],
+            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|v| v.get("cards").and_then(Value::as_array).cloned())
+            {
+                Some(cards) => cards
+                    .into_iter()
+                    .filter_map(|e| e.get("item").cloned())
+                    .collect(),
+                None => {
+                    let aside = self.path.with_extension("json.corrupt");
+                    tracing::warn!(path = %aside.display(), "card store unreadable; kept aside");
+                    let _ = std::fs::rename(&self.path, aside);
+                    vec![]
+                }
+            },
+        };
         let mut entries = self.entries.lock().expect("cards lock");
         entries.clear();
-        for (item, decided) in stored {
+        for item in items {
             match ApprovalCard::from_item(&item, trusted, me, now) {
-                Ok(card) if !entries.iter().any(|e| e.card.outbox_id == card.outbox_id) => {
-                    entries.push(Entry { card, decided })
+                Ok(card) => {
+                    entries.retain(|e| e.card.approval_id != card.approval_id);
+                    entries.push(Entry {
+                        card,
+                        deciding: false,
+                    });
                 }
-                Ok(_) => {}
                 Err(Rejected(reason)) => tracing::info!(reason, "stored approval card dropped"),
             }
         }
@@ -225,15 +257,23 @@ impl CardStore {
         entries.iter().map(|e| e.card.clone()).collect()
     }
 
-    /// Keep a card (replacing one with the same `outbox_id`).
-    pub fn add(&self, card: ApprovalCard) -> io::Result<()> {
+    /// Keep a card: one per approval, the newer item replacing the older.
+    pub fn add(&self, card: ApprovalCard) -> io::Result<Added> {
         let mut entries = self.entries.lock().expect("cards lock");
-        entries.retain(|e| e.card.outbox_id != card.outbox_id);
+        if entries.iter().any(|e| e.card.outbox_id == card.outbox_id) {
+            return Ok(Added::Already);
+        }
+        let older = entries
+            .iter()
+            .find(|e| e.card.approval_id == card.approval_id)
+            .map(|e| e.card.outbox_id);
+        entries.retain(|e| e.card.approval_id != card.approval_id);
         entries.push(Entry {
             card,
-            decided: false,
+            deciding: false,
         });
-        self.save(&entries)
+        self.save(&entries)?;
+        Ok(older.map_or(Added::New, Added::Replaced))
     }
 
     /// Forget a card; whether it was there.
@@ -255,53 +295,40 @@ impl CardStore {
             .any(|e| e.card.outbox_id == outbox_id)
     }
 
-    /// Claim a card for one decision: None if it is unknown or already decided. Undo with
-    /// `undo_decide` if the decision couldn't be sent.
+    /// Claim a card for one decision: None if it is unknown or a decision is being sent.
+    /// `undo_decide` gives it back if the decision couldn't be sent; `remove` ends it.
     pub fn begin_decide(&self, outbox_id: Uuid) -> Option<ApprovalCard> {
         let mut entries = self.entries.lock().expect("cards lock");
         let entry = entries
             .iter_mut()
-            .find(|e| e.card.outbox_id == outbox_id && !e.decided)?;
-        entry.decided = true;
-        let card = entry.card.clone();
-        if let Err(e) = self.save(&entries) {
-            tracing::warn!(error = %e, "couldn't record the decision in the card store");
-        }
-        Some(card)
+            .find(|e| e.card.outbox_id == outbox_id && !e.deciding)?;
+        entry.deciding = true;
+        Some(entry.card.clone())
     }
 
     pub fn undo_decide(&self, outbox_id: Uuid) {
         let mut entries = self.entries.lock().expect("cards lock");
         if let Some(e) = entries.iter_mut().find(|e| e.card.outbox_id == outbox_id) {
-            e.decided = false;
-            let _ = self.save(&entries);
+            e.deciding = false;
         }
     }
 
-    /// Open cards not yet decided (what a voice decision would apply to).
-    pub fn pending(&self) -> usize {
-        self.entries
-            .lock()
-            .expect("cards lock")
-            .iter()
-            .filter(|e| !e.decided)
-            .count()
-    }
-
-    /// The only undecided card, if exactly one is open.
-    pub fn only_pending(&self) -> Option<Uuid> {
+    /// For a spoken decision, in one look: how many cards can still be decided at `now`, and
+    /// the card if exactly one can.
+    pub fn voice_target(&self, now: DateTime<FixedOffset>) -> (usize, Option<Uuid>) {
         let entries = self.entries.lock().expect("cards lock");
-        let mut open = entries.iter().filter(|e| !e.decided);
-        match (open.next(), open.next()) {
-            (Some(e), None) => Some(e.card.outbox_id),
-            _ => None,
-        }
+        let open: Vec<Uuid> = entries
+            .iter()
+            .filter(|e| !e.deciding && now < e.card.valid_until - DECISION_MARGIN)
+            .map(|e| e.card.outbox_id)
+            .collect();
+        (open.len(), (open.len() == 1).then(|| open[0]))
     }
 
     fn save(&self, entries: &[Entry]) -> io::Result<()> {
         let cards: Vec<Value> = entries
             .iter()
-            .map(|e| json!({"item": e.card.item, "decided": e.decided}))
+            .map(|e| json!({"item": e.card.item}))
             .collect();
         let bytes = serde_json::to_vec(&json!({"v": 1, "cards": cards}))?;
         write_atomic(&self.path, &bytes)

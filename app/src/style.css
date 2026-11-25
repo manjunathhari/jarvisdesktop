@@ -286,7 +286,7 @@ body[data-mode="mic_off"] #orb span { opacity: 0.4; border-color: var(--ash); bo
 #notices {
   position: fixed;
   left: var(--gap);
-  top: var(--gap);
+  bottom: calc(var(--gap) + 7rem); /* above the presence footer, clear of the panels */
   margin: 0;
   padding: 0;
   list-style: none;

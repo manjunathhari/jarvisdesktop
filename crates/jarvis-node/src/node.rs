@@ -38,7 +38,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::{broadcast, mpsc, watch};
 use uuid::Uuid;
 
-use crate::approval::{ApprovalCard, CardStore, Decision, CARDS_FILE};
+use crate::approval::{Added, ApprovalCard, CardStore, Decision, CARDS_FILE};
 use crate::client::{self, Client, ClientConfig, EnrolError, LinkStatus, NotConnected};
 use crate::delivery::{Inbox, ItemFate};
 use crate::folder::{Executor, FolderOps, Recovered, LISTING};
@@ -75,7 +75,9 @@ pub enum UiEvent {
     /// Show this approval card (Task 7). Decide with `NodeHandle::decide`; it stays until
     /// `ApprovalCleared` for its `outbox_id`.
     ApprovalCard(ApprovalCard),
-    /// The server cleared this card (decided, superseded or expired).
+    /// The card ends: `SENT` (this node's decision and ack went out; the server's answer is
+    /// what shows next), `SUPERSEDED` (a newer card for the same approval replaced it), or the
+    /// server's reason from `outbox.cleared`.
     ApprovalCleared {
         outbox_id: Uuid,
         reason: String,
@@ -128,6 +130,7 @@ pub struct NodeHandle {
     replies: broadcast::Sender<ReplyEvent>,
     inbox: Inbox,
     cards: Arc<CardStore>,
+    ui: mpsc::Sender<UiEvent>,
 }
 
 impl NodeHandle {
@@ -153,9 +156,9 @@ impl NodeHandle {
     }
 
     /// Send the person's decision on an open card (Task 7): `approval.decision`, then `ack`
-    /// (journalled, like `shown`). Sent once: the card then waits for the server to clear it,
-    /// and the server's answer is what shows next (P2-E11). Nothing is sent once
-    /// `valid_until` has passed.
+    /// (journalled, like `shown`). Sent once: the card then ends here (`ApprovalCleared`,
+    /// `SENT`), since the gateway never clears an item for the node that acked it, and the
+    /// server's answer is what shows next (P2-E11). Nothing is sent in the card's last second.
     pub async fn decide(&self, outbox_id: Uuid, d: Decision) -> Result<(), DecideError> {
         let card = self
             .cards
@@ -181,17 +184,23 @@ impl NodeHandle {
             .client
             .send("ack", json!({"outbox_id": outbox_id}))
             .await;
+        if let Err(e) = self.cards.remove(outbox_id) {
+            tracing::warn!(error = %e, "couldn't update the card store");
+        }
+        let _ = self
+            .ui
+            .send(UiEvent::ApprovalCleared {
+                outbox_id,
+                reason: "SENT".into(),
+            })
+            .await;
         Ok(())
     }
 
-    /// Open cards not yet decided.
-    pub fn pending_cards(&self) -> usize {
-        self.cards.pending()
-    }
-
-    /// The only undecided card, for a spoken "approve" or "deny".
-    pub fn only_pending_card(&self) -> Option<Uuid> {
-        self.cards.only_pending()
+    /// For a spoken "approve" or "deny", in one look: how many cards can be decided now, and
+    /// the card if exactly one can.
+    pub fn voice_target(&self) -> (usize, Option<Uuid>) {
+        self.cards.voice_target(chrono::Utc::now().fixed_offset())
     }
 
     /// The app showed (or spoke) this item: acknowledge it (§8.2). The ack is journalled
@@ -233,6 +242,7 @@ pub fn start(cfg: ClientConfig, deps: NodeDeps) -> Result<NodeHandle, JournalErr
         cards: cards.clone(),
         executor,
     };
+    let ui = router.ui.clone();
     tokio::spawn(forward_status(client.status(), router.ui.clone()));
     tokio::spawn(router.run(frames, recovered));
     Ok(NodeHandle {
@@ -240,6 +250,7 @@ pub fn start(cfg: ClientConfig, deps: NodeDeps) -> Result<NodeHandle, JournalErr
         replies,
         inbox,
         cards,
+        ui,
     })
 }
 
@@ -452,19 +463,39 @@ impl Router {
             Self::refused("outbox.item", "untrusted_key_id");
             return self.client.require_reenrol();
         }
+        let card = match checked {
+            Ok(card) => card,
+            Err(Rejected(reason)) => {
+                // Never showable: confirm transport so it isn't offered again.
+                let _ = self
+                    .client
+                    .send("received", json!({"outbox_id": outbox_id}))
+                    .await;
+                return Self::refused("approval.card", reason);
+            }
+        };
+        // Stored before `received` (the gateway never re-sends a received item) and before the
+        // seen-list, so no crash point can lose the card.
+        let was_stored = self.cards.contains(outbox_id);
+        match self.cards.add(card.clone()) {
+            Ok(Added::Replaced(older)) => {
+                let _ = self
+                    .ui
+                    .send(UiEvent::ApprovalCleared {
+                        outbox_id: older,
+                        reason: "SUPERSEDED".into(),
+                    })
+                    .await;
+            }
+            Ok(Added::New | Added::Already) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "couldn't keep the approval card; it won't survive a restart")
+            }
+        }
         let _ = self
             .client
             .send("received", json!({"outbox_id": outbox_id}))
             .await;
-        let card = match checked {
-            Ok(card) => card,
-            Err(Rejected(reason)) => return Self::refused("approval.card", reason),
-        };
-        // Stored before the seen-list, so a crash between the two can't lose the card.
-        let was_stored = self.cards.contains(outbox_id);
-        if let Err(e) = self.cards.add(card.clone()) {
-            tracing::error!(error = %e, "couldn't keep the approval card; it won't survive a restart");
-        }
         match self.inbox.on_item(outbox_id) {
             Ok(ItemFate::Show) => {
                 let _ = self.ui.send(UiEvent::ApprovalCard(card)).await;
@@ -480,8 +511,8 @@ impl Router {
                 }
             }
             Err(e) => {
-                let _ = self.cards.remove(outbox_id);
-                tracing::error!(error = %e, "journal write failed; the card is not shown");
+                // Kept in the store, so it shows after a restart.
+                tracing::error!(error = %e, "journal write failed; the card is shown next start");
             }
         }
     }
