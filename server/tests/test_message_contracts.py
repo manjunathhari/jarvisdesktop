@@ -115,7 +115,12 @@ def test_authz_object_fields_are_exactly_the_spec_list() -> None:
     assert set(c.AuthzObject.model_fields) == set(fields)
 
 
-SPEECH = {"reply_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d", "seq": 1, "final": False}
+SPEECH = {
+    "reply_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+    "seq": 1,
+    "final": False,
+    "in_reply_to": None,
+}
 
 
 @pytest.mark.parametrize(

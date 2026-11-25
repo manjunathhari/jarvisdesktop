@@ -455,11 +455,25 @@ impl Session {
         payload: Value,
         now: DateTime<FixedOffset>,
     ) -> Result<String, SendError> {
+        self.send_tracked(kind, payload, now)
+            .map(|(_, frame)| frame)
+    }
+
+    /// As `send`, also returning the envelope's `message_id` (what a reply's `in_reply_to`
+    /// names, R12-37).
+    pub fn send_tracked(
+        &mut self,
+        kind: &str,
+        payload: Value,
+        now: DateTime<FixedOffset>,
+    ) -> Result<(Uuid, String), SendError> {
         let Phase::Ready { .. } = self.phase else {
             return Err(SendError::NotReady);
         };
         let node_id = self.state.node_id.ok_or(SendError::NotReady)?;
-        self.envelope(kind, payload, node_id, now)
+        let message_id = Uuid::new_v4();
+        self.envelope_with_id(message_id, kind, payload, node_id, now)
+            .map(|frame| (message_id, frame))
             .map_err(|_| SendError::Unsignable)
     }
 
@@ -471,9 +485,20 @@ impl Session {
         node_id: Uuid,
         now: DateTime<FixedOffset>,
     ) -> Result<String, crate::sign::SignError> {
+        self.envelope_with_id(Uuid::new_v4(), kind, payload, node_id, now)
+    }
+
+    fn envelope_with_id(
+        &mut self,
+        message_id: Uuid,
+        kind: &str,
+        payload: Value,
+        node_id: Uuid,
+        now: DateTime<FixedOffset>,
+    ) -> Result<String, crate::sign::SignError> {
         let mut env = json!({
             "version": 1,
-            "message_id": Uuid::new_v4(),
+            "message_id": message_id,
             "node_id": node_id,
             "seq": self.out_seq + 1,
             "sent_at": now.to_rfc3339_opts(SecondsFormat::Millis, true),

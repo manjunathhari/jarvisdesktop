@@ -36,7 +36,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from jarvis_server import comm, nodes
 from jarvis_server.comm import OutboxState, Priority
-from jarvis_server.contracts import Welcome
+from jarvis_server.contracts import MESSAGE_MODELS, Welcome
 from jarvis_server.core import rules, summary
 from jarvis_server.dbcall import OutboxRefused
 from jarvis_server.gateway import relay
@@ -176,14 +176,15 @@ def speech(
     who: uuid.UUID = MANJ,
     final: int | None = None,
     notify: bool = True,
+    in_reply_to: uuid.UUID | None = None,
 ) -> None:
     """Write SPEECH chunks as core does, then NOTIFY jarvis_stream with the reply ID only."""
     session = session_of(app, who)
     for seq in seqs:
         app.execute(
-            "INSERT INTO conv.stream_chunk (reply_id, session_id, seq, type, text, final)"
-            " VALUES (%s, %s, %s, 'SPEECH', 'A fictional reply', %s)",
-            (reply, session, seq, seq == final),
+            "INSERT INTO conv.stream_chunk (reply_id, session_id, seq, type, text, final,"
+            " in_reply_to) VALUES (%s, %s, %s, 'SPEECH', 'A fictional reply', %s, %s)",
+            (reply, session, seq, seq == final, in_reply_to),
         )
     if notify:
         app.execute("SELECT pg_notify('jarvis_stream', %s)", (str(reply),))
@@ -197,11 +198,13 @@ def action(
     authz: dict[str, Any],
     target: uuid.UUID,
     valid_until: datetime,
+    in_reply_to: uuid.UUID | None = None,
 ) -> None:
     app.execute(
         "INSERT INTO conv.stream_chunk (reply_id, session_id, seq, type, authz, final,"
-        " target_node_id, valid_until) VALUES (%s, %s, %s, 'ACTION', %s, false, %s, %s)",
-        (reply, session_of(app), seq, Jsonb(authz), target, valid_until),
+        " target_node_id, valid_until, in_reply_to)"
+        " VALUES (%s, %s, %s, 'ACTION', %s, false, %s, %s, %s)",
+        (reply, session_of(app), seq, Jsonb(authz), target, valid_until, in_reply_to),
     )
 
 
@@ -558,6 +561,31 @@ def test_core_restart_mid_stream(gw: Gw, app_conn: Conn) -> None:
     assert items[0]["body"] == "A request ended without a clear outcome"  # body["text"] (G4.1)
 
 
+def test_chunks_say_which_utterance_they_answer(gw: Gw, app_conn: Conn) -> None:
+    """R12-37: every reply.chunk and node.action carries the reply's `in_reply_to` (the
+    utterance's message_id), unsigned; null for a reply that answers no utterance."""
+    a = enrolled(gw)
+    utterance, reply, own = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    live = gw.authz(a.node_id)
+    until = gw.clock() + timedelta(minutes=2)
+    action(app_conn, reply, 1, authz=live, target=a.node_id, valid_until=until,
+           in_reply_to=utterance)  # fmt: skip
+    speech(app_conn, reply, [2], final=2, in_reply_to=utterance)
+    speech(app_conn, own, [1], final=1)  # a speak()-style result
+    envs = collect(a, lambda e: len(chunk_seqs(e, reply)) == 1 and len(chunk_seqs(e, own)) == 1)
+    got = [
+        (e["kind"], e["payload"].get("reply_id") or e["payload"]["authz"]["object"]["reply_id"],
+         e["payload"]["in_reply_to"])
+        for e in envs if e["kind"] in ("reply.chunk", "node.action")
+    ]  # fmt: skip
+    assert ("node.action", live["object"]["reply_id"], str(utterance)) in got
+    assert ("reply.chunk", str(reply), str(utterance)) in got
+    assert ("reply.chunk", str(own), None) in got
+    for e in envs:
+        if e["kind"] in ("reply.chunk", "node.action"):
+            MESSAGE_MODELS[e["kind"]].model_validate(e["payload"])
+
+
 def test_action_chunk_only_to_target_and_before_valid_until(gw: Gw, app_conn: Conn) -> None:
     """G4.2: a live ACTION chunk goes as `node.action {authz, seq}` to its target only, and
     only while now() <= valid_until. Never as `reply.chunk` type ACTION. `seq` is the chunk's,
@@ -582,7 +610,7 @@ def test_action_chunk_only_to_target_and_before_valid_until(gw: Gw, app_conn: Co
         ("node.action", 2),
         ("reply.chunk", 4),
     ]
-    assert relevant[1]["payload"] == {"authz": live, "seq": 2}
+    assert relevant[1]["payload"] == {"authz": live, "seq": 2, "in_reply_to": None}
     assert a.actions == [live["object"]] and a.rejected == []
     assert [e["kind"] for e in envs_b if e["kind"] in ("reply.chunk", "node.action")] == [
         "reply.chunk",

@@ -13,7 +13,9 @@
 //! - `reply.chunk` (SPEECH): `received` with its `seq`, then broadcast to `subscribe_replies`.
 //!   Live actions arrive as `node.action` frames, never as ACTION chunks (Phase 2 ruling G4.2),
 //!   so an ACTION chunk is refused.
-//! - `node.action {authz, seq}`: rules 2 to 4 of §7.1 (`check_node_action` under the trusted
+//! - `reply.chunk` and `node.action` carry `in_reply_to` (R12-37, unsigned): the utterance
+//!   the reply answers, or null; it is passed on with each `ReplyEvent`.
+//! - `node.action {authz, seq, in_reply_to}`: rules 2 to 4 of §7.1 (`check_node_action` under the trusted
 //!   core keys), and it must be a live action (a `reply_id`, no `execution_key`: approved
 //!   actions come in outbox items). `seq` is the chunk's, unsigned (R12-36), and only names
 //!   the action in its live receipt. Accepted ones are broadcast. A core signature under a key this node doesn't trust asks
@@ -78,10 +80,16 @@ pub enum ReplyEvent {
         seq: i64,
         text: String,
         final_: bool,
+        /// The utterance (envelope `message_id`) this reply answers; None if none (R12-37).
+        in_reply_to: Option<Uuid>,
     },
     /// A live action that passed §7.1 rules 2 to 4; `seq` (unsigned, R12-36) is what its
     /// `action.receipt` names, with `authz.reply_id`.
-    Action { seq: i64, authz: AuthzObject },
+    Action {
+        seq: i64,
+        in_reply_to: Option<Uuid>,
+        authz: AuthzObject,
+    },
 }
 
 pub struct NodeDeps {
@@ -108,6 +116,11 @@ impl NodeHandle {
 
     pub async fn send(&self, kind: &str, payload: Value) -> Result<(), NotConnected> {
         self.client.send(kind, payload).await
+    }
+
+    /// As `send`, returning the envelope's `message_id` (which replies name, R12-37).
+    pub async fn send_tracked(&self, kind: &str, payload: Value) -> Result<Uuid, NotConnected> {
+        self.client.send_tracked(kind, payload).await
     }
 
     pub async fn enrol(&self, code: &str) -> Result<(), EnrolError> {
@@ -169,6 +182,15 @@ struct Router {
     client: Client,
     replies: broadcast::Sender<ReplyEvent>,
     ui: mpsc::Sender<UiEvent>,
+}
+
+/// `in_reply_to` (R12-37): must be present, a UUID or null. `Some(None)` is null.
+fn answers(p: &Map<String, Value>) -> Option<Option<Uuid>> {
+    match p.get("in_reply_to")? {
+        Value::Null => Some(None),
+        Value::String(s) => Uuid::parse_str(s).ok().map(Some),
+        _ => None,
+    }
 }
 
 fn uuid_field(map: &Map<String, Value>, key: &str) -> Option<Uuid> {
@@ -295,7 +317,7 @@ impl Router {
     async fn on_chunk(&self, p: &Map<String, Value>) {
         let reply_id = uuid_field(p, "reply_id");
         let seq = p.get("seq").and_then(|s| s.as_i64()).filter(|s| *s >= 1);
-        let (Some(reply_id), Some(seq)) = (reply_id, seq) else {
+        let (Some(reply_id), Some(seq), Some(in_reply_to)) = (reply_id, seq, answers(p)) else {
             return Self::refused("reply.chunk", "malformed");
         };
         let _ = self
@@ -313,6 +335,7 @@ impl Router {
                     seq,
                     text: text.to_owned(),
                     final_,
+                    in_reply_to,
                 });
             }
             // Live actions come as node.action frames (G4.2), never as ACTION chunks.
@@ -321,9 +344,10 @@ impl Router {
     }
 
     async fn on_action(&self, p: &Map<String, Value>) {
-        let (Some(authz), Some(seq), 2) = (
+        let (Some(authz), Some(seq), Some(in_reply_to), 3) = (
             p.get("authz"),
             p.get("seq").and_then(Value::as_i64).filter(|s| *s >= 1),
+            answers(p),
             p.len(),
         ) else {
             return Self::refused("node.action", "malformed");
@@ -336,7 +360,11 @@ impl Router {
                 Self::refused("node.action", "not_live");
             }
             Ok(obj) => {
-                let _ = self.replies.send(ReplyEvent::Action { seq, authz: obj });
+                let _ = self.replies.send(ReplyEvent::Action {
+                    seq,
+                    in_reply_to,
+                    authz: obj,
+                });
             }
             Err(Rejected("untrusted_key_id")) => {
                 // A core key_id this node never pinned or no longer trusts (R12-29).

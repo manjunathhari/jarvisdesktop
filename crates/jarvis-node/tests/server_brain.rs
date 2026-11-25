@@ -25,6 +25,8 @@ struct FakeLink {
     events: broadcast::Sender<ReplyEvent>,
     sent: Mutex<Vec<(String, Value)>>,
     on_send: mpsc::UnboundedSender<(String, Value)>,
+    /// The `message_id` of the last utterance sent.
+    asked: Mutex<Option<Uuid>>,
 }
 
 #[async_trait]
@@ -35,16 +37,20 @@ impl Link for FakeLink {
     fn subscribe(&self) -> broadcast::Receiver<ReplyEvent> {
         self.events.subscribe()
     }
-    async fn send(&self, kind: &'static str, payload: Value) -> Result<(), NotConnected> {
+    async fn send(&self, kind: &'static str, payload: Value) -> Result<Uuid, NotConnected> {
         if !self.connected {
             return Err(NotConnected);
+        }
+        let message_id = Uuid::new_v4();
+        if kind == "utterance" {
+            *self.asked.lock().unwrap() = Some(message_id);
         }
         self.sent
             .lock()
             .unwrap()
             .push((kind.to_owned(), payload.clone()));
         let _ = self.on_send.send((kind.to_owned(), payload));
-        Ok(())
+        Ok(message_id)
     }
 }
 
@@ -61,6 +67,7 @@ fn rig(connected: bool) -> Rig {
         events: broadcast::channel(64).0,
         sent: Mutex::default(),
         on_send,
+        asked: Mutex::default(),
     });
     let brain = Arc::new(ServerBrain::new(link.clone()));
     Rig { link, sends, brain }
@@ -78,13 +85,27 @@ fn req(text: &str) -> BrainRequest {
     }
 }
 
+/// Stands for "the utterance this turn sent": `emit` puts in its real `message_id`.
+const ASKED: Uuid = Uuid::from_u128(0xa5);
+
 fn speech(reply_id: Uuid, seq: i64, text: &str, final_: bool) -> ReplyEvent {
     ReplyEvent::Speech {
         reply_id,
         seq,
         text: text.into(),
         final_,
+        in_reply_to: Some(ASKED),
     }
+}
+
+/// The same event, answering `to` (another utterance, or None: a reply to no utterance).
+fn answering(mut ev: ReplyEvent, to: Option<Uuid>) -> ReplyEvent {
+    match &mut ev {
+        ReplyEvent::Speech { in_reply_to, .. } | ReplyEvent::Action { in_reply_to, .. } => {
+            *in_reply_to = to
+        }
+    }
+    ev
 }
 
 fn action(reply_id: Uuid, seq: i64, action_kind: &str, tool: &str, input: Value) -> ReplyEvent {
@@ -93,6 +114,7 @@ fn action(reply_id: Uuid, seq: i64, action_kind: &str, tool: &str, input: Value)
     obj["args"] = json!({"tool": tool, "input": input});
     ReplyEvent::Action {
         seq,
+        in_reply_to: Some(ASKED),
         authz: parse_authz_object(&obj).unwrap(),
     }
 }
@@ -130,7 +152,15 @@ async fn next_send(r: &mut Rig) -> (String, Value) {
         .unwrap()
 }
 
-fn emit(r: &Rig, ev: ReplyEvent) {
+fn emit(r: &Rig, mut ev: ReplyEvent) {
+    let asked = r.link.asked.lock().unwrap().expect("an utterance was sent");
+    match &mut ev {
+        ReplyEvent::Speech { in_reply_to, .. } | ReplyEvent::Action { in_reply_to, .. } => {
+            if *in_reply_to == Some(ASKED) {
+                *in_reply_to = Some(asked);
+            }
+        }
+    }
     r.link.events.send(ev).unwrap();
 }
 
@@ -316,17 +346,40 @@ async fn malformed_args_and_unknown_kinds_refused_pc_left_alone() {
 }
 
 #[tokio::test]
-async fn other_reply_ids_ignored() {
+async fn other_replies_are_ignored() {
+    // R12-37: only the reply answering this utterance is followed.
     let mut r = rig(true);
     let (rx, done) = think(&r, req("hello"));
-    // Before the send: an old reply's chunk is already in flight.
-    let old = Uuid::new_v4();
     utterance(&mut r).await;
-    let (mine, other) = (Uuid::new_v4(), Uuid::new_v4());
-    emit(&r, speech(old, 3, "a resumed old reply", false)); // not seq 1: never followed
+    let (mine, phone, own, twin) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    // Another device's question, answered at the same moment, starting at seq 1.
+    emit(
+        &r,
+        answering(
+            speech(phone, 1, "someone else's", false),
+            Some(Uuid::new_v4()),
+        ),
+    );
+    emit(
+        &r,
+        answering(
+            action(phone, 2, "module.news", "show_news", json!({})),
+            Some(Uuid::new_v4()),
+        ),
+    );
+    // Core's own one-chunk result ("Done: ... is in the Recycle Bin."): answers no utterance.
+    emit(
+        &r,
+        answering(speech(own, 1, "A fictional result.", true), None),
+    );
     emit(&r, speech(mine, 1, "Hi.", false));
-    emit(&r, speech(other, 1, "someone else's", false));
-    emit(&r, action(other, 2, "module.news", "show_news", json!({})));
+    // A second reply naming the same utterance once one is followed: ignored.
+    emit(&r, speech(twin, 1, "a duplicate turn", false));
     emit(&r, speech(mine, 2, "Bye.", true));
     done.await.unwrap().unwrap();
     assert_eq!(drain(rx).await, vec![say("Hi."), say("Bye.")]);
@@ -340,18 +393,34 @@ async fn other_reply_ids_ignored() {
 }
 
 #[tokio::test]
-async fn a_reply_already_followed_is_never_followed_again() {
-    // A late chunk of the previous (timed-out) reply must not hijack the next turn.
+async fn the_answer_is_followed_when_its_first_event_never_arrives() {
+    // The ACTION chunk usually takes seq 1 and may be dropped (expired, never re-sent).
+    let mut r = rig(true);
+    let (rx, done) = think(&r, req("show me the news"));
+    utterance(&mut r).await;
+    let id = Uuid::new_v4();
+    emit(&r, speech(id, 2, "Here's the news.", true));
+    done.await.unwrap().unwrap();
+    assert_eq!(drain(rx).await, vec![say("Here's the news.")]);
+}
+
+#[tokio::test]
+async fn an_earlier_turns_reply_re_sent_is_ignored() {
+    // A late or re-sent chunk of the previous reply names the previous utterance.
     let mut r = rig(true);
     let (_rx, done) = think(&r, req("first"));
     utterance(&mut r).await;
+    let first_utterance = r.link.asked.lock().unwrap().unwrap();
     let first = Uuid::new_v4();
     emit(&r, speech(first, 1, "Part one.", false));
     emit(&r, speech(first, 2, "Done.", true));
     done.await.unwrap().unwrap();
     let (rx, done) = think(&r, req("second"));
     utterance(&mut r).await;
-    emit(&r, speech(first, 1, "Part one.", false)); // a re-send of the old reply
+    emit(
+        &r,
+        answering(speech(first, 1, "Part one.", false), Some(first_utterance)),
+    );
     let second = Uuid::new_v4();
     emit(&r, speech(second, 1, "Answer.", true));
     done.await.unwrap().unwrap();
@@ -381,7 +450,10 @@ async fn silence_times_out() {
     emit(&r, speech(id, 1, "Thinking.", false));
     // Ignored events don't count as an answer.
     tokio::time::sleep(SILENCE - Duration::from_secs(1)).await;
-    emit(&r, speech(Uuid::new_v4(), 1, "someone else's", false));
+    emit(
+        &r,
+        answering(speech(Uuid::new_v4(), 1, "someone else's", false), None),
+    );
     tokio::time::sleep(Duration::from_secs(2)).await;
     let err = done.await.unwrap().unwrap_err();
     assert!(
@@ -555,8 +627,8 @@ impl Link for ClosedLink {
     fn subscribe(&self) -> broadcast::Receiver<ReplyEvent> {
         broadcast::channel(1).1
     }
-    async fn send(&self, _: &'static str, _: Value) -> Result<(), NotConnected> {
-        Ok(())
+    async fn send(&self, _: &'static str, _: Value) -> Result<Uuid, NotConnected> {
+        Ok(Uuid::new_v4())
     }
 }
 

@@ -3,16 +3,13 @@
 //!
 //! - `think` sends `utterance {text, screen_summary}` and nothing else: the server owns the
 //!   history and the tools.
-//! - It follows one reply: the first whose first event after the send has `seq` 1, and never
-//!   one it followed before; within it, an event at or below the last `seq` seen is a re-send
-//!   (lost `received`, a gateway resync) and is dropped: never spoken or run twice.
-//!   **Interim rule, known to fail** (`reply_id` is not tied to the utterance): the real reply
-//!   is missed if its seq-1 event never arrives (an ACTION chunk usually takes seq 1, and the
-//!   gateway drops it after `valid_until` or never re-sends it), and a different reply that
-//!   starts at seq 1 during the turn is followed instead: a reply to another of the person's
-//!   devices (R12-9), core's own one-chunk `speak()` replies, a held turn released now, or a
-//!   reply this node never received being sent from seq 1 after a reconnect. The fix needs
-//!   the server to say which utterance each chunk answers (pending an owner ruling).
+//! - It follows the reply that answers that utterance: the first whose `in_reply_to` is the
+//!   utterance envelope's `message_id` (R12-37); every other reply (another device's, core's
+//!   own `speak()` results, re-sent old ones) is ignored. The first event seen may be past
+//!   seq 1 (a dropped ACTION chunk). Within it, an event at or below the last `seq` seen is a
+//!   re-send (a lost `received`, a gateway resync) and is dropped: never spoken or run twice.
+//!   `in_reply_to` is unsigned, so a faulty gateway could only hide the answer or point the
+//!   node at another reply of the same person; actions are still authorised by `authz` alone.
 //! - SPEECH becomes `BrainEvent::Speech` at once; `final` ends the turn.
 //! - A live `module.*` / `screen.*` action (args `{tool, input}`) whose tool `SERVER_TOOLS`
 //!   maps to that kind becomes `BrainEvent::Action`, then the receipt `OK` (D-2: OK means the
@@ -26,8 +23,7 @@
 //! - The desktop runtime (`jarvis-core` `BRAIN_TIMEOUT`, 8 s) caps the whole `think`, so in
 //!   the app a reply whose `final` comes later than 8 s after the send is cut there.
 
-use std::collections::{HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -59,8 +55,6 @@ pub const SILENCE: Duration = Duration::from_secs(20);
 /// The `utterance` contract's limits, in characters.
 pub const MAX_TEXT: usize = 4000;
 pub const MAX_SCREEN: usize = 2000;
-/// How many followed reply ids are remembered.
-const REMEMBERED: usize = 256;
 
 const UNREACHABLE: &str = "I can't reach the Jarvis server";
 const NO_ANSWER: &str = "the Jarvis server didn't answer";
@@ -71,7 +65,8 @@ const LOST: &str = "lost part of the Jarvis server's reply";
 pub trait Link: Send + Sync {
     fn connected(&self) -> bool;
     fn subscribe(&self) -> broadcast::Receiver<ReplyEvent>;
-    async fn send(&self, kind: &'static str, payload: Value) -> Result<(), NotConnected>;
+    /// Send a signed message; the envelope's `message_id` on success.
+    async fn send(&self, kind: &'static str, payload: Value) -> Result<Uuid, NotConnected>;
 }
 
 #[async_trait]
@@ -82,41 +77,18 @@ impl Link for NodeHandle {
     fn subscribe(&self) -> broadcast::Receiver<ReplyEvent> {
         self.subscribe_replies()
     }
-    async fn send(&self, kind: &'static str, payload: Value) -> Result<(), NotConnected> {
-        NodeHandle::send(self, kind, payload).await
+    async fn send(&self, kind: &'static str, payload: Value) -> Result<Uuid, NotConnected> {
+        self.send_tracked(kind, payload).await
     }
 }
 
 pub struct ServerBrain {
     link: Arc<dyn Link>,
-    followed: Mutex<Followed>,
-}
-
-#[derive(Default)]
-struct Followed {
-    set: HashSet<Uuid>,
-    order: VecDeque<Uuid>,
-}
-
-impl Followed {
-    fn add(&mut self, id: Uuid) {
-        if self.set.insert(id) {
-            self.order.push_back(id);
-            if self.order.len() > REMEMBERED {
-                if let Some(old) = self.order.pop_front() {
-                    self.set.remove(&old);
-                }
-            }
-        }
-    }
 }
 
 impl ServerBrain {
     pub fn new(link: Arc<dyn Link>) -> Self {
-        Self {
-            link,
-            followed: Mutex::default(),
-        }
+        Self { link }
     }
 
     /// Answer one live action of the followed reply.
@@ -204,9 +176,9 @@ impl Brain for ServerBrain {
         // Subscribe before sending, so nothing of the reply can slip past.
         let mut rx = self.link.subscribe();
         let utterance = json!({"text": clip(text, MAX_TEXT), "screen_summary": screen});
-        if self.link.send("utterance", utterance).await.is_err() {
+        let Ok(asked) = self.link.send("utterance", utterance).await else {
             return Err(BrainError::Unavailable(UNREACHABLE.into()));
-        }
+        };
 
         let mut following: Option<(Uuid, i64)> = None; // the reply, and its last seq seen
         let mut deadline = Instant::now() + SILENCE;
@@ -222,10 +194,19 @@ impl Brain for ServerBrain {
                 }
                 Ok(Ok(ev)) => ev,
             };
-            let (reply_id, seq) = match &ev {
-                ReplyEvent::Speech { reply_id, seq, .. } => (*reply_id, *seq),
-                ReplyEvent::Action { seq, authz } => match authz.reply_id {
-                    Some(id) => (id, *seq),
+            let (reply_id, seq, answers) = match &ev {
+                ReplyEvent::Speech {
+                    reply_id,
+                    seq,
+                    in_reply_to,
+                    ..
+                } => (*reply_id, *seq, *in_reply_to),
+                ReplyEvent::Action {
+                    seq,
+                    in_reply_to,
+                    authz,
+                } => match authz.reply_id {
+                    Some(id) => (id, *seq, *in_reply_to),
                     None => continue, // the node only broadcasts live actions
                 },
             };
@@ -238,14 +219,8 @@ impl Brain for ServerBrain {
                     *last = seq;
                 }
                 Some(_) => continue,
-                None => {
-                    let mut followed = self.followed.lock().expect("followed lock");
-                    if seq != 1 || followed.set.contains(&reply_id) {
-                        continue;
-                    }
-                    followed.add(reply_id);
-                    following = Some((reply_id, seq));
-                }
+                None if answers == Some(asked) => following = Some((reply_id, seq)),
+                None => continue,
             }
             deadline = Instant::now() + SILENCE;
             match ev {
@@ -257,7 +232,7 @@ impl Brain for ServerBrain {
                         return Ok(());
                     }
                 }
-                ReplyEvent::Action { seq, authz } => {
+                ReplyEvent::Action { seq, authz, .. } => {
                     self.on_action(reply_id, seq, authz, &tx).await;
                 }
             }

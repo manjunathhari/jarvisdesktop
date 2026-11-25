@@ -352,11 +352,24 @@ async fn speech_chunks_are_received_and_broadcast() {
     let mut r = rig().await;
     let mut replies = r.node.subscribe_replies();
     let reply_id = Uuid::new_v4();
-    let chunk = json!({"reply_id": reply_id, "seq": 1, "type": "SPEECH", "text": "Fictional reply.", "authz": null, "final": true});
+    let asked = Uuid::new_v4();
+    // R12-37: without `in_reply_to` (or with a bad one) a chunk is malformed: not received.
+    let bare = json!({"reply_id": reply_id, "seq": 1, "type": "SPEECH", "text": "Fictional reply.", "authz": null, "final": true});
+    r.push("reply.chunk", bare.clone()).await;
+    let mut bad = bare.clone();
+    bad["in_reply_to"] = json!("not-a-uuid");
+    r.push("reply.chunk", bad).await;
+    let mut chunk = bare;
+    chunk["in_reply_to"] = json!(asked);
     r.push("reply.chunk", chunk).await;
     let received = recv(&mut r.ws).await;
     assert_eq!(received["payload"], json!({"reply_id": reply_id, "seq": 1}));
     support::assert_conforms("received", &received["payload"]);
+    assert_eq!(
+        recv_within(&mut r.ws, Duration::from_millis(300)).await,
+        None,
+        "only the well-formed chunk is received"
+    );
     let got = tokio::time::timeout(Duration::from_secs(2), replies.recv())
         .await
         .unwrap()
@@ -367,7 +380,8 @@ async fn speech_chunks_are_received_and_broadcast() {
             reply_id,
             seq: 1,
             text: "Fictional reply.".into(),
-            final_: true
+            final_: true,
+            in_reply_to: Some(asked),
         }
     );
 }
@@ -382,26 +396,35 @@ async fn live_actions_are_checked_before_broadcast() {
         "core-1",
         live_action(Uuid::new_v4(), Uuid::new_v4(), now()),
     );
-    r.push("node.action", json!({"authz": other, "seq": 2}))
-        .await;
+    r.push(
+        "node.action",
+        json!({"authz": other, "seq": 2, "in_reply_to": null}),
+    )
+    .await;
     let gateway_only = signed(
         "gw-1",
         "core-1",
         live_action(r.node_id, Uuid::new_v4(), now()),
     );
-    r.push("node.action", json!({"authz": gateway_only, "seq": 2}))
-        .await;
+    r.push(
+        "node.action",
+        json!({"authz": gateway_only, "seq": 2, "in_reply_to": null}),
+    )
+    .await;
     // A valid one: broadcast.
     let reply_id = Uuid::new_v4();
     let good = signed("core-1", "core-1", live_action(r.node_id, reply_id, now()));
-    r.push("node.action", json!({"authz": good, "seq": 2}))
-        .await;
+    r.push(
+        "node.action",
+        json!({"authz": good, "seq": 2, "in_reply_to": null}),
+    )
+    .await;
     let got = tokio::time::timeout(Duration::from_secs(2), replies.recv())
         .await
         .unwrap()
         .unwrap();
     match got {
-        ReplyEvent::Action { seq, authz } => assert_eq!(
+        ReplyEvent::Action { seq, authz, .. } => assert_eq!(
             (seq, authz.reply_id),
             (2, Some(reply_id)),
             "the first broadcast is the valid one"
@@ -417,14 +440,28 @@ async fn a_node_action_needs_a_seq_and_a_live_authz() {
     let mut replies = r.node.subscribe_replies();
     let me = r.node_id;
     let good = || signed("core-1", "core-1", live_action(me, Uuid::new_v4(), now()));
-    r.push("node.action", json!({"authz": good()})).await;
-    r.push("node.action", json!({"authz": good(), "seq": 0}))
-        .await;
-    r.push("node.action", json!({"authz": good(), "seq": "2"}))
+    r.push("node.action", json!({"authz": good(), "in_reply_to": null}))
         .await;
     r.push(
         "node.action",
-        json!({"authz": good(), "seq": 2, "extra": 1}),
+        json!({"authz": good(), "seq": 0, "in_reply_to": null}),
+    )
+    .await;
+    r.push(
+        "node.action",
+        json!({"authz": good(), "seq": "2", "in_reply_to": null}),
+    )
+    .await;
+    r.push("node.action", json!({"authz": good(), "seq": 2}))
+        .await; // no in_reply_to
+    r.push(
+        "node.action",
+        json!({"authz": good(), "seq": 2, "in_reply_to": 5}),
+    )
+    .await;
+    r.push(
+        "node.action",
+        json!({"authz": good(), "seq": 2, "in_reply_to": null, "extra": 1}),
     )
     .await;
     let mut approved = live_action(r.node_id, Uuid::new_v4(), now());
@@ -433,22 +470,30 @@ async fn a_node_action_needs_a_seq_and_a_live_authz() {
     approved["approval_id"] = json!(Uuid::new_v4());
     r.push(
         "node.action",
-        json!({"authz": signed("core-1", "core-1", approved), "seq": 2}),
+        json!({"authz": signed("core-1", "core-1", approved), "seq": 2, "in_reply_to": null}),
     )
     .await;
     let reply_id = Uuid::new_v4();
     let last = signed("core-1", "core-1", live_action(r.node_id, reply_id, now()));
-    r.push("node.action", json!({"authz": last, "seq": 7}))
-        .await;
+    let asked = Uuid::new_v4();
+    r.push(
+        "node.action",
+        json!({"authz": last, "seq": 7, "in_reply_to": asked}),
+    )
+    .await;
     let got = tokio::time::timeout(Duration::from_secs(2), replies.recv())
         .await
         .unwrap()
         .unwrap();
     match got {
-        ReplyEvent::Action { seq, authz } => {
+        ReplyEvent::Action {
+            seq,
+            authz,
+            in_reply_to,
+        } => {
             assert_eq!(
-                (seq, authz.reply_id),
-                (7, Some(reply_id)),
+                (seq, authz.reply_id, in_reply_to),
+                (7, Some(reply_id), Some(asked)),
                 "only the last one"
             )
         }
@@ -464,8 +509,11 @@ async fn an_action_under_an_untrusted_core_key_asks_reenrol() {
         "core-9",
         live_action(r.node_id, Uuid::new_v4(), now()),
     );
-    r.push("node.action", json!({"authz": rogue, "seq": 2}))
-        .await;
+    r.push(
+        "node.action",
+        json!({"authz": rogue, "seq": 2, "in_reply_to": null}),
+    )
+    .await;
     let mut status = r.node.status();
     assert!(
         wait_for(
@@ -546,14 +594,19 @@ async fn server_brain_over_the_real_node() {
             &json!({"text": "show me the fictional news", "screen_summary": null})
         )
     );
+    let asked = utterance["message_id"].clone();
     let reply_id = Uuid::new_v4();
-    let chunk = |seq: i64, text: &str, last: bool| json!({"reply_id": reply_id, "seq": seq, "type": "SPEECH", "text": text, "authz": null, "final": last});
+    let chunk = |seq: i64, text: &str, last: bool| json!({"reply_id": reply_id, "seq": seq, "type": "SPEECH", "text": text, "authz": null, "final": last, "in_reply_to": asked});
+    // Another device's reply arriving first is ignored (R12-37).
+    let theirs = json!({"reply_id": Uuid::new_v4(), "seq": 1, "type": "SPEECH", "text": "Someone else's.", "authz": null, "final": true, "in_reply_to": Uuid::new_v4()});
+    r.push("reply.chunk", theirs).await;
+    assert_eq!(recv(&mut r.ws).await["kind"], "received");
     // The server's usual order: the ACTION chunk takes seq 1, the held-back speech follows.
     let mut obj = live_action(r.node_id, reply_id, now());
     obj["args"] = json!({"tool": "show_news", "input": {"channel": "headlines"}});
     r.push(
         "node.action",
-        json!({"authz": signed("core-1", "core-1", obj), "seq": 1}),
+        json!({"authz": signed("core-1", "core-1", obj), "seq": 1, "in_reply_to": asked}),
     )
     .await;
     let receipt = recv(&mut r.ws).await;

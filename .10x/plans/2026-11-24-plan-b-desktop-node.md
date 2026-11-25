@@ -341,16 +341,15 @@ As in the Phase 2 plan, shared interfaces belong to the spec and the contracts. 
 - Behaviour of `think` (corrected 25 Nov: live actions arrive as `node.action {authz, seq}`, i.e. `ReplyEvent::Action { seq, authz }`, never as ACTION reply chunks, per ruling G4.2; `seq` is R12-36):
   - If not connected, return `Unavailable("I can't reach the Jarvis server")` at once. A blank utterance is a `Protocol` error and sends nothing.
   - Otherwise subscribe first, then send `utterance {text, screen_summary}`. `text` is clipped to 4000 characters and `screen_summary` to 2000, and a blank `screen_summary` is sent as null. History and tools are not sent, because the server owns them.
-  - Follow the first reply whose first event after the send has `seq` 1 and that this `ServerBrain` has never followed before; ignore all other `reply_id`s.
+  - Follow the reply that answers this utterance: the first event whose `in_reply_to` is the utterance envelope's `message_id` (R12-37) picks the `reply_id`; every other reply is ignored (another device's, core's own `speak()` results with null, re-sent old ones, a second reply naming the same utterance). The first event seen may be past seq 1 (a dropped ACTION chunk).
     - Within the followed reply, an event at or below the last `seq` seen is a re-send and is dropped (never spoken or run twice).
-    - **Interim rule, known to fail (Task 6 review I-2/I-3, owner ruling pending):** `reply_id` isn't tied to the utterance. So the real reply is missed when its seq-1 event (usually the ACTION chunk) never arrives, and another reply that starts at seq 1 during the turn is followed instead: another device's (R12-9), core's one-chunk `speak()` replies, a released held turn, or a never-received reply sent from seq 1 after a reconnect.
   - Each SPEECH chunk becomes `BrainEvent::Speech` immediately; empty text is skipped.
   - Each live action of the followed reply:
     - `pc.*` actions are left to Task 8's executor, with no receipt;
     - `module.*` / `screen.*` actions with args exactly `{tool, input?}`, where `SERVER_TOOLS` maps `tool` to that `action_kind`, become `BrainEvent::Action(Action::new(tool, input))`, followed by the receipt `{reply_id, seq, result: "OK", evidence: {}}` (D-2: verified and handed to the coordinator, not rendered);
     - otherwise the receipt is REFUSED, with `{check}` = `unknown_tool`, `malformed_args`, `unknown_action_kind`, or `not_delivered` (the caller has gone).
   - `think` returns on `final`. 20 s (`SILENCE`) with no event of the followed reply gives `Unavailable("the Jarvis server didn't answer")`. A broadcast `Lagged` gives `Unavailable("lost part of the Jarvis server's reply")`.
-  - In the app, `jarvis-core`'s `BRAIN_TIMEOUT` (8 s) caps the whole `think`, so a reply whose `final` lands more than 8 s after the send is cut, and `SILENCE` never fires there (owner ruling pending; Task 9 measures it).
+  - In the app, `jarvis-core`'s `BRAIN_TIMEOUT` (8 s) caps the whole `think`, so a reply whose `final` lands more than 8 s after the send is cut, and `SILENCE` never fires there (R12-37: kept for now; Task 9 measures it).
 
 - [ ] **Step 1: Write the failing tests** (with a fake `Link`; paused tokio time where timing matters).
   - `speech_streams_in_order_until_final`.

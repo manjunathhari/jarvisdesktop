@@ -7,7 +7,8 @@
   "additionalProperties": false,
   "required": [
     "authz",
-    "seq"
+    "seq",
+    "in_reply_to"
   ],
   "properties": {
     "authz": {
@@ -17,6 +18,18 @@
       "type": "integer",
       "minimum": 1,
       "description": "The ACTION chunk's `seq` in its reply (unsigned, R12-36)."
+    },
+    "in_reply_to": {
+      "oneOf": [
+        {
+          "type": "string",
+          "format": "uuid"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Unsigned (R12-37): the envelope `message_id` of the utterance this reply answers, so the node can tell its own answer from other replies of the person; null for a reply that answers no utterance (a result Jarvis reports on its own). A wrong value from a faulty gateway can only make the node ignore or follow the wrong reply's speech; actions are still authorised only by `authz`."
     }
   }
 }

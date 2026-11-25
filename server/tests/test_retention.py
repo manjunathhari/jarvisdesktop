@@ -502,6 +502,25 @@ def test_no_table_grant_was_added(owner: Conn) -> None:
         ).fetchone() == (ok,), (role, table)
 
 
+# --- migration 0014 (R12-37) -------------------------------------------------------------------
+
+
+def test_0014_down_and_up() -> None:
+    """Down to 0013: no `in_reply_to` column. Up again: it is back, and NULL by default."""
+    column = (
+        "SELECT count(*) FROM information_schema.columns"
+        " WHERE table_schema = 'conv' AND table_name = 'stream_chunk'"
+        " AND column_name = 'in_reply_to'"
+    )
+    with fresh_database() as d:
+        migrate.downgrade(d.owner, "0013")
+        with psycopg.connect(d.owner, autocommit=True) as conn:
+            assert conn.execute(column).fetchone() == (0,)
+        migrate.upgrade(d.owner, "head")
+        with psycopg.connect(d.owner, autocommit=True) as conn:
+            assert conn.execute(column).fetchone() == (1,)
+
+
 # --- migration 0013 (R12-32) -------------------------------------------------------------------
 
 

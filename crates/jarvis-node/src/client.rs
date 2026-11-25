@@ -20,6 +20,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{sleep, timeout, Instant};
 use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::code::EnrolmentCode;
@@ -104,7 +105,7 @@ enum Cmd {
     Send {
         kind: String,
         payload: Value,
-        reply: oneshot::Sender<Result<(), NotConnected>>,
+        reply: oneshot::Sender<Result<Uuid, NotConnected>>,
     },
     Enrol {
         code: String,
@@ -126,6 +127,11 @@ pub struct Client {
 impl Client {
     /// Send a signed message now; fails at once if the link isn't up.
     pub async fn send(&self, kind: &str, payload: Value) -> Result<(), NotConnected> {
+        self.send_tracked(kind, payload).await.map(|_| ())
+    }
+
+    /// As `send`, returning the envelope's `message_id` once the frame is written.
+    pub async fn send_tracked(&self, kind: &str, payload: Value) -> Result<Uuid, NotConnected> {
         let (reply, rx) = oneshot::channel();
         self.cmds
             .send(Cmd::Send {
@@ -578,10 +584,10 @@ where
                 }
                 Some(Cmd::Send { kind, payload, reply }) => {
                     let now = chrono::Utc::now().fixed_offset();
-                    match session.send(&kind, payload, now) {
-                        Ok(frame) => {
+                    match session.send_tracked(&kind, payload, now) {
+                        Ok((message_id, frame)) => {
                             let ok = sink.send(Message::text(frame)).await.is_ok();
-                            let _ = reply.send(if ok { Ok(()) } else { Err(NotConnected) });
+                            let _ = reply.send(if ok { Ok(message_id) } else { Err(NotConnected) });
                             if !ok {
                                 return End::Closed(LINK_LOST);
                             }

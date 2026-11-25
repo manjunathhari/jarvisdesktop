@@ -24,8 +24,9 @@ chunks after `conv.stream_cursor.acked_seq` for `(reply, node)`. A reply's recip
 connected nodes of the person whose session it is (`stream_chunk.session_id` →
 `conv.session.person_id`, R12-9). The in-memory "sent up to" mark only avoids re-sending on
 every wake-up; correctness rests on the cursor. A SPEECH chunk is a `reply.chunk`; a live ACTION
-chunk is a `node.action {authz, seq}` to its `target_node_id` only (`seq` unsigned, so the
-node's live receipt can name the chunk, R12-36), while `now() <= valid_until`, and
+chunk is a `node.action {authz, seq, in_reply_to}` to its `target_node_id` only (`seq`
+unsigned, so the node's live receipt can name the chunk, R12-36; `in_reply_to` unsigned, the
+utterance the reply answers, R12-37), while `now() <= valid_until`, and
 is never re-sent on (re)connect (§6.2 step 8).
 
 **Reconnect (R9-1).** Candidate replies are those of the node's own person's sessions with a
@@ -237,7 +238,8 @@ WHERE o.person_id = %(person)s AND o.state IN ('PENDING', 'DELIVERING', 'DELIVER
 ORDER BY (o.kind = 'keys.keyset') DESC, o.created_at, o.id
 """
 _CHUNKS: LiteralString = """
-SELECT seq, type, text, authz, final, target_node_id, valid_until FROM conv.stream_chunk
+SELECT seq, type, text, authz, final, target_node_id, valid_until, in_reply_to
+FROM conv.stream_chunk
 WHERE reply_id = %s AND seq >= %s ORDER BY seq
 """
 
@@ -449,7 +451,9 @@ class NodeLink:
             cur = await conn.execute(_CHUNKS, (reply_id, start))
             chunks = await cur.fetchall()
             frames: list[tuple[MessageKind, dict[str, Any]]] = []
-            for seq, kind, text, authz, final, target, valid_until in chunks:
+            for seq, kind, text, authz, final, target, valid_until, answers in chunks:
+                # R12-37: the utterance this reply answers (unsigned; null if none).
+                in_reply_to = None if answers is None else str(answers)
                 if kind == "SPEECH":
                     payload = {
                         "reply_id": str(reply_id),
@@ -458,10 +462,14 @@ class NodeLink:
                         "text": text,
                         "authz": None,
                         "final": final,
+                        "in_reply_to": in_reply_to,
                     }
                     frames.append((MessageKind.REPLY_CHUNK, payload))
                 elif live and target == self.node_id and now <= valid_until:
-                    frames.append((MessageKind.NODE_ACTION, {"authz": authz, "seq": seq}))
+                    frames.append(
+                        (MessageKind.NODE_ACTION,
+                         {"authz": authz, "seq": seq, "in_reply_to": in_reply_to})
+                    )  # fmt: skip
             if frames:
                 await self._fence(conn)
         if chunks:

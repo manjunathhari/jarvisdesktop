@@ -405,9 +405,10 @@ class _Stream:
     """SPEECH chunks of one reply, each committed with its NOTIFY. One piece is kept back, so
     that the last one can be written as the final chunk when the call has been settled."""
 
-    def __init__(self, c: psycopg.Connection[Any], session_id: UUID) -> None:
+    def __init__(self, c: psycopg.Connection[Any], session_id: UUID, in_reply_to: UUID) -> None:
         self.c = c
         self.session_id = session_id
+        self.in_reply_to = in_reply_to  # the utterance this reply answers (R12-37)
         self.reply_id = uuid.uuid4()
         self.seq = 0
         self.pieces: list[str] = []
@@ -457,14 +458,15 @@ class _Stream:
         self.seq = actions.issue_live(
             self.c, reply_id=self.reply_id, session_id=self.session_id, target_node_id=target,
             person_id=person_id, action_kind=kind, args=args, now=now,
+            in_reply_to=self.in_reply_to,
         )  # fmt: skip
 
     def _write(self, text: str, *, final: bool) -> None:
         self.seq += 1
         self.c.execute(
-            "INSERT INTO conv.stream_chunk (reply_id, session_id, seq, type, text, final)"
-            " VALUES (%s, %s, %s, 'SPEECH', %s, %s)",
-            (self.reply_id, self.session_id, self.seq, text, final),
+            "INSERT INTO conv.stream_chunk (reply_id, session_id, seq, type, text, final,"
+            " in_reply_to) VALUES (%s, %s, %s, 'SPEECH', %s, %s, %s)",
+            (self.reply_id, self.session_id, self.seq, text, final, self.in_reply_to),
         )
         self.c.execute("SELECT pg_notify('jarvis_stream', %s)", (str(self.reply_id),))
 
@@ -695,7 +697,7 @@ def run(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
             return
         assert reservation is not None
 
-        stream = _Stream(c, session_id)
+        stream = _Stream(c, session_id, turn.id)
         phase = _call(c, brain, req, turn, stream)
         usage = brain.usage
         if phase is None and usage is None:  # completed but unmetered: fail closed (carry-over c)
