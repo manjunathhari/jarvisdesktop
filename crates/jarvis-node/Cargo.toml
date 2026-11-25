@@ -20,6 +20,7 @@ uuid.workspace = true
 chrono.workspace = true
 zeroize.workspace = true
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 tokio-tungstenite = "0.30.0"
 futures-util = "0.3.34"
 getrandom = "0.3"
@@ -42,7 +43,11 @@ windows = { version = "0.61", features = [
 
 [features]
 # Test doubles (MemoryKeyStore) for this crate's integration tests and test tools.
-test-support = []
+test-support = ["dep:tracing-subscriber"]
+
+[[bin]]
+name = "jarvis-node-probe"
+required-features = ["test-support"]
 
 [dev-dependencies]
 jarvis-node = { path = ".", features = ["test-support"] }

@@ -1,7 +1,7 @@
 //! Approval cards and server notices in the window (plan B Task 7).
 //!
-//! The node is started by the ServerBrain cutover (Task 9); until then `NodeSlot` is empty,
-//! no card can arrive, and "approve" / "deny" reach the coordinator as before.
+//! The node runs in server mode (`node.toml`, see `server_mode`); otherwise `NodeSlot` is
+//! empty, no card can arrive, and "approve" / "deny" reach the coordinator as before.
 //! - `forward` relays the node's `UiEvent`s to the window: `jarvis://approval-card`,
 //!   `jarvis://approval-cleared`, `jarvis://notice`, `jarvis://notice-cleared`.
 //! - `decide_approval` is the Approve / Deny buttons' command.
@@ -30,7 +30,6 @@ pub const NOT_SENT_GONE: &str = "That approval is no longer open.";
 pub const NOT_SENT_OFFLINE: &str = "I can't reach the Jarvis server, so nothing was sent.";
 
 /// What the window draws for a card. The countdown runs from `valid_until`.
-#[allow(dead_code)] // reached through `forward`, which the Task 9 cutover starts
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CardView {
     pub outbox_id: String,
@@ -39,7 +38,6 @@ pub struct CardView {
     pub valid_until: String,
 }
 
-#[allow(dead_code)] // reached through `forward`, which the Task 9 cutover starts
 pub fn card_view(card: &ApprovalCard) -> CardView {
     CardView {
         outbox_id: card.outbox_id.to_string(),
@@ -49,14 +47,12 @@ pub fn card_view(card: &ApprovalCard) -> CardView {
     }
 }
 
-#[allow(dead_code)] // reached through `forward`, which the Task 9 cutover starts
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Cleared {
     pub outbox_id: String,
     pub reason: String,
 }
 
-#[allow(dead_code)] // reached through `forward`, which the Task 9 cutover starts
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NoticeView {
     pub outbox_id: String,
@@ -143,7 +139,6 @@ pub async fn decide_approval(
 
 /// Relay the node's events to the window until the node stops. Notices are acknowledged
 /// once they have been handed to the window (`NodeHandle::shown`).
-#[allow(dead_code)] // reached through `forward`, which the Task 9 cutover starts
 pub async fn forward(app: AppHandle, slot: NodeSlot, mut events: mpsc::Receiver<NodeEvent>) {
     while let Some(ev) = events.recv().await {
         let r = match ev {
@@ -184,8 +179,12 @@ pub async fn forward(app: AppHandle, slot: NodeSlot, mut events: mpsc::Receiver<
                     reason,
                 },
             ),
-            // Link status, the reconnect summary and clock warnings: Task 9's screen.
-            NodeEvent::Summary(_) | NodeEvent::Link(_) | NodeEvent::ClockOff(_) => Ok(()),
+            NodeEvent::Link(status) => {
+                app.emit("jarvis://link", crate::server_mode::link_text(&status))
+            }
+            NodeEvent::ClockOff(ms) => app.emit("jarvis://clock_off", ms),
+            // The reconnect summary is display-only; its items also arrive as notices.
+            NodeEvent::Summary(_) => Ok(()),
         };
         if let Err(e) = r {
             tracing::warn!(error = %e, "emit failed");

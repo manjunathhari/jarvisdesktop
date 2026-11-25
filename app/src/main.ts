@@ -184,7 +184,7 @@ if (await invoke<boolean>("needs_key")) {
 
 // Tapping anywhere wakes JARVIS (except inside the video, which keeps its own controls).
 document.addEventListener("pointerdown", (e) => {
-  if ((e.target as HTMLElement).closest("#devtype, #setup, #approvals, #notices")) return;
+if ((e.target as HTMLElement).closest("#devtype, #setup, #enrolment, #approvals, #notices")) return;
   invoke("tap");
 });
 // Esc always closes JARVIS; F11 switches between window and full screen.
@@ -328,3 +328,48 @@ listen<Cleared>("jarvis://notice-cleared", ({ payload }) => {
     if (li.dataset.id === payload.outbox_id) li.remove();
   }
 });
+
+// ── The Jarvis server link and enrolment (Plan B Task 9) ──────────────────
+// Status words come from Rust: claude | error: … | not_enrolled | connecting | connected |
+// needs_reenrol | failed: …
+const enrolment = $<HTMLFormElement>("enrolment");
+const enrolCode = $<HTMLInputElement>("enrolcode");
+const enrolError = $("enrolerror");
+const linkLine = $("link");
+const LINK_WORDS: Record<string, string> = {
+  not_enrolled: "Not connected to the Jarvis server yet",
+  connecting: "Connecting to the Jarvis server…",
+  connected: "Jarvis server",
+  needs_reenrol: "The Jarvis server needs this PC enrolled again",
+};
+
+function showLink(status: string) {
+  if (status === "claude") {
+    linkLine.hidden = true;
+    enrolment.hidden = true;
+    return;
+  }
+  linkLine.hidden = false;
+  linkLine.textContent = LINK_WORDS[status] ?? (status.startsWith("error: ") ? status.slice(7) : status);
+  linkLine.dataset.state = status === "connected" ? "connected" : status === "connecting" ? "" : "trouble";
+  const enrol = status === "not_enrolled" || status === "needs_reenrol";
+  if (enrol && enrolment.hidden) {
+    enrolment.hidden = false;
+    enrolCode.focus();
+  }
+  if (!enrol) enrolment.hidden = true;
+}
+
+enrolment.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  enrolError.textContent = "";
+  try {
+    await invoke("enrol", { code: enrolCode.value });
+    enrolCode.value = "";
+  } catch (msg) {
+    enrolError.textContent = String(msg);
+  }
+});
+
+listen<string>("jarvis://link", ({ payload }) => showLink(payload));
+showLink(await invoke<string>("node_status"));

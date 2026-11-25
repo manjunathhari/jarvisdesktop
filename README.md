@@ -29,3 +29,29 @@ Score the brain against the test phrasings:
 ```powershell
 cargo run -p jarvis-brain --bin jarvis-eval
 ```
+
+## Connecting the desktop to the Jarvis server
+
+By default the desktop uses its own Claude brain, as above. To have the Jarvis server answer instead, with your memory, approvals and the test folder, create `node.toml` in the app's local data folder (`%LOCALAPPDATA%\in.mhsurgery.jarvis\`):
+
+```toml
+brain = "server"
+gateway = "<your gateway's tailnet name>:<port>"   # host:port, never committed anywhere
+test_folder = 'C:\Users\<you>\JarvisTest'          # optional: the only folder Jarvis may delete from
+```
+
+Then start JARVIS. It shows **Connect to the Jarvis server** the first time:
+
+1. On the server, run `jarvis-core node enrol --person <you> --kind DESKTOP --name "<this PC>"`. It prints a one-time code.
+2. Type the code into the screen and press **Connect**. The code works once and expires soon; it is never stored or logged.
+
+The status line at the bottom right shows the link. In server mode the Anthropic key is never read; once you have accepted Phase 2, the `forget_claude_key` command removes it from Credential Manager. Delete `node.toml` to go back to the desktop's own brain.
+
+Deletes only ever go to the Recycle Bin, only from `test_folder`, and only after you approve the card (tap, or say "approve" when one card is showing).
+
+The Rust node's end-to-end tests run against the real server code:
+
+```bash
+cargo build -p jarvis-node --features test-support --bin jarvis-node-probe
+cd server && JARVIS_NODE_PROBE=../target/debug/jarvis-node-probe uv run pytest tests/test_rust_node.py
+```

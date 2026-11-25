@@ -1,9 +1,9 @@
 name: Server
 on:
   push:
-    paths: ['server/**', 'contracts/**', '.github/workflows/server.yml']
+    paths: ['server/**', 'contracts/**', 'crates/jarvis-node/**', 'crates/jarvis-core/**', 'Cargo.lock', '.github/workflows/server.yml']
   pull_request:
-    paths: ['server/**', 'contracts/**', '.github/workflows/server.yml']
+    paths: ['server/**', 'contracts/**', 'crates/jarvis-node/**', 'crates/jarvis-core/**', 'Cargo.lock', '.github/workflows/server.yml']
 
 permissions:
   contents: read
@@ -47,8 +47,15 @@ jobs:
         run: uv run ruff check . && uv run ruff format --check .
       - name: Types
         run: uv run mypy
-      - name: Tests (P0-1 … P0-6 and unit tests)
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the Rust node probe (plan B Task 9, D-3)
+        working-directory: .
+        run: cargo build -p jarvis-node --features test-support --bin jarvis-node-probe
+      - name: Tests (P0-1 … P0-6, unit tests, and the Rust node end to end)
         run: uv run pytest -v
+        env:
+          JARVIS_NODE_PROBE: ${{ github.workspace }}/target/debug/jarvis-node-probe
       - name: Compose file is valid
         run: docker compose -f deploy/compose.yaml config --quiet
         env:

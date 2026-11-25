@@ -111,7 +111,7 @@ html, body {
 #overlay p.body { font-size: var(--s1); line-height: 1.55; margin: 0; color: var(--ink); }
 
 /* first-run setup: the one screen with a button */
-#setup {
+#setup, #enrolment {
   position: absolute;
   inset: 0;
   z-index: 2;
@@ -122,12 +122,12 @@ html, body {
   gap: 0.9rem;
   padding: var(--gap) max(var(--gap), calc((100vw - 40rem) / 2));
 }
-#setup > * { width: 100%; }
-#setup button { width: auto; }
-#setup[hidden] { display: none; }
-#setup h1 { margin: 0; font: 600 var(--s3) / 1.15 var(--display); }
-#setup p { margin: 0; color: var(--ash); max-width: 52ch; }
-#setup input {
+#setup > *, #enrolment > * { width: 100%; }
+#setup button, #enrolment button { width: auto; }
+#setup[hidden], #enrolment[hidden] { display: none; }
+#setup h1, #enrolment h1 { margin: 0; font: 600 var(--s3) / 1.15 var(--display); }
+#setup p, #enrolment p { margin: 0; color: var(--ash); max-width: 52ch; }
+#setup input, #enrolment input {
   width: 100%;
   background: transparent;
   border: 1px solid var(--ash);
@@ -136,8 +136,8 @@ html, body {
   padding: 0.6em 0.8em;
   border-radius: 0.4rem;
 }
-#setup input:focus { outline: 2px solid var(--arc); outline-offset: 2px; }
-#setup button {
+#setup input:focus, #enrolment input:focus { outline: 2px solid var(--arc); outline-offset: 2px; }
+#setup button, #enrolment button {
   font: 600 var(--s0) var(--text);
   color: var(--void);
   background: var(--arc);
@@ -146,9 +146,9 @@ html, body {
   padding: 0.55em 1.2em;
   cursor: pointer;
 }
-#setup button:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
-#setuperror { color: var(--ink) !important; min-height: 1.45em; }
-#setup .hint { font-size: var(--s-1); }
+#setup button:focus-visible, #enrolment button:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
+#setuperror, #enrolerror { color: var(--ink) !important; min-height: 1.45em; }
+#setup .hint, #enrolment .hint { font-size: var(--s-1); }
 
 /* ── presence: orb + captions ───────────────────────────── */
 
@@ -302,3 +302,15 @@ body[data-mode="mic_off"] #orb span { opacity: 0.4; border-color: var(--ash); bo
 }
 #notices li.urgent { border-left-color: var(--live); }
 #notices li.today { border-left-color: var(--arc); }
+
+/* ── the link to the Jarvis server (Plan B Task 9) ─────── */
+#link {
+  position: fixed;
+  right: var(--gap);
+  bottom: var(--gap);
+  margin: 0;
+  font-size: var(--s-1);
+  color: var(--ash);
+}
+#link[data-state="connected"]::before { content: "● "; color: var(--arc); }
+#link[data-state="trouble"]::before { content: "● "; color: var(--live); }

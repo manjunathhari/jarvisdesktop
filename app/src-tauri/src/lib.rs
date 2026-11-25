@@ -2,6 +2,8 @@
 
 mod approvals;
 mod key;
+mod node_config;
+mod server_mode;
 
 use chrono::Timelike;
 use jarvis_brain::ClaudeBrain;
@@ -35,6 +37,7 @@ struct TauriUi {
     app: AppHandle,
     voice: VoiceSlot,
     ears: EarsSlot,
+    clock: server_mode::TurnClock,
 }
 
 impl Ui for TauriUi {
@@ -43,6 +46,7 @@ impl Ui for TauriUi {
         let r = match ev {
             UiEvent::Screen(v) => app.emit("jarvis://screen", v),
             UiEvent::Speak(s) => {
+                self.clock.speaking();
                 let _ = app.emit("jarvis://caption", &s);
                 match self.voice.lock().ok().as_deref().and_then(Option::as_ref) {
                     Some(v) => {
@@ -58,7 +62,10 @@ impl Ui for TauriUi {
                 }
                 app.emit("jarvis://stop_speaking", ())
             }
-            UiEvent::Heard(s) => app.emit("jarvis://heard", s),
+            UiEvent::Heard(s) => {
+                self.clock.heard();
+                app.emit("jarvis://heard", s)
+            }
             UiEvent::Status(m) => {
                 // The mic is on only while JARVIS is waiting for you to speak.
                 let on = matches!(m, Mode::Listening | Mode::FollowUp);
@@ -148,10 +155,11 @@ fn typed_input_enabled() -> bool {
     true
 }
 
-/// First run: the UI asks for the key once if none is stored.
+/// First run: the UI asks for the key once if none is stored (never in server mode, where
+/// the key isn't read at all).
 #[tauri::command]
-fn needs_key() -> bool {
-    key::load().is_none()
+fn needs_key(mode: State<'_, server_mode::Mode>) -> bool {
+    !mode.server() && mode.error.is_none() && key::load().is_none()
 }
 
 /// Save the pasted key to Credential Manager, then restart so the brain picks it up.
@@ -383,20 +391,74 @@ pub fn run() {
             registry.register(Box::new(LiveTvModule::new(cfg.channels.clone())));
             registry.register(Box::new(ScreenModule));
 
-            let brain = brain();
-            if brain.is_none() {
-                tracing::warn!("no Anthropic key stored yet; only local commands will work");
-            }
+            // Which brain: node.toml in the data folder (none: today's Claude brain).
+            let node: approvals::NodeSlot = Arc::default();
+            let data_dir = app.path().app_local_data_dir().ok();
+            let config = match &data_dir {
+                Some(dir) => node_config::load(dir),
+                None => Ok(node_config::NodeConfig::default()),
+            };
+            let (brain, mode) = match config {
+                Ok(c) if c.brain == node_config::BrainChoice::Server => {
+                    let dir = data_dir.clone().expect("a config was read from it");
+                    match server_mode::start(app.handle(), &c, &dir, &node) {
+                        Ok(b) => {
+                            tracing::info!("brain: the Jarvis server");
+                            (
+                                Some(b),
+                                server_mode::Mode {
+                                    brain: c.brain,
+                                    error: None,
+                                },
+                            )
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "server mode couldn't start");
+                            (
+                                None,
+                                server_mode::Mode {
+                                    brain: c.brain,
+                                    error: Some(e),
+                                },
+                            )
+                        }
+                    }
+                }
+                Ok(c) => {
+                    let b = brain();
+                    if b.is_none() {
+                        tracing::warn!(
+                            "no Anthropic key stored yet; only local commands will work"
+                        );
+                    }
+                    (
+                        b,
+                        server_mode::Mode {
+                            brain: c.brain,
+                            error: None,
+                        },
+                    )
+                }
+                Err(e) => {
+                    // A wrong node.toml is shown, never silently replaced by another brain.
+                    tracing::error!(error = %e, "node.toml");
+                    let mode = server_mode::Mode {
+                        brain: node_config::BrainChoice::Claude,
+                        error: Some(e),
+                    };
+                    (None, mode)
+                }
+            };
+            app.manage(mode);
             let voice: VoiceSlot = Arc::new(Mutex::new(None));
             let ears: EarsSlot = Arc::new(Mutex::new(None));
             let ui = Arc::new(TauriUi {
                 app: app.handle().clone(),
                 voice: voice.clone(),
                 ears: ears.clone(),
+                clock: server_mode::TurnClock::default(),
             });
             let (handle, fut) = runtime(USER_NAME, brain, Arc::new(registry), ui);
-            // The server node: started by the ServerBrain cutover (Task 9); empty until then.
-            let node: approvals::NodeSlot = Arc::default();
             app.manage(node.clone());
             app.manage(voice.clone());
             tauri::async_runtime::spawn(fut);
@@ -436,7 +498,10 @@ pub fn run() {
             typed_input_enabled,
             needs_key,
             save_key,
-            approvals::decide_approval
+            approvals::decide_approval,
+            server_mode::node_status,
+            server_mode::enrol,
+            server_mode::forget_claude_key
         ])
         .run(tauri::generate_context!())
         .expect("error while running JARVIS");
