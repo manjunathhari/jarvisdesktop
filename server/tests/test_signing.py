@@ -106,6 +106,8 @@ def test_vector_set_has_the_required_cases() -> None:
         "kannada-and-emoji",
         "hindi",
         "integers-only",
+        "rfc8785-sorting",
+        "key-order-utf16",
     ):
         assert required in names
     by_name = {v["name"]: v for v in VECTORS}
@@ -135,6 +137,24 @@ def test_rfc8785_case_is_the_published_output() -> None:
 
 
 # ---------------------------------------------------------------- binding and tampering
+
+
+def test_rfc8785_sorting_case_is_the_published_order() -> None:
+    """RFC 8785 §3.2.3: keys sort by UTF-16 code units; the RFC lists the values in order."""
+    case = next(v for v in VECTORS if v["name"] == "rfc8785-sorting")
+    text = case["expected_canonical_utf8"]
+    order = [
+        "Carriage Return",
+        "One",
+        "Control",
+        "Latin Small Letter O With Diaeresis",
+        "Euro Sign",
+        "Emoji: Grinning Face",
+        "Hebrew Letter Dalet With Dagesh",
+    ]
+    at = [text.index(f'"{value}"') for value in order]
+    assert at == sorted(at)
+    assert canonical(case["object"]).decode() == text
 
 
 def test_signed_bytes_layout() -> None:

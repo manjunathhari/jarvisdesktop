@@ -1,6 +1,6 @@
 # Status — JARVIS Desktop
 
-**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). Architecture v2 Phase 0 (server) complete, PR #2 merged 2026-11-21, running on the shared server. Phase 1 (memory engine) complete, PR #3 merged 2026-11-22. **Phase 2 server (core + nodes): Tasks 1–15 complete on `phase-2-server`; PR #5 to `main` open, not merged, not deployed. 1 202 tests green (`-W error`); final QA and security reviews 2026-11-24 found no blocking issues after one fix wave. Spec Revision 12 with owner rulings R12-1 to R12-34. Next: Manj's merge decision, then the deploy and the runbook's live checks (P2-S5, P2-S7, P0-8, 3 s first-chunk latency), then Plan B (the Rust desktop node).**
+**Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). Architecture v2 Phase 0 (server) complete, PR #2 merged 2026-11-21, running on the shared server. Phase 1 (memory engine) complete, PR #3 merged 2026-11-22. **Phase 2 server (core + nodes): complete, merged (PR #5, PR #6 deploy fix) and live on the shared server since 2026-11-24 at `main` = `c75fb9c`. Live checks passed: init smoke 18/18, P2-S5, P2-S7, P0-8, and an end-to-end run from Manj's PC with fictional phrases (first reply chunk 1.3–1.9 s in 4 of 5 turns, 4.0 s in one). The gateway is on the tailnet only; no devices enrolled. Plan B (the Rust desktop node): all 9 tasks built, reviewed and fixed (2026-11-24/25); branch `plan-b` pushed to GitHub with Manj's approval (not merged, not deployed); CI green on Linux and Windows (run #31, `d8d698b`), Server workflow green on `443d01f` (run #44; the later fix commits re-trigger it, confirm before merging). Next: Manj's review and merge, then the server deploy (migration 0014) before Step 7, the live P2-A1 check on his PC.**
 **Started:** 2026-11-21
 
 ## Known so far
@@ -102,3 +102,27 @@ Build: 236 tests green locally (Postgres 16, password auth) and in CI (Postgres 
 1. ~~Push and open PR~~ — PR #3. 2. ~~CI green~~. 3. ~~Live check~~ — passed 2026-11-22.
 4. ~~Manj merges PR #3~~ — merged 2026-11-22. ~~Remove the phase branches from the publish condition (main only)~~ — close-out PR #4. Redeploy `main` after this PR merges.
 5. Next phase: Phase 2 (Jarvis core + nodes) — brainstorm + design doc first.
+
+## 2026-11-24/25 — Plan B (the Rust desktop node)
+Plan `.10x/plans/2026-11-24-plan-b-desktop-node.md`, approved by Manj with D-1 to D-3 and the recovery table. Owner rulings added to spec §20: R12-35 (Rust JCS library), R12-36 (`node.action` carries the chunk's `seq`, unsigned), R12-37 (`in_reply_to` on every reply chunk, migration 0014). Decision 2: the desktop's 8 s `BRAIN_TIMEOUT` stays for now.
+
+### Plan B task list
+- [x] T1 S-9: shared keyset-target and role cases
+- [x] T2 `jarvis-node` crate: signing (JCS, R12-35), shared vectors, trust store
+- [x] T3 Session, enrolment, key store (DPAPI on Windows)
+- [x] T4 Client: reconnect after every close except 4409, heartbeats
+- [x] T5 Delivery: outbox items, seen-list, acks, keysets (R12-26)
+- [x] T6 `ServerBrain` (R12-36, R12-37)
+- [x] T7 Approval cards (spoken or clicked decisions; a card ends with SENT)
+- [x] T8 Test-folder executor: journal, Recycle Bin delete, recovery table; approved-action items are not acked (resent until cleared, 2 h window)
+- [x] T9 Cutover: `node.toml`, enrolment screen, `jarvis-node-probe`, end-to-end tests against the real gateway and core (D-3)
+
+### Verification
+- Local: Rust 298 tests, clippy `--all-features -D warnings` and fmt clean; server 1236 tests (2 Docker-only skipped), ruff and mypy clean.
+- GitHub (branch push approved by Manj, 25 Nov): CI run #31 green on ubuntu-latest and windows-latest; Server run #44 green on `443d01f`, nothing published (the fix commits re-trigger it; confirm the latest run before merging). The Windows-only tests (folder safety, Recycle Bin, crash recovery P2-A8, DPAPI key store) passed on windows-latest. Getting there took three CI-and-test fixes and no product change: keep sherpa-onnx's downloaded libraries in the CI cache; close a journal before reopening it in tests (the journal allows one writer on Windows); compare source text with LF endings; and `cargo test --no-fail-fast`.
+
+### Needs Manj
+- Review and merge `plan-b` (PR not opened yet).
+- Approve the server deploy (migration 0014) — it must go before the desktop.
+- Step 7 on his PC (checklist in the Task 9 handover): enrol, a fictional delete, 5 timed phrases.
+- Open decisions: not acking approved-action items; withholding `received` when there is nothing to send; whether an idle desktop shows replies with a null `in_reply_to`; timestamps in `jarvis-ears`/`jarvis-voice` for the full latency measure; the D-3 key-store deviation.

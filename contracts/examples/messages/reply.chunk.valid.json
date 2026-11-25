@@ -4,5 +4,6 @@
   "type": "SPEECH",
   "text": "नमस्ते! Thursday is clear.",
   "authz": null,
-  "final": false
+  "final": false,
+  "in_reply_to": "0b6c2f3e-8d1a-4c5b-9e7f-2a3b4c5d6e7f"
 }

@@ -39,6 +39,7 @@ const KEYS = {
   "core-1": keyFor("core-1"),
   "core-2": keyFor("core-2"),
   "gw-1": keyFor("gw-1"),
+  "gw-2": keyFor("gw-2"),
   "node-1": keyFor("node-1"),
   "unknown-1": keyFor("unknown-1"),
 };
@@ -86,6 +87,55 @@ if (Buffer.from(jcs(rfcObject), "utf8").toString("hex") !== RFC8785_OUTPUT_HEX) 
   throw new Error("canonicalize does not reproduce RFC 8785 §3.2.3/§3.2.4");
 }
 
+// RFC 8785 §3.2.3 property-sorting sample, copied from the RFC text at rfc-editor.org. Keys
+// sort by their UTF-16 code units; the RFC lists the resulting order of the values. The
+// generator refuses to run if `canonicalize` gives any other order.
+const RFC8785_SORTING_INPUT = String.raw`{
+  "€": "Euro Sign",
+  "\r": "Carriage Return",
+  "דּ": "Hebrew Letter Dalet With Dagesh",
+  "1": "One",
+  "😀": "Emoji: Grinning Face",
+  "\u0080": "Control",
+  "ö": "Latin Small Letter O With Diaeresis"
+}`;
+const RFC8785_SORTED_VALUES = [
+  "Carriage Return",
+  "One",
+  "Control",
+  "Latin Small Letter O With Diaeresis",
+  "Euro Sign",
+  "Emoji: Grinning Face",
+  "Hebrew Letter Dalet With Dagesh",
+];
+const rfcSortingObject = JSON.parse(RFC8785_SORTING_INPUT);
+// Checked on the canonical text itself: re-parsing it would not keep the order, because a
+// JavaScript object always lists integer-like keys such as "1" first.
+{
+  const text = jcs(rfcSortingObject);
+  const at = RFC8785_SORTED_VALUES.map((value) => text.indexOf(`"${value}"`));
+  if (at.some((i, n) => i < 0 || (n > 0 && i <= at[n - 1]))) {
+    throw new Error("canonicalize does not reproduce the RFC 8785 §3.2.3 property order");
+  }
+}
+
+// Keys whose UTF-16 order differs from the order of their escaped UTF-8 bytes: a prefix
+// followed by a character below '"' ("a" < "a b"), an escaped control character before a
+// letter ("\n" < "A"), an escaped quote ('"' < "#"), and an astral character (a surrogate
+// pair, D83D) before U+FFFF. Signers that sort serialised bytes get these wrong.
+const KEY_ORDER_OBJECT = {
+  "a b": 2,
+  a: 1,
+  A: 4,
+  "\n": 3,
+  "": 5,
+  "￿": 7,
+  "😀": 6,
+  "#": 9,
+  '"': 8,
+  args: { "name!": "y", name: "x" },
+};
+
 // ---------------------------------------------------------------- vectors
 
 const vector = (name, purpose, keyLabel, keyId, object) => ({
@@ -103,6 +153,8 @@ const SHARED = { kind: "ping", note: "same object, different binding", seq: 7 };
 
 const vectors = () => [
   vector("rfc8785-appendix", "core-authz", "core-1", "core-1", rfcObject),
+  vector("rfc8785-sorting", "core-authz", "core-1", "core-1", rfcSortingObject),
+  vector("key-order-utf16", "core-authz", "core-1", "core-1", KEY_ORDER_OBJECT),
   vector("ascii-simple", "node-msg", "node-1", "node-1", { kind: "ping", text: "hello jarvis" }),
   vector("nested-keys-unsorted", "gw-transport", "gw-1", "gw-1", {
     zeta: 1,
@@ -206,15 +258,27 @@ const NEW_CORE_KEY = {
   public_key: KEYS["core-2"].pubRaw.toString("base64url"),
 };
 
-const keysetCase = (name, now, payload, expect, reason, overrides = {}) => ({
+// A gateway key announcement (R6-3): accepted, but its key is pinned as a GATEWAY key and
+// never enters core trust.
+const NEW_GATEWAY_KEY = {
+  role: "gateway",
+  key_id: "gw-2",
+  public_key: KEYS["gw-2"].pubRaw.toString("base64url"),
+};
+
+// `receiving_node_id` is the node checking it (the target rule, R12-27); an accepted
+// keyset also says which pin set its key goes to (`pins_as`, the role rule, R6-3).
+const keysetCase = (name, now, payload, expect, reason, overrides = {}, args = NEW_CORE_KEY) => ({
   name,
   check: "keyset",
   trusted_keys: TRUSTED,
+  receiving_node_id: ME,
   now,
   payload,
-  authz: authzOf(keysetObject(NEW_CORE_KEY, overrides)),
+  authz: authzOf(keysetObject(args, overrides)),
   expect,
   reason,
+  ...(expect === "accept" ? { pins_as: args.role } : {}),
 });
 
 const tampered = () => {
@@ -363,6 +427,21 @@ const authzCases = () => [
     "wrong_target",
   ),
   authzCase("reject-expired", "2026-11-22T10:02:31Z", authzOf(actionObject()), "reject", "expired"),
+  // Reason order: another node's action that is also expired is wrong_target, not expired.
+  authzCase(
+    "reject-other-target-and-expired",
+    "2026-11-22T10:02:31Z",
+    authzOf(actionObject({ target_node_id: OTHER_NODE })),
+    "reject",
+    "wrong_target",
+  ),
+  authzCase(
+    "reject-card-for-other-target",
+    "2026-11-22T10:01:00Z",
+    authzOf(actionObject({ kind: "approval.card", reply_id: null, summary: "Delete a test file", target_node_id: OTHER_NODE })),
+    "reject",
+    "wrong_kind",
+  ),
   authzCase("accept-within-tolerance", "2026-11-22T10:02:29Z", authzOf(actionObject()), "accept", null),
   authzCase("accept-at-tolerance-limit", "2026-11-22T10:02:30Z", authzOf(actionObject()), "accept", null),
   authzCase(
@@ -405,6 +484,51 @@ const authzCases = () => [
     "reject",
     "malformed",
     { valid_until: "2026-11-23T10:00:00" },
+  ),
+  // keyset target (R12-27) and role (R6-3): S-9
+  keysetCase("reject-keyset-other-target", "2026-11-22T10:01:00Z", NEW_CORE_KEY, "reject", "wrong_target", {
+    target_node_id: OTHER_NODE,
+  }),
+  keysetCase("accept-keyset-for-this-node", "2026-11-22T10:01:00Z", NEW_CORE_KEY, "accept", null, {
+    target_node_id: ME,
+  }),
+  keysetCase(
+    "accept-keyset-gateway-role",
+    "2026-11-22T10:01:00Z",
+    NEW_GATEWAY_KEY,
+    "accept",
+    null,
+    {},
+    NEW_GATEWAY_KEY,
+  ),
+  // Reason order: a keyset with several faults gives the first one in the order listed.
+  keysetCase("reject-keyset-other-target-and-expired", "2026-11-23T10:00:31Z", NEW_CORE_KEY, "reject", "wrong_target", {
+    target_node_id: OTHER_NODE,
+  }),
+  keysetCase(
+    "reject-keyset-other-target-and-payload-mismatch",
+    "2026-11-22T10:01:00Z",
+    { ...NEW_CORE_KEY, public_key: b64("unknown-1") },
+    "reject",
+    "wrong_target",
+    { target_node_id: OTHER_NODE },
+  ),
+  keysetCase(
+    "reject-keyset-expired-and-payload-mismatch",
+    "2026-11-23T10:00:31Z",
+    { ...NEW_CORE_KEY, public_key: b64("unknown-1") },
+    "reject",
+    "expired",
+  ),
+  // A role other than core or gateway is malformed, never routed to a pin set.
+  keysetCase(
+    "reject-keyset-unknown-role",
+    "2026-11-22T10:01:00Z",
+    { ...NEW_CORE_KEY, role: "node" },
+    "reject",
+    "malformed",
+    {},
+    { ...NEW_CORE_KEY, role: "node" },
   ),
   // challenge
   challengeCase("accept-challenge", challengeEnvelope(), PINNED_GW, null, "accept", null),

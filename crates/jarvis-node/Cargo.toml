@@ -1,0 +1,57 @@
+[package]
+name = "jarvis-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The JARVIS desktop node: the Phase 2 protocol, journal and actions (Plan B)."
+
+[dependencies]
+jarvis-core.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+serde_json_canonicalizer.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+data-encoding.workspace = true
+base64.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+zeroize.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+tokio-tungstenite = "0.30.0"
+futures-util = "0.3.34"
+getrandom = "0.3"
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "sync", "time"] }
+
+# DPAPI key storage and write-through renames (Windows only).
+[target.'cfg(windows)'.dependencies]
+# Named directly: `#[implement]` (the Recycle Bin progress sink) expands to `::windows_core` paths.
+windows-core = "0.61"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+[features]
+# Test doubles (MemoryKeyStore) for this crate's integration tests and test tools.
+test-support = ["dep:tracing-subscriber"]
+
+[[bin]]
+name = "jarvis-node-probe"
+required-features = ["test-support"]
+
+[dev-dependencies]
+jarvis-node = { path = ".", features = ["test-support"] }
+tempfile = "3"
+hex = "0.4"
+jsonschema = { version = "0.30", default-features = false }
+tokio = { workspace = true, features = ["test-util"] }

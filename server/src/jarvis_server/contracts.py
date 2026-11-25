@@ -444,6 +444,7 @@ class ReplyChunk(_Contract):
     text: Annotated[str, Field(min_length=1, max_length=4000)] | None
     authz: Authz | None
     final: bool
+    in_reply_to: UUID | None  # unsigned: the utterance this reply answers (R12-37)
 
     @model_validator(mode="after")
     def _text_or_authz(self) -> ReplyChunk:
@@ -513,6 +514,8 @@ class ApprovalDecisionMessage(_Contract):
 
 class NodeAction(_Contract):
     authz: Authz
+    seq: Seq  # unsigned: the chunk's seq, for the live receipt (R12-36)
+    in_reply_to: UUID | None  # unsigned: the utterance the reply answers (R12-37)
 
 
 ResultCode = Annotated[str, Field(pattern=r"^[A-Z][A-Z_]{0,39}$")]

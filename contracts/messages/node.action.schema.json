@@ -2,15 +2,34 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/node.action.schema.json",
   "title": "Payload of `node.action`",
-  "description": "gateway → node: an action to run, authorised only by the core-signed `authz` (§7.1).",
+  "description": "gateway → node: an action to run, authorised only by the core-signed `authz` (§7.1). `seq` is the stream chunk's sequence number, unsigned, so the node's live `action.receipt` can name it (R12-36). Core accepts `(reply_id, seq)` only for an ACTION chunk of that reply for this node and person, so a wrong `seq` can only get the receipt refused or point it at another action of the same reply to the same node.",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "authz"
+    "authz",
+    "seq",
+    "in_reply_to"
   ],
   "properties": {
     "authz": {
       "$ref": "authz.schema.json"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The ACTION chunk's `seq` in its reply (unsigned, R12-36)."
+    },
+    "in_reply_to": {
+      "oneOf": [
+        {
+          "type": "string",
+          "format": "uuid"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Unsigned (R12-37): the envelope `message_id` of the utterance this reply answers, so the node can tell its own answer from other replies of the person; null for a reply that answers no utterance (a result Jarvis reports on its own). A faulty gateway could only make the node ignore its answer, or follow another reply of the same person (its speech and its core-signed actions for this node); nothing unsigned authorises an action."
     }
   }
 }

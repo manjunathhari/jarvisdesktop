@@ -15,6 +15,7 @@ from jarvis_server.signing import fingerprint
 from .fakes.node_rules import (
     Rejected,
     SeqChecker,
+    apply_keyset,
     check_challenge,
     check_enrolment_welcome,
     check_keyset,
@@ -43,13 +44,22 @@ def _run(case: dict[str, Any]) -> None:
             now=datetime.fromisoformat(case["now"]),
         )
     elif check == "keyset":
+        trusted = _keys(case["trusted_keys"]) or {}
         obj = check_keyset(
             case["payload"],
             case["authz"],
-            trusted=_keys(case["trusted_keys"]) or {},
+            trusted=trusted,
+            me=UUID(case["receiving_node_id"]),
             now=datetime.fromisoformat(case["now"]),
         )
         assert obj == case["authz"]["object"]
+        # The role picks the pin set; a gateway key never enters core trust (R6-3, S-9).
+        core, gateway = dict(trusted), {}
+        role = apply_keyset(obj, trusted_core=core, pinned_gateway=gateway, key_expiry={})
+        assert role == case["pins_as"]
+        new = case["payload"]["key_id"]
+        assert (new in core) == (role == "core")
+        assert (new in gateway) == (role == "gateway")
     elif check == "challenge":
         payload = check_challenge(
             case["envelope"],
@@ -106,6 +116,15 @@ REQUIRED = {
     "reject-challenge-signed-by-core-key",
     "reject-challenge-naive-time",
     "reject-non-canonical-base64url-key",
+    "reject-keyset-other-target",
+    "accept-keyset-for-this-node",
+    "accept-keyset-gateway-role",
+    "reject-keyset-other-target-and-expired",
+    "reject-keyset-other-target-and-payload-mismatch",
+    "reject-keyset-expired-and-payload-mismatch",
+    "reject-keyset-unknown-role",
+    "reject-other-target-and-expired",
+    "reject-card-for-other-target",
 }
 
 
@@ -132,6 +151,17 @@ def test_specific_reasons() -> None:
     assert BY_NAME["reject-naive-valid-until"]["reason"] == "malformed"
     assert BY_NAME["reject-keyset-naive-valid-until"]["reason"] == "malformed"
     assert BY_NAME["reject-challenge-naive-time"]["reason"] == "malformed"
+    assert BY_NAME["reject-keyset-other-target"]["reason"] == "wrong_target"
+    assert BY_NAME["accept-keyset-gateway-role"]["pins_as"] == "gateway"
+
+
+def test_every_keyset_case_names_its_node_and_every_accepted_one_its_pin_set() -> None:
+    for case in CASES:
+        if case["check"] == "keyset":
+            assert UUID(case["receiving_node_id"])
+            assert ("pins_as" in case) == (case["expect"] == "accept")
+            if case["expect"] == "accept":
+                assert case["pins_as"] == case["payload"]["role"]
 
 
 def test_seq_reject_cases_pass_every_value_but_the_last() -> None:
@@ -162,6 +192,7 @@ def test_keyset_rejects_any_payload_field_that_differs(field: str) -> None:
             {**case["payload"], field: other[field]},
             case["authz"],
             trusted=_keys(case["trusted_keys"]) or {},
+            me=UUID(case["receiving_node_id"]),
             now=datetime.fromisoformat(case["now"]),
         )
     assert excinfo.value.reason == "keyset_mismatch"
@@ -175,6 +206,7 @@ def test_keyset_rejects_an_action_authz() -> None:
             keyset["payload"],
             action["authz"],
             trusted=_keys(action["trusted_keys"]) or {},
+            me=UUID(keyset["receiving_node_id"]),
             now=datetime.fromisoformat(keyset["now"]),
         )
     assert excinfo.value.reason == "wrong_kind"

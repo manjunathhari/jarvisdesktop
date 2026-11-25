@@ -32,7 +32,7 @@ from jarvis_server.brain import (
     health,
 )
 from jarvis_server.contracts import MemoryCategory, MemoryTag, Visibility
-from jarvis_server.core import dispatch, identity, prompt, sessions, turn
+from jarvis_server.core import actions, dispatch, identity, prompt, sessions, turn
 from jarvis_server.memory import checks
 from jarvis_server.memory.engine import SYSTEM, MemoryEngine
 
@@ -361,6 +361,17 @@ def test_tool_calls_are_mapped_decided_and_speech_continues(
     assert rows[0][1:3] == ("module.news", {"tool": "show_news", "input": {"region": "india"}})
     assert _messages(app, tid)[-1] == ("JARVIS", "Here you are.")
     assert _outcome(app, tid) == "ANSWERED"
+    # R12-37: every chunk of the reply, ACTION included, names the utterance it answers.
+    answers = app.execute(
+        "SELECT DISTINCT in_reply_to FROM conv.stream_chunk WHERE session_id = %s",
+        (_session(app, tid),),
+    ).fetchall()
+    assert answers == [(tid,)]
+    # A result Jarvis reports on its own answers no utterance.
+    own = actions.speak(app, _session(app, tid), "A fictional result.")
+    assert app.execute(
+        "SELECT in_reply_to FROM conv.stream_chunk WHERE reply_id = %s", (own,)
+    ).fetchall() == [(None,)]
 
 
 def test_refused_tool_call_writes_no_action_and_speech_continues(

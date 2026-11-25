@@ -7,7 +7,8 @@ shared with the Rust node:
   envelope on the authenticated connection) is the transport's job; rule 5 (an unused
   ``execution_key`` for IRREVERSIBLE actions) needs the node's journal, so the fake node
   checks it on top of this.
-- ``check_keyset``: a ``keyset`` announcement (R6-2).
+- ``check_keyset``: a ``keyset`` announcement (R6-2), including its target (R12-27).
+- ``apply_keyset``: pinning an accepted keyset's key in the set its role names (R6-3).
 - ``check_challenge``: the gateway's first message on a connection (§6.1 step 3, R6-1).
 - ``check_enrolment_welcome``: core-key pinning after an enrolment (§7.2 step 5, R6-6).
 - ``SeqChecker``: the peer's per-connection ``seq`` (R6-8).
@@ -20,7 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -94,6 +95,7 @@ def check_keyset(
     authz: Mapping[str, Any],
     *,
     trusted: Mapping[str, bytes],
+    me: UUID,
     now: datetime,
 ) -> dict[str, Any]:
     """The signed keyset object, or ``Rejected(reason)``.
@@ -102,8 +104,10 @@ def check_keyset(
     ``authz`` (R12-26): ``role``, ``key_id`` and ``public_key``; ``authz`` comes separately.
     Validity comes only from the signed ``authz.object``
     (R6-2). Reasons, in order: ``malformed``, ``untrusted_key_id``, ``bad_signature``,
-    ``wrong_kind``, ``expired`` (``now`` > ``valid_until`` + 30 s), ``keyset_mismatch`` (the
+    ``wrong_kind``, ``wrong_target`` (the signed ``target_node_id`` is neither null nor ``me``,
+    R12-27), ``expired`` (``now`` > ``valid_until`` + 30 s), ``keyset_mismatch`` (the
     payload's role, key_id or public_key differs from ``authz.object.args``).
+    Which pin set the new key joins is ``apply_keyset``'s job.
     """
     try:
         KeysetAnnouncement.model_validate({**payload, "authz": authz})
@@ -112,12 +116,52 @@ def check_keyset(
     parsed = _verified(authz, trusted)
     if parsed.object.kind is not AuthzKind.KEYSET:
         raise Rejected("wrong_kind")
+    if parsed.object.target_node_id not in (None, me):
+        raise Rejected("wrong_target")
     if now > parsed.object.valid_until + CLOCK_TOLERANCE:
         raise Rejected("expired")
     args = parsed.object.args
     if any(args.get(f) != payload[f] for f in KEYSET_FIELDS) or set(args) != set(KEYSET_FIELDS):
         raise Rejected("keyset_mismatch")
     return dict(authz["object"])
+
+
+KEYSET_OVERLAP = timedelta(hours=24)  # old keys stay trusted this long after issued_at (R12-27)
+
+
+def apply_keyset(
+    obj: Mapping[str, Any],
+    *,
+    trusted_core: dict[str, bytes],
+    pinned_gateway: dict[str, bytes],
+    key_expiry: dict[str, datetime],
+) -> Literal["core", "gateway"]:
+    """Pin the key of a keyset object that ``check_keyset`` accepted; return the pin set used.
+
+    ``args.role`` alone picks the set: a ``gateway`` key goes into ``pinned_gateway`` and never
+    into ``trusted_core`` (R6-3). Every other key of that set expires at the signed
+    ``issued_at`` + 24 h, unless it is already in an earlier overlap, which this ends. A re-send
+    of the same key changes nothing.
+    """
+    args = obj["args"]
+    raw = b64url_decode(args["public_key"], 32)
+    if raw is None:  # check_keyset validated it
+        raise Rejected("malformed_key")
+    role: Literal["core", "gateway"] = "core" if args["role"] == "core" else "gateway"
+    pins = trusted_core if role == "core" else pinned_gateway
+    new_id = args["key_id"]
+    if pins.get(new_id) != raw or new_id in key_expiry:
+        until = datetime.fromisoformat(obj["issued_at"]) + KEYSET_OVERLAP
+        for key_id in list(pins):
+            if key_id == new_id:
+                continue
+            if key_id in key_expiry:  # still in an earlier overlap: this ends it
+                del pins[key_id], key_expiry[key_id]
+            else:
+                key_expiry[key_id] = until
+        pins[new_id] = raw
+        key_expiry.pop(new_id, None)
+    return role
 
 
 def check_challenge(

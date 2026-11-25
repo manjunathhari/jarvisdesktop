@@ -57,6 +57,20 @@ pub fn save(_key: &str) -> Result<(), String> {
     Err("Saving the key is only supported on Windows; set ANTHROPIC_API_KEY instead.".into())
 }
 
+/// Remove the stored key; removing one that isn't there is fine.
+#[cfg(windows)]
+pub fn delete() -> Result<(), String> {
+    match keyring::Entry::new(SERVICE, ACCOUNT).and_then(|e| e.delete_credential()) {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("Couldn't remove the key: {e}")),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn delete() -> Result<(), String> {
+    Ok(()) // nothing is stored outside Windows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

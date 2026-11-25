@@ -20,6 +20,16 @@
       <p class="hint">No key yet? Create one at console.anthropic.com → API keys.</p>
     </form>
 
+    <form id="enrolment" hidden>
+      <h1>Connect to the Jarvis server</h1>
+      <p>On the server, run <code>jarvis-core node enrol</code> for this PC, then type the code it prints here. It works once and expires soon.</p>
+      <input id="enrolcode" autocomplete="off" spellcheck="false" placeholder="enrolment code" />
+      <p id="enrolerror" role="alert"></p>
+      <button type="submit">Connect</button>
+    </form>
+
+    <p id="link" hidden></p>
+
     <footer id="presence">
       <p id="heard"></p>
       <p id="said"></p>

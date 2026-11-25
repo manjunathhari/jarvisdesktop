@@ -34,7 +34,7 @@ node generate.mjs authz-cases > /tmp/a.json && diff authz-cases.json /tmp/a.json
 ```
 
 **Keys.** Every key is a fixed *test* seed: SHA-256 of the public label
-`jarvis-signing-vectors test seed: <label>` (labels `core-1`, `core-2`, `gw-1`, `node-1`,
+`jarvis-signing-vectors test seed: <label>` (labels `core-1`, `core-2`, `gw-1`, `gw-2`, `node-1`,
 `unknown-1`). They are not secrets and must never be used outside tests.
 
 **The `rfc8785-appendix` case** uses the sample published in RFC 8785: the input of §3.2.2,
@@ -43,6 +43,8 @@ from the RFC text at rfc-editor.org (`rfc8785.txt`). The generator refuses to ru
 `canonicalize` reproduces the §3.2.4 bytes exactly, and the Python test checks the same
 bytes independently. This case has non-integer numbers; JARVIS's own signed objects
 use integers only.
+
+**The `rfc8785-sorting` case** is the RFC 8785 §3.2.3 property-sorting sample, also copied from the RFC text. The RFC lists the order of its values after sorting; the generator refuses to run unless `canonicalize` produces that order. **`key-order-utf16`** holds keys whose UTF-16 order differs from the order of their escaped UTF-8 bytes (`"a"` before `"a b"`, `"\n"` before `"A"`, `"\""` before `"#"`, an emoji before U+FFFF), so a signer that sorts serialised bytes fails it (R12-35).
 
 ## `vectors.json`
 
@@ -61,10 +63,14 @@ and `pinned_gateway` are raw 32-byte public keys in hex; in messages they are ba
 | `check` | Inputs | Reasons, in order |
 |---|---|---|
 | `node_action` | `trusted_keys` (CORE keys only), `receiving_node_id`, `now`, `authz` | `malformed` (including a time without an offset), `untrusted_key_id`, `bad_signature`, `wrong_kind`, `wrong_target`, `expired` (`now` > `valid_until` + 30 s) |
-| `keyset` | `trusted_keys`, `now`, `payload` (the keyset payload without its unsigned `outbox_id` and its `authz`, R12-26), `authz` | `malformed`, `untrusted_key_id`, `bad_signature`, `wrong_kind`, `expired` (from the signed `authz.object.valid_until`, + 30 s), `keyset_mismatch` (payload `role`, `key_id` or `public_key` differs from `authz.object.args`) |
+| `keyset` | `trusted_keys`, `receiving_node_id`, `now`, `payload` (the keyset payload without its unsigned `outbox_id` and its `authz`, R12-26), `authz`; an accepted case also has `pins_as` | `malformed`, `untrusted_key_id`, `bad_signature`, `wrong_kind`, `wrong_target` (the signed `target_node_id` is neither null nor `receiving_node_id`, compared as UUIDs, not as strings, R12-27), `expired` (from the signed `authz.object.valid_until`, + 30 s), `keyset_mismatch` (payload `role`, `key_id` or `public_key` differs from `authz.object.args`) |
 | `challenge` | `envelope` (the full signed envelope), `pinned_gateway` (GATEWAY keys, or null while enrolling), `enrol_fingerprint` (the code's gateway fingerprint, or null) | `malformed`, `malformed_key`, `unpinned_key`, `fingerprint_mismatch`, `bad_signature` (`gw-transport`) |
 | `enrolment_welcome` | `welcome` (payload), `core_fingerprint` (from the code) | `malformed`, `enrolment_missing`, `malformed_key`, `core_fingerprint_mismatch` |
 | `seq` | `seqs`: a fresh checker is fed each value in order | `bad_seq` on the last value; every earlier one passes |
+
+**Reason order.** A case with several faults expects the first reason in the order listed; the `*-and-*` cases (for example `reject-keyset-other-target-and-expired`, `reject-other-target-and-expired`) pin that order, so an implementation that checks in a different order fails them.
+
+**`pins_as` (R6-3).** For an accepted keyset, `pins_as` is the pin set the new key joins: `core` or `gateway`, from the signed `args.role`. A `gateway` key is pinned as a GATEWAY key only and never enters core trust, so it can never authorise an action (case `accept-keyset-gateway-role`). A `role` other than `core` or `gateway` is `malformed` (case `reject-keyset-unknown-role`).
 
 Base64url keys and signatures are decoded strictly: no padding, URL-safe alphabet only, and a final character with non-zero unused trailing bits is rejected (`malformed_key` for a key), never normalised (case `reject-non-canonical-base64url-key`).
 

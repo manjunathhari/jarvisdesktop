@@ -134,8 +134,10 @@ def issue_live(
     action_kind: str,
     args: dict[str, Any],
     now: datetime,
+    in_reply_to: UUID | None = None,
 ) -> int:
-    """Write one signed ACTION chunk (the next `seq` of the reply) and NOTIFY; return its seq."""
+    """Write one signed ACTION chunk (the next `seq` of the reply) and NOTIFY; return its seq.
+    `in_reply_to` is the utterance (`conv.inbound` id) the reply answers, if any (R12-37)."""
     valid_until = now + LIVE_VALIDITY
     authz = sign(
         conn,
@@ -148,10 +150,18 @@ def issue_live(
     with conn.transaction():
         row = conn.execute(
             "INSERT INTO conv.stream_chunk (reply_id, session_id, seq, type, authz, final,"
-            " target_node_id, valid_until)"
-            " SELECT %s, %s, coalesce(max(seq), 0) + 1, 'ACTION', %s, false, %s, %s"
+            " target_node_id, valid_until, in_reply_to)"
+            " SELECT %s, %s, coalesce(max(seq), 0) + 1, 'ACTION', %s, false, %s, %s, %s"
             " FROM conv.stream_chunk WHERE reply_id = %s RETURNING seq",
-            (reply_id, session_id, Jsonb(authz), target_node_id, valid_until, reply_id),
+            (
+                reply_id,
+                session_id,
+                Jsonb(authz),
+                target_node_id,
+                valid_until,
+                in_reply_to,
+                reply_id,
+            ),
         ).fetchone()
         assert row is not None
         conn.execute("SELECT pg_notify('jarvis_stream', %s)", (str(reply_id),))
@@ -159,7 +169,8 @@ def issue_live(
 
 
 def speak(conn: psycopg.Connection[Any], session_id: UUID, text: str) -> UUID:
-    """A one-chunk spoken reply in `session_id` (a result Jarvis reports on its own)."""
+    """A one-chunk spoken reply in `session_id` (a result Jarvis reports on its own). It answers
+    no utterance, so its `in_reply_to` is NULL (R12-37)."""
     reply_id = uuid.uuid4()
     with conn.transaction():
         conn.execute(
