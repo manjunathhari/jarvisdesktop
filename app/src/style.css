@@ -211,8 +211,15 @@ body:has(#wall:empty) #orb { --size: 13rem; }
 .rib-c { stroke-width: 14; opacity: 0.10; transform: rotate(10deg); }
 .ribbons .rim { stroke: url(#ribgrad); stroke-width: 2.2; opacity: 0.95; }
 .spin { transform-box: view-box; transform-origin: 0 0; }
-/* standby: one soft wave, kept small */
-.swave { stroke: url(#wavegrad); stroke-width: 2; opacity: 0.55; }
+/* standby: one wave, a bright line inside a soft band */
+.swaves { transition: opacity 400ms ease; }
+.swave { fill: none; stroke: url(#wavegrad); stroke-width: 2.6; opacity: 0.9; }
+.swave-band { fill: none; stroke: url(#ribgrad); stroke-width: 12; opacity: 0.22; }
+/* listening: two rounded diamonds of light, slightly apart, like crossing ribbons */
+.diamonds { transform-box: view-box; transform-origin: 0 0; opacity: 0; transform: scale(0.82); transition: opacity 450ms ease, transform 600ms cubic-bezier(.2,.8,.2,1); }
+.dia { fill: none; stroke: url(#ribgrad); stroke-linejoin: round; transform-box: view-box; transform-origin: 0 0; }
+.dia-a { stroke-width: 16; opacity: 0.5; transform: rotate(-9deg) scale(1.03, 0.97); }
+.dia-b { stroke-width: 6; opacity: 0.9; transform: rotate(9deg) scale(0.97, 1.02); }
 /* The light it casts on the "floor". */
 #orb::after {
   content: "";
@@ -308,12 +315,13 @@ body:not(:has(#wall:empty)) #orbhint { display: none; }
 body:not(:has(#wall:empty)) #orbstate { margin-top: 0.5rem; }
 
 /* listening (and the follow-up window, which listens too): the ribbons open out and glow */
-body:is([data-mode="listening"], [data-mode="follow_up"]) .rib-a { rx: 106px; ry: 88px; opacity: 0.5; stroke-width: 18; }
-body:is([data-mode="listening"], [data-mode="follow_up"]) .rib-b { rx: 106px; ry: 88px; opacity: 0.6; stroke-width: 9; }
-body:is([data-mode="listening"], [data-mode="follow_up"]) .rib-c { rx: 98px; ry: 104px; opacity: 0.2; stroke-width: 24; }
+body:is([data-mode="listening"], [data-mode="follow_up"]) .rib-a,
+body:is([data-mode="listening"], [data-mode="follow_up"]) .rib-b { opacity: 0.12; }
+body:is([data-mode="listening"], [data-mode="follow_up"]) .rib-c { opacity: 0.18; stroke-width: 22; }
+body:is([data-mode="listening"], [data-mode="follow_up"]) .diamonds { opacity: 1; transform: scale(1); animation: sway 6s ease-in-out infinite; }
 body:is([data-mode="listening"], [data-mode="follow_up"]) .ribbons .rim { stroke-width: 3; opacity: 1; }
 body:is([data-mode="listening"], [data-mode="follow_up"]) .spin { animation: turn 20s linear infinite; }
-body:is([data-mode="listening"], [data-mode="follow_up"]) .swave { opacity: 0; }
+body:is([data-mode="listening"], [data-mode="follow_up"]) .swaves { opacity: 0; }
 body:is([data-mode="listening"], [data-mode="follow_up"]) .sphere { filter: drop-shadow(0 0 1.2em rgb(62 200 255 / 0.45)); }
 body:is([data-mode="listening"], [data-mode="follow_up"]) #orb::after { opacity: 1; }
 body:is([data-mode="listening"], [data-mode="follow_up"]) .bars { opacity: 1; }
@@ -328,7 +336,7 @@ body:is([data-mode="listening"], [data-mode="follow_up"]) #orbstate .dot {
 body[data-mode="thinking"] .rib { rx: 104px; ry: 92px; }
 body[data-mode="thinking"] .rib-a, body[data-mode="thinking"] .rib-b { opacity: 0.45; }
 body[data-mode="thinking"] .spin { animation: turn 2.2s linear infinite; }
-body[data-mode="thinking"] .swave { opacity: 0.2; }
+body[data-mode="thinking"] .swaves { opacity: 0.35; }
 body[data-mode="thinking"] #orbstate .dot { background: #a35cff; border-color: #a35cff; }
 
 /* mic off: grey and still */
@@ -345,7 +353,7 @@ body[data-mode="mic_off"] #orb::after { opacity: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .spin, .bars i, .arc { animation: none !important; }
+  .spin, .bars i, .arc, .diamonds { animation: none !important; }
   .bars i { transform: scaleY(0.7); }
 }
 
@@ -367,6 +375,7 @@ body[data-mode="mic_off"] #orb::after { opacity: 0; }
 #devinput:focus { outline: none; border-color: var(--ash); }
 
 @keyframes breathe { 50% { opacity: 0.6; } }
+@keyframes sway { 0%, 100% { transform: rotate(-4deg); } 50% { transform: rotate(4deg); } }
 @keyframes voice { 0%, 100% { transform: scaleY(0.35); } 50% { transform: scaleY(1); } }
 @keyframes sound { 0% { transform: scale(0.92); opacity: 0.9; } 100% { transform: scale(1.12); opacity: 0.15; } }
 @keyframes turn { to { transform: rotate(1turn); } }
