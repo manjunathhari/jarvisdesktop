@@ -29,7 +29,7 @@
           "type": "null"
         }
       ],
-      "description": "Unsigned (R12-37): the envelope `message_id` of the utterance this reply answers, so the node can tell its own answer from other replies of the person; null for a reply that answers no utterance (a result Jarvis reports on its own). A wrong value from a faulty gateway can only make the node ignore or follow the wrong reply's speech; actions are still authorised only by `authz`."
+      "description": "Unsigned (R12-37): the envelope `message_id` of the utterance this reply answers, so the node can tell its own answer from other replies of the person; null for a reply that answers no utterance (a result Jarvis reports on its own). A faulty gateway could only make the node ignore its answer, or follow another reply of the same person (its speech and its core-signed actions for this node); nothing unsigned authorises an action."
     }
   }
 }

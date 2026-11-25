@@ -8,8 +8,10 @@
 //!   own `speak()` results, re-sent old ones) is ignored. The first event seen may be past
 //!   seq 1 (a dropped ACTION chunk). Within it, an event at or below the last `seq` seen is a
 //!   re-send (a lost `received`, a gateway resync) and is dropped: never spoken or run twice.
-//!   `in_reply_to` is unsigned, so a faulty gateway could only hide the answer or point the
-//!   node at another reply of the same person; actions are still authorised by `authz` alone.
+//!   `in_reply_to` is unsigned, so a faulty gateway could only hide the answer, or point the
+//!   node at another reply of the same person (its speech and its core-signed actions for this
+//!   node); nothing unsigned authorises an action. Replies that answer no current utterance
+//!   (null: core's `speak()` results) are not voiced here.
 //! - SPEECH becomes `BrainEvent::Speech` at once; `final` ends the turn.
 //! - A live `module.*` / `screen.*` action (args `{tool, input}`) whose tool `SERVER_TOOLS`
 //!   maps to that kind becomes `BrainEvent::Action`, then the receipt `OK` (D-2: OK means the

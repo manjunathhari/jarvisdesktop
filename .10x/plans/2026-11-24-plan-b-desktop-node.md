@@ -338,7 +338,7 @@ As in the Phase 2 plan, shared interfaces belong to the spec and the contracts. 
   - `#[async_trait] trait Link: Send + Sync { fn connected(&self) -> bool; fn subscribe(&self) -> broadcast::Receiver<ReplyChunk>; async fn send(&self, kind: &'static str, payload: Value) -> Result<(), NotConnected>; }`, implemented for `NodeHandle`
   - `ServerBrain::new(Arc<dyn Link>)` and `impl Brain for ServerBrain`
   - `const SERVER_TOOLS: &[(&str, &str)]`: the seven desktop tool → action-kind pairs from `server/src/jarvis_server/core/prompt.py` `TOOL_ACTIONS`, which are `show_news`, `open_story` and `summarise_story` → `module.news`; `play_live_tv` and `next_channel` → `module.live_tv`; `close_panel` → `screen.close_panel`; and `clear_screen` → `screen.clear`.
-- Behaviour of `think` (corrected 25 Nov: live actions arrive as `node.action {authz, seq}`, i.e. `ReplyEvent::Action { seq, authz }`, never as ACTION reply chunks, per ruling G4.2; `seq` is R12-36):
+- Behaviour of `think` (corrected 25 Nov: live actions arrive as `node.action {authz, seq, in_reply_to}`, i.e. `ReplyEvent::Action { seq, in_reply_to, authz }`, never as ACTION reply chunks, per ruling G4.2; `seq` is R12-36):
   - If not connected, return `Unavailable("I can't reach the Jarvis server")` at once. A blank utterance is a `Protocol` error and sends nothing.
   - Otherwise subscribe first, then send `utterance {text, screen_summary}`. `text` is clipped to 4000 characters and `screen_summary` to 2000, and a blank `screen_summary` is sent as null. History and tools are not sent, because the server owns them.
   - Follow the reply that answers this utterance: the first event whose `in_reply_to` is the utterance envelope's `message_id` (R12-37) picks the `reply_id`; every other reply is ignored (another device's, core's own `speak()` results with null, re-sent old ones, a second reply naming the same utterance). The first event seen may be past seq 1 (a dropped ACTION chunk).
@@ -356,7 +356,7 @@ As in the Phase 2 plan, shared interfaces belong to the spec and the contracts. 
   - `first_speech_forwarded_before_final`: `tx` holds the first Speech while the final chunk hasn't been sent yet.
   - `module_action_maps_tool_and_sends_ok_receipt`: the receipt passes `assert_conforms("action.receipt", …)`.
   - `tool_kind_mismatch_refused`.
-  - `other_reply_ids_ignored`.
+  - `other_replies_are_ignored`, `the_answer_is_followed_when_its_first_event_never_arrives`, `an_earlier_turns_reply_re_sent_is_ignored`.
   - `not_connected_fails_fast`: returns `Unavailable` within 100 ms and sends nothing.
   - `silence_times_out`.
   - `utterance_conforms_and_omits_history`.
