@@ -81,17 +81,20 @@ export class BoardModel {
     return this.newestFirst(["closed"]);
   }
 
-  apply(event: BoardEvent): void {
+  /// Follow an event from the store. False: it changed nothing (an arrival older than what
+  /// is held, or a panel this Board does not have).
+  apply(event: BoardEvent): boolean {
     if (event.type === "show" || event.type === "update") {
       const { type: _type, ...panel } = event;
       const at = this.panels.findIndex((p) => p.panel_id === panel.panel_id);
+      if (at >= 0 && this.panels[at].revision > panel.revision) return false;
       if (at >= 0) this.panels[at] = panel;
       else this.panels.push(panel);
       this.focused = panel.panel_id;
-      return;
+      return true;
     }
     const held = this.get(event.panel_id);
-    if (!held) return;
+    if (!held) return false;
     if (event.type === "state") {
       held.state = event.state;
     } else {
@@ -99,6 +102,7 @@ export class BoardModel {
       if (held.state === "minimised" || held.state === "closed") held.state = "open";
       this.focused = held.panel_id;
     }
+    return true;
   }
 
   /// A click on this Board: the model follows at once.
@@ -107,10 +111,11 @@ export class BoardModel {
     if (held) held.state = state;
   }
 
-  /// The panels that keep `id` from being seen though it is open: another that is maximised.
+  /// The panels that keep `id` from being seen though it is in view: any other that is
+  /// maximised. Only one panel is maximised at a time; the Board steps these back to open.
   covering(id: string): string[] {
     const mine = this.get(id);
-    if (!mine || mine.state !== "open") return [];
+    if (!mine || (mine.state !== "open" && mine.state !== "maximised")) return [];
     return this.panels
       .filter((p) => p.panel_id !== id && p.state === "maximised")
       .map((p) => p.panel_id);

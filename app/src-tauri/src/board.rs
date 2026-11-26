@@ -2,15 +2,18 @@
 //! `BoardStore` holds.
 //!
 //! - The window is declared in `tauri.conf.json` (label `board`, page `board.html`), created
-//!   hidden with the app, and shown by `ensure_open`: when the node starts, when a panel
-//!   arrives, and on F9 in the main window. With two or more monitors it goes full screen on
-//!   the largest one the main window is not on; with one it is an ordinary window
+//!   hidden with the app, and shown by `ensure_open`: when a panel arrives and on F9 in the
+//!   main window. With two or more monitors it goes full screen on the largest one the main
+//!   window is not on, opens there when the node starts, and hands the keyboard back to the
+//!   main window; with one monitor it is an ordinary window that waits for a panel or F9
 //!   (`jarvis_node::board::view::pick_placement`, tested there).
 //! - Closing the Board hides it; JARVIS, the voice and the main window carry on. Closing the
 //!   main window still ends the app, as it did when it was the only window.
 //! - `on_event` passes each of the node's Board events to the window as `jarvis://board`. The
 //!   panel in it is already in the store. The window draws it and calls `board_rendered`,
-//!   which is what lets the node send its `RENDERED` receipt.
+//!   which is what lets the node send its `RENDERED` receipt. Events that come before the
+//!   page has asked for its first snapshot are held and passed on then: an event sent to a
+//!   page that is not listening yet would be lost.
 //! - The commands are the window's only way to change anything: `board_set_state` (a click),
 //!   `board_clear_closed` (after the person confirms), `board_snapshot` and `board_open`.
 //!   Without a node (the app is not in server mode) there is no Board: the snapshot is empty
@@ -20,6 +23,7 @@
 use jarvis_node::board::view::{pick_placement, snapshot, BoardSnapshot, MonitorInfo, Placement};
 use jarvis_node::board::{BoardEvent, PanelState};
 use jarvis_node::node::NodeHandle;
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow, Window, WindowEvent};
 use uuid::Uuid;
 
@@ -29,27 +33,17 @@ pub const WINDOW: &str = "board";
 pub const EVENT: &str = "jarvis://board";
 const NO_BOARD: &str = "The Board needs the Jarvis server.";
 
+/// Events held until the page asks for its first snapshot (`Some`); after that, `None`.
+static HELD: Mutex<Option<Vec<BoardEvent>>> = Mutex::new(Some(Vec::new()));
+/// More than this before the page is ready and the oldest wait for their timeout instead.
+const HELD_MAX: usize = 64;
+
 fn node(slot: &NodeSlot) -> Option<NodeHandle> {
     slot.lock().ok().and_then(|n| n.clone())
 }
 
-/// Show the Board window if it is hidden, placing it first.
-pub fn ensure_open(app: &AppHandle) {
-    let Some(board) = app.get_webview_window(WINDOW) else {
-        tracing::warn!("the Board window does not exist");
-        return;
-    };
-    if board.is_visible().unwrap_or(false) {
-        return;
-    }
-    place(app, &board);
-    if let Err(e) = board.show() {
-        tracing::warn!(error = %e, "couldn't show the Board window");
-    }
-}
-
-/// Full screen on the other monitor, or an ordinary window if there is only one.
-fn place(app: &AppHandle, board: &WebviewWindow) {
+/// Where the Board belongs now, and the monitor to fill if that is a whole one.
+fn wanted(app: &AppHandle, board: &WebviewWindow) -> (Placement, Option<MonitorInfo>) {
     let monitors: Vec<MonitorInfo> = board
         .available_monitors()
         .unwrap_or_default()
@@ -69,12 +63,61 @@ fn place(app: &AppHandle, board: &WebviewWindow) {
                 .iter()
                 .position(|m| m.x == on.position().x && m.y == on.position().y)
         });
-    // Leave full screen before moving: a full-screen window does not change monitor.
-    let _ = board.set_fullscreen(false);
-    if let Placement::Borderless { monitor } = pick_placement(&monitors, main) {
-        let at = monitors[monitor];
-        let _ = board.set_position(tauri::PhysicalPosition::new(at.x, at.y));
-        let _ = board.set_fullscreen(true);
+    let placement = pick_placement(&monitors, main);
+    let target = match placement {
+        Placement::Borderless { monitor } => monitors.get(monitor).copied(),
+        Placement::Normal => None,
+    };
+    (placement, target)
+}
+
+/// Bring the Board into sight: placed if it was hidden (or if the monitor it filled has
+/// gone), restored if it was minimised, shown if it was hidden. On a second monitor the
+/// keyboard goes back to the main window, whose keys must keep working.
+pub fn ensure_open(app: &AppHandle) {
+    let Some(board) = app.get_webview_window(WINDOW) else {
+        tracing::warn!("the Board window does not exist");
+        return;
+    };
+    let visible = board.is_visible().unwrap_or(false);
+    let filling = board.is_fullscreen().unwrap_or(false);
+    let (_, target) = wanted(app, &board);
+    match target {
+        Some(at) if !visible => {
+            // The middle of the monitor: a point that is certainly on it.
+            let middle = tauri::PhysicalPosition::new(
+                f64::from(at.x) + f64::from(at.width) / 2.0,
+                f64::from(at.y) + f64::from(at.height) / 2.0,
+            );
+            let _ = board.set_fullscreen_on_monitor(middle);
+        }
+        None if filling => {
+            let _ = board.set_fullscreen(false);
+        }
+        _ => {}
+    }
+    let _ = board.unminimize();
+    if visible {
+        return;
+    }
+    if let Err(e) = board.show() {
+        tracing::warn!(error = %e, "couldn't show the Board window");
+    }
+    if target.is_some() {
+        if let Some(main) = app.get_webview_window("main") {
+            let _ = main.set_focus();
+        }
+    }
+}
+
+/// When the node starts: the Board opens by itself only where it has a monitor of its own.
+/// On one monitor it would open over the main window, so it waits for a panel or F9.
+pub fn open_at_start(app: &AppHandle) {
+    let Some(board) = app.get_webview_window(WINDOW) else {
+        return;
+    };
+    if wanted(app, &board).1.is_some() {
+        ensure_open(app);
     }
 }
 
@@ -84,7 +127,24 @@ pub fn on_event(app: &AppHandle, event: BoardEvent) -> tauri::Result<()> {
     if !matches!(event, BoardEvent::State { .. }) {
         ensure_open(app);
     }
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(waiting) = held.as_mut() {
+        if waiting.len() < HELD_MAX {
+            waiting.push(event);
+        }
+        return Ok(());
+    }
     app.emit_to(WINDOW, EVENT, event)
+}
+
+/// The page is listening: pass on what was held, in order, and hold nothing from now on.
+fn release_held(app: &AppHandle) {
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    for event in held.take().unwrap_or_default() {
+        if let Err(e) = app.emit_to(WINDOW, EVENT, event) {
+            tracing::warn!(error = %e, "couldn't pass a held Board event to the window");
+        }
+    }
 }
 
 /// Closing the Board hides it. Closing the main window ends the app, as before the Board (a
@@ -118,17 +178,24 @@ pub fn board_open(app: AppHandle) {
 
 /// What the window draws when it opens: the panels, the conversation and today's spend.
 #[tauri::command]
-pub async fn board_snapshot(node_slot: State<'_, NodeSlot>) -> Result<BoardSnapshot, String> {
+pub async fn board_snapshot(
+    app: AppHandle,
+    node_slot: State<'_, NodeSlot>,
+) -> Result<BoardSnapshot, String> {
     let Some(node) = node(&node_slot) else {
+        release_held(&app);
         return Ok(BoardSnapshot::default());
     };
     let store = node.board();
-    tauri::async_runtime::spawn_blocking(move || {
+    let taken = tauri::async_runtime::spawn_blocking(move || {
         let store = store.lock().unwrap_or_else(|e| e.into_inner());
         snapshot(&store, chrono::Utc::now().fixed_offset())
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string());
+    // The page asks only once it listens (and it queues events until this answer arrives).
+    release_held(&app);
+    taken
 }
 
 /// The person minimised, maximised, restored, closed or reopened a panel by hand.

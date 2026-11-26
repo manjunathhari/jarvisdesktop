@@ -7,10 +7,12 @@ import { fillBody } from "./frames";
 import { tile } from "./layout";
 import { BoardModel, type BoardEvent, type BoardSnapshot, type PanelState } from "./model";
 import { formatRupees, renderClosed, renderDock, renderPanel } from "./panels";
+import { Receipts } from "./receipts";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const area = $("panels");
 const shelf = $("shelf");
+const FOCUS_SHOWN_MS = 1500;
 
 interface Mounted {
   el: HTMLElement;
@@ -19,13 +21,16 @@ interface Mounted {
   title: string;
 }
 const mounted = new Map<string, Mounted>();
-/// Panels that arrived by an event and whose receipt waits for them to be drawn.
-const awaiting = new Map<string, number>();
+const receipts = new Receipts();
 
 let model = new BoardModel([]);
 /// What the shelf (dock and closed list) was last built from. It is rebuilt only when that
 /// changes, so a redraw for any other reason never wipes an open "Clear closed panels?".
 let shelfBuiltFor = "";
+/// Events that came while the snapshot was being fetched: applied after it, in order.
+let loading = false;
+const waiting: BoardEvent[] = [];
+let focusTimer: ReturnType<typeof setTimeout> | undefined;
 
 function problem(text: string | null) {
   const line = $("problem");
@@ -33,28 +38,38 @@ function problem(text: string | null) {
   line.textContent = text ?? "";
 }
 
+function report(id: string, revision: number, ok: boolean) {
+  void invoke("board_rendered", { panelId: id, revision, ok }).catch(() => {});
+}
+
+/// Only one panel is maximised at a time, and a panel Jarvis shows or points at must be
+/// seen: any other maximised panel steps back to open.
+function uncover(id: string) {
+  for (const other of model.covering(id)) void setState(other, "open");
+}
+
 async function setState(id: string, state: PanelState) {
   model.setState(id, state);
+  if (state === "maximised") uncover(id);
   draw();
   try {
     await invoke("board_set_state", { panelId: id, state });
     problem(null);
   } catch {
     // The desktop did not record it: show what it really holds.
-    problem("That change could not be saved.");
     await load();
+    problem("That change could not be saved.");
   }
 }
 
 async function clearClosed() {
   try {
     await invoke<number>("board_clear_closed");
-    model.clearClosed();
-    problem(null);
+    await load(); // what the desktop now holds
   } catch {
     problem("The closed panels could not be cleared.");
+    draw();
   }
-  draw();
 }
 
 const actions = { onState: setState, onClear: clearClosed };
@@ -63,7 +78,6 @@ function mount(id: string) {
   const panel = model.get(id);
   if (!panel) return;
   const fresh = renderPanel(panel, actions);
-  const now: Mounted = { el: fresh, revision: panel.revision, state: panel.state, title: panel.title };
   const old = mounted.get(id);
   if (old && old.revision === panel.revision && old.title === panel.title) {
     // Only its state changed: a new header, the same body (a frame is never redrawn for that).
@@ -72,17 +86,18 @@ function mount(id: string) {
     old.state = panel.state;
     return;
   }
-  if (old) old.el.replaceWith(fresh);
-  else area.append(fresh);
-  mounted.set(id, now);
+  if (old) {
+    old.el.replaceWith(fresh);
+    receipts.removed(id);
+  } else {
+    area.append(fresh);
+  }
+  mounted.set(id, { el: fresh, revision: panel.revision, state: panel.state, title: panel.title });
   const body = fresh.querySelector<HTMLElement>(".body")!;
   const revision = panel.revision;
   void fillBody(body, panel).then((ok) => {
-    // Report only a panel that came by an event, and only while this drawing is still the
-    // one on screen.
-    if (awaiting.get(id) !== revision || mounted.get(id)?.el !== fresh) return;
-    awaiting.delete(id);
-    void invoke("board_rendered", { panelId: id, revision, ok }).catch(() => {});
+    if (mounted.get(id)?.el !== fresh) return; // replaced or removed meanwhile
+    if (receipts.filled(id, revision, ok)) report(id, revision, ok);
   });
 }
 
@@ -117,6 +132,7 @@ function draw() {
     if (!shown.has(id)) {
       m.el.remove(); // minimised, closed, covered or gone: its frame leaves the page
       mounted.delete(id);
+      receipts.removed(id);
     }
   }
   for (const r of rects) {
@@ -140,38 +156,53 @@ function draw() {
       renderClosed(model.closed(), actions),
     );
   }
-  const open = inView.length;
   const docked = model.docked().length;
-  $("counts").textContent =
-    `${open} open` + (docked ? `, ${docked} minimised` : "");
+  $("counts").textContent = `${inView.length} open` + (docked ? `, ${docked} minimised` : "");
   $("spend").textContent = `Today: ${formatRupees(model.spendTodayPaise(new Date()))}`;
+}
 
-  if (model.focused) {
-    const id = model.focused;
-    mounted.get(id)?.el.scrollIntoView({ block: "nearest" });
-    setTimeout(() => {
-      if (model.focused === id) {
-        model.focused = null;
-        mounted.get(id)?.el.classList.remove("focused");
-      }
-    }, 1500);
-  }
+/// Bring the panel Jarvis pointed at into sight and mark it for a moment.
+function pointAt(id: string) {
+  draw();
+  mounted.get(id)?.el.scrollIntoView({ block: "nearest" });
+  clearTimeout(focusTimer);
+  focusTimer = setTimeout(() => {
+    model.focused = null;
+    draw();
+  }, FOCUS_SHOWN_MS);
 }
 
 function onEvent(event: BoardEvent) {
-  model.apply(event);
-  if (event.type === "show" || event.type === "update") {
-    awaiting.set(event.panel_id, event.revision);
-    // A new arrival must be seen to be reported drawn: a panel that covers it steps back.
-    for (const other of model.covering(event.panel_id)) void setState(other, "open");
+  if (loading) {
+    waiting.push(event);
+    return;
   }
-  draw();
+  if (!model.apply(event)) return;
+  const id = event.panel_id;
+  const arrival = event.type === "show" || event.type === "update";
+  if (arrival || event.type === "focus" || event.state === "maximised") uncover(id);
+  if (arrival || event.type === "focus") pointAt(id);
+  else draw();
+  // After drawing: a panel sent again at the revision already on the page is reported now.
+  if (arrival && receipts.arrived(id, event.revision)) report(id, event.revision, true);
 }
 
 async function load() {
-  const snapshot = await invoke<BoardSnapshot>("board_snapshot");
-  model = new BoardModel(snapshot.panels);
+  loading = true;
+  try {
+    const snapshot = await invoke<BoardSnapshot>("board_snapshot");
+    model = new BoardModel(snapshot.panels);
+    // A store that somehow holds two maximised panels: the newest keeps it.
+    const top = model.inView().find((p) => p.state === "maximised");
+    if (top) for (const other of model.covering(top.panel_id)) model.setState(other, "open");
+    problem(null);
+  } catch {
+    problem("The Board could not be loaded.");
+  } finally {
+    loading = false;
+  }
   draw();
+  for (const event of waiting.splice(0)) onEvent(event);
 }
 
 await listen<BoardEvent>("jarvis://board", (e) => onEvent(e.payload));

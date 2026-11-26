@@ -572,9 +572,10 @@ pub fn run() {
                 mode: mode.clone(),
             });
             let (handle, fut) = runtime(USER_NAME, brain, Arc::new(registry), ui);
-            // The Board (slice 1) is the server's: it opens only when the node runs.
+            // The Board (slice 1) is the server's: it opens only when the node runs, and by
+            // itself only on a monitor of its own.
             if node.lock().ok().is_some_and(|n| n.is_some()) {
-                board::ensure_open(app.handle());
+                board::open_at_start(app.handle());
             }
             app.manage(node.clone());
             app.manage(voice.clone());

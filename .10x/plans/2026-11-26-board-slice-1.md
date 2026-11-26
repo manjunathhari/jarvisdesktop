@@ -240,6 +240,17 @@ As in Plan B: contracts and the spec own shared interfaces. If the code shows a 
 - [ ] **Step 4: Run** both test commands and `npm run build`. Expected: PASS and a clean build. A screenshot of the empty Board from a Windows run goes in the task report.
 - [ ] **Step 5: Commit:** `desktop: Board window, tiling and panel controls`.
 
+**As built (commit `cabd54b`), where it differs from the steps above:**
+- `pick_placement`, `spend_today_paise`, `BoardSnapshot` and `snapshot` live in `jarvis-node` (`board::view`), with their tests in `crates/jarvis-node/tests/board.rs`, because the app crate cannot be built or tested off Windows. `pick_placement(monitors, main: Option<usize>)`: the largest monitor other than the main window's; `Normal` with fewer than two.
+- The Board window is declared in `tauri.conf.json` (label `board`, hidden at start) rather than built in code; `ensure_open` places and shows it. Extra command `board_open`; F9 in the main window calls it.
+- `app/src/board/model.ts` (`BoardModel`) holds the page's copy of the panels; `frames.ts` (`fillBody`) is the one place a panel body is drawn. Until Tasks 7 and 8 both kinds are shown as plain text through `textContent`.
+- The "Clear closed panels" confirmation is in the page (no system dialog).
+- A panel that arrives while another is maximised puts that one back to open, so the arrival is really on screen before it is reported drawn.
+- Checked here: 22 vitest tests, `npm run build`, the node crate's tests and lint, and the built page driven in headless Chrome with a stand-in for the app (arrival, maximise, update, clear, restore, receipts). **Not checked: the app's Rust (`app/src-tauri`), which only Windows CI can compile.** No Windows screenshot yet.
+- After the independent review (second commit): the receipt rule is its own tested module (`receipts.ts`): a panel sent again at the revision already on the page is reported at once; events that reach the app before the page listens are held in Rust and passed on at its first snapshot; events during a snapshot fetch are queued and applied after it; an arrival older than what is held is ignored. Only one panel is maximised at a time: maximising one, or Jarvis showing, updating or pointing at one, steps any other maximised panel back to open (reported to the server like a click). The window is restored if minimised; it fills its monitor with `set_fullscreen_on_monitor`; on two monitors it opens at start and gives the keyboard back to the main window; on one monitor it does not open at start (it would cover the main window) and opens when a panel arrives or on F9.
+- **Carried to Task 8 (must be done before rendered content goes in this window):** limit which app commands each window may call (`tauri_build` app manifest + per-window permissions). Today both windows can call every command; the Board shows text only.
+- Known limits: a Board hidden behind another window on one monitor still reports "drawn"; today's spend drops the cost of panels cleared from the closed list.
+
 ### Task 7: Text frame
 
 **Files:**

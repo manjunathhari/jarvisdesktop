@@ -83,4 +83,22 @@ describe("BoardModel", () => {
     ]);
     expect(m.spendTodayPaise(new Date("2026-11-26T17:00:00Z"))).toBe(120);
   });
+
+  it("a maximised panel is covered by another maximised one", () => {
+    const m = new BoardModel([panel("a", { state: "maximised" }), panel("b", { state: "maximised" })]);
+    expect(m.covering("b")).toEqual(["a"]);
+    expect(m.covering("a")).toEqual(["b"]);
+  });
+
+  it("nothing covers a panel that is itself out of view", () => {
+    const m = new BoardModel([panel("a", { state: "maximised" }), panel("b", { state: "minimised" })]);
+    expect(m.covering("b")).toEqual([]);
+  });
+
+  it("ignores an arrival older than what it holds", () => {
+    const m = new BoardModel([panel("a", { revision: 3, title: "Third" })]);
+    expect(m.apply({ type: "update", ...panel("a", { revision: 2, title: "Second" }) })).toBe(false);
+    expect(m.get("a")?.title).toBe("Third");
+    expect(m.apply({ type: "update", ...panel("a", { revision: 3, title: "Third" }) })).toBe(true);
+  });
 });
