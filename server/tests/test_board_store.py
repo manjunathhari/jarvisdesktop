@@ -20,7 +20,7 @@ from jarvis_server.core.board import BadPanel, TooLarge, UnknownPanel
 
 from .conftest import Dsns, fresh_database
 from .helpers import flow
-from .helpers.threads import run_all
+from .helpers.threads import InThread, run_all
 from .schema_registry import CONTRACTS, validator
 
 Conn = psycopg.Connection[Any]
@@ -296,3 +296,134 @@ def test_app_role_cannot_delete_or_rewrite_a_revision(app: Conn, person: uuid.UU
     ):
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             app.execute(sql, (made.panel_id,))
+
+
+# --- two writers on one panel (independent review of Task 2, F1) --------------------------------
+
+
+@pytest.mark.parametrize("second", ["update", "set_state", "mark_rendered", "get"])
+def test_a_writer_that_waited_behind_an_update_still_finds_the_panel(
+    dsns: Dsns, app: Conn, person: uuid.UUID, session: uuid.UUID, second: str
+) -> None:
+    """A Board job holds the panel's row lock from its `update` until it commits. A receipt, a
+    click or a voice command for the same panel waits, and must then act on the panel as it now
+    is, never report it unknown."""
+    made = _make(app, person, session)
+    pid = made.panel_id
+    calls = {
+        "update": lambda c: board.update(c, person_id=person, panel_id=pid, title="Second",
+                                         content="second", cost_paise=7),
+        "set_state": lambda c: board.set_state(c, person_id=person, panel_id=pid, state="closed"),
+        "mark_rendered": lambda c: board.mark_rendered(c, person_id=person, panel_id=pid,
+                                                       revision=1),
+        "get": lambda c: board.get(c, person, pid, lock=True),
+    }  # fmt: skip
+    with psycopg.connect(dsns.app, autocommit=True) as first, first.transaction():
+        board.update(first, person_id=person, panel_id=pid, title="First", content="first",
+                     cost_paise=5)  # fmt: skip
+        waiter = InThread(dsns.app, calls[second])
+        assert waiter.wait_until_blocked(dsns.superuser) in ("tuple", "transactionid")
+    waiter.join()  # the first writer has committed; re-raises anything the second raised
+    now = board.get(app, person, pid)
+    rendered = app.execute(
+        "SELECT rendered_revision FROM board.panel WHERE id = %s", (pid,)
+    ).fetchone()
+    if second == "update":
+        assert (now.revision, now.title, now.content, now.cost_paise) == (3, "Second", "second", 12)
+    else:
+        assert (now.revision, now.title, now.cost_paise) == (2, "First", 5)
+    assert now.state == ("closed" if second == "set_state" else "open")
+    assert rendered == ((1,) if second == "mark_rendered" else (None,))
+
+
+def test_inside_a_job_transaction_a_refused_panel_leaves_it_usable(
+    app: Conn, person: uuid.UUID, session: uuid.UUID
+) -> None:
+    with app.transaction():
+        kept = _make(app, person, session, "Kept")
+        with pytest.raises(TooLarge):
+            _make(app, person, session, content="é" * 15_001)
+        with pytest.raises(TooLarge):
+            board.update(app, person_id=person, panel_id=kept.panel_id, title="t",
+                         content="é" * 15_001, cost_paise=1)  # fmt: skip
+        assert board.get(app, person, kept.panel_id) == kept  # the transaction still works
+    assert [p.title for p in board.listing(app, person)] == ["Kept"]
+    with pytest.raises(RuntimeError, match="undo"), app.transaction():
+        _make(app, person, session, "Undone")
+        raise RuntimeError("undo")
+    assert [p.title for p in board.listing(app, person)] == ["Kept"]
+    assert _make(app, person, session, "Next").panel_id == board.resolve(app, person, "p2")
+
+
+@pytest.mark.parametrize(
+    ("kind", "title", "content"),
+    [
+        ("text", "A title", None),
+        ("text", "A title", 5),
+        ("text", "A title", b"bytes"),
+        ("text", "A title", ["a"]),
+        ("text", None, TEXT),
+        ("text", 7, TEXT),
+        (["text"], "A title", TEXT),
+        (None, "A title", TEXT),
+    ],
+)
+def test_check_content_refuses_what_is_not_text(kind: Any, title: Any, content: Any) -> None:
+    """Claude's tool input reaches this as it came: a missing or mistyped field is a bad panel,
+    never a crash."""
+    with pytest.raises(BadPanel):
+        board.check_content(kind, title, content)
+
+
+@pytest.mark.parametrize("revision", [True, 1.0, "1", None, 0, -1])
+def test_mark_rendered_takes_a_whole_revision_number(
+    app: Conn, person: uuid.UUID, session: uuid.UUID, revision: Any
+) -> None:
+    made = _make(app, person, session)
+    with pytest.raises(ValueError):
+        board.mark_rendered(app, person_id=person, panel_id=made.panel_id, revision=revision)
+    row = app.execute(
+        "SELECT rendered_revision FROM board.panel WHERE id = %s", (made.panel_id,)
+    ).fetchone()
+    assert row == (None,)
+
+
+def test_a_panel_cannot_name_another_persons_session(
+    app: Conn, owner: Conn, person: uuid.UUID, session: uuid.UUID
+) -> None:
+    other = flow.new_person(owner, "Ravi Fictional")
+    theirs = flow.open_session(app, other)
+    with pytest.raises(ValueError, match="session"):
+        _make(app, person, theirs)
+    with pytest.raises(ValueError, match="session"):
+        _make(app, person, uuid.uuid4())
+    assert _count(app, person) == 0
+    assert _make(app, person, session).revision == 1
+    none = board.create(app, person_id=person, session_id=None, kind="text", title="No session",
+                        content=TEXT, cost_paise=0)  # fmt: skip
+    assert none.revision == 1
+
+
+def test_setting_the_same_state_again_does_not_move_it_up_the_closed_list(
+    app: Conn, person: uuid.UUID, session: uuid.UUID
+) -> None:
+    made = _make(app, person, session)
+    sql = "SELECT state_changed_at FROM board.panel WHERE id = %s"
+    board.set_state(app, person_id=person, panel_id=made.panel_id, state="closed")
+    first = app.execute(sql, (made.panel_id,)).fetchone()
+    board.set_state(app, person_id=person, panel_id=made.panel_id, state="closed")
+    assert app.execute(sql, (made.panel_id,)).fetchone() == first
+
+
+def test_widest_panel_and_a_second_revision_conform(
+    app: Conn, person: uuid.UUID, session: uuid.UUID
+) -> None:
+    schema = json.loads((CONTRACTS / "messages" / "board.update.args.schema.json").read_text())
+    made = _make(app, person, session, "\U0001f600" * 120, content="é" * 15_000)
+    new = board.update(app, person_id=person, panel_id=made.panel_id, title="\U0001f600" * 120,
+                       content="\U0001f600" * 7_500, cost_paise=c.INT_MAX)  # fmt: skip
+    for panel in (made, new):
+        validator(schema).validate(panel.args())
+        c.BoardUpdateArgs.model_validate(panel.args())
+    assert new.args()["revision"] == 2 and new.args()["cost_paise"] == c.INT_MAX
+    assert new.created_at.tzinfo is not None  # an offset on the wire, as the contract requires

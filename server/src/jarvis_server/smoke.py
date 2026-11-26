@@ -131,7 +131,7 @@ def run(conn: psycopg.Connection[Any]) -> list[tuple[str, bool, str]]:
 SMOKE_PERSON = "Smoke Fictional"
 SMOKE_REF = "smoke-check"
 TERMINAL = ("ACKNOWLEDGED", "SUPERSEDED", "EXPIRED")
-SCHEMAS = ["gw", "conv", "comm", "ledger", "ops", "audit"]
+SCHEMAS = ["gw", "conv", "comm", "ledger", "ops", "audit", "board"]
 
 
 class _World:

@@ -551,6 +551,11 @@ def test_0016_down_and_up() -> None:
         " has_function_privilege('jarvis_app', %s, 'EXECUTE'),"
         " has_function_privilege('public', %s, 'EXECUTE') FROM pg_proc WHERE oid = %s::regprocedure"
     )
+    # Owner, search_path and the body: at 0015 the body is 0009's, word for word.
+    shape = (
+        "SELECT pg_get_userbyid(proowner), proconfig, prosrc FROM pg_proc"
+        " WHERE oid = %s::regprocedure"
+    )
     schema = "SELECT count(*) FROM pg_namespace WHERE nspname = 'board'"
     kinds = (
         "SELECT pg_get_constraintdef(oid) FROM pg_constraint"
@@ -561,11 +566,18 @@ def test_0016_down_and_up() -> None:
         with psycopg.connect(d.owner, autocommit=True) as conn:
             before = conn.execute(grants, (fn, fn, fn, fn)).fetchone()
             assert before == (True, True, False, False)
+            owner_, config, at_head = conn.execute(shape, (fn,)).fetchone()  # type: ignore[misc]
+            assert (owner_, config) == ("jarvis_owner", ["search_path=pg_catalog, pg_temp"])
+            assert at_head.count("WHEN 'board.state' THEN 'board.state'") == 1
             assert "board.state" in str(conn.execute(kinds).fetchone())
         migrate.downgrade(d.owner, "0015")
         with psycopg.connect(d.owner, autocommit=True) as conn:
             assert conn.execute(schema).fetchone() == (0,)
             assert conn.execute(grants, (fn, fn, fn, fn)).fetchone() == before
+            owner_, config, at_0015 = conn.execute(shape, (fn,)).fetchone()  # type: ignore[misc]
+            assert (owner_, config) == ("jarvis_owner", ["search_path=pg_catalog, pg_temp"])
+            assert at_0015 == at_head.replace("        WHEN 'board.state' THEN 'board.state'\n", "")
+            assert "board" not in at_0015
             assert "board.state" not in str(conn.execute(kinds).fetchone())
         migrate.upgrade(d.owner, "head")
         with psycopg.connect(d.owner, autocommit=True) as conn:

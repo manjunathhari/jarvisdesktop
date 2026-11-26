@@ -94,7 +94,10 @@ class PanelLine:
 
 
 def check_content(kind: str, title: str, content: str) -> None:
-    """Raise `TooLarge` or `BadPanel` unless this may be stored and sent as a panel."""
+    """Raise `TooLarge` or `BadPanel` unless this may be stored and sent as a panel. The three
+    come from the model's tool call as they are, so anything that is not text is a bad panel."""
+    if not (isinstance(kind, str) and isinstance(title, str) and isinstance(content, str)):
+        raise BadPanel("kind, title and content are text")
     if kind not in _KINDS:
         raise BadPanel("unknown panel kind")
     try:
@@ -121,10 +124,19 @@ _PANEL = (
 def get(
     conn: psycopg.Connection[Any], person_id: UUID, panel_id: UUID, *, lock: bool = False
 ) -> Panel:
-    """This person's panel at its current revision. `lock`: FOR UPDATE of the panel row."""
-    row = conn.execute(
-        _PANEL + (" FOR UPDATE OF p" if lock else ""), (panel_id, person_id)
-    ).fetchone()
+    """This person's panel at its current revision. `lock`: FOR UPDATE of the panel row first.
+
+    The row is locked on its own, then read: a locking read of the join would, after waiting
+    behind a concurrent `update`, re-check the new `revision` against the old revision row and
+    find nothing, reporting a panel that exists as unknown."""
+    if lock:
+        held = conn.execute(
+            "SELECT 1 FROM board.panel WHERE id = %s AND person_id = %s FOR UPDATE",
+            (panel_id, person_id),
+        ).fetchone()
+        if held is None:
+            raise UnknownPanel(str(panel_id))
+    row = conn.execute(_PANEL, (panel_id, person_id)).fetchone()
     if row is None:
         raise UnknownPanel(str(panel_id))
     return Panel(UUID(str(row[0])), *row[1:])
@@ -140,9 +152,20 @@ def create(
     content: str,
     cost_paise: int,
 ) -> Panel:
-    """Store a new panel (revision 1, open) and return it."""
+    """Store a new panel (revision 1, open) and return it. `session_id`, if given, is a session
+    of this person. The advisory lock is held until the caller's transaction ends, so a job
+    should create its panels late, not before a long call. (Under READ COMMITTED, which is all
+    the server uses, the lock makes numbers unique; the UNIQUE constraint is the backstop.)"""
     check_content(kind, title, content)
     with conn.transaction():
+        if session_id is not None and (
+            conn.execute(
+                "SELECT 1 FROM conv.session WHERE id = %s AND person_id = %s",
+                (session_id, person_id),
+            ).fetchone()
+            is None
+        ):
+            raise ValueError("the session is not this person's")
         # One number at a time per person, so two jobs never take the same `p<number>`.
         conn.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"board.panel:{person_id}",)
@@ -201,7 +224,11 @@ def set_state(
 def mark_rendered(
     conn: psycopg.Connection[Any], *, person_id: UUID, panel_id: UUID, revision: int
 ) -> None:
-    """The desktop drew this revision. A late report of an older one changes nothing."""
+    """The desktop drew this revision. A late report of an older one changes nothing.
+    `ValueError` for a revision this panel never had, `UnknownPanel` for a panel that is not
+    this person's: the caller (a receipt handler) refuses the receipt on either."""
+    if isinstance(revision, bool) or not isinstance(revision, int):
+        raise ValueError("revision is a whole number")
     with conn.transaction():
         held = get(conn, person_id, panel_id, lock=True)
         if not 1 <= revision <= held.revision:
