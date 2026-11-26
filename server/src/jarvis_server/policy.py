@@ -42,8 +42,8 @@ class Tier(StrEnum):
     IRREVERSIBLE = "IRREVERSIBLE"
 
 
-# §9.1, exactly, and the Board's five kinds (R12-39). `screen.*` is every `screen.<name>` kind. Anything
-# else is refused.
+# §9.1, exactly, and the Board's five kinds (R12-39). `screen.*` is every `screen.<name>` kind.
+# Anything else is refused.
 TIERS: Mapping[str, Tier] = MappingProxyType(
     {
         "module.news": Tier.READ_ONLY,
