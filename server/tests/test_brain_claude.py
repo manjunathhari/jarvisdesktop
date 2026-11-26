@@ -654,3 +654,142 @@ def test_fake_brain_raises_a_scripted_failure_in_place() -> None:
     assert ei.value is failure
     assert ei.value.phase is CallPhase.SEND
     assert ei.value.status == 529
+
+
+# --- server tools: web search (Board slice 1, Task 4) ---------------------------------------
+
+SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
+
+
+def block(index: int, content_block: dict[str, Any], *deltas: dict[str, Any]) -> list[Any]:
+    out: list[Any] = [
+        (
+            "content_block_start",
+            {"type": "content_block_start", "index": index, "content_block": content_block},
+        )
+    ]
+    for d in deltas:
+        out.append(
+            ("content_block_delta", {"type": "content_block_delta", "index": index, "delta": d})
+        )
+    out.append(("content_block_stop", {"type": "content_block_stop", "index": index}))
+    return out
+
+
+def stop(reason: str, out_tokens: int = 7, **usage: Any) -> list[tuple[str, dict[str, Any]]]:
+    return [
+        (
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": reason},
+                "usage": {"output_tokens": out_tokens, **usage},
+            },
+        ),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+
+
+def test_server_tools_are_sent_after_the_client_tools() -> None:
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return stream_response(GOOD_STREAM)
+
+    tool = ToolSpec("board_show", "Show a panel", {"type": "object", "properties": {}})
+    list(mock_brain(handler).think(make_request(tools=[tool], server_tools=[SEARCH_TOOL])))
+    assert [t.get("name") for t in seen[0]["tools"]] == ["board_show", "web_search"]
+    assert seen[0]["tools"][1] == SEARCH_TOOL
+    list(mock_brain(handler).think(make_request(server_tools=[SEARCH_TOOL])))
+    assert seen[1]["tools"] == [SEARCH_TOOL]
+    assert count_input_tokens(make_request(server_tools=[SEARCH_TOOL])) > count_input_tokens(
+        make_request()
+    )
+
+
+def test_parser_skips_server_tool_blocks_and_counts_searches() -> None:
+    """A search is run by the API: its query and results are not tool calls for core. The
+    result pages and the number of searches are kept, for the sources list and the bill."""
+    results = [
+        {"type": "web_search_result", "url": "https://example.org/a", "title": "Fictional A",
+         "encrypted_content": "xx", "page_age": None},
+        {"type": "web_search_result", "url": "https://example.org/b", "title": "Fictional B",
+         "encrypted_content": "yy"},
+    ]  # fmt: skip
+    body = sse(
+        start(),
+        *text_block(0, "Let me look."),
+        *block(1, {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search"},
+               {"type": "input_json_delta", "partial_json": '{"query": "fictional hill'},
+               {"type": "input_json_delta", "partial_json": ' stations"}'}),
+        *block(2, {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+                   "content": results}),
+        *block(3, {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_2",
+                   "content": {"type": "web_search_tool_result_error",
+                               "error_code": "max_uses_exceeded"}}),
+        *block(4, {"type": "text", "text": ""},
+               {"type": "citations_delta", "citation": {"type": "web_search_result_location",
+                                                        "url": "https://example.org/a"}},
+               {"type": "text_delta", "text": "Found it."}),
+        *tool_block(5, "board_show", '{"kind": "text"}'),
+        *stop("tool_use", server_tool_use={"web_search_requests": 2}),
+    )  # fmt: skip
+    brain = mock_brain(lambda r: stream_response(body))
+    events = list(brain.think(make_request(server_tools=[SEARCH_TOOL])))
+    assert events == [
+        Speech("Let me look."),
+        Speech("Found it."),
+        ToolCall("board_show", {"kind": "text"}),
+    ]
+    assert brain.searches == 2
+    assert brain.sources == [
+        ("Fictional A", "https://example.org/a"),
+        ("Fictional B", "https://example.org/b"),
+    ]
+    assert brain.usage == (11, 7) and brain.stop_reason == "tool_use" and not brain.truncated
+    list(mock_brain(lambda r: stream_response(GOOD_STREAM)).think(make_request()))
+
+
+def test_search_state_is_reset_between_calls() -> None:
+    searched = sse(
+        start(),
+        *block(0, {"type": "web_search_tool_result", "tool_use_id": "s",
+                   "content": [{"type": "web_search_result", "url": "https://example.org/a",
+                                "title": "A"}]}),
+        *stop("end_turn", server_tool_use={"web_search_requests": 1}),
+    )  # fmt: skip
+    responses = iter([stream_response(searched), stream_response(GOOD_STREAM)])
+    brain = mock_brain(lambda r: next(responses))
+    list(brain.think(make_request()))
+    assert (brain.searches, len(brain.sources)) == (1, 1)
+    list(brain.think(make_request()))
+    assert (brain.searches, brain.sources, brain.stop_reason) == (0, [], "end_turn")
+
+
+def test_a_tool_call_cut_by_max_tokens_is_a_completed_call() -> None:
+    """The output limit cut the tool's input: the call was made and is billed, so it completes
+    (with its usage) and gives no tool call. Malformed input for any other reason still fails."""
+    cut = sse(start(), *text_block(0, "Here."), *tool_block(1, "board_show", '{"kind": "te'),
+              *stop("max_tokens", out_tokens=6000))  # fmt: skip
+    brain = mock_brain(lambda r: stream_response(cut))
+    assert list(brain.think(make_request())) == [Speech("Here.")]
+    assert brain.usage == (11, 6000) and brain.truncated and brain.stop_reason == "max_tokens"
+    whole = sse(start(), *tool_block(0, "board_show", '{"kind": "text"}'), *stop("max_tokens"))
+    brain = mock_brain(lambda r: stream_response(whole))
+    assert list(brain.think(make_request())) == [ToolCall("board_show", {"kind": "text"})]
+    assert brain.truncated  # the limit was reached, though this call's input was whole
+
+
+def test_pause_turn_ends_the_call() -> None:
+    body = sse(start(), *text_block(0, "Searching."), *stop("pause_turn"))
+    brain = mock_brain(lambda r: stream_response(body))
+    assert list(brain.think(make_request())) == [Speech("Searching.")]
+    assert brain.usage == (11, 7) and brain.stop_reason == "pause_turn"
+
+
+def test_fake_brain_reports_searches_and_sources() -> None:
+    fake = FakeBrain([Speech("x")], usage=(1, 1), searches=2, sources=[("A", "https://a.example")])
+    assert fake.searches == 0
+    list(fake.think(make_request()))
+    assert (fake.searches, fake.sources, fake.truncated) == (2, [("A", "https://a.example")], False)

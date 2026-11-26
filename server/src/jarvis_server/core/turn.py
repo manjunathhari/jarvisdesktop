@@ -180,6 +180,19 @@ def set_memory(engine: MemoryEngine | None) -> None:
     policy.set_memory(engine)
 
 
+def provider() -> BrainProvider:
+    """The brain factory, for the other job that calls the brain (`core.board_job`)."""
+    if _brain is None:
+        raise NoTurnBrain("no brain is configured")
+    return _brain
+
+
+def memory() -> MemoryEngine:
+    if _memory is None:
+        raise NoMemory("no memory engine is configured")
+    return _memory
+
+
 def set_clock(clock: Clock | None) -> None:
     """Tests only: the time sessions and holds use. None: the database's `now()`."""
     global _clock

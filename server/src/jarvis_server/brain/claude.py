@@ -156,11 +156,13 @@ def build_payload(req: BrainRequest) -> dict[str, Any]:
         "system": _system_prompt(req),
         "messages": _messages(req),
     }
-    if req.tools:
-        payload["tools"] = [
-            {"name": t.name, "description": t.description, "input_schema": t.input_schema}
-            for t in req.tools
-        ]
+    tools: list[dict[str, Any]] = [
+        {"name": t.name, "description": t.description, "input_schema": t.input_schema}
+        for t in req.tools
+    ]
+    tools.extend(req.server_tools)  # run by the provider (web search), sent as given
+    if tools:
+        payload["tools"] = tools
     return payload
 
 
@@ -177,7 +179,7 @@ def count_input_tokens(req: BrainRequest) -> int:
     body = {k: payload[k] for k in ("system", "messages", "tools") if k in payload}
     raw = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
     tokens = -(-raw // BYTES_PER_TOKEN_FLOOR)
-    return tokens + (TOOL_PROMPT_ALLOWANCE if req.tools else 0)
+    return tokens + (TOOL_PROMPT_ALLOWANCE if req.tools or req.server_tools else 0)
 
 
 class ClaudeBrain:
@@ -187,6 +189,15 @@ class ClaudeBrain:
     used as given (the proxy argument is then ignored) and is not closed by `close()`.
     After `think` finishes, `usage` is `(input_tokens, output_tokens)`, or None if the call did
     not complete.
+
+    Server tools (web search, `req.server_tools`): the API runs the search inside the call. Its
+    `server_tool_use` and `web_search_tool_result` blocks are not tool calls for the caller and
+    are never yielded. `searches` is `usage.server_tool_use.web_search_requests` (what is
+    billed per search), `sources` the (title, address) of the pages returned. `stop_reason` is
+    the API's; `pause_turn` (a long search turn the API paused) ends the call like any other:
+    one call per job, never resumed. `truncated`: the output limit ended the reply; a tool call
+    whose input it cut is dropped and the call still completes, with its usage, because it was
+    made and is billed. Tool input that is malformed for any other reason fails the call.
     """
 
     def __init__(
@@ -202,6 +213,10 @@ class ClaudeBrain:
         self._owns_client = client is None
         self._client = client or httpx.Client(proxy=proxy, timeout=TIMEOUT, trust_env=False)
         self.usage: tuple[int, int] | None = None
+        self.searches = 0
+        self.sources: list[tuple[str, str]] = []
+        self.truncated = False
+        self.stop_reason: str | None = None
 
     def close(self) -> None:
         if self._owns_client:
@@ -209,6 +224,7 @@ class ClaudeBrain:
 
     def think(self, req: BrainRequest) -> Iterator[BrainEvent]:
         self.usage = None
+        self.searches, self.sources, self.truncated, self.stop_reason = 0, [], False, None
         body = {"model": self._model, "stream": True, **build_payload(req)}
         headers = {
             "x-api-key": self._api_key,
@@ -238,6 +254,11 @@ class ClaudeBrain:
         output_tokens = 0
         tool_name: str | None = None
         fragments: list[str] = []
+        searches = 0
+        sources: list[tuple[str, str]] = []
+        stop_reason: str | None = None
+        cut_tool = False  # a client tool's input did not parse
+        in_client_tool = False
         for line in lines:
             if not line.startswith("data:"):
                 continue
@@ -249,28 +270,46 @@ class ClaudeBrain:
                 output_tokens = int(usage.get("output_tokens", 0))
             elif kind == "content_block_start":
                 block = event["content_block"]
-                if block.get("type") == "tool_use":
+                in_client_tool = block.get("type") == "tool_use"
+                if in_client_tool:
                     tool_name = str(block["name"])
                     fragments = []
+                elif block.get("type") == "web_search_tool_result":
+                    results = block.get("content")
+                    for result in results if isinstance(results, list) else []:  # else an error
+                        if isinstance(result, dict) and isinstance(result.get("url"), str):
+                            sources.append((str(result.get("title") or ""), result["url"]))
             elif kind == "content_block_delta":
                 delta = event["delta"]
                 if delta.get("type") == "text_delta":
                     if delta["text"]:
                         yield Speech(delta["text"])
-                elif delta.get("type") == "input_json_delta":
-                    fragments.append(delta["partial_json"])
+                elif delta.get("type") == "input_json_delta" and in_client_tool:
+                    fragments.append(delta["partial_json"])  # not a server tool's query
             elif kind == "content_block_stop":
                 if tool_name is not None:
-                    args = json.loads("".join(fragments) or "{}")
+                    name, tool_name, in_client_tool = tool_name, None, False
+                    try:
+                        args = json.loads("".join(fragments) or "{}")
+                    except json.JSONDecodeError:
+                        cut_tool = True  # judged at the end: cut by the output limit, or bad
+                        continue
                     if not isinstance(args, dict):
                         raise BrainCallFailed(CallPhase.SEND, detail="tool input is not an object")
-                    yield ToolCall(tool_name, args)
-                    tool_name = None
+                    yield ToolCall(name, args)
             elif kind == "message_delta":
                 usage = event.get("usage", {})
                 output_tokens = int(usage.get("output_tokens", output_tokens))
                 input_tokens = int(usage.get("input_tokens", input_tokens))
+                server = usage.get("server_tool_use") or {}
+                searches = int(server.get("web_search_requests", searches))
+                stop_reason = (event.get("delta") or {}).get("stop_reason", stop_reason)
             elif kind == "message_stop":
+                if cut_tool and stop_reason != "max_tokens":
+                    raise BrainCallFailed(CallPhase.SEND, detail="malformed tool input")
+                self.searches, self.sources = searches, sources
+                self.stop_reason = stop_reason
+                self.truncated = stop_reason == "max_tokens"
                 self.usage = (input_tokens, output_tokens)
                 return
             elif kind == "error":

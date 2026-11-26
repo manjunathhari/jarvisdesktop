@@ -26,6 +26,10 @@ class UnknownModelPrice(LookupError):
     """The model has no entry in the price table."""
 
 
+class UnknownToolPrice(LookupError):
+    """A tool billed per use has no entry in the price table."""
+
+
 @dataclass(frozen=True)
 class Price:
     input: int  # paise per million input tokens
@@ -36,6 +40,7 @@ class Price:
 class PriceTable:
     default_model: str
     models: dict[str, Price]
+    tools: dict[str, int]  # paise per use of a tool Anthropic runs (web search)
 
 
 def _count(value: object, what: str) -> int:
@@ -62,7 +67,15 @@ def load(path: Path = PRICES_FILE) -> PriceTable:
     default = raw.get("default_model")
     if not isinstance(default, str) or default not in models:
         raise ValueError(f"{path}: default_model must name a model in the table")
-    return PriceTable(default_model=default, models=models)
+    tools: dict[str, int] = {}
+    tools_raw = raw.get("tools", {})
+    if not isinstance(tools_raw, dict):
+        raise ValueError(f"{path}: [tools] must be a table")
+    for name, entry in tools_raw.items():
+        if not isinstance(entry, dict) or set(entry) != {"per_use"}:
+            raise ValueError(f"{path}: tool {name!r} needs exactly per_use")
+        tools[name] = _count(entry["per_use"], f"{name} price per use")
+    return PriceTable(default_model=default, models=models, tools=tools)
 
 
 @functools.cache
@@ -85,3 +98,12 @@ def cost_paise(model: str, input_tokens: int, output_tokens: int) -> int:
         + _count(output_tokens, "output_tokens") * price.output
     )
     return -(-numerator // TOKENS_PER_PRICE_UNIT)
+
+
+def tool_paise(tool: str, uses: int = 1) -> int:
+    """The cost of `uses` uses of a tool Anthropic runs and bills per use. A tool without a
+    price raises `UnknownToolPrice`: it must not be offered to the model (fail closed)."""
+    price = table().tools.get(tool)
+    if price is None:
+        raise UnknownToolPrice(f"no price for tool {tool!r}")
+    return _count(uses, "uses") * price

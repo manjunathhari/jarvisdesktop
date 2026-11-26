@@ -14,6 +14,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -782,3 +783,25 @@ def test_owner_is_the_seeded_person(app: Conn) -> None:  # R12-16
     assert str(OWNER) == "00000000-0000-4000-8000-000000000002"  # migration 0006 MANJ_ID
     row = app.execute("SELECT organization_id FROM ledger.person WHERE id = %s", (OWNER,))
     assert row.fetchone() == (config.HOUSEHOLD_ID,)
+
+
+# --- the price of a web search (Board slice 1, Task 4) --------------------------------------
+
+
+def test_web_search_has_a_price_and_a_missing_one_fails_closed(tmp_path: Path) -> None:
+    assert prices.tool_paise("web_search") == 100  # $10 per 1,000 searches at Rs 100 per dollar
+    assert prices.tool_paise("web_search", 3) == 300
+    assert prices.tool_paise("web_search", 0) == 0
+    with pytest.raises(prices.UnknownToolPrice):
+        prices.tool_paise("web_fetch")
+    without = tmp_path / "prices.toml"
+    without.write_text('default_model = "m"\n[models.m]\ninput = 1\noutput = 1\n', encoding="utf-8")
+    assert prices.load(without).tools == {}
+    bad = tmp_path / "bad.toml"
+    bad.write_text(
+        'default_model = "m"\n[models.m]\ninput = 1\noutput = 1\n'
+        "[tools.web_search]\nper_use = -1\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        prices.load(bad)

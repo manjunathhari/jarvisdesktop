@@ -83,6 +83,7 @@ def on_live_receipt(
         ).fetchone()
         if said is None and drawn is None:  # once, and never about a chunk reported drawn
             actions.speak(conn, session_id, text)
+        release_headline(conn, reply_id)
 
     try:
         if action_kind in _SHOWN:
@@ -136,6 +137,30 @@ def on_live_receipt(
         person_id=person_id,
         details={"panel_id": str(issued.panel_id), "revision": str(issued.revision)},
     )  # fmt: skip
+    release_headline(conn, reply_id)
+
+
+# Whether the desktop has answered every panel of a Board job's reply: no ACTION chunk of the
+# reply is left without a `board.rendered` or `board.render_failed` event.
+_RELEASE = """
+UPDATE ops.job SET run_at = now()
+WHERE kind = 'board.headline' AND status = 'QUEUED' AND payload->>'job_key' = %(reply)s
+  AND NOT EXISTS (
+      SELECT 1 FROM conv.stream_chunk k WHERE k.reply_id = %(reply)s::uuid AND k.type = 'ACTION'
+        AND NOT EXISTS (
+            SELECT 1 FROM comm.event e WHERE e.subject_type = 'stream'
+              AND e.subject_id = k.reply_id::text || ':' || k.seq::text
+              AND e.kind IN ('board.rendered', 'board.render_failed')))
+RETURNING id
+"""
+
+
+def release_headline(conn: psycopg.Connection[Any], reply_id: UUID) -> None:
+    """A Board job's headline waits (job `board.headline`) until the desktop has answered for
+    every panel of its reply, then runs at once."""
+    row = conn.execute(_RELEASE, {"reply": str(reply_id)}).fetchone()
+    if row is not None:
+        conn.execute("SELECT pg_notify('jarvis_jobs', %s)", (str(row[0]),))
 
 
 @dispatch.register("board.state")

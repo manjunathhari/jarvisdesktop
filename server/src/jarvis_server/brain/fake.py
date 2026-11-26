@@ -20,17 +20,30 @@ class FakeBrain:
         script: list[BrainEvent | BrainCallFailed],
         *,
         usage: tuple[int, int] | None = None,
+        searches: int = 0,
+        sources: list[tuple[str, str]] | None = None,
+        truncated: bool = False,
     ) -> None:
         self._script = list(script)
         self.requests: list[BrainRequest] = []
         self.usage: tuple[int, int] | None = None
         self._final_usage = usage
+        self._final = (searches, list(sources or []), truncated)
+        self.searches = 0
+        self.sources: list[tuple[str, str]] = []
+        self.truncated = False
 
     def think(self, req: BrainRequest) -> Iterator[BrainEvent]:
         self.requests.append(req)
         self.usage = None
+        self.searches, self.sources, self.truncated = 0, [], False
         for item in self._script:
             if isinstance(item, BrainCallFailed):
                 raise item
             yield item
         self.usage = self._final_usage
+        self.searches, self.sources, self.truncated = (
+            self._final[0],
+            list(self._final[1]),
+            self._final[2],
+        )
