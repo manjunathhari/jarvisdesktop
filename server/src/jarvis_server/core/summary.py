@@ -37,6 +37,7 @@ LINE: dict[str, str] = {
     "turn.completed_after_hold": "A held request has been answered",
     "action.readonly_ok": "Action completed",
     "action.approved": "Running the approved action",
+    "action.no_receipt": "An approved action was not confirmed",
     "approval.decision_refused": "A decision could not be applied",
     "brain.config_error": "Claude configuration error",
 }

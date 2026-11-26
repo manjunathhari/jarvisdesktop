@@ -399,12 +399,17 @@ def on_decision(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     if not actions.transition_in_job(conn, task_id, "IN_PROGRESS", "issued"):
         _answered(conn, inbound_id, "REFUSED")
         return
-    conn.execute(
+    action_row = conn.execute(
         "INSERT INTO ledger.action (task_id, actor_kind, actor_id, idempotency_key, status,"
-        " source_ref) VALUES (%s, 'AGENT', 'core', %s, 'ISSUED', %s)",
+        " source_ref) VALUES (%s, 'AGENT', 'core', %s, 'ISSUED', %s) RETURNING id",
         (task_id, str(execution_key), f"approval:{approval_id}"),
-    )
+    ).fetchone()
+    assert action_row is not None
     db_now = actions.db_now(conn)
+    # No receipt by then (the desktop went off): the task is failed and Manj is told, so an
+    # issued action never stays IN_PROGRESS for ever (v2 §9.3).
+    jobs.enqueue(conn, "action.receipt_timeout", {"action_id": str(action_row[0])},
+                 delay=valid_until - db_now + actions.RECEIPT_GRACE)  # fmt: skip
     authz = actions.sign(
         conn,
         actions.authz_object(

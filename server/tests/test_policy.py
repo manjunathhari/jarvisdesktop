@@ -424,7 +424,7 @@ def test_refuse_receipt_codes_privileges_and_entities(
     EXECUTE for jarvis_app only."""
     codes = ("bad_node_signature", "unknown_key", "reused_key", "unknown_action", "late",
              "malformed", "not_recycled", "file_mismatch", "listing_failed", "still_listed",
-             "listing_missing")  # fmt: skip
+             "listing_missing", "no_receipt")  # fmt: skip
     assert codes == actions.RECEIPT_REFUSALS
     for code in codes:
         ref = uuid.uuid4()
@@ -436,7 +436,7 @@ def test_refuse_receipt_codes_privileges_and_entities(
             " WHERE entity_id = %s",
             (ref,),
         ).fetchall()
-        entity = "approval" if code == "listing_missing" else "inbound"
+        entity = "approval" if code in ("listing_missing", "no_receipt") else "inbound"
         assert rows == [(entity, "RECEIPT", "REJECTED", code, {"node_id": str(node)})]
     for bad in ("expired", "duplicate_receipt", "anything", None):
         with pytest.raises(psycopg.errors.InvalidParameterValue):

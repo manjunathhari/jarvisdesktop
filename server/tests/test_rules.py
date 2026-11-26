@@ -97,6 +97,7 @@ def _in(minutes: float) -> datetime:
         ("turn.indeterminate", Priority.TODAY),
         ("turn.completed_after_hold", Priority.TODAY),  # controller ruling 1
         ("action.readonly_ok", Priority.SILENT),
+        ("action.no_receipt", Priority.TODAY),  # owner, 26 Nov
         ("brain.config_error", Priority.TODAY),
     ],
 )
@@ -118,7 +119,7 @@ def test_event_kinds_are_exactly_the_shared_interface() -> None:
         "turn.cap_expired", "turn.down_expired",
         "turn.indeterminate", "turn.completed_after_hold", "action.readonly_ok",
         "brain.config_error", "action.approved", "memory.written", "approval.decision_refused",
-        "keys.keyset",
+        "keys.keyset", "action.no_receipt",
     }  # fmt: skip
 
 

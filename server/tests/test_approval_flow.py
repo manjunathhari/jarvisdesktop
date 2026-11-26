@@ -802,6 +802,130 @@ def test_verify_timeout_after_the_listing_does_nothing(
     )
 
 
+# --- no receipt at all: the issued action's own timeout (server task, 26 Nov) -------------------
+
+
+def _receipt_timeout_job(app: Conn, key: str) -> tuple[dict[str, Any], datetime]:
+    """(payload, run_at) of the queued `action.receipt_timeout` for an issued key."""
+    row = app.execute(
+        "SELECT j.payload, j.run_at FROM ops.job j JOIN ledger.action a"
+        " ON j.payload->>'action_id' = a.id::text"
+        " WHERE j.kind = 'action.receipt_timeout' AND j.status = 'QUEUED'"
+        " AND a.idempotency_key = %s",
+        (key,),
+    ).fetchone()
+    assert row is not None, "no action.receipt_timeout job was queued with the action"
+    return dict(row[0]), row[1]
+
+
+def test_no_receipt_fails_the_task_after_valid_until(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    proposed: uuid.UUID,
+) -> None:  # fmt: skip
+    """An approved action whose receipt never comes: a job queued with the action, 60 s after
+    its valid_until, fails the task, says so, audits `no_receipt` against the approval and
+    leaves a TODAY notice for a desktop that was off."""
+    key = _approve(app, owner, person, node, proposed)
+    [item] = _issued(app, person)
+    payload, run_at = _receipt_timeout_job(app, key)
+    late_by = (run_at - item["expires_at"]).total_seconds()
+    assert abs(late_by - actions.RECEIPT_GRACE.total_seconds()) < 1
+    assert flow.task_state(app, proposed) == "IN_PROGRESS" and _action(app, key)[0] == "ISSUED"
+    flow.run(app, "action.receipt_timeout", payload)  # the clock reaches its run_at
+    assert flow.task_state(app, proposed) == "FAILED"
+    assert _action(app, key) == ("FAILED", False, 1)
+    assert flow.audit(app, proposed)[-1] == ("RECEIPT", "REJECTED", "no_receipt", None, None)
+    assert _last_speech(app, session) == "I couldn't confirm that a.txt was deleted."
+    [notice] = flow.items(app, person, "action.no_receipt")
+    assert notice["priority"] == "TODAY" and notice["target_node_id"] is None
+    assert notice["body"]["text"] == "I couldn't confirm that a.txt was deleted"
+    [item] = _issued(app, person)  # the signed action is never offered again
+    assert item["state"] not in ("PENDING", "DELIVERING", "DELIVERED")
+
+
+def test_receipt_before_the_timeout_wins(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, proposed: uuid.UUID
+) -> None:
+    key = _approve(app, owner, person, node, proposed)
+    payload, _ = _receipt_timeout_job(app, key)
+    flow.run(app, "action.receipt", {"inbound_id": str(_receipt(owner, node, person, key))})
+    since = int(app.execute("SELECT max(seq) FROM audit.event").fetchone()[0])  # type: ignore[index]
+    flow.run(app, "action.receipt_timeout", payload)
+    assert flow.task_state(app, proposed) == "IN_PROGRESS"  # still waiting for its listing
+    assert _action(app, key)[0] == "RECEIVED"
+    assert flow.items(app, person, "action.no_receipt") == []
+    assert app.execute("SELECT count(*) FROM audit.event WHERE seq > %s", (since,)).fetchone() == (
+        0,
+    )
+
+
+def test_receipt_timeout_run_twice_writes_nothing_more(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    proposed: uuid.UUID,
+) -> None:  # fmt: skip
+    key = _approve(app, owner, person, node, proposed)
+    payload, _ = _receipt_timeout_job(app, key)
+    flow.run(app, "action.receipt_timeout", payload)
+    since = int(app.execute("SELECT max(seq) FROM audit.event").fetchone()[0])  # type: ignore[index]
+    speech = "SELECT count(*) FROM conv.stream_chunk WHERE session_id = %s AND type = 'SPEECH'"
+    spoken = app.execute(speech, (session,)).fetchone()
+    flow.run(app, "action.receipt_timeout", payload)
+    assert _action(app, key) == ("FAILED", False, 1)
+    assert len(flow.items(app, person, "action.no_receipt")) == 1
+    assert app.execute(speech, (session,)).fetchone() == spoken
+    assert app.execute("SELECT count(*) FROM audit.event WHERE seq > %s", (since,)).fetchone() == (
+        0,
+    )
+
+
+def test_late_receipt_after_the_timeout_is_refused(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, proposed: uuid.UUID
+) -> None:
+    """Owner decision 1 (26 Nov): a RECYCLED receipt arriving after the timeout is refused
+    `reused_key` and audited; the task stays FAILED and nothing is verified."""
+    key = _approve(app, owner, person, node, proposed)
+    payload, _ = _receipt_timeout_job(app, key)
+    flow.run(app, "action.receipt_timeout", payload)
+    late = _receipt(owner, node, person, key)
+    flow.run(app, "action.receipt", {"inbound_id": str(late)})
+    assert flow.task_state(app, proposed) == "FAILED"
+    assert _action(app, key) == ("FAILED", False, 1)
+    assert [r[:2] for r in flow.receipt_audit(app, late)] == [("REJECTED", "reused_key")]
+
+
+def test_receipt_and_timeout_race_has_one_outcome(
+    dsns: Dsns, app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, proposed: uuid.UUID
+) -> None:
+    """The receipt job holds the action's row lock; the timeout waits on it, then finds the
+    action RECEIVED and does nothing."""
+    key = _approve(app, owner, person, node, proposed)
+    payload, _ = _receipt_timeout_job(app, key)
+    receipt = _receipt(owner, node, person, key)
+    claimed = [
+        flow.claim(app, jobs.enqueue(app, "action.receipt", {"inbound_id": str(receipt)})),
+        flow.claim(app, jobs.enqueue(app, "action.receipt_timeout", payload)),
+    ]
+    gate = threading.Event()
+    real = actions.end_items
+
+    def held_end_items(*args: Any, **kw: Any) -> Any:
+        gate.wait(10)  # the receipt job has locked and taken the action's row here
+        return real(*args, **kw)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(actions, "end_items", held_end_items)
+        one = InThread(dsns.app, lambda c: dispatch.handle(c, claimed[0]))
+        two = InThread(dsns.app, lambda c: dispatch.handle(c, claimed[1]))
+        blocked = two.wait_until_blocked(dsns.superuser)  # on the row lock the receipt holds
+        assert blocked in ("tuple", "transactionid")
+        gate.set()
+        one.join()
+        two.join()
+    assert _action(app, key)[0] == "RECEIVED" and flow.task_state(app, proposed) == "IN_PROGRESS"
+    assert flow.items(app, person, "action.no_receipt") == []
+    assert flow.receipt_audit(app, receipt) == []
+
+
 def test_refused_transition_writes_no_outcome(
     app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
     proposed: uuid.UUID,
