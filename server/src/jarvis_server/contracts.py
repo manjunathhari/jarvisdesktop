@@ -607,8 +607,11 @@ class DeleteReceipt(_Contract):
 
 # --- the Board (slice 1: plan `.10x/plans/2026-11-26-board-slice-1.md`) -------------------------
 
-BOARD_TITLE_MAX = 120
-BOARD_CONTENT_MAX_BYTES = 32_000  # of UTF-8; a message is limited to 65,536 bytes
+BOARD_TITLE_MAX = 120  # Unicode code points
+# Of UTF-8. With control characters refused, content at most doubles when it is serialised
+# (`"`, `\\`, line breaks), so a panel is under 62,000 bytes of a frame's 65,536.
+BOARD_CONTENT_MAX_BYTES = 30_000
+INT_MAX = 2_147_483_647
 
 
 class PanelKind(StrEnum):
@@ -623,9 +626,26 @@ class PanelState(StrEnum):
     CLOSED = "closed"
 
 
-Revision = Annotated[int, Field(ge=1, strict=True)]
-PanelTitle = Annotated[str, Field(min_length=1, max_length=BOARD_TITLE_MAX)]
-Paise = Annotated[int, Field(ge=0, strict=True)]
+Revision = Annotated[int, Field(ge=1, le=INT_MAX, strict=True)]
+# One line: no control character (C0 or DEL), and at least one character that is not a space.
+PanelTitle = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=BOARD_TITLE_MAX,
+        pattern=r"^[^\x00-\x1f\x7f]*[^\x00-\x20\x7f][^\x00-\x1f\x7f]*$",
+    ),
+]
+# No control character except tab, line feed and carriage return (Postgres cannot store NUL).
+PanelContent = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=BOARD_CONTENT_MAX_BYTES,
+        pattern=r"^[^\x00-\x08\x0b\x0c\x0e-\x1f]+$",
+    ),
+]
+Paise = Annotated[int, Field(ge=0, le=INT_MAX, strict=True)]
 
 
 def board_content_sha256(content: str) -> str:
@@ -633,33 +653,31 @@ def board_content_sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-class _PanelContent(_Contract):
-    """What `board.show` and `board.update` share. The schema counts characters; the limit is
-    in bytes, and the hash must be the content's, so the model checks both."""
+class BoardShowArgs(_Contract):
+    """One whole panel. The schema counts characters; the limit is in bytes, and the hash must
+    be the content's, so the model checks both."""
 
     panel_id: UUID
     revision: Revision
+    kind: PanelKind
     title: PanelTitle
-    content: Annotated[str, Field(min_length=1, max_length=BOARD_CONTENT_MAX_BYTES)]
+    content: PanelContent
     content_sha256: Sha256Hex
     cost_paise: Paise
+    created_at: AwareDatetime
 
     @model_validator(mode="after")
     def _content_fits_and_matches(self) -> Self:
         if len(self.content.encode("utf-8")) > BOARD_CONTENT_MAX_BYTES:
-            raise ValueError("content is over 32,000 bytes")
+            raise ValueError("content is over 30,000 bytes")
         if self.content_sha256 != board_content_sha256(self.content):
             raise ValueError("content_sha256 is not the content's hash")
         return self
 
 
-class BoardShowArgs(_PanelContent):
-    kind: PanelKind
-    created_at: AwareDatetime
-
-
-class BoardUpdateArgs(_PanelContent):
-    pass
+class BoardUpdateArgs(BoardShowArgs):
+    """The whole panel at its new revision, in the shape of `board.show`, so a node that has
+    lost the panel can restore it."""
 
 
 class BoardSetStateArgs(_Contract):
@@ -683,9 +701,11 @@ class _Check(_Contract):
 
 
 class RenderEvidence(_Check):
-    panel_id: UUID
-    revision: Revision
-    content_sha256: Sha256Hex
+    """Each is null only when the args gave the node no usable value."""
+
+    panel_id: UUID | None
+    revision: Revision | None
+    content_sha256: Sha256Hex | None
 
 
 class BoardShowReceipt(_Contract):
@@ -696,9 +716,16 @@ class BoardShowReceipt(_Contract):
     result: Literal["RENDERED", "REFUSED", "ERROR"]
     evidence: RenderEvidence
 
+    @model_validator(mode="after")
+    def _rendered_names_what_was_drawn(self) -> Self:
+        e = self.evidence
+        if self.result == "RENDERED" and None in (e.panel_id, e.revision, e.content_sha256):
+            raise ValueError("a RENDERED receipt names the panel, revision and hash")
+        return self
+
 
 class PanelEvidence(_Check):
-    panel_id: UUID
+    panel_id: UUID | None
 
 
 class BoardSetStateReceipt(_Contract):
@@ -706,6 +733,12 @@ class BoardSetStateReceipt(_Contract):
     seq: Seq
     result: Literal["OK", "REFUSED"]
     evidence: PanelEvidence
+
+    @model_validator(mode="after")
+    def _ok_names_the_panel(self) -> Self:
+        if self.result == "OK" and self.evidence.panel_id is None:
+            raise ValueError("an OK receipt names the panel")
+        return self
 
 
 class BoardState(_Contract):

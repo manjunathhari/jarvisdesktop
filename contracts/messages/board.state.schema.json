@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/board.state.schema.json",
   "title": "Payload of `board.state` (node to core)",
-  "description": "The person changed a panel's state on the Board by hand (a click on minimise, maximise or close, or a reopen). Core records it, so its panel list matches the screen. `revision` is the panel revision the node holds.",
+  "description": "The person changed a panel's state on the Board by hand (a click on minimise, maximise or close, or a reopen). Core records it, so its panel list matches the screen. `revision` is the panel revision the node holds. Core applies these in the order they arrive: the last one wins.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -26,7 +26,8 @@
     },
     "revision": {
       "type": "integer",
-      "minimum": 1
+      "minimum": 1,
+      "maximum": 2147483647
     },
     "at": {
       "type": "string",

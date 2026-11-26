@@ -37,24 +37,63 @@
       ],
       "properties": {
         "panel_id": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "format": "uuid"
         },
         "revision": {
-          "type": "integer",
-          "minimum": 1
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 2147483647
         },
         "content_sha256": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^[0-9a-f]{64}$",
-          "description": "The hash of the content the node received."
+          "description": "The hash the node computed over the content it received."
         },
         "check": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9_.]{0,63}$",
           "description": "The check that failed. Omitted when there is none, never null."
         }
+      },
+      "description": "What the node drew or refused. Each of the three is null only when the action's args gave the node no usable value (check `malformed`, `too_large` and the like)."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "result": {
+            "const": "RENDERED"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "evidence": {
+            "properties": {
+              "panel_id": {
+                "type": "string"
+              },
+              "revision": {
+                "type": "integer"
+              },
+              "content_sha256": {
+                "type": "string"
+              }
+            }
+          }
+        }
       }
     }
-  }
+  ]
 }

@@ -2,16 +2,18 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/board.update.args.schema.json",
   "title": "Arguments of `board.update` (a new revision of a panel)",
-  "description": "The `authz.object.args` of a live `board.update` action: the panel's whole new title and content. `revision` is the new revision; the node refuses one that is not newer than what it holds (`stale_revision`). The panel's kind does not change.",
+  "description": "The `authz.object.args` of a live `board.update` action: the whole panel at its new revision, in the same shape as `board.show`, so a node that has lost the panel can restore it. `revision` is the new revision; the node refuses one that is not newer than what it holds (`stale_revision`). `kind` and `created_at` are the panel's own and do not change.",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "panel_id",
     "revision",
+    "kind",
     "title",
     "content",
     "content_sha256",
-    "cost_paise"
+    "cost_paise",
+    "created_at"
   ],
   "properties": {
     "panel_id": {
@@ -20,18 +22,29 @@
     },
     "revision": {
       "type": "integer",
-      "minimum": 1
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "kind": {
+      "enum": [
+        "text",
+        "canvas"
+      ],
+      "description": "`text`: formatted text (Markdown, no raw HTML). `canvas`: one self-contained HTML page, shown sealed."
     },
     "title": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 120
+      "maxLength": 120,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]*[^\\u0000-\\u0020\\u007f][^\\u0000-\\u001f\\u007f]*$",
+      "description": "One line: 1 to 120 Unicode code points, no control character, not blank."
     },
     "content": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 32000,
-      "description": "At most 32,000 bytes of UTF-8. JSON Schema counts characters, so core and the node also count bytes."
+      "maxLength": 30000,
+      "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f]+$",
+      "description": "At most 30,000 bytes of UTF-8, with no control character except tab, line feed and carriage return. JSON Schema counts characters, so core and the node also count bytes."
     },
     "content_sha256": {
       "type": "string",
@@ -41,7 +54,12 @@
     "cost_paise": {
       "type": "integer",
       "minimum": 0,
-      "description": "What making this panel cost, in paise (0 when the cost is carried by another panel of the same job)."
+      "maximum": 2147483647,
+      "description": "What this panel has cost to make so far, all revisions together, in paise (0 when the cost is carried by another panel of the same job)."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
     }
   }
 }

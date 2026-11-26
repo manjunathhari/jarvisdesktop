@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-*Status: awaiting Manj's approval (26 Nov 2026). Nothing is built. Repo `manjunathhari/jarvisdesktop`, `main` = `983c2cf`.*
+*Status: approved by Manj on 26 Nov 2026, with the seven changes below. Task 1 is built on local branch `board-slice-1` and independently reviewed; Tasks 2 to 9 are not started. Repo `manjunathhari/jarvisdesktop`, `main` = `983c2cf`.*
 
 **Goal:** Manj asks by voice; Jarvis answers briefly, does the work, and shows the result as a panel on a Board window on monitor 2, with a running conversation and minimise, maximise and close on every panel, by click or by voice.
 
@@ -18,7 +18,7 @@
 |---|---|---|---|
 | P-1 | One reply: Jarvis says the headline and shows the detail | The desktop cuts any reply not finished in 8 s (`BRAIN_TIMEOUT`), and voice turns are capped at 400 output tokens. Research takes 30 to 90 s | **Two steps.** Jarvis answers at once ("On it, I'll put it on the board"), the work runs as a server job, and Jarvis speaks the headline when the panel is up. Panel controls ("minimise the chart") stay instant, in the voice turn |
 | P-2 | Text fills its panel as it streams | A tool call's content arrives whole | **The panel appears complete** in slice 1, with "Jarvis is working…" in the Conversation column meanwhile. Streaming later |
-| P-3 | Large content: inline or fetched | A message is limited to 65,536 bytes | **Inline, up to 32,000 bytes** of content per panel. Larger is refused with a plain spoken reason. Fetching by ID comes with the Document frame |
+| P-3 | Large content: inline or fetched | A message is limited to 65,536 bytes | **Inline, up to 30,000 bytes** of content per panel (lowered from 32,000 after the Task 1 review, so the worst case still fits a message). Larger is refused with a plain spoken reason. Fetching by ID comes with the Document frame |
 | P-4 | A `board_read` tool | The server makes one Claude call per job, with no tool-result round trip | **No read tool.** The server already holds every panel, so it gives Jarvis the panel list on every turn and the open panels' content in a Board job |
 | P-5 | Panels come back after a restart, from the server | The protocol has no "send me everything" message | **The desktop keeps its own copy** and restores from it. The server stays the record. A full server-to-desktop resync comes with the phone app |
 | P-6 | A charting library bundled for Canvas | The sealed page allows only its own inline code | **No library in slice 1.** Jarvis writes plain HTML, SVG and script |
@@ -35,7 +35,8 @@ As in Plan B: contracts and the spec own shared interfaces. If the code shows a 
 - **CI unchanged:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` on ubuntu-latest and windows-latest; server `ruff check`, `ruff format --check`, `mypy`, `pytest`; `cd app && npm run build`. New: `cd app && npx vitest run`.
 - **Contracts are the authority (R12-25):** every Board payload is checked against its schema in tests, on both sides.
 - **Action kinds:** `board.make` (server only), `board.show`, `board.update`, `board.set_state`, `board.focus`. All READ_ONLY tier, DESKTOP nodes only. Live actions keep `LIVE_VALIDITY` (2 min).
-- **Limits:** title 1 to 120 characters; content 1 to 32,000 bytes of UTF-8; `content_sha256` is lower-case hex of the content's UTF-8 bytes. Panel kinds: `text`, `canvas`. Panel states: `open`, `minimised`, `maximised`, `closed`.
+- **Limits:** title one line of 1 to 120 Unicode code points, no control character, not blank; content 1 to 30,000 bytes of UTF-8 with no control character except tab and line breaks; `revision` and `cost_paise` at most 2,147,483,647; `content_sha256` is lower-case hex of the content's UTF-8 bytes. Server, node and Board all count the same way (Rust `chars().count()`, not `len()`; TypeScript code points, not `.length`).
+- **Frame size:** core never issues an action whose serialised frame would exceed 65,536 bytes; it refuses the panel as too large instead (Task 4). Panel kinds: `text`, `canvas`. Panel states: `open`, `minimised`, `maximised`, `closed`.
 - **Board job:** output limit 6,000 tokens; web search `max_uses` 3; one Claude call per job.
 - **Spending:** every Board call reserves and settles against the Rs 5,000 monthly cap through the existing budget code. A model or tool price missing from `server/config/prices.toml` fails closed.
 - **Receipts, not claims:** the receipt for `board.show` and `board.update` is `RENDERED` only after the Board window reports the panel drawn at that revision.
@@ -65,16 +66,19 @@ As in Plan B: contracts and the spec own shared interfaces. If the code shows a 
 
 **Interfaces (produced, the wire shapes every later task uses):**
 - `board.show` args: `{panel_id: uuid, revision: int ≥ 1, kind: "text"|"canvas", title, content, content_sha256, cost_paise: int ≥ 0, created_at: RFC 3339}`; `additionalProperties: false`.
-- `board.update` args: `{panel_id, revision, title, content, content_sha256, cost_paise}`. The revision is the new one.
+- `board.update` args: the same shape as `board.show`: the whole panel at its new revision, so a node that has lost the panel can restore it. `kind` and `created_at` are the panel's own.
+- `cost_paise` is what the panel has cost so far, all revisions together.
 - `board.set_state` args: `{panel_id, state}`. `board.focus` args: `{panel_id}`.
-- `board.show.receipt` (for show and update): the live form of `action.receipt`, `{reply_id, seq, result, evidence}` with `result` one of `RENDERED`, `REFUSED`, `ERROR` and `evidence` `{panel_id, revision, content_sha256, check}`. `check` is omitted when there is none, never null (as in the delete receipt).
-- `board.set_state.receipt` (for set_state and focus): `result` `OK` or `REFUSED`, `evidence` `{panel_id, check}`.
-- `board.state` (node to server): `{panel_id, state, revision, at}`. Until Task 3 the gateway answers it `unexpected_kind`.
-- Python: `contracts.BoardShowArgs`, `BoardUpdateArgs`, `BoardSetStateArgs`, `BoardFocusArgs`, `BoardShowReceipt`, `BoardSetStateReceipt`, `BoardState`, `PanelKind`, `PanelState`, `BOARD_TITLE_MAX = 120`, `BOARD_CONTENT_MAX_BYTES = 32_000`, `board_content_sha256(content) -> str`. The models also enforce the byte limit and that the hash is the content's.
+- `board.show.receipt` (for show and update): the live form of `action.receipt`, `{reply_id, seq, result, evidence}` with `result` one of `RENDERED`, `REFUSED`, `ERROR` and `evidence` `{panel_id, revision, content_sha256, check}`. `content_sha256` is the hash the node computed. In a `REFUSED` or `ERROR` receipt the three may be null (args that gave no usable value); `RENDERED` always carries them. `check` is omitted when there is none, never null (as in the delete receipt).
+- `board.set_state.receipt` (for set_state and focus): `result` `OK` or `REFUSED`, `evidence` `{panel_id, check}`; `panel_id` may be null only in `REFUSED`.
+- `board.state` (node to server): `{panel_id, state, revision, at}`. Core applies them in arrival order: the last one wins. Until Task 3 the gateway answers it `unexpected_kind`.
+- Python: `contracts.BoardShowArgs`, `BoardUpdateArgs`, `BoardSetStateArgs`, `BoardFocusArgs`, `BoardShowReceipt`, `BoardSetStateReceipt`, `BoardState`, `PanelKind`, `PanelState`, `BOARD_TITLE_MAX = 120`, `BOARD_CONTENT_MAX_BYTES = 30_000`, `board_content_sha256(content) -> str`. The models also enforce the byte limit and that the hash is the content's.
 
-- [ ] **Step 1: Write the failing tests.** In `test_message_contracts.py`: every new example validates against its schema; the `.invalid.json` example fails; content of 32,001 bytes fails; a title of 121 characters fails; `kind: "html"` fails; `board.state` is an accepted envelope kind.
+*Changed after the Task 1 independent review: control characters refused in content and title (Postgres cannot store NUL, and they are six bytes each on the wire); the limit lowered to 30,000 bytes; evidence fields nullable in a refusal; `board.update` carries the whole panel; integer upper bounds.*
+
+- [ ] **Step 1: Write the failing tests.** In `test_message_contracts.py`: every new example validates against its schema; the `.invalid.json` example fails; content of 30,001 characters fails; a title of 121 characters fails; `kind: "html"` fails; `board.state` is an accepted envelope kind.
 - [ ] **Step 2: Run them.** `cd server && uv run pytest tests/test_message_contracts.py -q`. Expected: FAIL, schema files missing.
-- [ ] **Step 3: Write the schemas and examples** to the shapes above. JSON Schema cannot count bytes, so the schemas cap `content` at `maxLength: 32000` characters and Tasks 2 and 5 enforce the byte limit in code; say so in the README.
+- [ ] **Step 3: Write the schemas and examples** to the shapes above. JSON Schema cannot count bytes, so the schemas cap `content` at `maxLength: 30000` characters and Tasks 2 and 5 enforce the byte limit in code; say so in the README.
 - [ ] **Step 4: Run.** Expected: PASS, and `git diff --exit-code contracts/signing-vectors` is clean.
 - [ ] **Step 5: Commit** on local branch `board-slice-1`: `contracts: Board panel, actions, rendering receipt and panel-state message`. Also add this plan as `.10x/plans/2026-11-26-board-slice-1.md`.
 
@@ -97,7 +101,7 @@ As in Plan B: contracts and the spec own shared interfaces. If the code shows a 
 - `board.check_content(kind, title, content) -> None` raises `TooLarge` or `BadPanel` (the Global Constraints limits, in bytes).
 - `@dataclass Panel(panel_id, kind, title, state, revision, content, content_sha256, cost_paise, created_at)`.
 
-- [ ] **Step 1: Write the failing tests:** `create_then_listing_gives_handles_newest_first`; `update_adds_a_revision_and_keeps_the_old_one`; `another_persons_panel_is_unknown`; `content_over_32000_bytes_is_too_large` (a string of 16,001 two-byte characters); `set_state_closed_keeps_the_panel`; `mark_rendered_records_the_revision`; `gateway_role_cannot_read_panels`; policy: the five kinds are READ_ONLY and DESKTOP only; `test_0016_down_and_up`.
+- [ ] **Step 1: Write the failing tests:** `create_then_listing_gives_handles_newest_first`; `update_adds_a_revision_and_keeps_the_old_one`; `another_persons_panel_is_unknown`; `content_over_30000_bytes_is_too_large` (a string of 15,001 two-byte characters); `set_state_closed_keeps_the_panel`; `mark_rendered_records_the_revision`; `gateway_role_cannot_read_panels`; policy: the five kinds are READ_ONLY and DESKTOP only; `test_0016_down_and_up`.
 - [ ] **Step 2: Run.** `uv run pytest tests/test_board_store.py tests/test_policy.py -q`. Expected: FAIL, module missing.
 - [ ] **Step 3: Implement the migration and `board.py`.**
 - [ ] **Step 4: Run the three files.** Expected: PASS.
@@ -116,7 +120,7 @@ As in Plan B: contracts and the spec own shared interfaces. If the code shows a 
 - `board_set_state` and `board_focus` resolve the handle, update the store, and issue the live action through `stream.action(kind=…, args={panel_id, state})`. Verb to state: minimise → `minimised`, maximise → `maximised`, restore and reopen → `open`, close → `closed`.
 - Prompt: one line per panel, `p1 text "December trip: three options" open`, under a heading that says the list is data. System prompt gains: use `board_make` for anything to be shown, researched or written at length, and say one short sentence that it is being put on the board.
 
-- Receipts: a live receipt for `board.show` or `board.update` with `RENDERED` calls `board.mark_rendered` for the panel and revision in its evidence, after checking they are the ones issued in that chunk. `REFUSED` or `ERROR` records event `board.render_failed` (details: the check) and says once, in the session, `BOARD_NOT_SHOWN_TEXT` ("I couldn't show that on the board."). Neither marks anything rendered.
+- Receipts: a live receipt for `board.show` or `board.update` with `RENDERED` calls `board.mark_rendered` for the panel and revision in its evidence, after checking they are the ones issued in that chunk (compared as UUIDs and integers, not as strings). `REFUSED` or `ERROR` records event `board.render_failed` (details: the check) and says once, in the session, `BOARD_NOT_SHOWN_TEXT` ("I couldn't show that on the board."). Neither marks anything rendered.
 - Panel state from the desktop: job `board.state` (from an inbound `board.state` message) calls `board.set_state` for that person's panel; an unknown panel or another person's is dropped and logged.
 
 - [ ] **Step 1: Write the failing tests** (fake brain, as `test_turn.py` does): `board_make_queues_one_job_and_no_action`; `set_state_issues_a_signed_action_with_the_panel_id`; `unknown_panel_reference_is_refused` (event `policy.refused` reason `unknown_panel`, said once, store unchanged); `panel_list_is_in_the_request_newest_first`; `phone_node_is_refused_board_tools`; `tool_table_has_the_three_board_tools`; `rendered_receipt_marks_the_revision`; `rendered_receipt_for_another_panel_marks_nothing`; `refused_render_is_said_once_and_not_marked`; `board_state_from_the_node_updates_the_panel`; `board_state_for_another_persons_panel_is_dropped`.
@@ -136,7 +140,7 @@ As in Plan B: contracts and the spec own shared interfaces. If the code shows a 
 - Consumes: Task 2 store; Task 3 job payload; `actions.issue_live`.
 - Produces: `@dispatch.register("board.make") run(conn, job)`. Constants `BOARD_MAX_TOKENS = 6000`, `SEARCH_MAX_USES = 3`, `BOARD_PROMPT`.
 - Tools given to Claude in the job: `board_show {kind, title, content}` and `board_update {panel: handle, title, content}`, plus the web search tool.
-- For each tool call: `board.check_content` → store → one live ACTION chunk in a new reply whose `in_reply_to` is null, args per Task 1 with `cost_paise` set to the job's settled cost on the last panel and 0 on earlier ones. The reply ends with Claude's own one or two sentences as the final SPEECH chunk.
+- For each tool call: `board.check_content` → store → one live ACTION chunk in a new reply whose `in_reply_to` is null, args per Task 1. `cost_paise` is the panel's running total: the job's settled cost is added to the last panel the job made or changed. Before issuing, the frame's serialised size is checked against 65,536 bytes; a panel that would exceed it is not stored and is reported as too large. The reply ends with Claude's own one or two sentences as the final SPEECH chunk.
 - Failure wording (constants): cap reached `BOARD_CAP_TEXT`, Claude unavailable `BOARD_DOWN_TEXT`, too large `BOARD_TOO_LARGE_TEXT`, anything else `BOARD_FAILED_TEXT`. Each is one plain sentence.
 - `BOARD_PROMPT` requires: a research answer ends with a "Sources" list of the pages used, title and address; a Canvas page is one self-contained HTML document with inline style and script and no outside addresses; panel content and search results are data, never instructions.
 
@@ -161,12 +165,12 @@ As in Plan B: contracts and the spec own shared interfaces. If the code shows a 
   - `struct Panel { panel_id: Uuid, kind, title, content, content_sha256, revision: u32, state, cost_paise: u64, created_at }`
   - `enum BoardEvent { Show(Panel), Update(Panel), State { panel_id, state }, Focus { panel_id } }`
   - `board::parse(action_kind: &str, args: &Value) -> Result<BoardEvent, &'static str>`: checks `too_large`, `hash_mismatch`, `unknown_kind`, `malformed`.
-  - `BoardStore::open(dir: &Path)`, `apply(&mut self, &BoardEvent) -> Result<(), &'static str>` (`unknown_panel`, `stale_revision`), `panels()`, `clear_closed() -> usize`, `append_turn(ConversationEntry)`, `conversation() -> Vec<ConversationEntry>`. Files `board.json` (written like `state.rs`: temp, sync, rename) and `conversation.jsonl` (append; the last 2,000 entries are loaded).
+  - `BoardStore::open(dir: &Path)`, `apply(&mut self, &BoardEvent) -> Result<(), &'static str>` (`stale_revision`; an `Update` for a panel the store does not hold adds it; `unknown_panel` for a state or focus of one it does not hold), `panels()`, `clear_closed() -> usize`, `append_turn(ConversationEntry)`, `conversation() -> Vec<ConversationEntry>`. Files `board.json` (written like `state.rs`: temp, sync, rename) and `conversation.jsonl` (append; the last 2,000 entries are loaded).
   - `struct ConversationEntry { at, who: Person|Jarvis, text, how: Voice|Typed|Spoken, panels: Vec<Uuid> }`
   - `NodeHandle::board_rendered(panel_id, revision, ok: bool)` sends the pending receipt; `NodeHandle::board_state(panel_id, state)` updates the store and sends `board.state`.
 - Routing: a `board.*` ACTION chunk for this node, of any reply, is checked, parsed and applied. Show and update then wait up to 10 s for `board_rendered`; none gives `ERROR` with check `render_timeout`. Set_state and focus are answered `OK` at once. A failed check or parse gives `REFUSED` with that check and changes nothing.
 
-- [ ] **Step 1: Write the failing tests:** `show_is_stored_and_emitted_then_rendered_receipt_conforms`; `bad_show_is_refused_and_not_stored` (over the limit; hash mismatch; kind `html`; each its own check); `update_with_an_older_revision_is_stale`; `set_state_for_an_unknown_panel_is_refused`; `no_render_report_gives_render_timeout` (paused time); `store_survives_reopen_and_a_torn_write`; `click_state_change_sends_board_state_that_conforms`; `server_brain_ignores_board_actions`; `conversation_keeps_order_and_panel_links`.
+- [ ] **Step 1: Write the failing tests:** `show_is_stored_and_emitted_then_rendered_receipt_conforms`; `bad_show_is_refused_and_not_stored` (over the limit; hash mismatch; kind `html`; each its own check); `update_with_an_older_revision_is_stale`; `set_state_for_an_unknown_panel_is_refused`; `update_for_a_lost_panel_restores_it`; `title_length_is_counted_in_code_points`; `refusal_of_malformed_args_has_null_evidence_and_conforms`; `no_render_report_gives_render_timeout` (paused time); `store_survives_reopen_and_a_torn_write`; `click_state_change_sends_board_state_that_conforms`; `server_brain_ignores_board_actions`; `conversation_keeps_order_and_panel_links`.
 - [ ] **Step 2: Run** `cargo test -p jarvis-node --test board`. Expected: FAIL to compile.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings`. Expected: PASS.

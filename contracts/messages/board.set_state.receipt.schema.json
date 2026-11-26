@@ -34,8 +34,12 @@
       ],
       "properties": {
         "panel_id": {
-          "type": "string",
-          "format": "uuid"
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "description": "Null only when the args gave the node no usable panel ID (check `malformed`)."
         },
         "check": {
           "type": "string",
@@ -44,5 +48,27 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "result": {
+            "const": "OK"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "evidence": {
+            "properties": {
+              "panel_id": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }
