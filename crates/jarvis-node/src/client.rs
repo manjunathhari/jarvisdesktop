@@ -43,8 +43,9 @@ pub const RECHECK: Duration = Duration::from_secs(30);
 const STABLE_LINK: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A panel the Board has not reported drawn after this long gets an `ERROR` receipt.
-pub const BOARD_RENDER_TIMEOUT: Duration = Duration::from_secs(10);
+/// A panel the Board has not reported drawn after this long gets an `ERROR` receipt. Long
+/// enough for the Board window to be opened first; the server accepts a receipt for 2 minutes.
+pub const BOARD_RENDER_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {

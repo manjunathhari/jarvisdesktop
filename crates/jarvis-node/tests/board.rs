@@ -225,13 +225,13 @@ fn an_update_keeps_the_panels_state_and_a_lost_panel_is_restored() {
     store
         .apply(&BoardEvent::State {
             panel_id: id,
-            state: PanelState::Minimised,
+            state: PanelState::Maximised,
         })
         .unwrap();
     store
         .apply(&BoardEvent::Update(panel(id, 2, "two")))
         .unwrap();
-    assert_eq!(store.panels()[0].state, PanelState::Minimised);
+    assert_eq!(store.panels()[0].state, PanelState::Maximised);
     // An update carries the whole panel, so one the store has lost comes back, open.
     let lost = Uuid::new_v4();
     store
@@ -767,7 +767,7 @@ async fn board_actions_never_reach_the_reply_stream() {
 }
 
 #[tokio::test]
-async fn an_action_for_another_node_or_under_a_bad_signature_is_not_applied() {
+async fn an_action_changed_after_signing_is_not_applied() {
     let mut r = rig().await;
     let id = Uuid::new_v4();
     let mut authz = action(
@@ -837,4 +837,310 @@ async fn two_waiting_panels_each_get_their_own_receipt() {
     assert!(recv_within(&mut r.ws, Duration::from_millis(300))
         .await
         .is_none());
+}
+
+// --- after the independent review of Task 5 ---------------------------------------------------
+
+#[test]
+fn an_update_brings_a_hidden_panel_back_so_it_can_be_drawn() {
+    // A minimised or closed panel is not on screen, so its update could never be reported
+    // drawn. The person asked for the change: it comes back, open.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = BoardStore::open(dir.path());
+    let id = Uuid::new_v4();
+    store.apply(&BoardEvent::Show(panel(id, 1, "one"))).unwrap();
+    for (hidden, revision) in [(PanelState::Minimised, 2), (PanelState::Closed, 3)] {
+        store
+            .apply(&BoardEvent::State {
+                panel_id: id,
+                state: hidden,
+            })
+            .unwrap();
+        store
+            .apply(&BoardEvent::Update(panel(id, revision, "newer")))
+            .unwrap();
+        assert_eq!(store.panels()[0].state, PanelState::Open);
+    }
+    // One in view keeps its state.
+    store
+        .apply(&BoardEvent::State {
+            panel_id: id,
+            state: PanelState::Maximised,
+        })
+        .unwrap();
+    store
+        .apply(&BoardEvent::Update(panel(id, 4, "newest")))
+        .unwrap();
+    assert_eq!(store.panels()[0].state, PanelState::Maximised);
+}
+
+#[test]
+fn files_from_a_newer_build_are_not_thrown_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = Uuid::new_v4();
+    {
+        let mut store = BoardStore::open(dir.path());
+        store.apply(&BoardEvent::Show(panel(id, 1, "one"))).unwrap();
+        store
+            .append_turn(ConversationEntry {
+                at: now(),
+                who: Who::Person,
+                text: "hello".into(),
+                how: How::Typed,
+                panels: vec![],
+            })
+            .unwrap();
+    }
+    // A later build added a field to each; this build reads what it knows.
+    let path = dir.path().join("board.json");
+    let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    file["panels"][0]["pinned"] = json!(true);
+    file["layout"] = json!("grid");
+    std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+    let talk = dir.path().join("conversation.jsonl");
+    let line = std::fs::read_to_string(&talk).unwrap();
+    std::fs::write(&talk, line.replacen('{', "{\"mood\":\"calm\",", 1)).unwrap();
+    let store = BoardStore::open(dir.path());
+    assert_eq!(store.panels().len(), 1);
+    assert_eq!(store.conversation().len(), 1);
+    assert!(!dir.path().join("board.json.unreadable").exists());
+}
+
+#[test]
+fn a_store_from_a_newer_format_is_left_alone_and_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("board.json");
+    let newer = br#"{"v":2,"panels":[],"something":"new"}"#;
+    std::fs::write(&path, newer).unwrap();
+    let mut store = BoardStore::open(dir.path());
+    assert_eq!(
+        store.apply(&BoardEvent::Show(panel(Uuid::new_v4(), 1, "one"))),
+        Err("store_failed")
+    );
+    assert!(store.clear_closed().is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), newer, "untouched");
+}
+
+#[test]
+fn every_unreadable_store_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    for bad in [&b"first bad file"[..], &b"second bad file"[..]] {
+        std::fs::write(dir.path().join("board.json"), bad).unwrap();
+        let mut store = BoardStore::open(dir.path());
+        store
+            .apply(&BoardEvent::Show(panel(Uuid::new_v4(), 1, "one")))
+            .unwrap();
+    }
+    let kept: Vec<Vec<u8>> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().contains("unreadable"))
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+    assert_eq!(kept.len(), 2, "neither bad file was overwritten");
+}
+
+#[test]
+fn a_conversation_torn_inside_a_character_keeps_its_good_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = |text: &str| ConversationEntry {
+        at: now(),
+        who: Who::Jarvis,
+        text: text.into(),
+        how: How::Spoken,
+        panels: vec![],
+    };
+    {
+        let mut store = BoardStore::open(dir.path());
+        store.append_turn(entry("one")).unwrap();
+        store.append_turn(entry("two")).unwrap();
+    }
+    let path = dir.path().join("conversation.jsonl");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"{\"text\":\"caf\xc3"); // cut in the middle of a two-byte letter
+    std::fs::write(&path, bytes).unwrap();
+    let mut store = BoardStore::open(dir.path());
+    assert_eq!(store.conversation().len(), 2);
+    store.append_turn(entry("three")).unwrap();
+    let texts: Vec<String> = BoardStore::open(dir.path())
+        .conversation()
+        .into_iter()
+        .map(|e| e.text)
+        .collect();
+    assert_eq!(texts, ["one", "two", "three"]);
+}
+
+#[test]
+fn a_board_event_serialises_for_the_window() {
+    let id = Uuid::new_v4();
+    let show = serde_json::to_value(BoardEvent::Show(panel(id, 1, "one"))).unwrap();
+    assert_eq!(
+        (&show["type"], &show["panel_id"], &show["state"]),
+        (&json!("show"), &json!(id), &json!("open"))
+    );
+    assert_eq!(
+        serde_json::to_value(BoardEvent::State {
+            panel_id: id,
+            state: PanelState::Closed
+        })
+        .unwrap(),
+        json!({"type": "state", "panel_id": id, "state": "closed"})
+    );
+    assert_eq!(
+        serde_json::to_value(BoardEvent::Focus { panel_id: id }).unwrap(),
+        json!({"type": "focus", "panel_id": id})
+    );
+}
+
+#[tokio::test]
+async fn the_event_for_an_update_carries_the_panels_real_state() {
+    let mut r = rig().await;
+    let id = Uuid::new_v4();
+    push(&mut r, 1, "board.show", &args(id, 1, "text", "Trip", "one")).await;
+    board_event(&mut r).await;
+    r.node.board_rendered(id, 1, true).await;
+    sent(&mut r, "action.receipt").await;
+    r.node.board_state(id, PanelState::Maximised).await.unwrap();
+    sent(&mut r, "board.state").await;
+    push(
+        &mut r,
+        1,
+        "board.update",
+        &args(id, 2, "text", "Trip", "two"),
+    )
+    .await;
+    let BoardEvent::Update(p) = board_event(&mut r).await else {
+        panic!()
+    };
+    assert_eq!(
+        p.state,
+        PanelState::Maximised,
+        "what the store holds, not a default"
+    );
+
+    // Minimised: the update brings it back, the window is told so, and so is the server.
+    r.node.board_rendered(id, 2, true).await;
+    sent(&mut r, "action.receipt").await;
+    r.node.board_state(id, PanelState::Minimised).await.unwrap();
+    sent(&mut r, "board.state").await;
+    push(
+        &mut r,
+        1,
+        "board.update",
+        &args(id, 3, "text", "Trip", "three"),
+    )
+    .await;
+    let report = sent(&mut r, "board.state").await;
+    assert_conforms("board.state", &report);
+    assert_eq!(
+        (&report["state"], &report["revision"]),
+        (&json!("open"), &json!(3))
+    );
+    let BoardEvent::Update(p) = board_event(&mut r).await else {
+        panic!()
+    };
+    assert_eq!(p.state, PanelState::Open);
+}
+
+#[tokio::test]
+async fn a_newer_revision_drawn_ends_the_wait_for_an_older_one() {
+    // Two changes to one panel close together; the window draws only the newer. The older
+    // gets no receipt at all: it was neither drawn nor did it fail.
+    let mut r = rig_with(|cfg| cfg.board_render_timeout = Duration::from_millis(400)).await;
+    let id = Uuid::new_v4();
+    push(&mut r, 1, "board.show", &args(id, 1, "text", "Trip", "one")).await;
+    let newer = push(
+        &mut r,
+        1,
+        "board.update",
+        &args(id, 2, "text", "Trip", "two"),
+    )
+    .await;
+    board_event(&mut r).await;
+    board_event(&mut r).await;
+    r.node.board_rendered(id, 2, true).await;
+    let receipt = sent(&mut r, "action.receipt").await;
+    assert_eq!(
+        (&receipt["reply_id"], &receipt["result"]),
+        (&json!(newer), &json!("RENDERED"))
+    );
+    assert!(
+        recv_within(&mut r.ws, Duration::from_millis(900))
+            .await
+            .is_none(),
+        "no timeout for the older"
+    );
+}
+
+#[tokio::test]
+async fn the_same_action_twice_waits_once() {
+    let mut r = rig_with(|cfg| cfg.board_render_timeout = Duration::from_millis(300)).await;
+    let id = Uuid::new_v4();
+    let reply_id = Uuid::new_v4();
+    let authz = action(
+        &r,
+        reply_id,
+        "board.show",
+        &args(id, 1, "text", "Trip", TEXT),
+    );
+    for _ in 0..2 {
+        r.push(
+            "node.action",
+            json!({"authz": authz, "seq": 1, "in_reply_to": null}),
+        )
+        .await;
+        board_event(&mut r).await;
+    }
+    let first = sent(&mut r, "action.receipt").await;
+    assert_eq!(evidence(&first), ("ERROR", Some("render_timeout")));
+    assert!(
+        recv_within(&mut r.ws, Duration::from_millis(600))
+            .await
+            .is_none(),
+        "one receipt"
+    );
+}
+
+#[tokio::test]
+async fn focus_on_a_panel_in_view_reports_no_state() {
+    let mut r = rig().await;
+    let id = Uuid::new_v4();
+    push(&mut r, 1, "board.show", &args(id, 1, "text", "Trip", TEXT)).await;
+    board_event(&mut r).await;
+    push(&mut r, 1, "board.focus", &json!({"panel_id": id})).await;
+    // The frames that follow: the focus receipt, and nothing else.
+    let mut kinds = Vec::new();
+    while let Some(frame) = recv_within(&mut r.ws, Duration::from_millis(400)).await {
+        kinds.push(frame["kind"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(kinds, ["action.receipt"]);
+}
+
+#[tokio::test]
+async fn an_action_for_another_node_is_not_applied() {
+    let mut r = rig().await;
+    let at = now();
+    let ts = |t: chrono::DateTime<chrono::FixedOffset>| {
+        t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let other = signed(
+        "core-1",
+        "core-1",
+        json!({
+            "v": 1, "kind": "node.action", "action_kind": "board.show",
+            "args": args(Uuid::new_v4(), 1, "text", "Trip", TEXT),
+            "target_node_id": Uuid::new_v4(), "person_id": Uuid::new_v4(),
+            "approval_id": null, "execution_key": null, "reply_id": Uuid::new_v4(),
+            "summary": null, "issued_at": ts(at), "valid_until": ts(at + Span::minutes(2)),
+        }),
+    );
+    r.push(
+        "node.action",
+        json!({"authz": other, "seq": 1, "in_reply_to": null}),
+    )
+    .await;
+    assert!(recv_within(&mut r.ws, Duration::from_millis(300))
+        .await
+        .is_none());
+    assert!(r.node.board().lock().unwrap().panels().is_empty());
 }

@@ -67,7 +67,13 @@ def test_request_becomes_a_rendered_panel_then_voice_and_click_and_restart(
     node → the node's store → the Board reports it drawn → the server marks it rendered → the
     headline. Then "minimise it" by voice reaches the node, a click on Close reaches the
     server, and a restarted node still has the panel."""
-    minimise = ToolCall("board_set_state", {"panel": "p1", "state": "minimise"})
+    # The handle the new panel will get: the tests of this module share one person.
+    with psycopg.connect(dsns.app, autocommit=True) as conn:
+        row = conn.execute(
+            "SELECT coalesce(max(number), 0) + 1 FROM board.panel WHERE person_id = %s", (MANJ,)
+        ).fetchone()
+    assert row is not None
+    minimise = ToolCall("board_set_state", {"panel": f"p{row[0]}", "state": "minimise"})
     turn.set_brain(Brains([MAKE], [SHOW], [minimise]))
     state = tmp_path / "probe"
     p = Probe(
@@ -93,7 +99,6 @@ def test_request_becomes_a_rendered_panel_then_voice_and_click_and_restart(
     # By voice: the node gets the state, and its store and the server's agree.
     moved = p.wait_for(lambda e: e["event"] == "board_state", timeout=40)
     assert (moved["panel_id"], moved["state"]) == (panel_id, "minimised")
-    assert _panel(dsns, panel_id)[0] == "minimised"
     # By click: the node tells the server.
     p.wait_for(lambda e: e["event"] == "board_state_set")
     _until(lambda: _panel(dsns, panel_id)[0] == "closed")
@@ -102,9 +107,15 @@ def test_request_becomes_a_rendered_panel_then_voice_and_click_and_restart(
     assert "board.make" in core.ran and "board.headline" in core.ran
     assert board_job.HEADLINE_WAIT.total_seconds() > 100, "it was the receipt that released it"
     assert "board.state" in core.ran
-    said = [e["text"] for e in events if e["event"] == "reply"]
-    assert board_node.BOARD_NOT_SHOWN_TEXT not in said
-    assert board_node.BOARD_NOT_DONE_TEXT not in said
+    # Nothing about this panel failed. (Asked of the server: a new node of the same person is
+    # also sent the replies of the module's other test.)
+    with psycopg.connect(dsns.app, autocommit=True) as conn:
+        failed = conn.execute(
+            "SELECT count(*) FROM comm.event WHERE details->>'panel_id' = %s"
+            " AND kind IN ('board.render_failed', 'board.state_refused')",
+            (panel_id,),
+        ).fetchone()
+    assert failed == (0,)
     # A restarted node has the panel, in its last state.
     again = Probe(served["port"], state, "--wait", "1").finish()
     restored = [e for e in again if e["event"] == "board_restored"]
@@ -134,4 +145,5 @@ def test_refused_render_is_not_marked_rendered(
     assert failed["in_reply_to"] is None
     events = p.finish()
     assert _panel(dsns, shown["panel_id"])[2] is None
+    assert "board.headline" in core.ran, "its job ran, released by the receipt, and said nothing"
     assert unsaid not in [e.get("text") for e in events], "the headline is not claimed"

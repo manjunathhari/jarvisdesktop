@@ -27,10 +27,15 @@
 //!   and `board.update` then go to the app (`UiEvent::Board`) and wait for
 //!   `NodeHandle::board_rendered`: `RENDERED` only when the Board window reports the panel
 //!   drawn at that revision (receipts, not claims), `ERROR` `render_failed` if it reports it
-//!   could not, and `ERROR` `render_timeout` if it reports nothing in time. A waiting receipt
-//!   does not survive a restart: the panel is restored from the store and no receipt is sent.
-//!   `board.set_state` and `board.focus` are answered `OK` at once. A focus that brings a
-//!   minimised or closed panel back changes its state, so the server is told (`board.state`).
+//!   could not, and `ERROR` `render_timeout` if it reports nothing in time. When a newer
+//!   revision of the same panel is reported drawn, an older one still waiting gets no receipt:
+//!   it was neither drawn nor did it fail. The same action delivered twice waits once. A
+//!   waiting receipt does not survive a restart: the panel is restored from the store and no
+//!   receipt is sent. A receipt that cannot be sent (the link is down) is logged and lost.
+//!   The store's file work runs off the routing path (`spawn_blocking`).
+//!   `board.set_state` and `board.focus` are answered `OK` at once. A focus or an update that
+//!   brings a minimised or closed panel back changes its state, so the server is told
+//!   (`board.state`). The event the app gets carries the panel as the store now holds it.
 //! - `NodeHandle::board_state`: the person changed a panel by hand. The store is updated and
 //!   `board.state` sent; if the link is down the server is not told (the resync is later work).
 //! - `welcome` summary: shown as lines, display only, so a summary line never marks an
@@ -188,10 +193,14 @@ impl NodeHandle {
     pub async fn board_rendered(&self, panel_id: Uuid, revision: u32, ok: bool) {
         let waiting: Vec<PendingRender> = {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            let (mine, rest) = std::mem::take(&mut *pending)
+            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *pending)
                 .into_iter()
                 .partition(|p| p.panel_id == panel_id && p.revision == revision);
             *pending = rest;
+            if ok && !mine.is_empty() {
+                // The newer revision is on screen: an older one of this panel will never be.
+                pending.retain(|p| p.panel_id != panel_id || p.revision > revision);
+            }
             mine
         };
         for p in waiting {
@@ -209,11 +218,14 @@ impl NodeHandle {
     /// The person minimised, maximised, restored or closed a panel by hand: record it and tell
     /// the server. `Err` names why nothing changed (`unknown_panel`, `store_failed`).
     pub async fn board_state(&self, panel_id: Uuid, state: PanelState) -> Result<(), &'static str> {
-        let revision = {
-            let mut store = self.board.lock().unwrap_or_else(|e| e.into_inner());
+        let board = self.board.clone();
+        let revision = tokio::task::spawn_blocking(move || {
+            let mut store = board.lock().unwrap_or_else(|e| e.into_inner());
             store.apply(&BoardEvent::State { panel_id, state })?;
-            store.panel(panel_id).map(|p| p.revision)
-        };
+            Ok(store.panel(panel_id).map(|p| p.revision))
+        })
+        .await
+        .unwrap_or(Err("store_failed"))?;
         if let Some(revision) = revision {
             send_board_state(&self.client, panel_id, state, revision).await;
         }
@@ -796,19 +808,37 @@ impl Router {
                 "evidence": board::refused_evidence(kind, args, check),
             })
         };
-        let applied = board::parse(kind, args).and_then(|event| {
-            let mut store = self.board.lock().unwrap_or_else(|e| e.into_inner());
+        // Parsing hashes the content and applying writes the file: off the routing path.
+        let (store, k, a) = (self.board.clone(), kind.to_owned(), args.clone());
+        let applied = tokio::task::spawn_blocking(move || {
+            let event = board::parse(&k, &a)?;
+            let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
             let before = store.panel(event.panel_id()).map(|p| p.state);
             store.apply(&event)?;
             let after = store.panel(event.panel_id()).cloned();
-            Ok((event, before, after))
-        });
+            Ok((event, before, after.ok_or("store_failed")?))
+        })
+        .await
+        .unwrap_or(Err("store_failed"));
         let (event, before, after) = match applied {
             Ok(done) => done,
             Err(check) => {
-                let _ = self.client.send("action.receipt", refuse(check)).await;
+                if self
+                    .client
+                    .send("action.receipt", refuse(check))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(%reply_id, seq, "refusal not sent: not connected");
+                }
                 return;
             }
+        };
+        // The app is given the panel as the store holds it (its real state), not as parsed.
+        let event = match event {
+            BoardEvent::Show(_) => BoardEvent::Show(after.clone()),
+            BoardEvent::Update(_) => BoardEvent::Update(after.clone()),
+            other => other,
         };
         match &event {
             BoardEvent::Show(p) | BoardEvent::Update(p) => self.await_render(reply_id, seq, p),
@@ -817,15 +847,17 @@ impl Router {
                     "reply_id": reply_id, "seq": seq, "result": "OK",
                     "evidence": {"panel_id": panel_id},
                 });
-                let _ = self.client.send("action.receipt", receipt).await;
-                // A focus that brought the panel back changed its state: the server's record
-                // follows (it is not told of a state it set itself).
-                if let (BoardEvent::Focus { .. }, Some(now)) = (&event, &after) {
-                    if before != Some(now.state) {
-                        send_board_state(&self.client, now.panel_id, now.state, now.revision).await;
-                    }
+                if self.client.send("action.receipt", receipt).await.is_err() {
+                    tracing::warn!(%reply_id, seq, "receipt not sent: not connected");
                 }
             }
+        }
+        // A focus or an update that brought the panel back changed its state: the server's
+        // record follows. (It is not told of a state it set itself, nor of a new panel's.)
+        let brought_back = !matches!(event, BoardEvent::State { .. })
+            && before.is_some_and(|was| was != after.state);
+        if brought_back {
+            send_board_state(&self.client, after.panel_id, after.state, after.revision).await;
         }
         let _ = self.ui.send(UiEvent::Board(event)).await;
     }
@@ -839,10 +871,16 @@ impl Router {
             revision: panel.revision,
             content_sha256: panel.content_sha256.clone(),
         };
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(waiting);
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if pending
+                .iter()
+                .any(|p| p.reply_id == reply_id && p.seq == seq)
+            {
+                return; // the same action again: it already waits, with its own timeout
+            }
+            pending.push(waiting);
+        }
         let (pending, client, timeout) = (
             self.pending.clone(),
             self.client.clone(),
@@ -860,7 +898,9 @@ impl Router {
             if let Some(p) = late {
                 tracing::warn!(%reply_id, seq, "the Board did not report the panel drawn in time");
                 let receipt = p.receipt("ERROR", Some("render_timeout"));
-                let _ = client.send("action.receipt", receipt).await;
+                if client.send("action.receipt", receipt).await.is_err() {
+                    tracing::warn!(%reply_id, seq, "timeout receipt not sent: not connected");
+                }
             }
         });
     }

@@ -12,13 +12,19 @@
 //!   and is rewritten whole on each change (temp file, sync, rename, like the node's state);
 //!   `conversation.jsonl` is appended to. Nothing is deleted except closed panels, by
 //!   `clear_closed`, which the Board calls only after the person confirms.
+//! - The files outlive builds. Fields this build does not know are ignored, not refused, so a
+//!   file written by a newer build still loads after a roll-back. A `board.json` that cannot be
+//!   parsed is set aside under a name of its own (never overwritten) and the Board starts
+//!   empty. One in a newer format (`v` above 1), or one that could not be read or set aside, is
+//!   left exactly as it is and the store is read-only: every change is `store_failed`.
 //! - What `apply` decides:
 //!   - a `Show` or `Update` at a revision older than the one held is `stale_revision`; so is the
 //!     held revision again with other content. The same revision and content again is a
 //!     re-send and changes nothing;
-//!   - an `Update` keeps the panel's state (a closed panel stays closed; its content is new
-//!     when it is reopened). An `Update` for a panel the store does not hold adds it, open: an
-//!     update carries the whole panel;
+//!   - a `Show` or `Update` of a panel in view keeps its state. One that is minimised or
+//!     closed comes back, open: the person asked for the change, and a panel that is not on
+//!     screen could never be reported drawn. An `Update` for a panel the store does not hold
+//!     adds it, open: an update carries the whole panel;
 //!   - `State` sets the state given, whatever it was (so "minimise" on a closed panel brings it
 //!     back, minimised);
 //!   - `Focus` brings a minimised or closed panel back to open; one already in view keeps its
@@ -26,7 +32,7 @@
 //!   - `State` or `Focus` for a panel the store does not hold is `unknown_panel`.
 
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset};
@@ -86,7 +92,6 @@ impl PanelState {
 
 /// One panel at its current revision. `cost_paise` is what it has cost so far.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Panel {
     pub panel_id: Uuid,
     pub kind: PanelKind,
@@ -99,8 +104,10 @@ pub struct Panel {
     pub created_at: DateTime<FixedOffset>,
 }
 
-/// What a verified Board action asks of the Board.
-#[derive(Debug, Clone, PartialEq)]
+/// What a verified Board action asks of the Board. For the window it serialises with a
+/// `type` of `show`, `update`, `state` or `focus` beside the panel's or the event's fields.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum BoardEvent {
     Show(Panel),
     Update(Panel),
@@ -277,7 +284,6 @@ pub enum How {
 
 /// One line of the conversation; `panels` are those made in that reply.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ConversationEntry {
     pub at: DateTime<FixedOffset>,
     pub who: Who,
@@ -287,7 +293,6 @@ pub struct ConversationEntry {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct BoardFile {
     v: u32,
     panels: Vec<Panel>,
@@ -298,41 +303,66 @@ pub struct BoardStore {
     dir: PathBuf,
     panels: Vec<Panel>,
     conversation: Vec<ConversationEntry>,
+    /// `board.json` is there but was not taken in: it must not be replaced.
+    read_only: bool,
+}
+
+/// A name that no earlier set-aside file has.
+fn set_aside_path(dir: &Path) -> PathBuf {
+    let first = dir.join(format!("{BOARD_FILE}.unreadable"));
+    if !first.exists() {
+        return first;
+    }
+    (2u32..)
+        .map(|n| dir.join(format!("{BOARD_FILE}.unreadable-{n}")))
+        .find(|p| !p.exists())
+        .expect("some name is free")
 }
 
 impl BoardStore {
-    /// Open the store in the app's data folder. A `board.json` that cannot be read is set
-    /// aside as `board.json.unreadable` (never deleted) and the Board starts empty: the server
-    /// still holds every panel.
+    /// Open the store in the app's data folder (see the module comment for a file that cannot
+    /// be used). The server still holds every panel.
     pub fn open(dir: &Path) -> Self {
         let path = dir.join(BOARD_FILE);
+        let mut read_only = false;
         let panels = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<BoardFile>(&bytes) {
                 Ok(file) if file.v == 1 => file.panels,
-                _ => {
+                Ok(file) => {
+                    tracing::error!(v = file.v, "board.json is from a newer build; left alone");
+                    read_only = true;
+                    Vec::new()
+                }
+                Err(_) => {
                     tracing::error!("board.json is unreadable; set aside, starting empty");
-                    let _ = std::fs::rename(&path, dir.join(format!("{BOARD_FILE}.unreadable")));
+                    if let Err(e) = std::fs::rename(&path, set_aside_path(dir)) {
+                        tracing::error!(error = %e, "couldn't set board.json aside; left alone");
+                        read_only = true;
+                    }
                     Vec::new()
                 }
             },
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(e) => {
-                tracing::error!(error = %e, "couldn't read board.json; starting empty");
+                tracing::error!(error = %e, "couldn't read board.json; left alone");
+                read_only = true;
                 Vec::new()
             }
         };
-        let mut conversation: Vec<ConversationEntry> =
-            std::fs::read_to_string(dir.join(CONVERSATION_FILE))
-                .unwrap_or_default()
-                .lines()
-                .filter_map(|line| serde_json::from_str(line).ok()) // a torn last line is skipped
-                .collect();
+        // By bytes and by line: a line torn by a crash, even inside a character, is skipped
+        // and the lines before it are kept.
+        let mut conversation: Vec<ConversationEntry> = std::fs::read(dir.join(CONVERSATION_FILE))
+            .unwrap_or_default()
+            .split(|b| *b == b'\n')
+            .filter_map(|line| serde_json::from_slice(line).ok())
+            .collect();
         let extra = conversation.len().saturating_sub(CONVERSATION_LOADED);
         conversation.drain(..extra);
         Self {
             dir: dir.to_owned(),
             panels,
             conversation,
+            read_only,
         }
     }
 
@@ -345,6 +375,11 @@ impl BoardStore {
     }
 
     fn save(&self, panels: &[Panel]) -> io::Result<()> {
+        if self.read_only {
+            return Err(io::Error::other(
+                "board.json was not taken in; not replacing it",
+            ));
+        }
         let file = BoardFile {
             v: 1,
             panels: panels.to_vec(),
@@ -371,7 +406,10 @@ impl BoardStore {
                 if new.revision <= held.revision {
                     return Err("stale_revision");
                 }
-                let state = held.state;
+                let state = match held.state {
+                    PanelState::Minimised | PanelState::Closed => PanelState::Open,
+                    in_view => in_view,
+                };
                 next[i] = Panel {
                     state,
                     ..new.clone()
@@ -401,6 +439,11 @@ impl BoardStore {
     /// Remove the closed panels from this desktop's copy; how many went. The Board asks the
     /// person first. The server keeps them.
     pub fn clear_closed(&mut self) -> io::Result<usize> {
+        if self.read_only {
+            return Err(io::Error::other(
+                "board.json was not taken in; not replacing it",
+            ));
+        }
         let kept: Vec<Panel> = self
             .panels
             .iter()
@@ -419,9 +462,18 @@ impl BoardStore {
         let mut line = serde_json::to_string(&entry).map_err(io::Error::other)?;
         line.push('\n');
         let path = self.dir.join(CONVERSATION_FILE);
-        // A torn last line (a crash mid-write) must not swallow this one.
-        let torn = std::fs::read(&path).is_ok_and(|b| b.last().is_some_and(|c| *c != b'\n'));
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)?;
+        // A torn last line (a crash mid-write) must not swallow this one: look at the last byte.
+        let mut last = *b"\n";
+        if file.seek(SeekFrom::End(0))? > 0 {
+            file.seek(SeekFrom::End(-1))?;
+            file.read_exact(&mut last)?;
+        }
+        let torn = last[0] != b'\n';
         if torn {
             file.write_all(b"\n")?;
         }
