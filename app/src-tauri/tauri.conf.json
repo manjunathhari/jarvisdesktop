@@ -25,6 +25,22 @@
         "minHeight": 600,
         "center": true,
         "theme": "Dark"
+      },
+      {
+        "label": "board",
+        "title": "JARVIS Board",
+        "url": "board.html",
+        "visible": false,
+        "fullscreen": false,
+        "decorations": true,
+        "resizable": true,
+        "backgroundColor": "#0e1216",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "theme": "Dark"
       }
     ],
     "security": {

@@ -3,7 +3,8 @@
 //! The node runs in server mode (`node.toml`, see `server_mode`); otherwise `NodeSlot` is
 //! empty, no card can arrive, and "approve" / "deny" reach the coordinator as before.
 //! - `forward` relays the node's `UiEvent`s to the window: `jarvis://approval-card`,
-//!   `jarvis://approval-cleared`, `jarvis://notice`, `jarvis://notice-cleared`.
+//!   `jarvis://approval-cleared`, `jarvis://notice`, `jarvis://notice-cleared`. Board events go
+//!   to the Board window (`board::on_event`).
 //! - `decide_approval` is the Approve / Deny buttons' command.
 //! - `intercept` takes a spoken "approve" or "deny" before it reaches the coordinator, when
 //!   exactly one card can still be decided; with two or more it asks the person to tap. The
@@ -185,8 +186,7 @@ pub async fn forward(app: AppHandle, slot: NodeSlot, mut events: mpsc::Receiver<
             NodeEvent::ClockOff(ms) => app.emit("jarvis://clock_off", ms),
             // The reconnect summary is display-only; its items also arrive as notices.
             NodeEvent::Summary(_) => Ok(()),
-            // The Board window forwards these (Board slice 1, Task 6).
-            NodeEvent::Board(_) => Ok(()),
+            NodeEvent::Board(event) => crate::board::on_event(&app, event),
         };
         if let Err(e) = r {
             tracing::warn!(error = %e, "emit failed");

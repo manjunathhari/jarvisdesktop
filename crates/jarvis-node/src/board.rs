@@ -487,3 +487,85 @@ impl BoardStore {
         self.conversation.clone()
     }
 }
+
+/// What the Board window needs from the store, kept here (not in the app) so it is tested on
+/// every platform: where the window goes, today's spend, and the snapshot it draws at start.
+pub mod view {
+    use chrono::{DateTime, FixedOffset};
+    use serde::Serialize;
+
+    use super::{BoardStore, ConversationEntry, Panel};
+
+    /// A monitor's place and size on the desktop, in physical pixels.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct MonitorInfo {
+        pub x: i32,
+        pub y: i32,
+        pub width: u32,
+        pub height: u32,
+    }
+
+    /// Where the Board window goes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Placement {
+        /// Full screen, without a border, on `monitors[monitor]`.
+        Borderless { monitor: usize },
+        /// An ordinary window: there is no second monitor to give it.
+        Normal,
+    }
+
+    /// With two or more monitors, the Board takes the largest one that the main window is not
+    /// on (`main` is its index, if known; otherwise the first monitor is taken to be its). With
+    /// one monitor, or none reported, it is an ordinary window.
+    pub fn pick_placement(monitors: &[MonitorInfo], main: Option<usize>) -> Placement {
+        if monitors.len() < 2 {
+            return Placement::Normal;
+        }
+        let main = main.filter(|i| *i < monitors.len()).unwrap_or(0);
+        let area = |m: &MonitorInfo| u64::from(m.width) * u64::from(m.height);
+        let best = monitors
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != main)
+            // The largest; of equals, the first.
+            .max_by(|(i, a), (j, b)| area(a).cmp(&area(b)).then(j.cmp(i)))
+            .map(|(i, _)| i);
+        match best {
+            Some(monitor) => Placement::Borderless { monitor },
+            None => Placement::Normal,
+        }
+    }
+
+    /// India's offset: "today" on the Board is the day in India (plan P-7).
+    fn ist() -> FixedOffset {
+        FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("a valid offset")
+    }
+
+    /// What today's panels have cost: the sum of `cost_paise` of the panels created today. An
+    /// update made today to an older panel is counted on that panel's day.
+    pub fn spend_today_paise(panels: &[Panel], now: DateTime<FixedOffset>) -> u64 {
+        let today = now.with_timezone(&ist()).date_naive();
+        panels
+            .iter()
+            .filter(|p| p.created_at.with_timezone(&ist()).date_naive() == today)
+            .map(|p| p.cost_paise)
+            .sum()
+    }
+
+    /// Everything the Board window draws when it opens.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize)]
+    pub struct BoardSnapshot {
+        pub panels: Vec<Panel>,
+        pub conversation: Vec<ConversationEntry>,
+        pub spend_today_paise: u64,
+    }
+
+    pub fn snapshot(store: &BoardStore, now: DateTime<FixedOffset>) -> BoardSnapshot {
+        let panels = store.panels();
+        BoardSnapshot {
+            spend_today_paise: spend_today_paise(&panels, now),
+            conversation: store.conversation(),
+            panels,
+        }
+    }
+}

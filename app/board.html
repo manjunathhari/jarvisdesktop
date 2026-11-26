@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en-GB">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JARVIS Board</title>
+    <link rel="stylesheet" href="/src/board/board.css" />
+  </head>
+  <body>
+    <header id="topbar">
+      <h1>JARVIS Board</h1>
+      <p id="counts" aria-live="polite"></p>
+      <p id="spend" aria-label="Spent on the Board today"></p>
+    </header>
+
+    <aside id="conversation" aria-label="Conversation">
+      <h2>Conversation</h2>
+      <p class="empty">What you and Jarvis say will appear here.</p>
+    </aside>
+
+    <main id="board">
+      <p id="problem" role="alert" hidden></p>
+      <div id="panels" aria-label="Panels"></div>
+      <p id="nothing" class="empty">Nothing on the board yet. Ask Jarvis to show something.</p>
+    </main>
+
+    <footer id="shelf"></footer>
+
+    <script type="module" src="/src/board/main.ts"></script>
+  </body>
+</html>

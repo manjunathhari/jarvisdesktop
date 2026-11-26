@@ -2,6 +2,7 @@
 
 mod announce;
 mod approvals;
+mod board;
 mod key;
 mod node_config;
 mod server_mode;
@@ -571,6 +572,10 @@ pub fn run() {
                 mode: mode.clone(),
             });
             let (handle, fut) = runtime(USER_NAME, brain, Arc::new(registry), ui);
+            // The Board (slice 1) is the server's: it opens only when the node runs.
+            if node.lock().ok().is_some_and(|n| n.is_some()) {
+                board::ensure_open(app.handle());
+            }
             app.manage(node.clone());
             app.manage(voice.clone());
             tauri::async_runtime::spawn(fut);
@@ -614,8 +619,14 @@ pub fn run() {
             server_mode::node_status,
             server_mode::enrol,
             server_mode::forget_claude_key,
-            build_label
+            build_label,
+            board::board_snapshot,
+            board::board_set_state,
+            board::board_rendered,
+            board::board_clear_closed,
+            board::board_open
         ])
+        .on_window_event(board::on_window_event)
         .run(tauri::generate_context!())
         .expect("error while running JARVIS");
 }

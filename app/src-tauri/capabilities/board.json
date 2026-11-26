@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "board",
+  "description": "The Board window may only listen for events from Rust and call the app's own commands.",
+  "windows": ["board"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

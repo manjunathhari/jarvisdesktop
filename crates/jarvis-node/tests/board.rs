@@ -1144,3 +1144,102 @@ async fn an_action_for_another_node_is_not_applied() {
         .is_none());
     assert!(r.node.board().lock().unwrap().panels().is_empty());
 }
+
+// --- what the Board window needs (Task 6) -----------------------------------------------------
+
+mod window {
+    use super::*;
+    use jarvis_node::board::view::{
+        pick_placement, snapshot, spend_today_paise, MonitorInfo, Placement,
+    };
+
+    fn monitor(x: i32, width: u32) -> MonitorInfo {
+        MonitorInfo {
+            x,
+            y: 0,
+            width,
+            height: 1080,
+        }
+    }
+
+    #[test]
+    fn placement_prefers_the_other_monitor() {
+        let two = [monitor(0, 1920), monitor(1920, 2560)];
+        assert_eq!(
+            pick_placement(&two, Some(0)),
+            Placement::Borderless { monitor: 1 }
+        );
+        assert_eq!(
+            pick_placement(&two, Some(1)),
+            Placement::Borderless { monitor: 0 }
+        );
+        // With three, the largest of the others.
+        let three = [monitor(0, 1920), monitor(1920, 1280), monitor(3200, 3840)];
+        assert_eq!(
+            pick_placement(&three, Some(0)),
+            Placement::Borderless { monitor: 2 }
+        );
+        // The main window's monitor is not known: never cover the first one.
+        assert_eq!(
+            pick_placement(&two, None),
+            Placement::Borderless { monitor: 1 }
+        );
+        assert_eq!(
+            pick_placement(&two, Some(7)),
+            Placement::Borderless { monitor: 1 }
+        );
+    }
+
+    #[test]
+    fn placement_falls_back_to_one_monitor() {
+        assert_eq!(
+            pick_placement(&[monitor(0, 1920)], Some(0)),
+            Placement::Normal
+        );
+        assert_eq!(pick_placement(&[], None), Placement::Normal);
+    }
+
+    fn costing(created_at: &str, cost: u64) -> Panel {
+        let mut v = args(Uuid::new_v4(), 1, "text", "Trip", TEXT);
+        v["created_at"] = json!(created_at);
+        v["cost_paise"] = json!(cost);
+        shown(&v)
+    }
+
+    #[test]
+    fn spend_today_sums_todays_panels_only() {
+        // "Today" is the day in India, whatever offset a timestamp carries.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-26T22:30:00+05:30").unwrap();
+        let panels = [
+            costing("2026-11-26T00:00:00+05:30", 100), // the first minute of today
+            costing("2026-11-26T18:29:59Z", 20),       // 23:59:59 in India: today
+            costing("2026-11-25T23:59:59+05:30", 4000), // yesterday
+            costing("2026-11-26T18:30:00Z", 8000),     // midnight in India: tomorrow
+            costing("2026-11-26T11:00:00-08:00", 16000), // tomorrow in India
+        ];
+        assert_eq!(spend_today_paise(&panels, now), 120);
+        assert_eq!(spend_today_paise(&[], now), 0);
+    }
+
+    #[test]
+    fn snapshot_is_what_the_window_draws() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = BoardStore::open(dir.path());
+        let id = Uuid::new_v4();
+        let mut v = args(id, 1, "text", "Trip", TEXT);
+        v["created_at"] = json!("2026-11-26T10:00:00+05:30");
+        store.apply(&BoardEvent::Show(shown(&v))).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-26T22:30:00+05:30").unwrap();
+        let snap = serde_json::to_value(snapshot(&store, now)).unwrap();
+        assert_eq!(snap["spend_today_paise"], 1240);
+        assert_eq!(snap["conversation"], json!([]));
+        assert_eq!(
+            snap["panels"][0],
+            json!({
+                "panel_id": id, "kind": "text", "title": "Trip", "content": TEXT,
+                "content_sha256": content_sha256(TEXT), "revision": 1, "state": "open",
+                "cost_paise": 1240, "created_at": "2026-11-26T10:00:00+05:30",
+            })
+        );
+    }
+}
