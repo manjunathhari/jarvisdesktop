@@ -32,7 +32,7 @@ from psycopg.types.json import Jsonb
 from jarvis_server import comm, jobs, scheduler_main
 from jarvis_server.brain import budget, health
 from jarvis_server.comm import Priority
-from jarvis_server.core import approvals, dispatch
+from jarvis_server.core import actions, approvals, dispatch
 from jarvis_server.gateway import relay
 from jarvis_server.scheduler_main import Scheduler
 
@@ -342,6 +342,47 @@ def test_outbox_expire_sweep_skips_an_item_with_its_own_job(
 
 
 # --- periodic jobs ------------------------------------------------------------------------------
+
+
+def test_scheduler_sweeps_an_issued_action_whose_timeout_was_lost(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID
+) -> None:
+    """Review M4: an approved action still ISSUED well after its deadline (its own
+    `action.receipt_timeout` job failed twice, or it was issued before that job existed) gets
+    one more, keyed, from the scheduler. Not before, and never for an action already answered."""
+    approval_id = _proposed(app, owner, person, node)
+    flow.decide(app, owner, node=node, person=person, approval_id=approval_id)
+    key = str(flow.approval_row(app, approval_id)["execution_key"])
+    row = app.execute("SELECT id FROM ledger.action WHERE idempotency_key = %s", (key,)).fetchone()
+    assert row is not None
+    action_id = str(row[0])
+    owner.execute(
+        "UPDATE ops.job SET status = 'FAILED' WHERE kind = 'action.receipt_timeout'"
+        " AND payload->>'action_id' = %s",
+        (action_id,),
+    )  # the action's own timeout job is lost
+    [item] = flow.items(app, person, "action.approved")
+    due = item["expires_at"] + actions.RECEIPT_GRACE + actions.RECEIPT_SWEEP_AFTER
+    job_key = jobs.job_key("action.receipt_timeout", action_id)
+    Scheduler().tick(app, due - timedelta(seconds=1))
+    assert _keyed(app, "action.receipt_timeout", job_key) == []
+    s = Scheduler()
+    s.tick(app, due)
+    s.tick(app, due + timedelta(seconds=30))
+    Scheduler().tick(app, due + timedelta(minutes=1))  # a restart: the database dedups
+    [job_id] = _keyed(app, "action.receipt_timeout", job_key)
+    payload = app.execute("SELECT payload FROM ops.job WHERE id = %s", (job_id,)).fetchone()
+    assert payload is not None and payload[0]["action_id"] == action_id
+    # an action whose receipt was taken is never swept
+    other = _proposed(app, owner, person, node)
+    flow.decide(app, owner, node=node, person=person, approval_id=other)
+    other_key = str(flow.approval_row(app, other)["execution_key"])
+    owner.execute(
+        "UPDATE ledger.action SET status = 'RECEIVED' WHERE idempotency_key = %s", (other_key,)
+    )
+    before = _last_job(app)
+    Scheduler().tick(app, due + timedelta(hours=1))
+    assert _of_kind(app, "action.receipt_timeout", before) == []
 
 
 def test_periodic_jobs_once_per_minute(app: Conn) -> None:

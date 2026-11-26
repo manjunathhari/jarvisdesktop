@@ -1,5 +1,7 @@
 # Status — JARVIS Desktop
 
+**Latest (26 Nov 2026): Plan B is merged, deployed and live-checked (PR #7 to #9); the desktop follow-ups (single instance, wake word, reused Claude connection with Opus) are merged (PR #10 to #14); the receipt timeout (R12-38, PR #15, migration 0015) is merged and deployed, `main` = `354f1fe`. See `handoff.md` for what is in hand. The paragraph below is the history up to 25 Nov.**
+
 **Phase:** Desktop node in tweak mode (merged to main 2026-11-21, PR #1). Architecture v2 Phase 0 (server) complete, PR #2 merged 2026-11-21, running on the shared server. Phase 1 (memory engine) complete, PR #3 merged 2026-11-22. **Phase 2 server (core + nodes): complete, merged (PR #5, PR #6 deploy fix) and live on the shared server since 2026-11-24 at `main` = `c75fb9c`. Live checks passed: init smoke 18/18, P2-S5, P2-S7, P0-8, and an end-to-end run from Manj's PC with fictional phrases (first reply chunk 1.3–1.9 s in 4 of 5 turns, 4.0 s in one). The gateway is on the tailnet only; no devices enrolled. Plan B (the Rust desktop node): all 9 tasks built, reviewed and fixed (2026-11-24/25); branch `plan-b` pushed to GitHub with Manj's approval (not merged, not deployed); CI green on Linux and Windows (run #31, `d8d698b`), Server workflow green on `443d01f` (run #44; the later fix commits re-trigger it, confirm before merging). Next: Manj's review and merge, then the server deploy (migration 0014) before Step 7, the live P2-A1 check on his PC.**
 **Started:** 2026-11-21
 

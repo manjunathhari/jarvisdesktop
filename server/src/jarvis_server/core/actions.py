@@ -29,7 +29,9 @@ Shapes are the shared contracts (R12-25): `pc.list_test_folder.receipt` and
 - no receipt at all (the desktop went off, or never answered): `action.receipt_timeout`, queued
   with the action for `RECEIPT_GRACE` after its `valid_until`, fails the task (`no_receipt`),
   says so, and leaves a TODAY `action.no_receipt` notice. It never runs, re-issues or retries
-  the action; a receipt arriving later is `reused_key` (owner, 26 Nov).
+  the action; a receipt arriving later is `reused_key` (R12-38; owner, 26 Nov). The handler
+  checks the deadline itself and re-queues a run that is early. If that job is lost, the
+  scheduler queues one more, `RECEIPT_SWEEP_AFTER` later (`scheduler_main`).
 
 Before any of this, a receipt must be the node's own signed message (R12-34,
 `core.node_signature`): the stored envelope verifies under the node's key and matches the row.
@@ -45,7 +47,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, LiteralString, cast
@@ -68,6 +70,9 @@ LISTING_TIMEOUT = timedelta(seconds=10)  # the fixed listing timeout, for the fr
 # After an approved action's valid_until, how long core still waits for its receipt: the node's
 # 30 s clock tolerance, and delivery.
 RECEIPT_GRACE = timedelta(seconds=60)
+# The scheduler's safety net: an action still ISSUED this long after that deadline has lost its
+# own timeout job (two failed attempts take up to two 5-minute leases), so it gets one more.
+RECEIPT_SWEEP_AFTER = timedelta(minutes=15)
 LISTING = "pc.list_test_folder"
 DELETE = "pc.delete_test_file"
 LISTING_OK = "OK"
@@ -363,10 +368,12 @@ def _fail(
     ref: UUID,
     inbound_id: UUID | None,
     evidence: dict[str, Any],
+    before_audit: Callable[[], None] | None = None,
 ) -> bool:
     """§9.4 "If any check fails, the task is FAILED and Jarvis says so". The transition comes
     first: refused, it is kept and nothing else is written (returns False). Then the action
-    and its outcome (never verified), the spoken result, and last the audited receipt refusal."""
+    and its outcome (never verified), the spoken result, anything the caller adds through
+    `before_audit`, and last the audited receipt refusal (R11-1)."""
     if not transition_in_job(conn, issued.task_id, "FAILED", code):
         return False
     conn.execute("UPDATE ledger.action SET status = 'FAILED' WHERE id = %s", (issued.action_id,))
@@ -390,6 +397,8 @@ def _fail(
             else f"I didn't delete {name}: the file had changed or couldn't be recycled."
         )
         speak(conn, session_id, text)
+    if before_audit is not None:
+        before_audit()
     refuse_receipt(conn, ref=ref, node_id=issued.node_id, code=code, inbound_id=inbound_id)
     return True
 
@@ -570,29 +579,48 @@ def on_verify_timeout(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
           evidence={})  # fmt: skip
 
 
+_RECEIPT_DEADLINE = """
+SELECT max(o.expires_at) + %s - now() FROM comm.outbox o JOIN comm.event e ON e.id = o.event_id
+WHERE e.subject_type = 'approval' AND e.subject_id = %s AND o.kind = 'action.approved'
+"""
+
+
 @dispatch.register("action.receipt_timeout")
 def on_receipt_timeout(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     """An approved action whose receipt never came by `valid_until` + `RECEIPT_GRACE`: the node
     may or may not have done it, so the task is FAILED and Jarvis says it couldn't confirm.
     Payload `{action_id}`. The action's row lock orders this against the receipt's job: whichever
-    takes the row first decides, and the other finds a status that is no longer ISSUED."""
+    takes the row first decides, and the other finds a status that is no longer ISSUED.
+
+    The deadline is read here, from the `action.approved` item (its `expires_at` is the action's
+    signed `valid_until`), not taken from the job's run time: a run that is early changes
+    nothing and queues itself again for the deadline, as `outbox.expire` does. The transition
+    comes first (in `_fail`): refused, it is kept and nothing else is written."""
     issued = _issued(conn, "a.id = %s", str(UUID(job.payload["action_id"])))
     if issued is None or issued.status != "ISSUED":
         return  # its receipt was handled, or it has failed already
-    end_items(conn, issued.approval_id, ("action.approved",))  # never offered again
-    if not _fail(conn, issued, code="no_receipt", ref=issued.approval_id, inbound_id=None,
-                 evidence={}):  # fmt: skip
-        return  # the task couldn't move (kept, audited): nothing to tell
-    name = issued.args.get("name", "the file")
-    event_id = comm.record_event(
-        conn, "action.no_receipt", subject_type="approval", subject_id=str(issued.approval_id),
-        person_id=issued.person_id, details={"task_id": str(issued.task_id)},
-    )  # fmt: skip
-    rules.notify(
-        conn, "action.no_receipt", person_id=issued.person_id, event_id=event_id,
-        context={"text": f"I couldn't confirm that {name} was deleted",
-                 "group_key": f"action:{issued.approval_id}"},
-    )  # fmt: skip
+    row = conn.execute(_RECEIPT_DEADLINE, (RECEIPT_GRACE, str(issued.approval_id))).fetchone()
+    wait: timedelta | None = None if row is None else row[0]
+    if wait is not None and wait > timedelta(0):
+        jobs.enqueue(conn, "action.receipt_timeout", jobs.requeue_payload(job.payload), delay=wait)
+        return
+
+    def ended_and_told() -> None:
+        end_items(conn, issued.approval_id, ("action.approved",))  # never offered again
+        name = issued.args.get("name", "the file")
+        event_id = comm.record_event(
+            conn, "action.no_receipt", subject_type="approval",
+            subject_id=str(issued.approval_id), person_id=issued.person_id,
+            details={"task_id": str(issued.task_id)},
+        )  # fmt: skip
+        rules.notify(
+            conn, "action.no_receipt", person_id=issued.person_id, event_id=event_id,
+            context={"text": f"I couldn't confirm that {name} was deleted",
+                     "group_key": f"action:{issued.approval_id}"},
+        )  # fmt: skip
+
+    _fail(conn, issued, code="no_receipt", ref=issued.approval_id, inbound_id=None, evidence={},
+          before_audit=ended_and_told)  # fmt: skip
 
 
 @dispatch.register("outbox.expire")

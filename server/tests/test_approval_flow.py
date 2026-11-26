@@ -818,9 +818,15 @@ def _receipt_timeout_job(app: Conn, key: str) -> tuple[dict[str, Any], datetime]
     return dict(row[0]), row[1]
 
 
+def _deadline_passed(mp: pytest.MonkeyPatch) -> None:
+    """As if the action's valid_until and the grace were over: the handler checks the clock
+    itself, and an outbox item's expires_at cannot be moved (it changes only its state)."""
+    mp.setattr(actions, "RECEIPT_GRACE", -timedelta(minutes=5))
+
+
 def test_no_receipt_fails_the_task_after_valid_until(
     app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
-    proposed: uuid.UUID,
+    proposed: uuid.UUID, monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # fmt: skip
     """An approved action whose receipt never comes: a job queued with the action, 60 s after
     its valid_until, fails the task, says so, audits `no_receipt` against the approval and
@@ -831,10 +837,16 @@ def test_no_receipt_fails_the_task_after_valid_until(
     late_by = (run_at - item["expires_at"]).total_seconds()
     assert abs(late_by - actions.RECEIPT_GRACE.total_seconds()) < 1
     assert flow.task_state(app, proposed) == "IN_PROGRESS" and _action(app, key)[0] == "ISSUED"
+    _deadline_passed(monkeypatch)
     flow.run(app, "action.receipt_timeout", payload)  # the clock reaches its run_at
     assert flow.task_state(app, proposed) == "FAILED"
     assert _action(app, key) == ("FAILED", False, 1)
     assert flow.audit(app, proposed)[-1] == ("RECEIPT", "REJECTED", "no_receipt", None, None)
+    # R11-1: the audited refusal is the handler's last audited write
+    last = app.execute(
+        "SELECT action::text, reason FROM audit.event ORDER BY seq DESC LIMIT 1"
+    ).fetchone()
+    assert last == ("RECEIPT", "no_receipt")
     assert _last_speech(app, session) == "I couldn't confirm that a.txt was deleted."
     [notice] = flow.items(app, person, "action.no_receipt")
     assert notice["priority"] == "TODAY" and notice["target_node_id"] is None
@@ -844,10 +856,12 @@ def test_no_receipt_fails_the_task_after_valid_until(
 
 
 def test_receipt_before_the_timeout_wins(
-    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, proposed: uuid.UUID
-) -> None:
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, proposed: uuid.UUID,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
     key = _approve(app, owner, person, node, proposed)
     payload, _ = _receipt_timeout_job(app, key)
+    _deadline_passed(monkeypatch)
     flow.run(app, "action.receipt", {"inbound_id": str(_receipt(owner, node, person, key))})
     since = int(app.execute("SELECT max(seq) FROM audit.event").fetchone()[0])  # type: ignore[index]
     flow.run(app, "action.receipt_timeout", payload)
@@ -861,10 +875,11 @@ def test_receipt_before_the_timeout_wins(
 
 def test_receipt_timeout_run_twice_writes_nothing_more(
     app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
-    proposed: uuid.UUID,
+    proposed: uuid.UUID, monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # fmt: skip
     key = _approve(app, owner, person, node, proposed)
     payload, _ = _receipt_timeout_job(app, key)
+    _deadline_passed(monkeypatch)
     flow.run(app, "action.receipt_timeout", payload)
     since = int(app.execute("SELECT max(seq) FROM audit.event").fetchone()[0])  # type: ignore[index]
     speech = "SELECT count(*) FROM conv.stream_chunk WHERE session_id = %s AND type = 'SPEECH'"
@@ -879,12 +894,14 @@ def test_receipt_timeout_run_twice_writes_nothing_more(
 
 
 def test_late_receipt_after_the_timeout_is_refused(
-    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, proposed: uuid.UUID
-) -> None:
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, proposed: uuid.UUID,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
     """Owner decision 1 (26 Nov): a RECYCLED receipt arriving after the timeout is refused
     `reused_key` and audited; the task stays FAILED and nothing is verified."""
     key = _approve(app, owner, person, node, proposed)
     payload, _ = _receipt_timeout_job(app, key)
+    _deadline_passed(monkeypatch)
     flow.run(app, "action.receipt_timeout", payload)
     late = _receipt(owner, node, person, key)
     flow.run(app, "action.receipt", {"inbound_id": str(late)})
@@ -914,6 +931,7 @@ def test_receipt_and_timeout_race_has_one_outcome(
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(actions, "end_items", held_end_items)
+        _deadline_passed(mp)
         one = InThread(dsns.app, lambda c: dispatch.handle(c, claimed[0]))
         two = InThread(dsns.app, lambda c: dispatch.handle(c, claimed[1]))
         blocked = two.wait_until_blocked(dsns.superuser)  # on the row lock the receipt holds
@@ -924,6 +942,104 @@ def test_receipt_and_timeout_race_has_one_outcome(
     assert _action(app, key)[0] == "RECEIVED" and flow.task_state(app, proposed) == "IN_PROGRESS"
     assert flow.items(app, person, "action.no_receipt") == []
     assert flow.receipt_audit(app, receipt) == []
+
+
+def _audit_since(app: Conn, seq: int) -> list[tuple[Any, ...]]:
+    rows = app.execute(
+        "SELECT action::text, outcome::text, reason FROM audit.event WHERE seq > %s ORDER BY seq",
+        (seq,),
+    ).fetchall()
+    return [tuple(r) for r in rows]
+
+
+def _max_seq(app: Conn) -> int:
+    row = app.execute("SELECT max(seq) FROM audit.event").fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def test_receipt_timeout_run_early_requeues_itself(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, proposed: uuid.UUID
+) -> None:
+    """Review M1: the handler checks the deadline itself (the item's valid_until and the
+    grace), as `outbox.expire` does. Run early it changes nothing and queues itself again."""
+    key = _approve(app, owner, person, node, proposed)
+    [item] = _issued(app, person)
+    payload, _ = _receipt_timeout_job(app, key)
+    since = _max_seq(app)
+    done = flow.run(app, "action.receipt_timeout", payload)  # well before valid_until
+    assert flow.task_state(app, proposed) == "IN_PROGRESS" and _action(app, key)[0] == "ISSUED"
+    assert _issued(app, person)[0]["state"] == "PENDING"  # the action is still on offer
+    assert flow.items(app, person, "action.no_receipt") == [] and _audit_since(app, since) == []
+    again = app.execute(
+        "SELECT payload, run_at FROM ops.job WHERE kind = 'action.receipt_timeout'"
+        " AND status = 'QUEUED' AND id > %s",
+        (done,),
+    ).fetchall()
+    assert [r[0] for r in again] == [payload]
+    due = item["expires_at"] + actions.RECEIPT_GRACE
+    assert abs((again[0][1] - due).total_seconds()) < 1
+
+
+def test_receipt_timeout_leaves_a_task_that_cannot_fail(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    proposed: uuid.UUID, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """Review M2: the transition comes first. The task was cancelled meanwhile, so FAILED is
+    refused (and audited) and nothing else is written: the item is not ended, nothing is said
+    and there is no notice."""
+    key = _approve(app, owner, person, node, proposed)
+    payload, _ = _receipt_timeout_job(app, key)
+    task_id = flow.approval_row(app, proposed)["task_id"]
+    app.execute("SELECT ledger.transition('task', %s, 'CANCELLED', 'AGENT', 'test', 'test')",
+                (task_id,))  # fmt: skip
+    speech = "SELECT count(*) FROM conv.stream_chunk WHERE session_id = %s AND type = 'SPEECH'"
+    spoken = app.execute(speech, (session,)).fetchone()
+    since = _max_seq(app)
+    _deadline_passed(monkeypatch)
+    flow.run(app, "action.receipt_timeout", payload)
+    assert flow.task_state(app, proposed) == "CANCELLED"
+    assert _audit_since(app, since) == [("TRANSITION", "REJECTED", "no_receipt")]
+    assert _issued(app, person)[0]["state"] == "PENDING"
+    assert flow.items(app, person, "action.no_receipt") == []
+    assert app.execute(speech, (session,)).fetchone() == spoken
+
+
+def test_receipt_timeout_after_the_item_has_ended(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, proposed: uuid.UUID,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """The production order: the item ends at valid_until (`outbox.expire`) and the timeout
+    runs after the grace. The ended item is left as it is, with no second audit row."""
+    key = _approve(app, owner, person, node, proposed)
+    payload, _ = _receipt_timeout_job(app, key)
+    [item] = _issued(app, person)
+    app.execute("SELECT comm.supersede(%s)", (item["id"],))  # ended before the timeout runs
+    ended = flow.audit(app, item["id"])
+    _deadline_passed(monkeypatch)
+    flow.run(app, "action.receipt_timeout", payload)
+    assert flow.task_state(app, proposed) == "FAILED" and _action(app, key)[0] == "FAILED"
+    assert flow.audit(app, item["id"]) == ended
+    assert len(flow.items(app, person, "action.no_receipt")) == 1
+
+
+def test_receipt_timeout_without_a_session_still_leaves_the_notice(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    proposed: uuid.UUID, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """Nowhere to speak (no session ticket): the notice is the only signal, and it is left."""
+    key = _approve(app, owner, person, node, proposed)
+    payload, _ = _receipt_timeout_job(app, key)
+    task_id = flow.approval_row(app, proposed)["task_id"]
+    owner.execute("DELETE FROM conv.session_ticket WHERE task_id = %s", (task_id,))
+    speech = "SELECT count(*) FROM conv.stream_chunk WHERE session_id = %s AND type = 'SPEECH'"
+    spoken = app.execute(speech, (session,)).fetchone()
+    _deadline_passed(monkeypatch)
+    flow.run(app, "action.receipt_timeout", payload)
+    assert flow.task_state(app, proposed) == "FAILED"
+    assert app.execute(speech, (session,)).fetchone() == spoken
+    [notice] = flow.items(app, person, "action.no_receipt")
+    assert notice["state"] == "PENDING"
 
 
 def test_refused_transition_writes_no_outcome(
