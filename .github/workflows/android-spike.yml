@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write # to publish the test app as a pre-release
 
 jobs:
   apk:
@@ -71,3 +71,13 @@ jobs:
           name: jarvis-spike-apk
           path: app/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
+      - name: Publish as a pre-release (direct download for the phone)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          apk=$(find app/src-tauri/gen/android -name '*.apk' | head -1)
+          cp "$apk" JARVIS-spike-android.apk
+          gh release create "spike-android-${{ github.run_number }}" JARVIS-spike-android.apk \
+            --prerelease --target "${{ github.sha }}" \
+            --title "JARVIS Android spike ${{ github.run_number }} (test build)" \
+            --notes "Throwaway test build for the phone node spike. Not a product release. Download JARVIS-spike-android.apk on the phone and install it."
