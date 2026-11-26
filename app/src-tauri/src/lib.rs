@@ -5,6 +5,7 @@ mod approvals;
 mod key;
 mod node_config;
 mod server_mode;
+mod spike;
 
 use chrono::Timelike;
 use jarvis_brain::ClaudeBrain;
@@ -167,8 +168,16 @@ fn video_failed(jarvis: State<'_, Handle>) {
 /// F11: switch between JARVIS's window and full screen.
 #[tauri::command]
 fn toggle_fullscreen(window: tauri::WebviewWindow) -> Result<(), String> {
-    let full = window.is_fullscreen().map_err(|e| e.to_string())?;
-    window.set_fullscreen(!full).map_err(|e| e.to_string())
+    #[cfg(desktop)]
+    {
+        let full = window.is_fullscreen().map_err(|e| e.to_string())?;
+        window.set_fullscreen(!full).map_err(|e| e.to_string())
+    }
+    #[cfg(mobile)]
+    {
+        let _ = window;
+        Ok(())
+    }
 }
 
 /// Emergency exit (Esc key): closes immediately.
@@ -187,15 +196,27 @@ fn typed_input_enabled() -> bool {
 /// the key isn't read at all).
 #[tauri::command]
 fn needs_key(mode: State<'_, server_mode::Mode>) -> bool {
+    // SPIKE: the phone build has no key screen.
+    if cfg!(target_os = "android") {
+        return false;
+    }
     !mode.server() && mode.error.is_none() && key::load().is_none()
 }
 
 /// Save the pasted key to Credential Manager, then restart so the brain picks it up.
 #[tauri::command]
 fn save_key(key: String, app: AppHandle) -> Result<(), String> {
-    let k = key::clean_key(&key)?;
-    key::save(&k)?;
-    app.restart();
+    #[cfg(desktop)]
+    {
+        let k = key::clean_key(&key)?;
+        key::save(&k)?;
+        app.restart();
+    }
+    #[cfg(mobile)]
+    {
+        let _ = (key, app);
+        Err("the phone build has no key screen".into())
+    }
 }
 
 fn brain() -> Option<Arc<dyn Brain>> {
@@ -211,7 +232,7 @@ struct VoiceStatus {
 }
 
 /// Download George's voice the first time, load it, and switch to it.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 async fn prepare_voice(app: AppHandle, slot: VoiceSlot, models_dir: PathBuf) {
     use jarvis_voice::model::{self, HttpDownload, GEORGE, KOKORO_URL};
     use jarvis_voice::{kokoro::Kokoro, speaker::Speaker, AudioOut};
@@ -229,17 +250,23 @@ async fn prepare_voice(app: AppHandle, slot: VoiceSlot, models_dir: PathBuf) {
     {
         Ok(f) => f,
         Err(e) => {
+            spike::note(format!("voice download failed: {e}"));
             tracing::warn!(error = %e, "voice download failed; using the stand-in voice");
             status("unavailable", 0);
             return;
         }
     };
     status("loading", 100);
+    let t = std::time::Instant::now();
     let loaded = tokio::task::spawn_blocking(move || Kokoro::load(&files, GEORGE)).await;
+    spike::note(format!(
+        "voice model loaded in {} ms",
+        t.elapsed().as_millis()
+    ));
     match loaded {
         Ok(Ok(engine)) => {
             let voice = Voice::start(
-                Box::new(engine),
+                Box::new(spike::TimedEngine(engine)),
                 Box::new(|| Speaker::open().map(|s| Box::new(s) as Box<dyn AudioOut>)),
             );
             if let Ok(mut s) = slot.lock() {
@@ -249,6 +276,7 @@ async fn prepare_voice(app: AppHandle, slot: VoiceSlot, models_dir: PathBuf) {
             status("ready", 100);
         }
         Ok(Err(e)) => {
+            spike::note(format!("voice could not load: {e}"));
             tracing::warn!(error = %e, "couldn't load the voice; using the stand-in voice");
             status("unavailable", 0);
         }
@@ -260,7 +288,7 @@ async fn prepare_voice(app: AppHandle, slot: VoiceSlot, models_dir: PathBuf) {
 }
 
 /// Download the listening models the first time, load them, open the mic.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 async fn prepare_ears(
     app: AppHandle,
     slot: EarsSlot,
@@ -314,12 +342,14 @@ async fn prepare_ears(
     let (whisper_dir, vad_dir) = match dirs.await {
         Ok(d) => d,
         Err(e) => {
+            spike::note(format!("listening models download failed: {e}"));
             tracing::warn!(error = %e, "listening models unavailable; typing still works");
             status("unavailable", 0);
             return;
         }
     };
     status("loading", 100);
+    let t = std::time::Instant::now();
     let loaded = tokio::task::spawn_blocking(move || {
         Ok::<_, String>((
             SileroVad::load(&vad_dir.join(VAD_FILE))?,
@@ -327,9 +357,14 @@ async fn prepare_ears(
         ))
     })
     .await;
+    spike::note(format!(
+        "listening models loaded in {} ms",
+        t.elapsed().as_millis()
+    ));
     let (vad, whisper) = match loaded {
         Ok(Ok(m)) => m,
         Ok(Err(e)) => {
+            spike::note(format!("listening models could not load: {e}"));
             tracing::warn!(error = %e, "couldn't load the listening models");
             status("unavailable", 0);
             return;
@@ -361,8 +396,9 @@ async fn prepare_ears(
     .await;
     let wake_detector = match wake_dir {
         Ok(dir) => match tokio::task::spawn_blocking(move || KeywordWake::load(&dir)).await {
-            Ok(Ok(w)) => Some(Box::new(w) as Box<dyn WakeDetector>),
+            Ok(Ok(w)) => Some(Box::new(spike::TimedWake(Box::new(w))) as Box<dyn WakeDetector>),
             Ok(Err(e)) => {
+                spike::note(format!("wake word could not load: {e}"));
                 tracing::warn!(error = %e, "couldn't load the wake word; tap or type instead");
                 None
             }
@@ -372,6 +408,7 @@ async fn prepare_ears(
             }
         },
         Err(e) => {
+            spike::note(format!("wake word download failed: {e}"));
             tracing::warn!(error = %e, "wake-word model unavailable; tap or type instead");
             None
         }
@@ -387,7 +424,7 @@ async fn prepare_ears(
     });
     let ears = Ears::start_with_wake(
         Box::new(vad),
-        Box::new(whisper),
+        Box::new(spike::TimedEars(whisper)),
         speaking,
         Box::new(move |text| {
             tracing::info!(%text, "heard");
@@ -414,17 +451,22 @@ async fn prepare_ears(
             if let Ok(mut s) = slot.lock() {
                 *s = Some(l);
             }
+            spike::note(format!(
+                "microphone open; wake word {}",
+                if has_wake { "on" } else { "off" }
+            ));
             tracing::info!(wake_word = has_wake, "listening is ready");
             status("ready", 100);
         }
         Err(e) => {
+            spike::note(format!("no microphone: {e}"));
             tracing::warn!(error = %e, "no microphone; typing still works");
             status("no_mic", 0);
         }
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "android")))]
 async fn prepare_ears(
     _app: AppHandle,
     _slot: EarsSlot,
@@ -438,7 +480,7 @@ async fn prepare_ears(
 }
 
 /// Other platforms keep the stand-in voice for now.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "android")))]
 async fn prepare_voice(_app: AppHandle, _slot: VoiceSlot, _models_dir: PathBuf) {
     let _ = VoiceStatus {
         state: "unavailable",
@@ -457,13 +499,17 @@ fn build_label() -> String {
 
 /// Show, restore and focus the main window.
 fn bring_to_front(app: &AppHandle) {
+    #[cfg(desktop)]
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
+    #[cfg(mobile)]
+    let _ = app;
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -471,14 +517,17 @@ pub fn run() {
         )
         .init();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder
         // One JARVIS at a time (live check, 25 Nov): a second copy can't open the node's
         // journal, so it had no brain and blamed a missing key. Starting JARVIS again now
         // brings the running window to the front instead. Registered first, as the plugin
         // requires.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             bring_to_front(app);
-        }))
+        }));
+    builder
         .setup(|app| {
             let cfg = SourcesConfig::default_config();
             let news = Arc::new(NewsModule::new(
@@ -614,7 +663,9 @@ pub fn run() {
             server_mode::node_status,
             server_mode::enrol,
             server_mode::forget_claude_key,
-            build_label
+            build_label,
+            spike::spike_info,
+            spike::spike_reach
         ])
         .run(tauri::generate_context!())
         .expect("error while running JARVIS");

@@ -458,3 +458,24 @@ body[data-mode="mic_off"] #orb::after { opacity: 0; }
 }
 #link[data-state="connected"]::before { content: "● "; color: var(--arc); }
 #link[data-state="trouble"]::before { content: "● "; color: var(--live); }
+
+/* THROWAWAY (slice 0 spike): the phone readout. */
+#spike {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 50;
+  max-height: 45vh;
+  overflow: auto;
+  padding: 2.2rem 0.6rem 0.6rem;
+  background: rgba(0, 0, 0, 0.88);
+  color: #cfe8ff;
+  font: 12px/1.4 ui-monospace, monospace;
+  user-select: text;
+  -webkit-user-select: text;
+}
+#spike h2 { font-size: 12px; margin: 0.6rem 0 0.2rem; color: #7fb6ff; }
+#spike pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
+#spike input { width: 100%; padding: 0.5rem; margin: 0.4rem 0; background: #111; color: #fff; border: 1px solid #456; font-size: 16px; }
+#spike button { padding: 0.5rem 0.8rem; background: #123; color: #cfe8ff; border: 1px solid #456; font-size: 14px; }

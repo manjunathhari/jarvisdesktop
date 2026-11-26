@@ -44,7 +44,7 @@ pub mod models {
     pub const WAKE_KEYWORDS: &str = "▁HE Y ▁JA R VI S @HEY_JARVIS\n▁JA R VI S @JARVIS";
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub mod sherpa;
 
 use std::sync::atomic::{AtomicBool, Ordering};

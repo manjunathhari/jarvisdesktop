@@ -392,3 +392,54 @@ enrolment.addEventListener("submit", async (e) => {
 
 listen<string>("jarvis://link", ({ payload }) => showLink(payload));
 showLink(await invoke<string>("node_status"));
+
+// THROWAWAY (slice 0 spike): a readout shown on the phone build only. Never merged.
+type SpikeInfo = { android: boolean; device: string; lines: string[]; battery: string[] };
+async function spike() {
+  let first: SpikeInfo;
+  try {
+    first = await invoke<SpikeInfo>("spike_info");
+  } catch {
+    return;
+  }
+  if (!first.android) return;
+  const box = el("section");
+  box.id = "spike";
+  const toggle = el("button", "", "Spike readout (tap to hide)");
+  toggle.type = "button";
+  const body = el("div");
+  const device = el("p", "", first.device);
+  const form = el("form");
+  const addr = el("input");
+  addr.placeholder = "server address, host:port";
+  addr.autocomplete = "off";
+  addr.spellcheck = false;
+  const go = el("button", "", "Test server link");
+  go.type = "submit";
+  const result = el("p");
+  form.append(addr, go);
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    result.textContent = "Testing…";
+    invoke<string>("spike_reach", { addr: addr.value })
+      .then((r) => (result.textContent = r))
+      .catch((err) => (result.textContent = String(err)));
+  });
+  const log = el("pre");
+  const battery = el("pre");
+  body.append(device, form, result, el("h2", "", "Log"), log, el("h2", "", "Battery"), battery);
+  box.append(toggle, body);
+  toggle.addEventListener("click", () => {
+    body.hidden = !body.hidden;
+    toggle.textContent = body.hidden ? "Spike readout (tap to show)" : "Spike readout (tap to hide)";
+  });
+  document.body.append(box);
+  const tick = async () => {
+    const i = await invoke<SpikeInfo>("spike_info");
+    log.textContent = i.lines.join("\n");
+    battery.textContent = i.battery.join("\n");
+  };
+  await tick();
+  setInterval(() => void tick(), 3000);
+}
+void spike();

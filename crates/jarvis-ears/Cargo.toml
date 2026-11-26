@@ -12,3 +12,8 @@ cpal = "0.15"
 [target.'cfg(windows)'.dependencies]
 sherpa-onnx = "=1.13.2"
 sherpa-onnx-sys = "=1.13.2"
+
+# SPIKE (slice 0): Android links sherpa-onnx's prebuilt shared libraries (SHERPA_ONNX_LIB_DIR).
+[target.'cfg(target_os = "android")'.dependencies]
+sherpa-onnx = { version = "=1.13.2", default-features = false, features = ["shared"] }
+sherpa-onnx-sys = { version = "=1.13.2", default-features = false, features = ["shared"] }

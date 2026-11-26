@@ -7,7 +7,7 @@
 pub mod model;
 pub mod speaker;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 pub mod kokoro;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

@@ -2217,6 +2217,7 @@ name = "jarvis-app"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures-util",
  "jarvis-brain",
  "jarvis-core",
  "jarvis-ears",
@@ -2231,6 +2232,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",

@@ -1,0 +1,63 @@
+name: Android spike (throwaway)
+# Slice 0 of the phone node design (26 Nov 2026): builds a test app for Manj's phone.
+# Lives only on the spike-android branch. Never merged.
+on:
+  push:
+    branches: [spike-android]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-spike
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Point at the Android NDK
+        run: |
+          test -d "$ANDROID_NDK_LATEST_HOME"
+          echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      - name: Fetch sherpa-onnx's Android libraries
+        run: |
+          mkdir -p "$RUNNER_TEMP/sherpa"
+          curl -fsSL -o "$RUNNER_TEMP/sherpa.tar.bz2" \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.2/sherpa-onnx-v1.13.2-android.tar.bz2
+          tar xjf "$RUNNER_TEMP/sherpa.tar.bz2" -C "$RUNNER_TEMP/sherpa"
+          ls -l "$RUNNER_TEMP/sherpa/jniLibs/arm64-v8a"
+          echo "SHERPA_ONNX_LIB_DIR=$RUNNER_TEMP/sherpa/jniLibs/arm64-v8a" >> "$GITHUB_ENV"
+      - name: Install UI dependencies
+        working-directory: app
+        run: npm ci
+      - name: Generate the Android project
+        working-directory: app
+        run: npx tauri android init --ci
+      - name: Add the spike's Android pieces
+        run: python3 spike/android/patch.py app/src-tauri/gen/android "$SHERPA_ONNX_LIB_DIR"
+      - name: Build the app
+        working-directory: app
+        env:
+          JARVIS_BUILD: spike-${{ github.run_number }}
+        run: npx tauri android build --debug --apk --target aarch64 --ci
+      - name: Find the app file
+        run: find app/src-tauri/gen/android -name '*.apk' -exec ls -l {} \;
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-spike-apk
+          path: app/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
