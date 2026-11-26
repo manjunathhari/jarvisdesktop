@@ -98,6 +98,8 @@ RULES: dict[str, Rule] = {
     "action.readonly_ok": Rule(Priority.SILENT, "action", "Action completed"),
     # R12-22: the approval flow (§9.3, §12).
     "action.approved": Rule(Priority.URGENT, "action", "Running the approved action"),
+    # An approved action whose receipt never came (26 Nov): seen even if the desktop was off.
+    "action.no_receipt": Rule(Priority.TODAY, "action", "An approved action was not confirmed"),
     "memory.written": Rule(Priority.SILENT, "memory", "Remembered"),
     "approval.decision_refused": Rule(
         Priority.URGENT, "approval", "That decision could not be applied"

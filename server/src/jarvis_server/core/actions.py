@@ -26,6 +26,10 @@ Shapes are the shared contracts (R12-25): `pc.list_test_folder.receipt` and
 - the fresh listing verifies at source: only an `OK` listing without the file ID closes the
   task (outcome verified, COMPLETED, "Done"). A non-OK or malformed listing, the file still
   listed, a late listing, or none by the timeout: FAILED, and Jarvis says so (v2 §13.3).
+- no receipt at all (the desktop went off, or never answered): `action.receipt_timeout`, queued
+  with the action for `RECEIPT_GRACE` after its `valid_until`, fails the task (`no_receipt`),
+  says so, and leaves a TODAY `action.no_receipt` notice. It never runs, re-issues or retries
+  the action; a receipt arriving later is `reused_key` (owner, 26 Nov).
 
 Before any of this, a receipt must be the node's own signed message (R12-34,
 `core.node_signature`): the stored envelope verifies under the node's key and matches the row.
@@ -61,6 +65,9 @@ log = logging.getLogger("jarvis.core.actions")
 
 LIVE_VALIDITY = timedelta(minutes=2)
 LISTING_TIMEOUT = timedelta(seconds=10)  # the fixed listing timeout, for the fresh listing too
+# After an approved action's valid_until, how long core still waits for its receipt: the node's
+# 30 s clock tolerance, and delivery.
+RECEIPT_GRACE = timedelta(seconds=60)
 LISTING = "pc.list_test_folder"
 DELETE = "pc.delete_test_file"
 LISTING_OK = "OK"
@@ -70,9 +77,11 @@ CORE = ("AGENT", "core")
 RECEIPT_REFUSALS = (
     node_signature.BAD_NODE_SIGNATURE, "unknown_key", "reused_key", "unknown_action", "late",
     "malformed", "not_recycled", "file_mismatch", "listing_failed", "still_listed",
-    "listing_missing",
+    "listing_missing", "no_receipt",
 )  # fmt: skip
-VERIFY_FAILURES = frozenset({"late", "listing_failed", "still_listed", "listing_missing"})
+VERIFY_FAILURES = frozenset(
+    {"late", "listing_failed", "still_listed", "listing_missing", "no_receipt"}
+)
 
 
 # --- signing -----------------------------------------------------------------------------------
@@ -354,12 +363,12 @@ def _fail(
     ref: UUID,
     inbound_id: UUID | None,
     evidence: dict[str, Any],
-) -> None:
+) -> bool:
     """§9.4 "If any check fails, the task is FAILED and Jarvis says so". The transition comes
-    first: refused, it is kept and nothing else is written. Then the action and its outcome
-    (never verified), the spoken result, and last the audited receipt refusal."""
+    first: refused, it is kept and nothing else is written (returns False). Then the action
+    and its outcome (never verified), the spoken result, and last the audited receipt refusal."""
     if not transition_in_job(conn, issued.task_id, "FAILED", code):
-        return
+        return False
     conn.execute("UPDATE ledger.action SET status = 'FAILED' WHERE id = %s", (issued.action_id,))
     updated = conn.execute(
         "UPDATE ledger.outcome SET evidence = evidence || %s WHERE action_id = %s",
@@ -382,6 +391,7 @@ def _fail(
         )
         speak(conn, session_id, text)
     refuse_receipt(conn, ref=ref, node_id=issued.node_id, code=code, inbound_id=inbound_id)
+    return True
 
 
 @dispatch.register("action.receipt")
@@ -558,6 +568,31 @@ def on_verify_timeout(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
         return  # verified or failed already
     _fail(conn, issued, code="listing_missing", ref=issued.approval_id, inbound_id=None,
           evidence={})  # fmt: skip
+
+
+@dispatch.register("action.receipt_timeout")
+def on_receipt_timeout(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
+    """An approved action whose receipt never came by `valid_until` + `RECEIPT_GRACE`: the node
+    may or may not have done it, so the task is FAILED and Jarvis says it couldn't confirm.
+    Payload `{action_id}`. The action's row lock orders this against the receipt's job: whichever
+    takes the row first decides, and the other finds a status that is no longer ISSUED."""
+    issued = _issued(conn, "a.id = %s", str(UUID(job.payload["action_id"])))
+    if issued is None or issued.status != "ISSUED":
+        return  # its receipt was handled, or it has failed already
+    end_items(conn, issued.approval_id, ("action.approved",))  # never offered again
+    if not _fail(conn, issued, code="no_receipt", ref=issued.approval_id, inbound_id=None,
+                 evidence={}):  # fmt: skip
+        return  # the task couldn't move (kept, audited): nothing to tell
+    name = issued.args.get("name", "the file")
+    event_id = comm.record_event(
+        conn, "action.no_receipt", subject_type="approval", subject_id=str(issued.approval_id),
+        person_id=issued.person_id, details={"task_id": str(issued.task_id)},
+    )  # fmt: skip
+    rules.notify(
+        conn, "action.no_receipt", person_id=issued.person_id, event_id=event_id,
+        context={"text": f"I couldn't confirm that {name} was deleted",
+                 "group_key": f"action:{issued.approval_id}"},
+    )  # fmt: skip
 
 
 @dispatch.register("outbox.expire")
