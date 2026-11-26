@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-*Status: approved by Manj on 26 Nov 2026, with the seven changes below. Tasks 1 to 5 are built on local branch `board-slice-1` and independently reviewed, with the reviews' fixes applied; Tasks 6 to 9 are not started. Repo `manjunathhari/jarvisdesktop`, `main` = `983c2cf`.*
+*Status: approved by Manj on 26 Nov 2026, with the seven changes below. Tasks 1 to 6 are built on local branch `board-slice-1` and independently reviewed, with the reviews' fixes applied (Task 6's app code is not yet compiled: it needs the Windows build); Tasks 7 to 9 are not started. Repo `manjunathhari/jarvisdesktop`, `main` = `983c2cf`.*
 
 **Goal:** Manj asks by voice; Jarvis answers briefly, does the work, and shows the result as a panel on a Board window on monitor 2, with a running conversation and minimise, maximise and close on every panel, by click or by voice.
 
