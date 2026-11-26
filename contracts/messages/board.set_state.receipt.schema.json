@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/board.set_state.receipt.schema.json",
+  "title": "Receipt of `board.set_state` and `board.focus`",
+  "description": "The `action.receipt` payload (its live form) for a `board.set_state` or `board.focus` action. `OK`: the node applied it. `REFUSED`: a check failed (for example `unknown_panel`) and nothing changed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "reply_id",
+    "seq",
+    "result",
+    "evidence"
+  ],
+  "properties": {
+    "reply_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "result": {
+      "enum": [
+        "OK",
+        "REFUSED"
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "panel_id"
+      ],
+      "properties": {
+        "panel_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "check": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.]{0,63}$",
+          "description": "The check that failed. Omitted when there is none, never null."
+        }
+      }
+    }
+  }
+}

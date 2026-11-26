@@ -1,0 +1,9 @@
+{
+  "reply_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+  "seq": 2,
+  "result": "REFUSED",
+  "evidence": {
+    "panel_id": "7b1d6a52-3c4e-4f8a-9b0c-1d2e3f4a5b6c",
+    "check": "unknown_panel"
+  }
+}

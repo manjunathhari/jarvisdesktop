@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/board.show.args.schema.json",
+  "title": "Arguments of `board.show` (a new panel on the Board)",
+  "description": "The `authz.object.args` of a live `board.show` action: one whole panel, as core stored it. The node checks the limits and the hash, stores the panel, and answers `RENDERED` only after the Board has drawn this revision.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "panel_id",
+    "revision",
+    "kind",
+    "title",
+    "content",
+    "content_sha256",
+    "cost_paise",
+    "created_at"
+  ],
+  "properties": {
+    "panel_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "kind": {
+      "enum": [
+        "text",
+        "canvas"
+      ],
+      "description": "`text`: formatted text (Markdown, no raw HTML). `canvas`: one self-contained HTML page, shown sealed."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "content": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32000,
+      "description": "At most 32,000 bytes of UTF-8. JSON Schema counts characters, so core and the node also count bytes."
+    },
+    "content_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of `content`'s UTF-8 bytes, lower-case hex."
+    },
+    "cost_paise": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "What making this panel cost, in paise (0 when the cost is carried by another panel of the same job)."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

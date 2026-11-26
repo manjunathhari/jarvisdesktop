@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/board.state.schema.json",
+  "title": "Payload of `board.state` (node to core)",
+  "description": "The person changed a panel's state on the Board by hand (a click on minimise, maximise or close, or a reopen). Core records it, so its panel list matches the screen. `revision` is the panel revision the node holds.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "panel_id",
+    "state",
+    "revision",
+    "at"
+  ],
+  "properties": {
+    "panel_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "state": {
+      "enum": [
+        "open",
+        "minimised",
+        "maximised",
+        "closed"
+      ]
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

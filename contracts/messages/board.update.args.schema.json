@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/board.update.args.schema.json",
+  "title": "Arguments of `board.update` (a new revision of a panel)",
+  "description": "The `authz.object.args` of a live `board.update` action: the panel's whole new title and content. `revision` is the new revision; the node refuses one that is not newer than what it holds (`stale_revision`). The panel's kind does not change.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "panel_id",
+    "revision",
+    "title",
+    "content",
+    "content_sha256",
+    "cost_paise"
+  ],
+  "properties": {
+    "panel_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "content": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32000,
+      "description": "At most 32,000 bytes of UTF-8. JSON Schema counts characters, so core and the node also count bytes."
+    },
+    "content_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of `content`'s UTF-8 bytes, lower-case hex."
+    },
+    "cost_paise": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "What making this panel cost, in paise (0 when the cost is carried by another panel of the same job)."
+    }
+  }
+}

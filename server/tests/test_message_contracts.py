@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -22,6 +23,13 @@ DESKTOP = [
     "pc.delete_test_file.args",
     "pc.list_test_folder.receipt",
     "pc.delete_test_file.receipt",
+    # The Board (slice 1): the live actions' `authz.object.args` and their receipts.
+    "board.show.args",
+    "board.update.args",
+    "board.set_state.args",
+    "board.focus.args",
+    "board.show.receipt",
+    "board.set_state.receipt",
 ]
 
 KINDS = [
@@ -38,6 +46,7 @@ KINDS = [
     "approval.decision",
     "node.action",
     "action.receipt",
+    "board.state",
     "keyset",
     "ping",
     "pong",
@@ -379,3 +388,106 @@ def test_delete_evidence_check_is_omitted_never_null(check: Any, ok: bool) -> No
     else:
         with pytest.raises(ValidationError):
             c.DeleteReceipt.model_validate(payload)
+
+
+# --- the Board (slice 1) ---------------------------------------------------------------------
+
+
+def _both(name: str, payload: Any, *, ok: bool) -> None:
+    """The schema and the model agree on `payload`."""
+    assert validator(_schema(name)).is_valid(payload) is ok
+    if ok:
+        MODELS[name].model_validate(payload)
+    else:
+        with pytest.raises(ValidationError):
+            MODELS[name].model_validate(payload)
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+@pytest.mark.parametrize("name", ["board.show.args", "board.update.args"])
+def test_board_panel_limits(name: str) -> None:
+    good = _example(name, "valid")
+    _both(name, good, ok=True)
+    _both(name, {**good, "title": "t" * 120}, ok=True)
+    _both(name, {**good, "title": "t" * 121}, ok=False)
+    _both(name, {**good, "title": ""}, ok=False)
+    long = "c" * 32_000
+    _both(name, {**good, "content": long, "content_sha256": _sha(long)}, ok=True)
+    longer = "c" * 32_001
+    _both(name, {**good, "content": longer, "content_sha256": _sha(longer)}, ok=False)
+    _both(name, {**good, "content": "", "content_sha256": _sha("")}, ok=False)
+    _both(name, {**good, "revision": 0}, ok=False)
+    _both(name, {**good, "cost_paise": -1}, ok=False)
+    _both(name, {**good, "extra": 1}, ok=False)
+
+
+def test_board_show_kinds_are_text_and_canvas() -> None:
+    good = _example("board.show.args", "valid")
+    _both("board.show.args", {**good, "kind": "canvas"}, ok=True)
+    _both("board.show.args", {**good, "kind": "html"}, ok=False)
+    assert _schema("board.show.args")["properties"]["kind"]["enum"] == ["text", "canvas"]
+
+
+@pytest.mark.parametrize("name", ["board.show.args", "board.update.args"])
+def test_board_content_is_limited_in_bytes_by_the_model(name: str) -> None:
+    """JSON Schema counts characters; the limit is 32,000 bytes of UTF-8, so the model (and the
+    node) also count bytes. 16,001 two-byte characters pass the schema and fail the model."""
+    good = _example(name, "valid")
+    wide = "é" * 16_001
+    payload = {**good, "content": wide, "content_sha256": _sha(wide)}
+    assert validator(_schema(name)).is_valid(payload)
+    with pytest.raises(ValidationError):
+        MODELS[name].model_validate(payload)
+    fits = "é" * 16_000
+    MODELS[name].model_validate({**good, "content": fits, "content_sha256": _sha(fits)})
+
+
+@pytest.mark.parametrize("name", ["board.show.args", "board.update.args"])
+def test_board_hash_must_be_of_the_content(name: str) -> None:
+    good = _example(name, "valid")
+    assert good["content_sha256"] == _sha(good["content"])
+    with pytest.raises(ValidationError):
+        MODELS[name].model_validate({**good, "content_sha256": _sha("something else")})
+
+
+STATES = ["open", "minimised", "maximised", "closed"]
+
+
+@pytest.mark.parametrize("name", ["board.set_state.args", "board.state"])
+def test_board_states_are_the_four(name: str) -> None:
+    good = _example(name, "valid")
+    assert _schema(name)["properties"]["state"]["enum"] == STATES
+    for state in STATES:
+        _both(name, {**good, "state": state}, ok=True)
+    _both(name, {**good, "state": "hidden"}, ok=False)
+
+
+def test_board_receipt_results() -> None:
+    show = _example("board.show.receipt", "valid")
+    for result in ("RENDERED", "REFUSED", "ERROR"):
+        _both("board.show.receipt", {**show, "result": result}, ok=True)
+    _both("board.show.receipt", {**show, "result": "OK"}, ok=False)
+    state = _example("board.set_state.receipt", "valid")
+    for result in ("OK", "REFUSED"):
+        _both("board.set_state.receipt", {**state, "result": result}, ok=True)
+    _both("board.set_state.receipt", {**state, "result": "RENDERED"}, ok=False)
+
+
+@pytest.mark.parametrize("name", ["board.show.receipt", "board.set_state.receipt"])
+def test_board_receipt_check_is_omitted_never_null(name: str) -> None:
+    good = _example(name, "valid")
+    evidence = {k: v for k, v in good["evidence"].items() if k != "check"}
+    _both(name, {**good, "evidence": evidence}, ok=True)
+    _both(name, {**good, "evidence": {**evidence, "check": "too_large"}}, ok=True)
+    _both(name, {**good, "evidence": {**evidence, "check": None}}, ok=False)
+
+
+@pytest.mark.parametrize("name", ["board.show.receipt", "board.set_state.receipt"])
+def test_board_receipts_are_live_action_receipts(name: str) -> None:
+    """A Board receipt travels as `action.receipt` (its live form), so it must pass that too."""
+    good = _example(name, "valid")
+    validator(_schema("action.receipt")).validate(good)
+    c.MESSAGE_MODELS["action.receipt"].model_validate(good)

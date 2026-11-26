@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/board.set_state.args.schema.json",
+  "title": "Arguments of `board.set_state` (minimise, maximise, restore, close or reopen a panel)",
+  "description": "The `authz.object.args` of a live `board.set_state` action. `closed` keeps the panel (Recently closed); nothing is deleted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "panel_id",
+    "state"
+  ],
+  "properties": {
+    "panel_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "state": {
+      "enum": [
+        "open",
+        "minimised",
+        "maximised",
+        "closed"
+      ]
+    }
+  }
+}

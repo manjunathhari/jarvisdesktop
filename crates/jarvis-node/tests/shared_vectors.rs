@@ -244,3 +244,19 @@ fn test_keys_match_the_vectors() {
         );
     }
 }
+
+/// The node's list of message kinds is exactly the envelope schema's (`board.state` was added
+/// for the Board, slice 1): a kind the schema allows is never dropped as unknown, or the reverse.
+#[test]
+fn message_kinds_match_the_envelope_schema() {
+    let path = support::contracts().join("node-envelope.schema.json");
+    let schema: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let kinds: Vec<&str> = schema["properties"]["kind"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k.as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, jarvis_node::wire::MESSAGE_KINDS.to_vec());
+}
