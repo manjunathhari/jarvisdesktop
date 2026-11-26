@@ -502,6 +502,41 @@ def test_no_table_grant_was_added(owner: Conn) -> None:
         ).fetchone() == (ok,), (role, table)
 
 
+# --- migration 0015 (receipt code `no_receipt`, 26 Nov) ----------------------------------------
+
+
+def test_0015_down_and_up() -> None:
+    """Down to 0014: `ledger.refuse_receipt` refuses `no_receipt` again. Up: it is accepted,
+    audited against the approval, and still only jarvis_app may call the function."""
+    call = "SELECT ledger.refuse_receipt(%s, %s, 'no_receipt')"
+    with fresh_database() as d:
+        migrate.downgrade(d.owner, "0014")
+        with psycopg.connect(d.app, autocommit=True) as conn:
+            with pytest.raises(psycopg.errors.InvalidParameterValue):
+                conn.execute(call, (uuid.uuid4(), uuid.uuid4()))
+            assert conn.execute(
+                "SELECT ledger.refuse_receipt(%s, %s, 'listing_missing')",
+                (uuid.uuid4(), uuid.uuid4()),
+            ).fetchone() == ("listing_missing",)
+        migrate.upgrade(d.owner, "head")
+        ref = uuid.uuid4()
+        with psycopg.connect(d.app, autocommit=True) as conn:
+            assert conn.execute(call, (ref, uuid.uuid4())).fetchone() == ("no_receipt",)
+            assert conn.execute(
+                "SELECT entity_type, outcome::text, reason FROM audit.event WHERE entity_id = %s",
+                (ref,),
+            ).fetchall() == [("approval", "REJECTED", "no_receipt")]
+        with psycopg.connect(d.owner, autocommit=True) as conn:
+            fn = "ledger.refuse_receipt(uuid, uuid, text)"
+            assert conn.execute(
+                "SELECT prosecdef, has_function_privilege('jarvis_app', %s, 'EXECUTE'),"
+                " has_function_privilege('jarvis_gateway', %s, 'EXECUTE'),"
+                " has_function_privilege('public', %s, 'EXECUTE')"
+                " FROM pg_proc WHERE oid = %s::regprocedure",
+                (fn, fn, fn, fn),
+            ).fetchone() == (True, True, False, False)
+
+
 # --- migration 0014 (R12-37) -------------------------------------------------------------------
 
 

@@ -1,5 +1,7 @@
 # Handoff
-**Now:** Phase 2 server is merged (PR #5, PR #6) and **live** on the shared server at `main` = `c75fb9c`. No devices are enrolled. **Plan B (the Rust desktop node) is built**: all 9 tasks done, reviewed and fixed, on branch `plan-b` (`d8d698b`), which Manj pushed to GitHub on 25 Nov. It is not merged and not deployed. CI is green on Linux and Windows (run #31), and the Server workflow was green on `443d01f` (run #44; confirm the latest Server run before merging). Next: Manj reviews and merges; then the server deploy (migration 0014, R12-36/37) goes before the desktop; then Step 7, the live P2-A1 check on his PC (checklist in project doc `claude/plan-b-task-9-handover.md`).
+**Now (26 Nov):** the server runs `354f1fe` (deployed 26 Nov; migration 0015; smoke 18/18). Phase 2 server and Plan B (the Rust desktop node) are merged, deployed and live-checked on Manj's PC (PR #7 to #9, 25 Nov); his desktop "Manj PC" is enrolled and runs in server mode. Since then, all merged: single instance, the "Hey Jarvis" / "Jarvis" wake word, a reused connection to Claude with Opus for conversation (PR #10 to #14), and the receipt timeout (PR #15). The desktop's own-brain mode stays in the code as a fallback (owner, 26 Nov); Manj has deleted the stored Claude key on his PC.
+
+**Receipt-timeout hardening (PR #16, which also adds ruling R12-38 to the spec):** from the independent review of PR #15: the handler checks its deadline, the transition comes first, a scheduler safety net, and the missing tests. No migration. It needs a server deploy after merge. On that first deploy the safety net also closes any action left ISSUED from earlier testing (task FAILED, "I couldn't confirm", a notice). Project docs: `claude/server-task-receipt-timeout.md` and its handover.
 
 The "Before deploying" list below is historical: it was done for the 24 Nov deploy.
 
@@ -39,10 +41,12 @@ The "Before deploying" list below is historical: it was done for the 24 Nov depl
 - **QA:** the QA review lists its remaining minors.
 - **Earlier per-task minors:** listed in each task's review and summarised in the two final reviews.
 - **Plan B follow-ups (server, not approved yet):**
-  - core never ends an action still ISSUED when no receipt arrives (an `action.receipt_timeout`);
+  - ~~core never ends an action still ISSUED when no receipt arrives~~ (done: `action.receipt_timeout`, PR #15; hardened in PR #16, ruling R12-38);
   - clears are not replayed on reconnect;
   - REFUSED live receipts are recorded as `action.readonly_ok`.
 - **Plan B owner decisions:** not acking approved-action items; withholding `received` when nothing is sent; idle desktop and null `in_reply_to`; ears/voice timestamps for the full latency measure; the D-3 key-store deviation.
+- **Receipt-timeout review, left open (minor):** if core dies while handling a receipt, the timeout can win and a completed delete is reported "couldn't confirm"; a late receipt's result is not kept in the `reused_key` audit row. From the review of PR #16: an action whose task cannot be failed stays ISSUED and is retried by the sweep about once in 30 days (one REJECTED audit row each time); the sweep query has no supporting index (about 1 ms at 300k events; add a partial index on ISSUED actions with a later migration); nothing tests the sweep's job through the handler end to end.
+- **Deferred by Manj to the dedicated-server move (26 Nov):** `jarvis-core person add` and its deploy-guide step, to be done before the move.
 - **Carried from Phase 1:** run the P0-7 restore drill before the move; turn deploy smoke off once real data arrives (Q3).
 
 **Constraints:**

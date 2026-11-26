@@ -4,13 +4,16 @@
 item or period gets at most one job, deduplicated by a deterministic job key in its payload
 (`jobs.enqueue_once`, `<kind>:<item>`). Approvals and approved actions queue their own jobs under
 the same keys when they are created (Task 11), so the scheduler is their backstop and never
-their double.
+their double. The one exception is `action.receipt_timeout` (R12-38): the action's own job has
+no key, and the scheduler's keyed one comes 15 minutes later, only for an action still ISSUED
+then, so it can stand in for a job that failed.
 
 | Job | When | Key item |
 |---|---|---|
 | `approval.expiring` | from 2 min before a PENDING approval's expiry until it | the approval |
 | `approval.expire` | from a PENDING approval's expiry | the approval |
 | `outbox.expire` | from an open item's `expires_at` | the item |
+| `action.receipt_timeout` | from 15 min after an ISSUED action's receipt deadline | the action |
 | `brain.probe` | every 2 min while the brain is DOWN (§10.2) | the UTC 2-minute slot |
 | `brain.reservation_sweep` | every minute (§10.1) | the UTC minute |
 | `keys.activate` | every minute (Task 12, R12-28) | the UTC minute |
@@ -37,6 +40,7 @@ import psycopg
 from jarvis_server import config, jobs
 from jarvis_server.brain import health
 from jarvis_server.brain.budget import IST
+from jarvis_server.core.actions import RECEIPT_GRACE, RECEIPT_SWEEP_AFTER
 from jarvis_server.core.approvals import RESURFACE_BEFORE
 
 log = logging.getLogger("jarvis.scheduler")
@@ -63,11 +67,23 @@ _DUE_ITEMS: tuple[tuple[str, LiteralString], ...] = (
         "SELECT id FROM comm.outbox WHERE state IN ('PENDING', 'DELIVERING', 'DELIVERED')"
         " AND expires_at <= %(now)s ORDER BY expires_at, id",
     ),
+    (
+        # The safety net for an approved action's own timeout job (R12-38): still ISSUED well
+        # after its deadline, so that job was lost. One more, once (the job key).
+        "action.receipt_timeout",
+        "SELECT a.id FROM ledger.action a"
+        " JOIN ledger.approval p ON p.execution_key::text = a.idempotency_key"
+        " JOIN comm.event e ON e.subject_type = 'approval' AND e.subject_id = p.id::text"
+        " JOIN comm.outbox o ON o.event_id = e.id AND o.kind = 'action.approved'"
+        " WHERE a.status = 'ISSUED' GROUP BY a.id"
+        " HAVING max(o.expires_at) + %(receipt_after)s <= %(now)s ORDER BY max(o.expires_at), a.id",
+    ),
 )
 _PAYLOAD_KEY = {
     "approval.expiring": "approval_id",
     "approval.expire": "approval_id",
     "outbox.expire": "outbox_id",
+    "action.receipt_timeout": "action_id",
 }
 
 
@@ -91,7 +107,8 @@ class Scheduler:
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("now must carry a time zone")
         due: list[tuple[str, str, dict[str, Any]]] = []
-        params = {"now": now, "before": RESURFACE_BEFORE}
+        params = {"now": now, "before": RESURFACE_BEFORE,
+                  "receipt_after": RECEIPT_GRACE + RECEIPT_SWEEP_AFTER}  # fmt: skip
         for kind, sql in _DUE_ITEMS:
             for (item,) in conn.execute(sql, params).fetchall():
                 due.append((kind, str(item), {_PAYLOAD_KEY[kind]: str(item)}))
