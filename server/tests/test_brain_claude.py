@@ -751,6 +751,24 @@ def test_parser_skips_server_tool_blocks_and_counts_searches() -> None:
     list(mock_brain(lambda r: stream_response(GOOD_STREAM)).think(make_request()))
 
 
+def test_a_search_the_usage_does_not_report_is_still_counted() -> None:
+    """The bill is never under-counted: at least one search for each result block that came
+    back with pages."""
+    page = [{"type": "web_search_result", "url": "https://example.org/a", "title": "A"}]
+    error = {"type": "web_search_tool_result_error", "error_code": "unavailable"}
+    body = sse(
+        start(),
+        *block(0, {"type": "web_search_tool_result", "tool_use_id": "s1", "content": page}),
+        *block(1, {"type": "web_search_tool_result", "tool_use_id": "s2", "content": page}),
+        *block(2, {"type": "web_search_tool_result", "tool_use_id": "s3", "content": error}),
+        *block(3, {"type": "web_search_tool_result", "tool_use_id": "s4", "content": []}),
+        *stop("end_turn"),
+    )
+    brain = mock_brain(lambda r: stream_response(body))
+    list(brain.think(make_request()))
+    assert brain.searches == 3  # the failed one is not billed; an empty result is a search
+
+
 def test_search_state_is_reset_between_calls() -> None:
     searched = sse(
         start(),

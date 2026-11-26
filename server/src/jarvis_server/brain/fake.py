@@ -23,6 +23,7 @@ class FakeBrain:
         searches: int = 0,
         sources: list[tuple[str, str]] | None = None,
         truncated: bool = False,
+        stop_reason: str = "end_turn",
     ) -> None:
         self._script = list(script)
         self.requests: list[BrainRequest] = []
@@ -32,11 +33,13 @@ class FakeBrain:
         self.searches = 0
         self.sources: list[tuple[str, str]] = []
         self.truncated = False
+        self._final_stop = stop_reason
+        self.stop_reason: str | None = None
 
     def think(self, req: BrainRequest) -> Iterator[BrainEvent]:
         self.requests.append(req)
         self.usage = None
-        self.searches, self.sources, self.truncated = 0, [], False
+        self.searches, self.sources, self.truncated, self.stop_reason = 0, [], False, None
         for item in self._script:
             if isinstance(item, BrainCallFailed):
                 raise item
@@ -47,3 +50,4 @@ class FakeBrain:
             list(self._final[1]),
             self._final[2],
         )
+        self.stop_reason = self._final_stop

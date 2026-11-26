@@ -193,11 +193,12 @@ class ClaudeBrain:
     Server tools (web search, `req.server_tools`): the API runs the search inside the call. Its
     `server_tool_use` and `web_search_tool_result` blocks are not tool calls for the caller and
     are never yielded. `searches` is `usage.server_tool_use.web_search_requests` (what is
-    billed per search), `sources` the (title, address) of the pages returned. `stop_reason` is
-    the API's; `pause_turn` (a long search turn the API paused) ends the call like any other:
-    one call per job, never resumed. `truncated`: the output limit ended the reply; a tool call
-    whose input it cut is dropped and the call still completes, with its usage, because it was
-    made and is billed. Tool input that is malformed for any other reason fails the call.
+    billed per search), and never fewer than the result blocks that came back without an
+    error. `sources` is the (title, address) of the pages returned. `stop_reason` is the API's;
+    `pause_turn` (a long search turn the API paused) ends the call like any other: one call per
+    job, never resumed. `truncated`: the output limit ended the reply; a tool call whose input
+    it cut is dropped and the call still completes, with its usage, because it was made and is
+    billed. Tool input that is malformed for any other reason fails the call.
     """
 
     def __init__(
@@ -255,6 +256,7 @@ class ClaudeBrain:
         tool_name: str | None = None
         fragments: list[str] = []
         searches = 0
+        answered = 0  # result blocks that are not errors: each was a search that ran
         sources: list[tuple[str, str]] = []
         stop_reason: str | None = None
         cut_tool = False  # a client tool's input did not parse
@@ -276,6 +278,8 @@ class ClaudeBrain:
                     fragments = []
                 elif block.get("type") == "web_search_tool_result":
                     results = block.get("content")
+                    if isinstance(results, list):
+                        answered += 1
                     for result in results if isinstance(results, list) else []:  # else an error
                         if isinstance(result, dict) and isinstance(result.get("url"), str):
                             sources.append((str(result.get("title") or ""), result["url"]))
@@ -307,7 +311,8 @@ class ClaudeBrain:
             elif kind == "message_stop":
                 if cut_tool and stop_reason != "max_tokens":
                     raise BrainCallFailed(CallPhase.SEND, detail="malformed tool input")
-                self.searches, self.sources = searches, sources
+                # Never fewer than the searches seen to run, should the usage not report them.
+                self.searches, self.sources = max(searches, answered), sources
                 self.stop_reason = stop_reason
                 self.truncated = stop_reason == "max_tokens"
                 self.usage = (input_tokens, output_tokens)
