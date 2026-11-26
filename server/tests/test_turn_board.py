@@ -724,3 +724,131 @@ def test_core_registers_the_board_state_job() -> None:
     )
     assert json.loads(out.stdout) is True
     assert "board.state" in dispatch._HANDLERS
+
+
+# --- after the independent review of Task 3 -------------------------------------------------
+
+
+def test_a_report_of_the_same_state_still_counts_as_the_newest(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID
+) -> None:
+    """Minimised; "open" arrives, then "minimised"; the later one's job runs first. The later
+    report changes nothing, and must still outdate the earlier one."""
+    panel = _make(app, person, session)
+    board.set_state(app, person_id=person, panel_id=panel.panel_id, state="minimised")
+    now = flow.db_now(app)
+    opened = _report(owner, node, person, panel.panel_id, "open",
+                     received_at=now + timedelta(seconds=1))  # fmt: skip
+    minimised = _report(owner, node, person, panel.panel_id, "minimised",
+                        received_at=now + timedelta(seconds=2))  # fmt: skip
+    _run_state(app, minimised)
+    _run_state(app, opened)
+    assert _state(app, panel.panel_id) == "minimised"
+
+
+def test_a_voice_command_that_changes_nothing_still_outdates_an_older_click(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    engine: MemoryEngine,
+) -> None:  # fmt: skip
+    panel = _make(app, person, session)
+    board.set_state(app, person_id=person, panel_id=panel.panel_id, state="maximised")
+    clicked = _report(owner, node, person, panel.panel_id, "closed")  # its job is still queued
+    turn.set_brain(Brains([ToolCall("board_set_state", {"panel": "p1", "state": "maximise"})]))
+    _turn(app, owner, node, person)
+    _run_state(app, clicked)
+    assert _state(app, panel.panel_id) == "maximised"
+
+
+def test_a_state_set_inside_a_long_transaction_is_dated_when_it_happens(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID
+) -> None:
+    """A click that arrived before a job set the state, but after that job's transaction
+    began, does not win."""
+    panel = _make(app, person, session)
+    with app.transaction():
+        app.execute("SELECT now()")
+        clicked = _report(owner, node, person, panel.panel_id, "closed")  # arrives meanwhile
+        board.set_state(app, person_id=person, panel_id=panel.panel_id, state="maximised")
+    _run_state(app, clicked)
+    assert _state(app, panel.panel_id) == "maximised"
+
+
+def test_board_state_from_a_phone_node_is_dropped(
+    app: Conn, owner: Conn, person: uuid.UUID, session: uuid.UUID
+) -> None:
+    phone = flow.new_node(owner, person, "PHONE")
+    panel = _make(app, person, session)
+    iid = _report(owner, phone, person, panel.panel_id, "closed")
+    _run_state(app, iid)
+    assert flow.outcome_of(app, iid) == "REFUSED" and _state(app, panel.panel_id) == "open"
+
+
+def test_a_failure_receipt_after_rendered_is_not_said(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID
+) -> None:
+    panel = _make(app, person, session)
+    reply, seq = _show(app, node, person, session, panel)
+    _receive(app, owner, node, person, _show_receipt(reply, seq, panel))
+    _receive(app, owner, node, person, _show_receipt(reply, seq, panel, "ERROR", "render_timeout"))
+    assert _rendered(app, panel.panel_id) == 1
+    assert _spoken(app, session) == []
+    assert len(_events(app, "board.render_failed", person)) == 1  # still recorded
+
+
+def test_the_current_desktops_refusal_shape_is_refused_malformed(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID
+) -> None:
+    """A desktop build from before the Board answers `unknown_action_kind` with no panel."""
+    panel = _make(app, person, session)
+    reply, seq = _issue(app, node, person, session, "board.set_state",
+                        {"panel_id": str(panel.panel_id), "state": "closed"})  # fmt: skip
+    old = {"reply_id": str(reply), "seq": seq, "result": "REFUSED",
+           "evidence": {"check": "unknown_action_kind"}}  # fmt: skip
+    iid = _receive(app, owner, node, person, old)
+    assert flow.receipt_audit(app, iid) == [("REJECTED", "malformed", {"node_id": str(node)})]
+    assert _spoken(app, session) == []
+
+
+@pytest.mark.parametrize("seq", [True, "1", 1.0, 2**40])
+def test_a_receipt_with_a_seq_that_is_not_a_whole_number_does_not_fail_the_job(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID, seq: Any
+) -> None:
+    panel = _make(app, person, session)
+    reply, real = _show(app, node, person, session, panel)
+    payload = {**_show_receipt(reply, real, panel), "seq": seq}
+    iid = _receive(app, owner, node, person, payload)  # asserts the job is DONE
+    assert flow.receipt_audit(app, iid) == [("REJECTED", "unknown_action", {"node_id": str(node)})]
+    assert _rendered(app, panel.panel_id) is None
+
+
+@pytest.mark.parametrize("request_text", ["a\x00b", "a\ud800b", "a\x07b"])
+def test_a_request_that_cannot_be_stored_is_refused_not_lost(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine,
+    request_text: str,
+) -> None:  # fmt: skip
+    turn.set_brain(Brains([ToolCall("board_make", {"request": request_text})]))
+    tid = _turn(app, owner, node, person)
+    assert _outcome(app, tid) == "ANSWERED" and _board_jobs(app, person) == []
+    assert _refusals(app, tid) == [{"reason": "bad_args", "action_kind": "board.make"}]
+
+
+def test_set_state_is_rolled_back_if_the_action_cannot_be_issued(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    engine: MemoryEngine, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    panel = _make(app, person, session)
+
+    def broken(*_: Any, **__: Any) -> int:
+        raise RuntimeError("no key")
+
+    monkeypatch.setattr(actions, "issue_live", broken)
+    turn.set_brain(Brains([ToolCall("board_set_state", {"panel": "p1", "state": "close"})]))
+    _turn(app, owner, node, person)
+    assert _state(app, panel.panel_id) == "open"
+
+
+def test_long_titles_are_cut_in_the_list() -> None:
+    line = prompt.board_line(board.PanelLine("p1", uuid.uuid4(), "text", "é" * 120, "open"))
+    assert line == 'p1 text "' + "é" * 59 + '…" open'
+    short = prompt.board_line(board.PanelLine("p1", uuid.uuid4(), "text", "é" * 60, "open"))
+    assert short == 'p1 text "' + "é" * 60 + '" open'

@@ -42,6 +42,8 @@ TURN_MAX_TOKENS = 400
 BOARD_REQUEST_MAX = 1000
 # Panel lines in a prompt: the newest, then one line counting the rest.
 BOARD_LINES_MAX = 30
+# A title in the list is cut to this many characters: the list is in every turn's prompt.
+BOARD_TITLE_SHOWN = 60
 # The tool's word for what to do with a panel, and the state it leaves the panel in.
 BOARD_STATES: dict[str, str] = {
     "minimise": "minimised",
@@ -231,8 +233,11 @@ def history(
 
 def board_line(panel: board.PanelLine) -> str:
     """`p3 text "December trip: three options" open`. The title is quoted as JSON, so a quote
-    or a line break in it cannot end the title or the line."""
-    title = json.dumps(panel.title, ensure_ascii=False)
+    or a line break in it cannot end the title or the line. A long title is cut."""
+    shown = panel.title
+    if len(shown) > BOARD_TITLE_SHOWN:
+        shown = shown[: BOARD_TITLE_SHOWN - 1] + "…"
+    title = json.dumps(shown, ensure_ascii=False)
     return f"{panel.handle} {panel.kind} {title} {panel.state}"
 
 

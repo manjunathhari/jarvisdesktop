@@ -16,7 +16,8 @@ panel counts as drawn only when the desktop's Board reported it.
 A receipt sent twice is taken twice and said once (the event of that chunk is the marker).
 
 **Panel state** (job `board.state`, from an inbound `board.state` message). The node's own
-signed message (R12-34), in the contract's shape, for a panel of the node's person; then
+signed message (R12-34), in the contract's shape, from a DESKTOP node, for a panel of the
+node's person; then
 `board.report_state`, which applies reports in arrival order. An unknown panel, or another
 person's, is dropped and logged. The server stays the record: the desktop is not answered.
 """
@@ -75,7 +76,12 @@ def on_live_receipt(
             conn, event, subject_type="stream", subject_id=subject, person_id=person_id,
             details={"panel_id": str(panel_id), "result": result, "check": check or "none"},
         )  # fmt: skip
-        if said is None:
+        drawn = conn.execute(
+            "SELECT 1 FROM comm.event WHERE kind = 'board.rendered' AND subject_type = 'stream'"
+            " AND subject_id = %s LIMIT 1",
+            (subject,),
+        ).fetchone()
+        if said is None and drawn is None:  # once, and never about a chunk reported drawn
             actions.speak(conn, session_id, text)
 
     try:
@@ -146,6 +152,14 @@ def on_state(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     node_id, person_id, kind, payload = UUID(str(row[0])), UUID(str(row[1])), row[2], row[3]
     if kind != "board.state":
         raise ValueError(f"inbound {inbound_id} is a {kind}, not a board.state")
+    desktop = conn.execute(
+        "SELECT 1 FROM gw.node WHERE id = %s AND kind = 'DESKTOP' AND revoked_at IS NULL",
+        (node_id,),
+    ).fetchone()
+    if desktop is None:  # the Board is the desktop's (R12-39)
+        log.info("board.state %s: not from a desktop node; dropped", inbound_id)
+        actions.set_outcome(conn, inbound_id, "REFUSED")
+        return
     if not node_signature.signed_by_node(
         conn, inbound_id=inbound_id, node_id=node_id, kind=kind, payload=payload,
         envelope=row[6],

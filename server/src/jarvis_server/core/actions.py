@@ -445,6 +445,12 @@ def _live_receipt(
     received_at: datetime,
 ) -> None:
     reply_id = UUID(str(payload["reply_id"]))
+    seq = payload["seq"]
+    if isinstance(seq, bool) or not isinstance(seq, int) or not 1 <= seq <= contracts.INT_MAX:
+        # The gateway's check lets "1", 1.0 and true through; no chunk has such a seq.
+        refuse_receipt(conn, ref=inbound_id, node_id=node_id, code="unknown_action",
+                       inbound_id=inbound_id)  # fmt: skip
+        return
     chunk = conn.execute(
         "SELECT k.authz, k.valid_until, k.target_node_id, s.person_id, k.session_id"
         " FROM conv.stream_chunk k JOIN conv.session s ON s.id = k.session_id"

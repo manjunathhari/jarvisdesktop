@@ -213,11 +213,15 @@ def set_state(
         raise ValueError("unknown panel state")
     with conn.transaction():
         held = get(conn, person_id, panel_id, lock=True)
-        if held.state != state:
-            conn.execute(
-                "UPDATE board.panel SET state = %s, state_changed_at = now() WHERE id = %s",
-                (state, panel_id),
-            )
+        # Dated when it happens, not when the caller's transaction began (a job's may be long).
+        # `state_seen_at` moves even when nothing changes: this is now the newest word on the
+        # panel's state, and an older report from the desktop must not undo it.
+        conn.execute(
+            "UPDATE board.panel SET state = %(s)s, state_seen_at = clock_timestamp(),"
+            " state_changed_at = CASE WHEN state = %(s)s THEN state_changed_at"
+            "                         ELSE clock_timestamp() END WHERE id = %(id)s",
+            {"s": state, "id": held.panel_id},
+        )
         return get(conn, person_id, panel_id)
 
 
@@ -231,22 +235,24 @@ def report_state(
 ) -> bool:
     """A state the desktop reported (the person clicked), which arrived at `reported_at`.
     Reports apply in arrival order whatever order their jobs run in: one that arrived before
-    the panel's last change of state is left out (False). The change is dated `reported_at`."""
+    the newest word on the panel's state (`state_seen_at`: a voice command or a later report,
+    even one that changed nothing) is left out (False). It is dated `reported_at`."""
     if state not in _STATES:
         raise ValueError("unknown panel state")
     with conn.transaction():
         get(conn, person_id, panel_id, lock=True)
         row = conn.execute(
-            "SELECT state, state_changed_at FROM board.panel WHERE id = %s", (panel_id,)
+            "SELECT state_seen_at FROM board.panel WHERE id = %s", (panel_id,)
         ).fetchone()
         assert row is not None
-        if row[1] > reported_at:
+        if row[0] > reported_at:
             return False
-        if row[0] != state:
-            conn.execute(
-                "UPDATE board.panel SET state = %s, state_changed_at = %s WHERE id = %s",
-                (state, reported_at, panel_id),
-            )
+        conn.execute(
+            "UPDATE board.panel SET state = %(s)s, state_seen_at = %(at)s,"
+            " state_changed_at = CASE WHEN state = %(s)s THEN state_changed_at ELSE %(at)s END"
+            " WHERE id = %(id)s",
+            {"s": state, "at": reported_at, "id": panel_id},
+        )
         return True
 
 

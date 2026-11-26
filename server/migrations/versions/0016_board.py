@@ -119,6 +119,9 @@ def upgrade() -> None:
         created_at         timestamptz NOT NULL DEFAULT now(),
         updated_at         timestamptz NOT NULL DEFAULT now(),
         state_changed_at   timestamptz NOT NULL DEFAULT now(),
+        -- When a state was last set or reported, even one that changed nothing: reports
+        -- from the desktop older than this are left out (core.board.report_state).
+        state_seen_at      timestamptz NOT NULL DEFAULT now(),
         UNIQUE (person_id, number)
     );
 

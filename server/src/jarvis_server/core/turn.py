@@ -586,6 +586,16 @@ def _refuse(
         stream.say(text)
 
 
+def _storable(text: str) -> bool:
+    """Whether a job payload can hold `text`: valid Unicode, and no control character other
+    than tab and line breaks (Postgres cannot store NUL)."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return not any(ord(ch) < 32 and ch not in "\t\n\r" for ch in text)
+
+
 _BOARD_KINDS = frozenset({"board.make", "board.set_state", "board.focus"})
 
 
@@ -601,7 +611,7 @@ def _board(
     looked up among the authenticated person's own."""
     if kind == "board.make":
         request = call.args.get("request")
-        if not isinstance(request, str) or not request.strip():
+        if not isinstance(request, str) or not request.strip() or not _storable(request):
             _refuse(c, turn, stream, told, "bad_args", kind, BOARD_UNCLEAR_TEXT)
             return
         payload = {
