@@ -317,6 +317,30 @@ def test_inbound_stores_the_envelope_as_given(gateway: Conn, app: Conn) -> None:
             gateway.execute(sql, (conn_id, uuid.uuid4(), "utterance", Jsonb(payload), Jsonb(bad)))
 
 
+def test_inbound_board_state_is_recorded_and_queued(gateway: Conn, app: Conn) -> None:
+    """Migration 0016: a `board.state` message (a click on a panel's control) is an inbound
+    kind, queued as job `board.state`."""
+    node_id, conn_id = _connected(app, gateway)
+    message_id = uuid.uuid4()
+    payload = {"panel_id": str(uuid.uuid4()), "state": "closed", "revision": 1,
+               "at": "2026-11-26T11:50:03+05:30"}  # fmt: skip
+    sql = "SELECT recorded, refusal FROM conv.record_inbound(%s, %s, %s, %s, NULL)"
+    assert gateway.execute(
+        sql, (conn_id, message_id, "board.state", Jsonb(payload))
+    ).fetchone() == (
+        True,
+        None,
+    )
+    row = app.execute(
+        "SELECT node_id, person_id, kind, payload FROM conv.inbound WHERE id = %s", (message_id,)
+    ).fetchone()
+    assert row == (node_id, MANJ, "board.state", payload)
+    assert _jobs_for(app, message_id) == [("board.state", {"inbound_id": str(message_id)})]
+    again = gateway.execute(sql, (conn_id, message_id, "board.state", Jsonb(payload))).fetchone()
+    assert again == (False, None)  # a resend is a no-op
+    assert len(_jobs_for(app, message_id)) == 1
+
+
 def test_inbound_unknown_kind_refused(gateway: Conn, app: Conn, dsns: Dsns) -> None:
     node_id, conn_id = _connected(app, gateway)
     message_id = uuid.uuid4()

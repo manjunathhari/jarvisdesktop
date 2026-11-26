@@ -104,6 +104,12 @@ def test_tier_table_exact() -> None:
         "memory.write": Tier.REVERSIBLE,
         "pc.list_test_folder": Tier.READ_ONLY,
         "pc.delete_test_file": Tier.IRREVERSIBLE,
+        # The Board (slice 1): display only.
+        "board.make": Tier.READ_ONLY,
+        "board.show": Tier.READ_ONLY,
+        "board.update": Tier.READ_ONLY,
+        "board.set_state": Tier.READ_ONLY,
+        "board.focus": Tier.READ_ONLY,
     }
     with pytest.raises(TypeError):
         policy.TIERS["shell.run"] = Tier.READ_ONLY  # type: ignore[index]
@@ -111,6 +117,23 @@ def test_tier_table_exact() -> None:
     assert policy.tier_of("screen.*") is None  # the row's name is not itself a kind
     for kind in ("screen", "screen.", "screen.Close", "module.news.x", "pc.delete", "shell.run"):
         assert policy.tier_of(kind) is None, kind
+
+
+BOARD_KINDS = ("board.make", "board.show", "board.update", "board.set_state", "board.focus")
+
+
+def test_board_kinds_are_read_only_and_desktop_only(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID
+) -> None:
+    phone = flow.new_node(owner, person, "PHONE")
+    for kind in BOARD_KINDS:
+        assert policy.tier_of(kind) is Tier.READ_ONLY
+        assert _decide(app, person, session, node, kind) == Allow(Tier.READ_ONLY)
+        assert _decide(app, person, session, phone, kind, node_kind="PHONE") == Refuse(
+            "node_kind_not_allowed"
+        )
+    for kind in ("board", "board.", "board.delete", "board.clear", "board.show.x", "board.*"):
+        assert policy.tier_of(kind) is None, kind  # no wildcard: only the five named kinds
 
 
 def test_unknown_action_refused(
