@@ -221,6 +221,35 @@ def set_state(
         return get(conn, person_id, panel_id)
 
 
+def report_state(
+    conn: psycopg.Connection[Any],
+    *,
+    person_id: UUID,
+    panel_id: UUID,
+    state: str,
+    reported_at: datetime,
+) -> bool:
+    """A state the desktop reported (the person clicked), which arrived at `reported_at`.
+    Reports apply in arrival order whatever order their jobs run in: one that arrived before
+    the panel's last change of state is left out (False). The change is dated `reported_at`."""
+    if state not in _STATES:
+        raise ValueError("unknown panel state")
+    with conn.transaction():
+        get(conn, person_id, panel_id, lock=True)
+        row = conn.execute(
+            "SELECT state, state_changed_at FROM board.panel WHERE id = %s", (panel_id,)
+        ).fetchone()
+        assert row is not None
+        if row[1] > reported_at:
+            return False
+        if row[0] != state:
+            conn.execute(
+                "UPDATE board.panel SET state = %s, state_changed_at = %s WHERE id = %s",
+                (state, reported_at, panel_id),
+            )
+        return True
+
+
 def mark_rendered(
     conn: psycopg.Connection[Any], *, person_id: UUID, panel_id: UUID, revision: int
 ) -> None:

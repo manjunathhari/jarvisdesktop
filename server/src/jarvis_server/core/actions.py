@@ -17,7 +17,9 @@ Shapes are the shared contracts (R12-25): `pc.list_test_folder.receipt` and
 - a live receipt (`reply_id` + `seq`) is accepted only from the chunk's target node, for an
   ACTION chunk of that node's person, received no later than its `valid_until`. A listing that
   verifies a delete goes on to the verification below; a module or screen action gets a SILENT
-  `action.readonly_ok`; a listing `approvals.propose_delete` waits for needs nothing more.
+  `action.readonly_ok`; a listing `approvals.propose_delete` waits for needs nothing more;
+  a Board action's receipt goes to `core.board_node` (a panel is marked drawn only by a
+  `RENDERED` receipt that names what the chunk issued).
 - an approved action's receipt (`execution_key`): one per key, through the `ledger.action` row
   issued with the action (`status` ISSUED, locked here), and only from the requesting node. It
   ends the `action.approved` item. RECYCLED with the approved file ID and SHA-256 -> RECEIVED,
@@ -262,7 +264,7 @@ def memory_write(
 # --- receipts ----------------------------------------------------------------------------------
 
 
-def _set_outcome(conn: psycopg.Connection[Any], inbound_id: UUID, outcome: str) -> None:
+def set_outcome(conn: psycopg.Connection[Any], inbound_id: UUID, outcome: str) -> None:
     conn.execute(
         "UPDATE conv.inbound SET outcome = %s WHERE id = %s AND outcome IS NULL",
         (outcome, inbound_id),
@@ -280,7 +282,7 @@ def refuse_receipt(
     """A rejected receipt (R12-24): the inbound's REFUSED outcome, then, last, the audited
     `ledger.refuse_receipt` row in the job's transaction (R11-1). The caller returns next."""
     if inbound_id is not None:
-        _set_outcome(conn, inbound_id, "REFUSED")
+        set_outcome(conn, inbound_id, "REFUSED")
     audited_call_in_job(conn, "SELECT ledger.refuse_receipt(%s, %s, %s)", (ref, node_id, code))
     log.info("receipt for %s refused: %s", ref, code)
 
@@ -444,7 +446,7 @@ def _live_receipt(
 ) -> None:
     reply_id = UUID(str(payload["reply_id"]))
     chunk = conn.execute(
-        "SELECT k.authz, k.valid_until, k.target_node_id, s.person_id"
+        "SELECT k.authz, k.valid_until, k.target_node_id, s.person_id, k.session_id"
         " FROM conv.stream_chunk k JOIN conv.session s ON s.id = k.session_id"
         " WHERE k.reply_id = %s AND k.seq = %s AND k.type = 'ACTION'",
         (reply_id, payload["seq"]),
@@ -472,7 +474,16 @@ def _live_receipt(
     if late:
         refuse_receipt(conn, ref=inbound_id, node_id=node_id, code="late", inbound_id=inbound_id)
         return
-    _set_outcome(conn, inbound_id, "ANSWERED")
+    if action_kind.startswith("board."):
+        from jarvis_server.core import board_node  # it imports this module
+
+        board_node.on_live_receipt(
+            conn, inbound_id=inbound_id, node_id=node_id, person_id=person_id,
+            session_id=UUID(str(chunk[4])), reply_id=reply_id, seq=int(payload["seq"]),
+            action_kind=action_kind, args=chunk[0]["object"]["args"], payload=payload,
+        )  # fmt: skip
+        return
+    set_outcome(conn, inbound_id, "ANSWERED")
     if action_kind != LISTING:
         event_id = comm.record_event(
             conn, "action.readonly_ok", subject_type="stream", subject_id=str(reply_id),
@@ -519,7 +530,7 @@ def _approved_receipt(
         return
     session_id = ticket_session(conn, issued.task_id)
     if session_id is None:  # nowhere to list: it can't be verified, so it is never done
-        _set_outcome(conn, inbound_id, "ANSWERED")  # the receipt itself was right
+        set_outcome(conn, inbound_id, "ANSWERED")  # the receipt itself was right
         _fail(conn, issued, code="listing_missing", ref=issued.approval_id,
               inbound_id=None, evidence=evidence)  # fmt: skip
         return
@@ -536,7 +547,7 @@ def _approved_receipt(
     )  # fmt: skip
     jobs.enqueue(conn, "action.verify_timeout", {"action_id": str(issued.action_id)},
                  delay=LISTING_TIMEOUT)  # fmt: skip
-    _set_outcome(conn, inbound_id, "ANSWERED")
+    set_outcome(conn, inbound_id, "ANSWERED")
 
 
 def _verify(
@@ -562,7 +573,7 @@ def _verify(
         (Jsonb({"verified_by": "fresh_listing"}), issued.action_id),
     )
     conn.execute("UPDATE ledger.action SET status = 'VERIFIED' WHERE id = %s", (issued.action_id,))
-    _set_outcome(conn, inbound_id, "ANSWERED")
+    set_outcome(conn, inbound_id, "ANSWERED")
     session_id = ticket_session(conn, issued.task_id)
     if session_id is not None:
         speak(conn, session_id, f"Done: {issued.args.get('name')} is in the Recycle Bin.")

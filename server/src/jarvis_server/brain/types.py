@@ -7,7 +7,7 @@ Prompts and outputs are plain frozen dataclasses so a second provider can sit be
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal, Protocol
 
@@ -41,6 +41,8 @@ class BrainRequest:
     memory: list[MemoryLine]
     tools: list[ToolSpec]
     max_tokens: int
+    # The person's Board, one line per panel (`prompt.board_lines`); untrusted data.
+    board: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

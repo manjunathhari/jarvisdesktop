@@ -23,6 +23,11 @@ One job runs one utterance (`conv.inbound`) through these steps:
    a signed live ACTION chunk in this reply (`actions.issue_live`). REVERSIBLE (`memory.write`):
    a STATED entry by the authenticated person. IRREVERSIBLE (`pc.delete_test_file`):
    `approvals.propose_delete`, which lists the folder and proposes the approval.
+   The Board's tools (slice 1) are READ_ONLY and handled by `_board`: `board_make` queues one
+   `board.make` job for the turn and issues nothing; `board_set_state` and `board_focus`
+   resolve the panel's handle for the authenticated person, record the state, and issue a live
+   action carrying the panel's ID. A handle that is not the person's panel is refused
+   (`unknown_panel`), like any refused call.
 8. After the call: CONNECT failure -> `release`, hold, re-run (the turn may try again);
    SEND failure, any unplaceable exception, or a completed stream with no usage -> `lapse`
    now, which runs the indeterminate path once (Task 9); success -> `settle`, the final chunk,
@@ -80,7 +85,17 @@ from jarvis_server.brain.types import (
     ToolCall,
 )
 from jarvis_server.contracts import MemoryCategory
-from jarvis_server.core import actions, approvals, dispatch, identity, prompt, rules, sessions
+from jarvis_server.core import (
+    actions,
+    approvals,
+    board,
+    dispatch,
+    identity,
+    prompt,
+    rules,
+    sessions,
+)
+from jarvis_server.core import board_node as _board_jobs  # noqa: F401  registers job kinds
 from jarvis_server.core.prompt import TURN_MAX_TOKENS
 from jarvis_server.memory.engine import MemoryEngine
 from jarvis_server.memory.errors import MemoryEngineError
@@ -124,6 +139,10 @@ NOT_LISTED_TEXT = "I can't find {name} in the test folder."
 NO_LISTING_TEXT = "I couldn't check the test folder just now."
 REMEMBERED_TEXT = "I'll remember that."
 NOT_REMEMBERED_TEXT = "I couldn't remember that."
+# The Board. The reply when the brain queued Board work and said nothing itself.
+BOARD_ACK_TEXT = "On it. I'll put it on the board."
+NO_PANEL_TEXT = "I can't find that panel on the board."
+BOARD_UNCLEAR_TEXT = "I didn't catch what to do on the board."
 # A fact the person states about themselves: their own identity file (no domain or date needed).
 MEMORY_CATEGORY = MemoryCategory.IDENTITY
 CAP_EXPIRED_TEXT = {
@@ -416,6 +435,7 @@ class _Stream:
         self.seq = 0
         self.pieces: list[str] = []
         self.acted = False  # a live action was issued in this reply
+        self.queued = False  # Board work was queued in this reply
         self._pending: str | None = None
         self._space_next = False  # after Jarvis's own words, the brain's next piece is spaced
 
@@ -442,7 +462,10 @@ class _Stream:
         """Write the final chunk (inside the caller's transaction); return the whole reply."""
         reply = "".join(self.pieces)
         if not reply.strip():
-            reply = ACTION_ONLY_TEXT if self.acted else NO_SPEECH_TEXT
+            if self.queued:
+                reply = BOARD_ACK_TEXT
+            else:
+                reply = ACTION_ONLY_TEXT if self.acted else NO_SPEECH_TEXT
             self._pending = reply if self._pending is None else self._pending
         assert self._pending is not None
         self._write(self._pending, final=True)
@@ -523,28 +546,98 @@ def _tool(
             node_kind=turn.node_kind, call=ToolCall(kind, call.args), memory_ids=memory_ids,
         )  # fmt: skip
     if isinstance(decision, Refuse):
-        log.info("turn %s: tool call refused (%s)", turn.id, decision.code)
-        details = {"reason": decision.code}
-        if kind is not None:
-            details["action_kind"] = kind
-        with c.transaction():
-            comm.record_event(
-                c, "policy.refused", subject_type="inbound", subject_id=str(turn.id),
-                person_id=turn.person_id, details=details,
-            )  # fmt: skip
-        if "refused" not in told:
-            told.add("refused")
-            stream.say(REFUSED_TEXT)
+        _refuse(c, turn, stream, told, decision.code, kind, REFUSED_TEXT)
         return
     assert kind is not None
     if isinstance(decision, NeedsApproval):
         _propose(c, turn, stream, call)
     elif decision.tier is Tier.REVERSIBLE:
         _remember(c, turn, stream, call)
+    elif kind in _BOARD_KINDS:
+        _board(c, turn, stream, kind, call, told)
     else:
         stream.action(
             target=turn.node_id, person_id=turn.person_id, kind=kind,
             args={"tool": call.name, "input": call.args}, now=_now(c),
+        )  # fmt: skip
+
+
+def _refuse(
+    c: psycopg.Connection[Any],
+    turn: _Inbound,
+    stream: _Stream,
+    told: set[str],
+    code: str,
+    kind: str | None,
+    text: str,
+) -> None:
+    """A refused tool call: not executed, recorded (codes only), and `text` said once."""
+    log.info("turn %s: tool call refused (%s)", turn.id, code)
+    details = {"reason": code}
+    if kind is not None:
+        details["action_kind"] = kind
+    with c.transaction():
+        comm.record_event(
+            c, "policy.refused", subject_type="inbound", subject_id=str(turn.id),
+            person_id=turn.person_id, details=details,
+        )  # fmt: skip
+    if text not in told:
+        told.add(text)
+        stream.say(text)
+
+
+_BOARD_KINDS = frozenset({"board.make", "board.set_state", "board.focus"})
+
+
+def _board(
+    c: psycopg.Connection[Any],
+    turn: _Inbound,
+    stream: _Stream,
+    kind: str,
+    call: ToolCall,
+    told: set[str],
+) -> None:
+    """A Board tool call the policy allowed. Nothing in the call names a person: the panel is
+    looked up among the authenticated person's own."""
+    if kind == "board.make":
+        request = call.args.get("request")
+        if not isinstance(request, str) or not request.strip():
+            _refuse(c, turn, stream, told, "bad_args", kind, BOARD_UNCLEAR_TEXT)
+            return
+        payload = {
+            "session_id": str(stream.session_id),
+            "person_id": str(turn.person_id),
+            "node_id": str(turn.node_id),
+            "inbound_id": str(turn.id),
+            "request": request.strip()[: prompt.BOARD_REQUEST_MAX],
+        }
+        with c.transaction():  # one Board job per turn: the turn is the job's key
+            queued = jobs.enqueue_once(c, "board.make", str(turn.id), payload)
+        if queued is None:
+            log.info("turn %s: Board work is already queued; a second request is left out", turn.id)
+        stream.queued = True
+        return
+    try:
+        panel_id = board.resolve(c, turn.person_id, call.args.get("panel"))  # type: ignore[arg-type]
+    except board.UnknownPanel:
+        _refuse(c, turn, stream, told, "unknown_panel", kind, NO_PANEL_TEXT)
+        return
+    args = {"panel_id": str(panel_id)}
+    if kind == "board.focus":
+        stream.action(
+            target=turn.node_id, person_id=turn.person_id, kind=kind, args=args, now=_now(c)
+        )
+        return
+    word = call.args.get("state")
+    state = prompt.BOARD_STATES.get(word) if isinstance(word, str) else None
+    if state is None:
+        _refuse(c, turn, stream, told, "bad_args", kind, BOARD_UNCLEAR_TEXT)
+        return
+    with c.transaction():  # the record and the action to the desktop, together
+        board.set_state(c, person_id=turn.person_id, panel_id=panel_id, state=state)
+        stream.action(
+            target=turn.node_id, person_id=turn.person_id, kind=kind,
+            args={**args, "state": state}, now=_now(c),
         )  # fmt: skip
 
 
