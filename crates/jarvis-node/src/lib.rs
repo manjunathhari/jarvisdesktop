@@ -6,9 +6,11 @@
 //! committed shared cases in `contracts/signing-vectors/`, which Rust never writes.
 //!
 //! Local durability: the append-only `journal`, the node's `state` (node ID and pinned keys,
-//! in `trust`), and the `keystore` for its private key (DPAPI on Windows).
+//! in `trust`), and the `keystore` for its private key (DPAPI on Windows). `board` holds the
+//! desktop's copy of the Board's panels and conversation.
 
 pub mod approval;
+pub mod board;
 pub mod client;
 pub mod code;
 pub mod delivery;

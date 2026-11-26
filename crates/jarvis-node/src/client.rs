@@ -43,6 +43,9 @@ pub const RECHECK: Duration = Duration::from_secs(30);
 const STABLE_LINK: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A panel the Board has not reported drawn after this long gets an `ERROR` receipt.
+pub const BOARD_RENDER_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     /// The gateway's `host:port` (its tailnet address); never committed to the repo.
@@ -52,6 +55,8 @@ pub struct ClientConfig {
     pub heartbeat_timeout: Duration,
     pub reenrol_retry: Duration,
     pub recheck: Duration,
+    /// How long a shown panel may wait for the Board to report it drawn (`node::on_board`).
+    pub board_render_timeout: Duration,
 }
 
 impl ClientConfig {
@@ -62,6 +67,7 @@ impl ClientConfig {
             heartbeat_timeout: HEARTBEAT_TIMEOUT,
             reenrol_retry: REENROL_RETRY,
             recheck: RECHECK,
+            board_render_timeout: BOARD_RENDER_TIMEOUT,
         }
     }
 }

@@ -105,8 +105,8 @@ impl ServerBrain {
         tx: &mpsc::Sender<BrainEvent>,
     ) {
         let kind = authz.action_kind.as_str();
-        if kind.starts_with("pc.") {
-            return; // the executor's (Task 8)
+        if kind.starts_with("pc.") || kind.starts_with("board.") {
+            return; // the executor's (Task 8); the node's own Board handling (`node::on_board`)
         }
         let check = if !(kind.starts_with("module.") || kind.starts_with("screen.")) {
             Err("unknown_action_kind")

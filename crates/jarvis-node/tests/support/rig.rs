@@ -32,9 +32,15 @@ pub fn core_public() -> [u8; 32] {
 
 /// An enrolled node, connected to the fake gateway.
 pub async fn rig() -> Rig {
+    rig_with(|_| {}).await
+}
+
+/// As `rig`, with the node's configuration changed first.
+pub async fn rig_with(configure: impl FnOnce(&mut ClientConfig)) -> Rig {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let cfg = ClientConfig::new(listener.local_addr().unwrap().to_string(), dir.path());
+    let mut cfg = ClientConfig::new(listener.local_addr().unwrap().to_string(), dir.path());
+    configure(&mut cfg);
     let (ui_tx, ui) = mpsc::channel(64);
     let folder = Arc::new(MemoryFolder::new());
     let deps = NodeDeps {

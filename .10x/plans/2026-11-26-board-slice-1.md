@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-*Status: approved by Manj on 26 Nov 2026, with the seven changes below. Tasks 1 to 4 are built on local branch `board-slice-1` and independently reviewed, with the reviews' fixes applied; Tasks 5 to 9 are not started. Repo `manjunathhari/jarvisdesktop`, `main` = `983c2cf`.*
+*Status: approved by Manj on 26 Nov 2026, with the seven changes below. Tasks 1 to 5 are built on local branch `board-slice-1` and independently reviewed, with the reviews' fixes applied; Tasks 6 to 9 are not started. Repo `manjunathhari/jarvisdesktop`, `main` = `983c2cf`.*
 
 **Goal:** Manj asks by voice; Jarvis answers briefly, does the work, and shows the result as a panel on a Board window on monitor 2, with a running conversation and minimise, maximise and close on every panel, by click or by voice.
 
@@ -185,28 +185,38 @@ As in Plan B: contracts and the spec own shared interfaces. If the code shows a 
 ### Task 5: Desktop node: Board actions, local store, receipts
 
 **Files:**
-- Create: `crates/jarvis-node/src/board.rs`
-- Modify: `crates/jarvis-node/src/node.rs` (route `board.*`; `NodeHandle::board_rendered`, `NodeHandle::board_state`; `UiEvent::Board`), `crates/jarvis-node/src/server_brain.rs` (skip `board.*`, as `pc.*` is skipped), `crates/jarvis-node/src/bin/jarvis-node-probe.rs` (print Board events; `--render-next`, `--refuse-render`)
-- Test: `crates/jarvis-node/tests/board.rs`
+- Create: `crates/jarvis-node/src/board.rs`, `crates/jarvis-node/tests/board.rs`, `server/tests/test_rust_node_board.py` (brought forward from Task 9: both ends now exist)
+- Modify: `crates/jarvis-node/src/node.rs` (route `board.*`; `NodeHandle::board`, `board_rendered`, `board_state`; `UiEvent::Board`), `crates/jarvis-node/src/client.rs` (`ClientConfig::board_render_timeout`), `crates/jarvis-node/src/server_brain.rs` (skip `board.*`, as `pc.*` is skipped), `crates/jarvis-node/src/bin/jarvis-node-probe.rs` (print Board events; `--render-next`, `--refuse-render`, `--set-state`), `app/src-tauri/src/approvals.rs` (one arm for the new event, ignored until Task 6), `crates/jarvis-node/tests/support/rig.rs` (`rig_with`)
+
+*Changed while building Task 5:*
+- *`board.*` actions are handled in `node.rs` and never broadcast to the reply stream, so `ServerBrain` cannot answer them too.*
+- *`parse` takes the args as a map (what a verified action carries), and there is `refused_evidence` for a refusal's evidence.*
+- *`board_rendered(panel_id, revision, ok)`: `ok == false` is `ERROR` with check `render_failed`.*
+- *A focus that brings a minimised or closed panel back changes its state, and the node tells the server (`board.state`).*
+- *The render timeout is a configuration value (10 s by default), so the test does not wait 10 s.*
+- *The end-to-end tests with the real node were written now, not in Task 9.*
 
 **Interfaces:**
 - Consumes: `check_node_action`; Task 1 schemas through `tests/support::assert_conforms`.
 - Produces:
-  - `enum PanelKind { Text, Canvas }`, `enum PanelState { Open, Minimised, Maximised, Closed }`
-  - `struct Panel { panel_id: Uuid, kind, title, content, content_sha256, revision: u32, state, cost_paise: u64, created_at }`
-  - `enum BoardEvent { Show(Panel), Update(Panel), State { panel_id, state }, Focus { panel_id } }`
-  - `board::parse(action_kind: &str, args: &Value) -> Result<BoardEvent, &'static str>`: checks `too_large`, `hash_mismatch`, `unknown_kind`, `malformed`.
-  - `BoardStore::open(dir: &Path)`, `apply(&mut self, &BoardEvent) -> Result<(), &'static str>` (`stale_revision`; an `Update` for a panel the store does not hold adds it; `unknown_panel` for a state or focus of one it does not hold), `panels()`, `clear_closed() -> usize`, `append_turn(ConversationEntry)`, `conversation() -> Vec<ConversationEntry>`. Files `board.json` (written like `state.rs`: temp, sync, rename) and `conversation.jsonl` (append; the last 2,000 entries are loaded).
-  - `struct ConversationEntry { at, who: Person|Jarvis, text, how: Voice|Typed|Spoken, panels: Vec<Uuid> }`
-  - `NodeHandle::board_rendered(panel_id, revision, ok: bool)` sends the pending receipt; `NodeHandle::board_state(panel_id, state)` updates the store and sends `board.state`.
-- From the Task 4 review: send exactly one receipt for each `(reply_id, seq)`, within the action's 2 minutes; a Board reply has only ACTION chunks and no final chunk; later panels of one job carry `cost_paise` 0; frames reach about 64 KB, so check the node's inbound limit; the Text frame must not load remote images (Task 7); decide what `board.update` does to a closed panel (core stores and sends it; the state stays closed).
-- From the Task 3 review: `server_brain` must stay silent for `board.*` (today it answers `REFUSED` `unknown_action_kind`, which core refuses as malformed, and a chunk would get two receipts). The node defines what a state word does to a panel in another state (minimise on a closed panel reopens it minimised) and what focus does to a closed or minimised panel; core passes both through.
-- Routing: a `board.*` ACTION chunk for this node, of any reply, is checked, parsed and applied. Show and update then wait up to 10 s for `board_rendered`; none gives `ERROR` with check `render_timeout`. Set_state and focus are answered `OK` at once. A failed check or parse gives `REFUSED` with that check and changes nothing.
+  - `enum PanelKind { Text, Canvas }`, `enum PanelState { Open, Minimised, Maximised, Closed }` (`as_str()` is the contract's word)
+  - `struct Panel { panel_id: Uuid, kind, title, content, content_sha256, revision: u32, state, cost_paise: u64, created_at: DateTime<FixedOffset> }` (serde; lower-case enum words)
+  - `enum BoardEvent { Show(Panel), Update(Panel), State { panel_id, state }, Focus { panel_id } }`, `BoardEvent::panel_id()`
+  - `board::parse(action_kind: &str, args: &Map<String, Value>) -> Result<BoardEvent, &'static str>`: checks `too_large`, `hash_mismatch`, `unknown_kind`, `malformed`, `unknown_action_kind`. Limits as the server counts them: title in code points (no C0 or DEL, not all spaces), content in bytes (no C0 except tab, LF, CR).
+  - `board::content_sha256(&str) -> String`; `board::refused_evidence(action_kind, args, check) -> Value`.
+  - `BoardStore::open(dir: &Path)`, `apply(&mut self, &BoardEvent) -> Result<(), &'static str>`, `panels() -> Vec<Panel>` (in the order they first arrived), `panel(id) -> Option<&Panel>`, `clear_closed() -> io::Result<usize>`, `append_turn(ConversationEntry) -> io::Result<()>`, `conversation() -> Vec<ConversationEntry>`. Files `board.json` (`{v: 1, panels}`, written like `state.rs`: temp, sync, rename) and `conversation.jsonl` (append; the last 2,000 entries are loaded). An unreadable `board.json` is set aside as `board.json.unreadable` and the Board starts empty.
+  - What `apply` decides: an older revision, or the held revision with other content, is `stale_revision`; the same revision and content again is a re-send and changes nothing; an `Update` keeps the panel's state (a closed panel stays closed) and adds a panel the store does not hold; `State` sets the state given, whatever it was; `Focus` brings a minimised or closed panel back to open; `State` or `Focus` for a panel not held is `unknown_panel`; a failed save is `store_failed` and nothing changes.
+  - `struct ConversationEntry { at, who: Who::{Person, Jarvis}, text, how: How::{Voice, Typed, Spoken}, panels: Vec<Uuid> }`
+  - `UiEvent::Board(BoardEvent)`: already in the local store. For `Show` and `Update` the app draws the panel and calls `board_rendered`.
+  - `NodeHandle::board() -> Arc<Mutex<BoardStore>>`; `NodeHandle::board_rendered(panel_id, revision: u32, ok: bool)` sends the waiting receipt (`RENDERED`, or `ERROR` `render_failed`), and nothing if none waits; `NodeHandle::board_state(panel_id, state) -> Result<(), &'static str>` updates the store and sends `board.state {panel_id, state, revision, at}`.
+- Routing: a live `board.*` action for this node is checked (`check_node_action`), parsed and applied. Show and update then wait up to `board_render_timeout` (10 s) for `board_rendered`; none gives `ERROR` with check `render_timeout`. Set_state and focus are answered `OK` at once. A failed check, parse or apply gives `REFUSED` with that check and changes nothing. Exactly one receipt for each action.
+- Not in this task: a receipt that was waiting does not survive a restart (the panel is restored from the store; the server never marks that revision drawn). If the link is down when the person clicks, the server is not told (the resync is later work).
+- From the Task 4 review: a Board reply has only actions and no final chunk; later panels of one job carry `cost_paise` 0; the node has no inbound frame limit below the gateway's (the WebSocket library's default is 64 MiB); the Text frame must not load remote images (Task 7).
 
-- [ ] **Step 1: Write the failing tests:** `show_is_stored_and_emitted_then_rendered_receipt_conforms`; `bad_show_is_refused_and_not_stored` (over the limit; hash mismatch; kind `html`; each its own check); `update_with_an_older_revision_is_stale`; `set_state_for_an_unknown_panel_is_refused`; `update_for_a_lost_panel_restores_it`; `title_length_is_counted_in_code_points`; `refusal_of_malformed_args_has_null_evidence_and_conforms`; `no_render_report_gives_render_timeout` (paused time); `store_survives_reopen_and_a_torn_write`; `click_state_change_sends_board_state_that_conforms`; `server_brain_ignores_board_actions`; `conversation_keeps_order_and_panel_links`.
+- [ ] **Step 1: Write the failing tests:** `the_contracts_example_parses`; `bad_show_args_each_have_their_own_check`; `title_length_is_counted_in_code_points`; `state_and_focus_args_parse`; `update_with_an_older_revision_is_stale`; `an_update_keeps_the_panels_state_and_a_lost_panel_is_restored`; `state_and_focus_of_an_unknown_panel_are_refused`; `focus_brings_a_minimised_or_closed_panel_back`; `store_survives_reopen_and_a_torn_write`; `an_unreadable_store_starts_empty_and_keeps_the_bad_file`; `conversation_keeps_order_and_panel_links`; `only_the_last_2000_entries_are_loaded`; `show_is_stored_and_emitted_then_rendered_receipt_conforms`; `bad_show_is_refused_and_not_stored`; `refusal_of_malformed_args_has_null_evidence_and_conforms`; `a_stale_update_is_refused_and_the_panel_is_unchanged`; `no_render_report_gives_render_timeout`; `a_failed_render_is_an_error_receipt`; `two_waiting_panels_each_get_their_own_receipt`; `set_state_and_focus_are_answered_at_once`; `set_state_for_an_unknown_panel_is_refused`; `click_state_change_sends_board_state_that_conforms`; `board_actions_never_reach_the_reply_stream`; `panels_are_back_after_a_restart`. End to end (`test_rust_node_board.py`, needs the built probe): `test_request_becomes_a_rendered_panel_then_voice_and_click_and_restart`; `test_refused_render_is_not_marked_rendered`.
 - [ ] **Step 2: Run** `cargo test -p jarvis-node --test board`. Expected: FAIL to compile.
 - [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings`. Expected: PASS.
+- [ ] **Step 4: Run** `cargo test -p jarvis-node`, clippy and `cargo fmt --check`; build the probe and run the server suite with `JARVIS_NODE_PROBE`. Expected: PASS. (The app crate needs Windows or the GTK libraries: CI builds it.)
 - [ ] **Step 5: Commit:** `jarvis-node: Board actions, local panel store and rendering receipts`.
 
 ### Task 6: Board window and panel shell
@@ -269,14 +279,14 @@ As in Plan B: contracts and the spec own shared interfaces. If the code shows a 
 ### Task 9: Conversation frame, end-to-end test, live check
 
 **Files:**
-- Create: `app/src/board/conversation.ts`, `app/src/board/conversation.test.ts`, `server/tests/test_rust_node_board.py`
+- Create: `app/src/board/conversation.ts`, `app/src/board/conversation.test.ts` (`server/tests/test_rust_node_board.py` exists since Task 5)
 - Modify: `app/src-tauri/src/lib.rs` and `board.rs` (record heard, typed and spoken lines with `append_turn`; command `board_say(text)` calling the same code as the existing `say` command), `README.md` ("The Board"), `.10x/handoff.md`, `.10x/status.md`
 
 **Interfaces:**
 - Consumes: Task 5 `ConversationEntry`; Task 6 `BoardSnapshot`.
 - Produces: `conversationModel(entries, panels)`: entries in order; each Jarvis entry lists the panels made in that reply, shown as buttons that focus the panel; "Jarvis is working…" shows from a `board_make` acknowledgement until the next reply that answers no utterance (the headline, or a failure sentence) or 3 minutes. A labelled input, "Type instead of speaking".
 
-- [ ] **Step 1: Write the failing tests.** Vitest: `entries_keep_order_and_mark_voice_or_typed`; `panel_markers_focus_their_panel`; `working_line_ends_on_the_headline`. In `test_rust_node_board.py` (skipped unless `JARVIS_NODE_PROBE` is set; the fake brain and the gateway fixture of `test_rust_node.py`): `test_request_becomes_a_rendered_panel` (say a fictional request → acknowledgement → job → `board.show` at the probe → `--render-next` → the server's `rendered_revision` equals the revision, then the headline arrives as its own reply, from job `board.headline`); `test_refused_render_is_not_marked_rendered`; `test_voice_minimise_reaches_the_node_and_the_store`; `test_click_close_reaches_the_server`; `test_restart_restores_panels_and_conversation`.
+- [ ] **Step 1: Write the failing tests.** Vitest: `entries_keep_order_and_mark_voice_or_typed`; `panel_markers_focus_their_panel`; `working_line_ends_on_the_headline`. In `test_rust_node_board.py` (written in Task 5; skipped unless `JARVIS_NODE_PROBE` is set), add what Task 5 could not cover, the conversation after a restart. Already there: `test_request_becomes_a_rendered_panel` (say a fictional request → acknowledgement → job → `board.show` at the probe → `--render-next` → the server's `rendered_revision` equals the revision, then the headline arrives as its own reply, from job `board.headline`); `test_refused_render_is_not_marked_rendered`; `test_voice_minimise_reaches_the_node_and_the_store`; `test_click_close_reaches_the_server`; `test_restart_restores_panels_and_conversation`.
 - [ ] **Step 2: Run.** Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run everything:** the full server suite with the probe built, `cargo test --workspace`, clippy, `npx vitest run`, `npm run build`. Expected: PASS. Existing tests for the orb, reply line, news wall and approvals are unchanged and green.

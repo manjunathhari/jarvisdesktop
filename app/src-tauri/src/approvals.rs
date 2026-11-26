@@ -185,6 +185,8 @@ pub async fn forward(app: AppHandle, slot: NodeSlot, mut events: mpsc::Receiver<
             NodeEvent::ClockOff(ms) => app.emit("jarvis://clock_off", ms),
             // The reconnect summary is display-only; its items also arrive as notices.
             NodeEvent::Summary(_) => Ok(()),
+            // The Board window forwards these (Board slice 1, Task 6).
+            NodeEvent::Board(_) => Ok(()),
         };
         if let Err(e) = r {
             tracing::warn!(error = %e, "emit failed");
