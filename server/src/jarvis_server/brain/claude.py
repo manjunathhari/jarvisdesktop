@@ -36,12 +36,20 @@ cannot close a section or start a new instruction line. `history` becomes altern
 and leading jarvis turns are dropped (the API wants the first message from the user), and the
 utterance is the final `user` message.
 
+Continuing a call: each `Exchange` after the utterance adds an `assistant` message (its text, if
+not blank, then one `tool_use` block per call, as the model sent them) and a `user` message (one
+`tool_result` block per call, in call order and before anything else, then the note if any). The
+results are untrusted data like the screen summary: the caller says so in `system`. An exchange
+with no text and no calls has no `assistant` message (the API refuses an empty one); its note is
+added to the `user` message before it. A request without exchanges is sent exactly as before.
+
 Secrets: the API key is only ever in the request header. It is never logged, and no exception
 raised from here carries it or the request body.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Iterator
 from typing import Any
@@ -53,8 +61,10 @@ from jarvis_server.brain.types import (
     BrainEvent,
     BrainRequest,
     CallPhase,
+    Exchange,
     Speech,
     ToolCall,
+    ToolResult,
 )
 
 API_URL = "https://api.anthropic.com/v1/messages"
@@ -81,6 +91,10 @@ def shared_client(proxy: str) -> httpx.Client:
 # Ceiling parameters for `count_input_tokens`.
 BYTES_PER_TOKEN_FLOOR = 2
 TOOL_PROMPT_ALLOWANCE = 1000
+# Tokens counted for each image sent back in a tool result, in place of its base64 bytes. The
+# API bills an image by its pixels (about width x height / 750 tokens): a 1,000 x 1,000 picture
+# is about 1,334, so 2,000 covers the pictures a tool sends back at up to 1.5 megapixels.
+IMAGE_TOKEN_ALLOWANCE = 2_000
 
 _CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError)
 
@@ -132,8 +146,8 @@ def _system_prompt(req: BrainRequest) -> str:
     return "\n\n".join(parts)
 
 
-def _messages(req: BrainRequest) -> list[dict[str, str]]:
-    messages: list[dict[str, str]] = []
+def _messages(req: BrainRequest) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
 
     def add(role: str, text: str) -> None:
         if not text.strip():
@@ -146,7 +160,64 @@ def _messages(req: BrainRequest) -> list[dict[str, str]]:
     for turn in req.history:
         add("user" if turn.role == "person" else "assistant", turn.text)
     add("user", req.utterance)
+    if req.exchanges and (not messages or messages[-1]["role"] != "user"):
+        raise ValueError("exchanges must follow a user message")
+    for exchange in req.exchanges:
+        _add_exchange(messages, exchange)
     return messages
+
+
+def _results_in_call_order(exchange: Exchange) -> list[ToolResult]:
+    ids = [call.call_id for call in exchange.calls]
+    if not all(ids) or len(set(ids)) != len(ids):
+        raise ValueError("each tool call needs its own provider id")
+    by_id = {result.call_id: result for result in exchange.results}
+    if len(by_id) != len(exchange.results) or set(by_id) != set(ids):
+        raise ValueError("an exchange's results must match its calls one for one")
+    return [by_id[call_id] for call_id in ids]
+
+
+def _result_block(result: ToolResult) -> dict[str, Any]:
+    content: list[dict[str, Any]] = [{"type": "text", "text": result.text}]
+    if result.image_png is not None:
+        data = base64.b64encode(result.image_png).decode("ascii")
+        content.append(
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}}
+        )
+    block: dict[str, Any] = {
+        "type": "tool_result",
+        "tool_use_id": result.call_id,
+        "content": content,
+    }
+    if result.is_error:
+        block["is_error"] = True
+    return block
+
+
+def _add_exchange(messages: list[dict[str, Any]], exchange: Exchange) -> None:
+    results = _results_in_call_order(exchange)
+    sent: list[dict[str, Any]] = []
+    if exchange.text.strip():
+        sent.append({"type": "text", "text": exchange.text})
+    sent.extend(
+        {"type": "tool_use", "id": call.call_id, "name": call.name, "input": call.args}
+        for call in exchange.calls
+    )
+    answer = [_result_block(result) for result in results]
+    if exchange.note.strip():
+        answer.append({"type": "text", "text": exchange.note})
+    if not answer:
+        raise ValueError("an exchange with no tool calls needs a note")
+    if sent:
+        messages.append({"role": "assistant", "content": sent})
+        messages.append({"role": "user", "content": answer})
+        return
+    # Nothing came back from the model (no calls, so `answer` is the note alone): join the user
+    # message before it, which this function's caller guarantees is last.
+    last = messages[-1]
+    if isinstance(last["content"], str):
+        last["content"] = [{"type": "text", "text": last["content"]}]
+    last["content"].extend(answer)
 
 
 def build_payload(req: BrainRequest) -> dict[str, Any]:
@@ -174,11 +245,22 @@ def count_input_tokens(req: BrainRequest) -> int:
     hidden tool-use system prompt (about 346 input tokens) that is billed but is not in the
     payload. One token per 2 bytes is a pessimistic floor, safe even for dense digits and symbols.
     Over-counting only reserves more: settlement uses the real `usage` the API reports.
+
+    Each image in a tool result counts as IMAGE_TOKEN_ALLOWANCE, and its base64 is left out of
+    the bytes: the API bills an image by its size in pixels, not by its encoding.
     """
     payload = build_payload(req)
+    images = 0
+    for message in payload["messages"]:
+        blocks = message["content"] if isinstance(message["content"], list) else []
+        for result in (b for b in blocks if b.get("type") == "tool_result"):
+            for item in result["content"]:
+                if item.get("type") == "image":
+                    item["source"] = {**item["source"], "data": ""}
+                    images += 1
     body = {k: payload[k] for k in ("system", "messages", "tools") if k in payload}
     raw = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
-    tokens = -(-raw // BYTES_PER_TOKEN_FLOOR)
+    tokens = -(-raw // BYTES_PER_TOKEN_FLOOR) + images * IMAGE_TOKEN_ALLOWANCE
     return tokens + (TOOL_PROMPT_ALLOWANCE if req.tools or req.server_tools else 0)
 
 
@@ -254,6 +336,7 @@ class ClaudeBrain:
         input_tokens = 0
         output_tokens = 0
         tool_name: str | None = None
+        tool_id = ""
         fragments: list[str] = []
         searches = 0
         answered = 0  # result blocks that are not errors: each was a search that ran
@@ -275,6 +358,7 @@ class ClaudeBrain:
                 in_client_tool = block.get("type") == "tool_use"
                 if in_client_tool:
                     tool_name = str(block["name"])
+                    tool_id = str(block.get("id") or "")
                     fragments = []
                 elif block.get("type") == "web_search_tool_result":
                     results = block.get("content")
@@ -300,7 +384,7 @@ class ClaudeBrain:
                         continue
                     if not isinstance(args, dict):
                         raise BrainCallFailed(CallPhase.SEND, detail="tool input is not an object")
-                    yield ToolCall(name, args)
+                    yield ToolCall(name, args, call_id=tool_id)
             elif kind == "message_delta":
                 usage = event.get("usage", {})
                 output_tokens = int(usage.get("output_tokens", output_tokens))

@@ -46,6 +46,8 @@ class BrainRequest:
     # Tools the provider runs itself (web search), sent as given after `tools`. Their use is
     # billed per use (`prices.tool_paise`); the brain reports the count in `searches`.
     server_tools: list[dict[str, Any]] = field(default_factory=list)
+    # Earlier rounds of the same job, sent after the utterance in order (`Exchange`).
+    exchanges: list[Exchange] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,31 @@ class Speech:
 class ToolCall:
     name: str
     args: dict[str, Any]
+    # The provider's id for this call (Claude's `tool_use` id), needed to send a result back.
+    # Not part of equality: a call is the same call whatever id the provider gave it.
+    call_id: str = field(default="", compare=False)
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    """What a tool call gave back, for the next call of the same job. Untrusted data."""
+
+    call_id: str
+    text: str
+    image_png: bytes | None = None
+    is_error: bool = False
+
+
+@dataclass(frozen=True)
+class Exchange:
+    """One earlier round of the same job: what the model sent (`text`, `calls`) and what it is
+    given back (`results`, one per call, matched by `call_id`). `note` is plain text for the
+    person's side, after any results; with no calls it is the whole answer."""
+
+    text: str
+    calls: tuple[ToolCall, ...]
+    results: tuple[ToolResult, ...]
+    note: str = ""
 
 
 BrainEvent = Speech | ToolCall
