@@ -1,0 +1,4 @@
+Changing this file on branch spike-cad-engine starts the drawing test.
+With the repository secret ANTHROPIC_API_KEY set, a run spends real money (cap: Rs 300).
+
+run 1: no key expected. Checks the harness with one canned drawing; no Claude call.

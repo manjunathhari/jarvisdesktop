@@ -44,6 +44,23 @@ No secrets are used and the job has read-only access to the repository.
 - A security review of CADCraft's code.
 - Anything on the JARVIS server. This spike never touches it.
 
+## Slice 0: can Claude draw?
+
+`draw_test.py`, `draw_requests.json` and `.github/workflows/spike-cad-draw-test.yml` are the test
+the approved design asks for before anything is built (project doc `claude/cad-board-design.md`):
+ten fictional requests, each drawn through the design's loop of at most four Claude calls, with
+the whole recipe replayed in a fresh engine container after every step.
+
+- **It spends real money** when the repository secret `ANTHROPIC_API_KEY` is set: up to Rs 300,
+  the cap Manj approved on 27 Nov 2026. The script stops before a call that could pass the cap.
+- It runs only when `draw-test-run.txt` changes on this branch, never on ordinary edits.
+- With no secret it makes no Claude call: one canned drawing goes through the loop to check the
+  harness, and the summary says so.
+- The key is given to one workflow step and is only ever put in the request header. The engine's
+  container has no network and no environment, so the engine never sees it.
+- Pass mark, set before the run: at least 8 of 10 drawings pass the script's checks and look
+  right to a person, with no more than four Claude calls each. Cost and time are recorded.
+
 ## Running the script against a stand-in
 
 `measure.py --server-cmd "<command>"` talks to any newline-delimited MCP server in place of the

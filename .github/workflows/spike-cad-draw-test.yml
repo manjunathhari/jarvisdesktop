@@ -1,0 +1,69 @@
+name: Spike - CAD drawing test (Claude)
+# Throwaway. Slice 0 of the CAD board design (project doc claude/cad-board-design.md): can Claude
+# draw with the pinned CAD engine? Ten fictional requests, at most four Claude calls each.
+#
+# MONEY: with the repository secret ANTHROPIC_API_KEY set, one run spends real money, up to the
+# cap in draw_test.py (Rs 300, approved by Manj on 27 Nov 2026). It therefore runs ONLY when the
+# run marker file changes on this branch, never on ordinary edits. With no secret it makes no
+# Claude call and runs one canned drawing to check the harness.
+#
+# The key is given to one step only. The engine's container has no network and no environment.
+
+on:
+  push:
+    branches: [spike-cad-engine]
+    paths: ['spikes/cad-engine/draw-test-run.txt']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spike-cad-draw-test
+  cancel-in-progress: false
+
+jobs:
+  draw:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CADCRAFT_VERSION: "0.12.0"
+      # From the release's SHA256SUMS.txt, read on 27 Nov 2026. A different file fails the job.
+      CADCRAFT_SHA256: 6ae27b9eabc3608caef356a00f69b9fdccbf1e408d6308b5614b6e6b256308de
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download the pinned release and verify its checksum
+        run: |
+          set -euo pipefail
+          file="cadcraft-${CADCRAFT_VERSION}-linux-x86_64.tar.gz"
+          curl -fsSL --retry 3 -o "$file" \
+            "https://github.com/storytold/cadcraft/releases/download/v${CADCRAFT_VERSION}/${file}"
+          echo "${CADCRAFT_SHA256}  ${file}" | sha256sum -c -
+          mkdir -p unpack
+          tar -xzf "$file" -C unpack
+          cli="$(find unpack -type f -name cadcraft-cli | head -n 1)"
+          test -n "$cli"
+          install -m 0755 "$cli" spikes/cad-engine/cadcraft-cli
+
+      - name: Build the bare engine image
+        run: docker build -q -t cad-engine-spike spikes/cad-engine
+
+      - name: Run the drawing test
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python3 spikes/cad-engine/draw_test.py --out out/draw --image cad-engine-spike
+
+      - name: Write the summary
+        if: always()
+        run: |
+          if [ -f out/draw/summary.md ]; then cat out/draw/summary.md >> "$GITHUB_STEP_SUMMARY"; else echo "No summary was produced." >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cad-draw-test-results
+          path: out/draw/
+          retention-days: 14
