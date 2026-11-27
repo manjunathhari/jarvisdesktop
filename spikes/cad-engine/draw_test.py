@@ -162,8 +162,7 @@ class Engine:
             return {}
         reply, _ = client.request("tools/call", {"name": "list_commands", "arguments": {}}, timeout=60)
         client.close()
-        text = "\n".join(c.get("text", "") for c in (reply or {}).get("result", {}).get("content", []) if c.get("type") == "text")
-        listed = as_json(text)
+        listed = as_json(whole_text(reply))
         notes = {str(c.get("id")): str(c.get("params") or "") for c in listed if isinstance(c, dict)} if isinstance(listed, list) else {}
         return {name: notes[name] for name in ALLOWED if name in notes}
 
@@ -181,9 +180,12 @@ class Engine:
                 worked, text, _ = self._call(client, "execute", {"command": cmd["command"], "params": cmd["params"]})
                 out["results"].append({"step": step_no, "n": cmd_no, "command": cmd["command"], "ok": worked, "text": " ".join(text.split())[:220]})
                 out["failed"] += 0 if worked else 1
-        _, inspect_text, _ = self._call(client, "inspect_drawing", {})
+        _, _, inspected = self._call(client, "inspect_drawing", {})
+        inspect_text = whole_text(inspected)
         out["summary"] = summarise(inspect_text)
-        _, texts_text, _ = self._call(client, "find_text", {"limit": 80})
+        _, _, texts_reply = self._call(client, "find_text", {"limit": 80})
+        texts_text = whole_text(texts_reply)
+        out["shapes"] = {"inspect_drawing": inspect_text[:1500], "find_text": texts_text[:600]}
         found = as_json(texts_text)
         rows = found if isinstance(found, list) else (found.get("texts") if isinstance(found, dict) else None)
         if isinstance(rows, list):
@@ -202,6 +204,11 @@ class Engine:
         client.close()
         self.replay_seconds += time.monotonic() - began
         return out
+
+
+def whole_text(reply: dict | None) -> str:
+    """All the text of a tool reply. measure.tool_text cuts at 4000 characters, which breaks JSON."""
+    return "\n".join(c.get("text", "") for c in (reply or {}).get("result", {}).get("content", []) if c.get("type") == "text")
 
 
 def image_of(reply: dict | None) -> bytes:
@@ -406,6 +413,7 @@ def draw_one(engine: Engine, request: dict, suffix: str, system: str, model: str
     record["seconds"] = round(time.monotonic() - began, 1)
     record["picture"] = base64.b64encode(final["png"]).decode() if final["png"] else ""
     record["checks"] = check(request, record, recipe, final)
+    record["shapes"] = final.get("shapes", {})
     return record
 
 
@@ -490,7 +498,8 @@ def main() -> None:
     spec = json.loads(Path(args.requests).read_text())
     wanted = [r for r in spec["requests"] if not args.only or r["id"] in args.only.split(",")]
     if stub:
-        wanted = wanted[:1]
+        wanted = [{"id": "canned", "group": "harness check", "size": [9000, 7000], "min": {"items": 5, "dimensions": 2, "texts": 2},
+                   "text": "(canned drawing: two rooms, two labels, two dimensions)"}]  # fmt: skip
     engine = Engine(args.image, out, args.server_cmd)
     notes = engine.catalogue()
     global ALLOWED_SET
@@ -510,6 +519,10 @@ def main() -> None:
     text = report(records, spend, stub, model, engine)
     (out / "summary.md").write_text(text)
     print(text)
+    if stub:  # what the engine's replies look like, so the counting can be checked (fictional drawing only)
+        for record in records:
+            for name, excerpt in (record.get("shapes") or {}).items():
+                print(f"SHAPE {name}: {' '.join(excerpt.split())}")
     for name, data in pictures.items():
         for start_at in range(0, len(data), 3000):
             print(f"PICTURE {name} {data[start_at:start_at + 3000]}")

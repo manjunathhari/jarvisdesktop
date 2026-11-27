@@ -1,4 +1,9 @@
 Changing this file on branch spike-cad-engine starts the drawing test.
-With the repository secret ANTHROPIC_API_KEY set, a run spends real money (cap: Rs 300).
 
-run 1: no key expected. Checks the harness with one canned drawing; no Claude call.
+The last "mode:" line below decides what the run does:
+  mode: canned  no key is used and no Claude call is made; one canned drawing checks the harness
+  mode: real    uses the repository secret ANTHROPIC_API_KEY and spends real money (cap: Rs 300)
+
+run 1: canned. Harness ran; the drawing's counts were not read.
+run 2: canned. Reads the engine's replies whole so the counts can be checked.
+mode: canned

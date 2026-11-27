@@ -53,9 +53,10 @@ the whole recipe replayed in a fresh engine container after every step.
 
 - **It spends real money** when the repository secret `ANTHROPIC_API_KEY` is set: up to Rs 300,
   the cap Manj approved on 27 Nov 2026. The script stops before a call that could pass the cap.
-- It runs only when `draw-test-run.txt` changes on this branch, never on ordinary edits.
-- With no secret it makes no Claude call: one canned drawing goes through the loop to check the
-  harness, and the summary says so.
+- It runs only when `draw-test-run.txt` changes on this branch, never on ordinary edits, and it
+  uses the key only when that file's last `mode:` line says `mode: real`.
+- In any other mode the key is given to no step and no Claude call is made: one canned drawing
+  goes through the loop to check the harness, and the summary says so.
 - The key is given to one workflow step and is only ever put in the request header. The engine's
   container has no network and no environment, so the engine never sees it.
 - Pass mark, set before the run: at least 8 of 10 drawings pass the script's checks and look

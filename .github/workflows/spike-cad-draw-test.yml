@@ -2,10 +2,10 @@ name: Spike - CAD drawing test (Claude)
 # Throwaway. Slice 0 of the CAD board design (project doc claude/cad-board-design.md): can Claude
 # draw with the pinned CAD engine? Ten fictional requests, at most four Claude calls each.
 #
-# MONEY: with the repository secret ANTHROPIC_API_KEY set, one run spends real money, up to the
-# cap in draw_test.py (Rs 300, approved by Manj on 27 Nov 2026). It therefore runs ONLY when the
-# run marker file changes on this branch, never on ordinary edits. With no secret it makes no
-# Claude call and runs one canned drawing to check the harness.
+# MONEY: a real run spends real money, up to the cap in draw_test.py (Rs 300, approved by Manj on
+# 27 Nov 2026). Two things must both be true for that: the run marker file changes on this branch
+# AND its last "mode:" line says "mode: real". Otherwise the key is not given to any step, no
+# Claude call is made, and one canned drawing checks the harness.
 #
 # The key is given to one step only. The engine's container has no network and no environment.
 
@@ -50,10 +50,24 @@ jobs:
       - name: Build the bare engine image
         run: docker build -q -t cad-engine-spike spikes/cad-engine
 
-      - name: Run the drawing test
+      - name: Read the mode from the run marker
+        id: mode
+        run: |
+          mode="$(grep -E '^mode: ' spikes/cad-engine/draw-test-run.txt | tail -n 1 | sed 's/^mode: //')"
+          if [ "$mode" = "real" ]; then echo "real=true" >> "$GITHUB_OUTPUT"; else echo "real=false" >> "$GITHUB_OUTPUT"; fi
+          echo "mode: ${mode:-none}"
+
+      - name: Run the drawing test (canned, no key, no Claude call)
+        if: steps.mode.outputs.real != 'true'
+        run: python3 spikes/cad-engine/draw_test.py --out out/draw --image cad-engine-spike
+
+      - name: Run the drawing test (real, spends money)
+        if: steps.mode.outputs.real == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python3 spikes/cad-engine/draw_test.py --out out/draw --image cad-engine-spike
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then echo "mode is real but the secret ANTHROPIC_API_KEY is not set" >&2; exit 1; fi
+          python3 spikes/cad-engine/draw_test.py --out out/draw --image cad-engine-spike
 
       - name: Write the summary
         if: always()
