@@ -75,6 +75,8 @@ jobs:
           JARVIS_REF: ${{ github.sha }}
       - name: Image builds
         run: docker build --tag jarvis-server:ci .
+      - name: Sandbox image builds (improve profile; built only, never pushed)
+        run: docker build -f deploy/improve/sandbox.Dockerfile --tag jarvis-sandbox:ci .
 
   publish:
     # After tests pass on main, publish the image the server pulls,
