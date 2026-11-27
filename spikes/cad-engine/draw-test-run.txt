@@ -7,3 +7,5 @@ The last "mode:" line below decides what the run does:
 run 1: canned. Harness ran; the drawing's counts were not read.
 run 2: canned. Reads the engine's replies whole so the counts can be checked.
 mode: canned
+run 3: real. Manj said "run it" on 27 Nov 2026, 23:52 IST. Ten requests, cap Rs 300.
+mode: real
