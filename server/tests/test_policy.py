@@ -140,7 +140,7 @@ def test_board_kinds_are_read_only_and_desktop_only(
             "node_kind_not_allowed"
         )
     for kind in ("board", "board.", "board.delete", "board.clear", "board.show.x", "board.*"):
-        assert policy.tier_of(kind) is None, kind  # no wildcard: only the five named kinds
+        assert policy.tier_of(kind) is None, kind  # no wildcard: only the named kinds
 
 
 def test_board_content_targets_desktops_only() -> None:

@@ -669,8 +669,16 @@ _BASE64_STD = r"^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$
 _CHUNK_DATA_MAX_CHARS = (BOARD_CHUNK_MAX_BYTES + 2) // 3 * 4
 
 PictureBytes = Annotated[int, Field(ge=1, le=BOARD_PICTURE_MAX_BYTES, strict=True)]
+# One line that says something: no control character (C0, DEL, C1), no Unicode line or paragraph
+# separator, and not blank. The node applies the same rule (plan Task 8).
+_LABEL_CHAR = r"[^\x00-\x1f\x7f-\x9f\u2028\u2029]"
 StepLabel = Annotated[
-    str, Field(min_length=1, max_length=DRAWING_STEP_LABEL_MAX, pattern=r"^[^\x00-\x1f\x7f]+$")
+    str,
+    Field(
+        min_length=1,
+        max_length=DRAWING_STEP_LABEL_MAX,
+        pattern=rf"^{_LABEL_CHAR}*[^\x00-\x20\x7f-\x9f\u2028\u2029]{_LABEL_CHAR}*$",
+    ),
 ]
 
 
@@ -703,7 +711,11 @@ def drawing_content(d: DrawingContent) -> str:
 
 def parse_drawing_content(content: str) -> DrawingContent:
     """The description in `content`; `ValueError` unless it is exactly `drawing_content` of it."""
-    d = DrawingContent.model_validate(json.loads(content))
+    try:
+        loaded = json.loads(content)
+    except RecursionError as e:  # thousands of nested brackets fit in 30,000 bytes
+        raise ValueError("a drawing's content is nested too deeply") from e
+    d = DrawingContent.model_validate(loaded)
     if drawing_content(d) != content:
         raise ValueError("a drawing's content is not in canonical form")
     return d

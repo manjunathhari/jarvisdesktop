@@ -650,6 +650,15 @@ def test_drawing_description_limits() -> None:
         {"steps": ("s" * 81,)},
         {"steps": ("",)},
         {"steps": ("a\nb",)},
+        {"steps": (" ",)},  # blank
+        {"steps": ("a\u0085b",)},  # a C1 control (next line)
+        {"steps": ("a\u2028b",)},  # the Unicode line separator
+        {"steps": ("a\u2029b",)},
+        {"items": True},
+        {"items": 3.0},
+        {"items": "3"},
+        {"picture": {**picture, "bytes": True}},
+        {"picture": {**picture, "bytes": 48000.0}},
         {"items": -1},
         {"items": 100_001},
         {"units": "inch"},
@@ -669,6 +678,15 @@ def test_drawing_description_limits() -> None:
     for changes in bad:
         with pytest.raises(ValidationError):
             make(**changes)
+
+
+def test_a_deeply_nested_description_is_refused_not_a_crash() -> None:
+    """20,000 characters of brackets fit the content limit; they must be a refusal."""
+    nested = "[" * 10_000 + "]" * 10_000
+    with pytest.raises(ValueError):
+        c.parse_drawing_content(nested)
+    with pytest.raises(ValidationError):
+        c.BoardShowArgs.model_validate(_drawing_args(nested))
 
 
 def test_show_args_accept_a_drawing_and_refuse_a_bad_description() -> None:
@@ -715,6 +733,9 @@ def test_content_chunk_limits() -> None:
         with pytest.raises(ValidationError):
             c.BoardContentArgs.model_validate(_chunk(index=index, count=count))
     _both(name, _chunk(count=0), ok=False)
+    for field, value in (("index", False), ("count", True), ("bytes", True), ("bytes", 48000.0)):
+        with pytest.raises(ValidationError):  # a number is a whole number, never a flag or a float
+            c.BoardContentArgs.model_validate(_chunk(**{field: value}))
     _both(name, _chunk(bytes=0), ok=False)
     _both(name, _chunk(bytes=c.BOARD_PICTURE_MAX_BYTES), ok=True)
     _both(name, _chunk(bytes=c.BOARD_PICTURE_MAX_BYTES + 1), ok=False)
