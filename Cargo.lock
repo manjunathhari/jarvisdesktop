@@ -2296,6 +2296,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "jarvis-fetch"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bzip2 0.5.2",
+ "futures",
+ "reqwest 0.12.28",
+ "tar",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "jarvis-helper"
 version = "0.1.0"
 dependencies = [
@@ -2357,17 +2370,11 @@ dependencies = [
 name = "jarvis-voice"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "bzip2 0.5.2",
- "futures",
  "jarvis-core",
- "reqwest 0.12.28",
+ "jarvis-fetch",
  "rodio",
  "sherpa-onnx",
  "sherpa-onnx-sys",
- "tar",
- "tempfile",
- "tokio",
  "tracing",
 ]
 

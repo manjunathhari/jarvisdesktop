@@ -6,13 +6,8 @@ license.workspace = true
 
 [dependencies]
 jarvis-core.workspace = true
-async-trait.workspace = true
-tokio.workspace = true
+jarvis-fetch.workspace = true
 tracing.workspace = true
-reqwest.workspace = true
-futures = "0.3"
-tar = "0.4"
-bzip2 = "0.5"
 rodio = { version = "0.20", default-features = false }
 
 # The Kokoro engine (sherpa-onnx) is built on Windows only: its build downloads
@@ -20,7 +15,3 @@ rodio = { version = "0.20", default-features = false }
 [target.'cfg(windows)'.dependencies]
 sherpa-onnx = "=1.13.2"
 sherpa-onnx-sys = "=1.13.2"  # must match sherpa-onnx exactly
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["test-util", "fs"] }
-tempfile = "3"

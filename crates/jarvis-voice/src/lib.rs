@@ -4,7 +4,7 @@
 //! The engine and the speaker sit behind small traits so the queueing and
 //! interruption logic is tested without audio hardware or model files.
 
-pub mod model;
+pub use jarvis_fetch as model;
 pub mod speaker;
 
 #[cfg(windows)]

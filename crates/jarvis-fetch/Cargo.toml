@@ -1,0 +1,18 @@
+[package]
+name = "jarvis-fetch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Downloading and unpacking model and helper files, with an integrity check. Pure: no audio."
+
+[dependencies]
+async-trait.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
+reqwest.workspace = true
+futures = "0.3"
+tar = "0.4"
+bzip2 = "0.5"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "fs"] }
+tempfile = "3"
