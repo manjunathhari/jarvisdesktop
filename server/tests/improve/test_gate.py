@@ -8,7 +8,9 @@ from jarvis_server.improve import gate
 from jarvis_server.improve.gate import ApprovedDesign, Patch
 
 DESIGN = ApprovedDesign(
-    files=frozenset({"server/src/jarvis_server/brain/research.py", "server/tests/test_research.py"}),
+    files=frozenset(
+        {"server/src/jarvis_server/brain/research.py", "server/tests/test_research.py"}
+    ),
     packages=frozenset(),
 )
 
@@ -51,7 +53,9 @@ def test_a_clean_patch_passes() -> None:
 )
 def test_a_protected_path_is_refused_even_when_the_design_names_it(path: str) -> None:
     design = ApprovedDesign(files=frozenset({path}), packages=frozenset())
-    problems = gate.check(design, _patch(changed=(path,)), fingerprints={}, current_hashes={}, evidence=())
+    problems = gate.check(
+        design, _patch(changed=(path,)), fingerprints={}, current_hashes={}, evidence=()
+    )
     assert any("protected" in p and path in p for p in problems)
 
 
@@ -63,13 +67,17 @@ def test_a_file_the_design_does_not_name_is_refused() -> None:
         current_hashes={},
         evidence=(),
     )
-    assert problems == ["server/src/jarvis_server/brain/other.py is not named in the approved design"]
+    assert problems == [
+        "server/src/jarvis_server/brain/other.py is not named in the approved design"
+    ]
 
 
 @pytest.mark.parametrize("path", ["../etc/passwd", "/etc/passwd", "server\\x.py", "a/./b.py", ""])
 def test_a_strange_path_is_refused(path: str) -> None:
     design = ApprovedDesign(files=frozenset({path}), packages=frozenset())
-    problems = gate.check(design, _patch(changed=(path,)), fingerprints={}, current_hashes={}, evidence=())
+    problems = gate.check(
+        design, _patch(changed=(path,)), fingerprints={}, current_hashes={}, evidence=()
+    )
     assert any("not a plain repo path" in p for p in problems)
 
 
@@ -81,7 +89,9 @@ def test_a_changed_fingerprinted_test_is_refused() -> None:
         current_hashes={"server/tests/test_research.py": "bbb"},
         evidence=(),
     )
-    assert problems == ["server/tests/test_research.py changed after the Test writer fingerprinted it"]
+    assert problems == [
+        "server/tests/test_research.py changed after the Test writer fingerprinted it"
+    ]
 
 
 def test_a_deleted_fingerprinted_test_is_refused() -> None:
@@ -92,7 +102,9 @@ def test_a_deleted_fingerprinted_test_is_refused() -> None:
         current_hashes={},
         evidence=(),
     )
-    assert problems == ["server/tests/test_research.py changed after the Test writer fingerprinted it"]
+    assert problems == [
+        "server/tests/test_research.py changed after the Test writer fingerprinted it"
+    ]
 
 
 def test_fingerprint_is_sha256_of_the_bytes() -> None:
@@ -149,10 +161,12 @@ def test_cargo_lock_is_read_the_same_way() -> None:
 
 def test_package_lock_json_is_read_too() -> None:
     old = '{"packages": {"": {}, "node_modules/a": {"version": "1.0.0"}}}'
-    new = '{"packages": {"": {}, "node_modules/a": {"version": "1.0.0"}, "node_modules/b": {"version": "2.0.0"}}}'
+    new = old.replace("}}}", '}, "node_modules/b": {"version": "2.0.0"}}}')
     problems = gate.check(
         DESIGN,
-        _patch(changed=("app/package-lock.json",), lock_texts={"app/package-lock.json": (old, new)}),
+        _patch(
+            changed=("app/package-lock.json",), lock_texts={"app/package-lock.json": (old, new)}
+        ),
         fingerprints={},
         current_hashes={},
         evidence=(),
@@ -190,7 +204,9 @@ def test_private_evidence_in_a_commit_message_is_refused() -> None:
 
 
 def test_short_evidence_fragments_do_not_trip_the_check() -> None:
-    problems = gate.check(DESIGN, _patch(), fingerprints={}, current_hashes={}, evidence=("the", ""))
+    problems = gate.check(
+        DESIGN, _patch(), fingerprints={}, current_hashes={}, evidence=("the", "")
+    )
     assert problems == []
 
 
@@ -206,7 +222,9 @@ def test_evidence_is_matched_ignoring_spacing() -> None:
 
 
 def test_an_empty_patch_is_refused() -> None:
-    problems = gate.check(DESIGN, _patch(changed=(), diff=""), fingerprints={}, current_hashes={}, evidence=())
+    problems = gate.check(
+        DESIGN, _patch(changed=(), diff=""), fingerprints={}, current_hashes={}, evidence=()
+    )
     assert problems == ["the patch changes nothing"]
 
 
