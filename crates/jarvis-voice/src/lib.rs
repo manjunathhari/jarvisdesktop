@@ -104,6 +104,20 @@ impl Voice {
     }
 }
 
+impl jarvis_core::Speaks for Voice {
+    fn speak(&self, text: &str) {
+        Voice::speak(self, text)
+    }
+
+    fn stop(&self) {
+        Voice::stop(self)
+    }
+
+    fn is_speaking(&self) -> bool {
+        Voice::is_speaking(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

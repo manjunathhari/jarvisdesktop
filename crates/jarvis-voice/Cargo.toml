@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+jarvis-core.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
