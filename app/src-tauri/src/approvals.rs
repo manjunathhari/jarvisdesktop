@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn no_node_means_nothing_is_taken() {
         let slot: NodeSlot = Arc::default();
-        assert!(!take_spoken_decision(&slot, "approve", |_| panic!(
+        assert!(!take_spoken_decision(&slot, "approve", true, |_| panic!(
             "nothing to say"
         )));
     }
