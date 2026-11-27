@@ -9,3 +9,5 @@ run 2: canned. Reads the engine's replies whole so the counts can be checked.
 mode: canned
 run 3: real. Manj said "run it" on 27 Nov 2026, 23:52 IST. Ten requests, cap Rs 300.
 mode: real
+run 3 finished (run 46048993923). Mode set back so that nothing spends by accident.
+mode: canned
