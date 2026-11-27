@@ -45,27 +45,42 @@ fn allowed(capability: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Every `invoke("name"` and `invoke<T>("name"` in the pages under `dir` (tests left out).
-fn invoked(dir: &str) -> BTreeSet<String> {
-    let mut found = BTreeSet::new();
-    for entry in std::fs::read_dir(app().join(dir)).unwrap() {
-        let path = entry.unwrap().path();
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if !name.ends_with(".ts") || name.ends_with(".test.ts") {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path).unwrap();
-        for piece in text.split("invoke").skip(1) {
-            let piece = piece.trim_start();
-            let piece = match piece.strip_prefix('<') {
-                Some(typed) => typed.split_once('>').map_or("", |(_, rest)| rest),
-                None => piece,
-            };
-            if let Some(call) = piece.strip_prefix("(\"") {
-                found.insert(call.split('"').next().unwrap().to_owned());
+/// Every command the pages under `dir` call: `invoke("name"` and `invoke<T>("name"`. Tests
+/// are left out; `skip` names a sub-folder that belongs to the other window. A call whose
+/// command is not a plain string would escape this check, so it is an error.
+fn invoked(dir: &str, skip: Option<&str>) -> BTreeSet<String> {
+    fn walk(dir: &Path, skip: Option<&str>, found: &mut BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if Some(name.as_str()) != skip {
+                    walk(&path, None, found);
+                }
+                continue;
+            }
+            if !name.ends_with(".ts") || name.ends_with(".test.ts") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for piece in text.split("invoke").skip(1) {
+                let piece = piece.trim_start();
+                let call = match piece.strip_prefix('<') {
+                    Some(typed) => typed.split_once('>').map_or("", |(_, rest)| rest),
+                    None => piece,
+                };
+                let Some(args) = call.strip_prefix('(') else {
+                    continue; // the word in an import or a comment, not a call
+                };
+                let command = args.trim_start().strip_prefix('"').unwrap_or_else(|| {
+                    panic!("{name}: invoke() with a command that is not a plain string")
+                });
+                found.insert(command.split('"').next().unwrap().to_owned());
             }
         }
     }
+    let mut found = BTreeSet::new();
+    walk(&app().join(dir), skip, &mut found);
     found
 }
 
@@ -93,8 +108,8 @@ fn every_command_is_allowed_to_exactly_one_window() {
 #[test]
 fn each_window_is_allowed_everything_its_pages_call() {
     let (main, board) = (allowed("default"), allowed("board"));
-    let main_calls = invoked("src");
-    let board_calls = invoked("src/board");
+    let main_calls = invoked("src", Some("board"));
+    let board_calls = invoked("src/board", None);
     assert!(main_calls.len() >= 10 && board_calls.len() >= 8);
     let missing: Vec<_> = main_calls.difference(&main).collect();
     assert!(
@@ -117,6 +132,15 @@ fn the_board_window_has_only_board_commands() {
     // Opening the Board is the main window's (F9); the Board has no use for it.
     assert!(!board.contains("board_open"));
     assert!(allowed("default").contains("board_open"));
+    // Not having `decide_approval` would mean little if the typing box could decide: the
+    // app's `board_say` is told it may not, and `from_board` turns every decision away.
+    assert!(
+        read("src-tauri/src/lib.rs").contains("say_text(text, false, &jarvis"),
+        "board_say must not decide"
+    );
+    assert!(read("src-tauri/src/approvals.rs").contains(
+        "Intercept::Decide(..) | Intercept::AskToTap | Intercept::NotHere => Intercept::NotHere"
+    ));
     for never in [
         "quit",
         "say",

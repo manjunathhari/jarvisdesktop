@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "board",
-  "description": "The Board window may listen for events from Rust and call the Board's commands only. It cannot quit the app, speak as the main window, enrol, decide approvals or touch the API key.",
+  "description": "The Board window may listen for events from Rust and call the Board's commands only. It cannot quit the app, enrol, decide approvals (its typing box is told it may not) or touch the API key.",
   "windows": [
     "board"
   ],

@@ -146,16 +146,22 @@ export function renderTyping({ onSay }: { onSay: (text: string) => Promise<void>
   input.autocomplete = "off";
   input.spellcheck = false;
   form.append(label, input);
+  let sending = false;
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     const text = input.value.trim();
-    if (!text) return;
-    void onSay(text).then(
-      () => {
-        if (input.value.trim() === text) input.value = "";
-      },
-      () => {},
-    );
+    if (!text || sending) return; // a second Enter while the first is on its way
+    sending = true;
+    void onSay(text)
+      .then(
+        () => {
+          if (input.value.trim() === text) input.value = "";
+        },
+        () => {},
+      )
+      .finally(() => {
+        sending = false;
+      });
   });
   return form;
 }

@@ -70,11 +70,30 @@ fn a_typed_line_that_was_never_heard_does_not_mark_the_next_spoken_one() {
     rig.recorder.typed("this one was dropped");
     rig.recorder.heard("something said aloud");
     assert_eq!(next(&rig).how, How::Voice);
-    // And the mark is used once.
+    // A mark is used once.
     rig.recorder.typed("typed twice");
     rig.recorder.heard("typed twice");
     rig.recorder.heard("typed twice");
     assert_eq!(next(&rig).how, How::Typed);
+    assert_eq!(next(&rig).how, How::Voice);
+}
+
+#[test]
+fn a_voice_line_before_the_typed_one_arrives_does_not_use_up_its_mark() {
+    let rig = rig();
+    rig.recorder.typed("add a column");
+    rig.recorder.heard("something else, said aloud");
+    rig.recorder.heard("add a column");
+    assert_eq!(next(&rig).how, How::Voice);
+    assert_eq!(next(&rig).how, How::Typed);
+}
+
+#[test]
+fn a_typed_mark_does_not_outlive_its_moment() {
+    let rig = rig();
+    rig.recorder.typed("say it again");
+    std::thread::sleep(jarvis_node::talk::TYPED_MARK_LASTS + Duration::from_millis(150));
+    rig.recorder.heard("say it again"); // the same words, spoken later
     assert_eq!(next(&rig).how, How::Voice);
 }
 

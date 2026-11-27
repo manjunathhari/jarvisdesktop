@@ -560,11 +560,17 @@ pub mod view {
         pub spend_today_paise: u64,
     }
 
+    /// The newest lines of the conversation a snapshot carries: what the window shows.
+    pub const SNAPSHOT_LINES: usize = 300;
+
     pub fn snapshot(store: &BoardStore, now: DateTime<FixedOffset>) -> BoardSnapshot {
         let panels = store.panels();
         BoardSnapshot {
             spend_today_paise: spend_today_paise(&panels, now),
-            conversation: store.conversation(),
+            conversation: {
+                let mut all = store.conversation();
+                all.split_off(all.len().saturating_sub(SNAPSHOT_LINES))
+            },
             panels,
         }
     }

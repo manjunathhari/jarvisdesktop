@@ -10,10 +10,11 @@
 //!   does not say which reply made a panel, and the headline is its own reply, so this is the
 //!   nearest honest link: the line spoken after a panel went up points at it.
 //! - A typed line reaches the coordinator like a spoken one, so the app says "this text was
-//!   typed" first; the mark is for that text only and is used once.
+//!   typed" first; the mark is for that text only, is used once, and lasts a few seconds.
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
@@ -21,10 +22,13 @@ use crate::board::{BoardStore, ConversationEntry, How, Who};
 
 /// The longest line kept, in characters. A spoken sentence or a typed request is far shorter.
 pub const TEXT_MAX: usize = 2000;
+/// How long a "this was typed" mark waits for its line. The line follows at once; a mark
+/// whose line was dropped (Jarvis was busy) must not label the same words spoken later.
+pub const TYPED_MARK_LASTS: Duration = Duration::from_secs(3);
 
 enum Job {
     Heard(String),
-    Typed(String),
+    Typed(String, Instant),
     Spoke(String),
     Panel(Uuid),
 }
@@ -50,12 +54,12 @@ impl Recorder {
         let spawned = std::thread::Builder::new()
             .name("board-conversation".into())
             .spawn(move || {
-                let mut typed: Option<String> = None;
+                let mut typed: Option<(String, Instant)> = None;
                 let mut shown: Vec<Uuid> = Vec::new();
                 for job in work {
                     let (who, how, text, panels) = match job {
-                        Job::Typed(text) => {
-                            typed = Some(text);
+                        Job::Typed(text, at) => {
+                            typed = Some((text, at));
                             continue;
                         }
                         Job::Panel(id) => {
@@ -65,7 +69,13 @@ impl Recorder {
                             continue;
                         }
                         Job::Heard(text) => {
-                            let how = if typed.take().as_deref() == Some(text.as_str()) {
+                            // The mark is for exactly these words, soon after: any other
+                            // line leaves it waiting, and time runs it out.
+                            let marked = typed.as_ref().is_some_and(|(marked, at)| {
+                                *marked == text && at.elapsed() <= TYPED_MARK_LASTS
+                            });
+                            let how = if marked {
+                                typed = None;
                                 How::Typed
                             } else {
                                 How::Voice
@@ -120,7 +130,7 @@ impl Recorder {
     /// This text is about to come through as heard, and it was typed.
     pub fn typed(&self, text: &str) {
         if let Some(text) = kept(text) {
-            self.send(Job::Typed(text));
+            self.send(Job::Typed(text, Instant::now()));
         }
     }
 

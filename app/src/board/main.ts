@@ -188,10 +188,11 @@ function drawTalk() {
   const built = JSON.stringify(turns);
   if (built === talkBuiltFor) return;
   talkBuiltFor = built;
-  const column = $("talk");
-  column.replaceChildren(renderConversation(turns, { onPanel: showFromTalk }));
   const aside = $("conversation");
-  aside.scrollTop = aside.scrollHeight; // the newest line in sight
+  // Follow the newest line only if the person was already at the end, not while reading back.
+  const atEnd = aside.scrollHeight - aside.scrollTop - aside.clientHeight < 40;
+  $("talk").replaceChildren(renderConversation(turns, { onPanel: showFromTalk }));
+  if (atEnd) aside.scrollTop = aside.scrollHeight;
 }
 
 async function say(text: string) {
@@ -199,7 +200,8 @@ async function say(text: string) {
     await invoke("board_say", { text });
     problem(null);
   } catch (e) {
-    problem("That could not be sent.");
+    // The app says why in plain words (Jarvis is busy, or not listening).
+    problem(typeof e === "string" && e.length < 120 ? e : "That could not be sent.");
     throw e;
   }
 }
@@ -255,7 +257,11 @@ document.addEventListener(LINK_REFUSED, () => problem("That link could not be op
 $("typing").replaceChildren(renderTyping({ onSay: say }));
 await listen<BoardEvent>("jarvis://board", (e) => onEvent(e.payload));
 await listen<ConversationEntry>("jarvis://board-talk", (e) => {
-  if (talk.add(e.payload)) drawTalk();
+  if (!talk.add(e.payload)) return;
+  drawTalk();
+  // For a screen reader: this line only, once (the list itself is rebuilt each time).
+  $("talk-latest").textContent =
+    `${e.payload.who === "jarvis" ? "Jarvis" : "You"}: ${e.payload.text}`;
 });
 await load();
 new ResizeObserver(() => layout()).observe(area);

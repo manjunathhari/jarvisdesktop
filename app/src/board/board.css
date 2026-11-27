@@ -580,3 +580,13 @@ iframe.canvas {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+
+/* For screen readers only: the newest line of the conversation, announced once. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

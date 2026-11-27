@@ -140,25 +140,38 @@ fn say(
     voice: State<'_, VoiceSlot>,
     app: AppHandle,
 ) {
-    say_text(text, &jarvis, &node, &voice, &app);
+    say_text(text, true, &jarvis, &node, &voice, &app);
 }
 
-/// The Board's "Type instead of speaking" box: exactly what `say` does. Its own command so
-/// that the Board window can be allowed this and not the main window's `say`.
+/// The Board's "Type instead of speaking" box. Its own command, so that the Board window can
+/// be allowed this and not the main window's `say`, and with two differences:
+/// - it never decides an approval (the Board shows untrusted content);
+/// - it says why when the line would be dropped (the coordinator takes nothing while it is
+///   thinking or the microphone is off), so the text stays in the box.
 #[tauri::command]
 fn board_say(
     text: String,
     jarvis: State<'_, Handle>,
     node: State<'_, approvals::NodeSlot>,
     voice: State<'_, VoiceSlot>,
+    mode: State<'_, ModeCell>,
     app: AppHandle,
-) {
-    say_text(text, &jarvis, &node, &voice, &app);
+) -> Result<(), String> {
+    match mode.lock().map(|m| *m) {
+        Ok(Mode::Thinking) => return Err("Jarvis is busy. Try again in a moment.".to_owned()),
+        Ok(Mode::MicOff) => {
+            return Err("Jarvis is not listening. Say or tap to wake it first.".to_owned())
+        }
+        _ => {}
+    }
+    say_text(text, false, &jarvis, &node, &voice, &app);
+    Ok(())
 }
 
-/// A typed line, from either window.
+/// A typed line, from either window. `may_decide`: whether an approval phrase may decide.
 fn say_text(
     text: String,
+    may_decide: bool,
     jarvis: &Handle,
     node: &approvals::NodeSlot,
     voice: &VoiceSlot,
@@ -166,12 +179,16 @@ fn say_text(
 ) {
     // Typed stand-in for the microphone until Milestone B; length-capped.
     let text: String = text.chars().take(500).collect();
-    let (app, voice) = (app.clone(), voice.clone());
-    if approvals::take_spoken_decision(node, &text, move |line| speak_locally(&app, &voice, line)) {
-        return;
-    }
     // For the Board's conversation: this line, when it is heard, was typed.
     board::typed(&text);
+    let (app, voice) = (app.clone(), voice.clone());
+    if approvals::take_spoken_decision(node, &text, may_decide, move |line| {
+        speak_locally(&app, &voice, line)
+    }) {
+        // Taken here, so the coordinator never reports it heard: record it ourselves.
+        board::heard(&text);
+        return;
+    }
     jarvis.send(Event::Utterance(text));
 }
 
@@ -421,9 +438,11 @@ async fn prepare_ears(
         Box::new(move |text| {
             tracing::info!(%text, "heard");
             let (app, voice) = (decision_app.clone(), decision_voice.clone());
-            if approvals::take_spoken_decision(&node, &text, move |line| {
+            if approvals::take_spoken_decision(&node, &text, true, move |line| {
                 speak_locally(&app, &voice, line)
             }) {
+                // Taken here, so the coordinator never reports it heard.
+                board::heard(&text);
                 return;
             }
             jarvis.send(Event::Utterance(text));
@@ -589,6 +608,7 @@ pub fn run() {
             let voice: VoiceSlot = Arc::new(Mutex::new(None));
             let ears: EarsSlot = Arc::new(Mutex::new(None));
             let mode: ModeCell = Arc::new(Mutex::new(Mode::Idle));
+            app.manage(mode.clone());
             let announcer = Arc::new(announce::Announcer::default());
             if let Some(n) = node.lock().ok().and_then(|n| n.clone()) {
                 let (app, voice) = (app.handle().clone(), voice.clone());

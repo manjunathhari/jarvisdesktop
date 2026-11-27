@@ -150,6 +150,21 @@ describe("typing instead of speaking", () => {
     expect(input.value).toBe("");
   });
 
+  it("a second Enter while the first is being sent sends nothing more", async () => {
+    let release = () => {};
+    const onSay = vi.fn(() => new Promise<void>((done) => (release = done)));
+    const form = renderTyping({ onSay });
+    form.querySelector<HTMLInputElement>("input")!.value = "once";
+    form.dispatchEvent(new Event("submit", { cancelable: true }));
+    form.dispatchEvent(new Event("submit", { cancelable: true }));
+    expect(onSay).toHaveBeenCalledTimes(1);
+    release();
+    await new Promise((r) => setTimeout(r, 0));
+    form.querySelector<HTMLInputElement>("input")!.value = "again";
+    form.dispatchEvent(new Event("submit", { cancelable: true }));
+    expect(onSay).toHaveBeenCalledTimes(2);
+  });
+
   it("sends nothing for an empty box, and keeps the text if sending failed", async () => {
     const onSay = vi.fn(async () => {
       throw new Error("no");

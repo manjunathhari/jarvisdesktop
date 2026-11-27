@@ -1244,6 +1244,36 @@ mod window {
     }
 }
 
+mod snapshot_size {
+    use jarvis_node::board::view::{snapshot, SNAPSHOT_LINES};
+    use jarvis_node::board::{BoardStore, ConversationEntry, How, Who};
+
+    #[test]
+    fn a_snapshot_carries_only_the_newest_lines_of_a_long_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = BoardStore::open(dir.path());
+        let now = chrono::Utc::now().fixed_offset();
+        for i in 0..SNAPSHOT_LINES + 25 {
+            store
+                .append_turn(ConversationEntry {
+                    at: now,
+                    who: Who::Person,
+                    text: format!("line {i}"),
+                    how: How::Voice,
+                    panels: vec![],
+                })
+                .unwrap();
+        }
+        let got = snapshot(&store, now).conversation;
+        assert_eq!(got.len(), SNAPSHOT_LINES);
+        assert_eq!(got[0].text, "line 25");
+        assert_eq!(
+            got.last().unwrap().text,
+            format!("line {}", SNAPSHOT_LINES + 24)
+        );
+    }
+}
+
 mod links {
     use jarvis_node::board::view::openable_link;
 

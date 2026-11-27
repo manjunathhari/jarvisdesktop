@@ -55,7 +55,8 @@ In server mode JARVIS has a second window, the Board, for anything worth looking
 
 - **Where it opens.** With two monitors, full screen on the one JARVIS is not on, when the app starts. With one monitor, as an ordinary window when a panel arrives. **F9** in the JARVIS window opens it at any time. Closing the Board only hides it.
 - **Panels.** A *text* panel is formatted writing; a *canvas* panel is a small page Jarvis draws. Each has Minimise, Maximise and Close, by click or by voice ("minimise the chart", "bring back the comparison"). Minimised panels wait in the dock; closed ones are listed under Recently closed. Nothing is deleted on the server.
-- **Conversation.** The left column shows what you said and what Jarvis said, with a button for each panel a reply brought. You can type there instead of speaking.
+- **Conversation.** The left column shows what you said and what Jarvis said, with a button for each panel a reply brought. You can type there instead of speaking, except to decide an approval: that is done on the card in the JARVIS window. If Jarvis is busy or not listening, the box says so and keeps your text.
+- **What is kept on this PC.** The conversation (every line heard, typed and spoken, as plain text) and the panels are saved in the app's data folder, in `node\conversation.jsonl` and `node\board.json`, so they survive a restart. The conversation file is never trimmed. To clear it, close JARVIS and delete the file.
 - **Spend.** The top bar shows what today's panels cost. Every Board request counts against the monthly cap.
 - **After a restart** the panels and the conversation are back as they were.
 
@@ -63,7 +64,7 @@ What Jarvis puts on the Board is treated as untrusted, because it is partly writ
 
 - In a text panel, HTML is shown as text, no image is loaded, and only a plain `https` link is a link. It shows its real address, and a click opens your browser after the app has checked the address again.
 - A canvas page is served from a small server on this PC only and shown in a sealed frame. It cannot reach the network, the app, your files or the other panels, and the Board window is muted. `.10x/reviews/2026-11-27-board-canvas-hostile-page.md` describes the seal and how it is checked.
-- Each window can call only its own commands of the app.
+- Each window can call only its own commands of the app. The Board has none that quits the app, decides an approval, enrols a device or touches the API key.
 
 Tests for the page: `cd app && npx vitest run`.
 

@@ -26,6 +26,8 @@ use uuid::Uuid;
 pub type NodeSlot = Arc<Mutex<Option<NodeHandle>>>;
 
 pub const ASK_TO_TAP: &str = "More than one approval is open. Tap the one you mean.";
+/// Said when a decision phrase is typed on the Board: that window never decides.
+pub const DECIDE_IN_MAIN: &str = "Approvals are decided in the JARVIS window. Tap the card there.";
 pub const NOT_SENT_EXPIRED: &str = "That approval has expired, so nothing was sent.";
 pub const NOT_SENT_GONE: &str = "That approval is no longer open.";
 pub const NOT_SENT_OFFLINE: &str = "I can't reach the Jarvis server, so nothing was sent.";
@@ -69,6 +71,8 @@ pub enum Intercept {
     Pass,
     Decide(Uuid, Decision),
     AskToTap,
+    /// A decision phrase from a window that may not decide (the Board).
+    NotHere,
 }
 
 pub fn intercept(text: &str, pending: usize, only: Option<Uuid>) -> Intercept {
@@ -76,6 +80,15 @@ pub fn intercept(text: &str, pending: usize, only: Option<Uuid>) -> Intercept {
         (VoiceDecision::Decide(d), Some(card)) => Intercept::Decide(card, d),
         (VoiceDecision::AskToTap, _) => Intercept::AskToTap,
         _ => Intercept::Pass,
+    }
+}
+
+/// What a phrase typed on the Board may do: never decide. The Board shows untrusted content
+/// and has no command to decide an approval; its typing box must not be a way round that.
+pub fn from_board(found: Intercept) -> Intercept {
+    match found {
+        Intercept::Pass => Intercept::Pass,
+        Intercept::Decide(..) | Intercept::AskToTap | Intercept::NotHere => Intercept::NotHere,
     }
 }
 
@@ -93,18 +106,25 @@ fn node(slot: &NodeSlot) -> Option<NodeHandle> {
 }
 
 /// Handle `text` here if it is a decision on an open card; `say` speaks a line locally.
-/// Returns whether the phrase was taken (and must not reach the coordinator).
+/// Returns whether the phrase was taken (and must not reach the coordinator). `may_decide` is
+/// false for the Board's typing box: a decision phrase there is taken but decides nothing.
 pub fn take_spoken_decision(
     slot: &NodeSlot,
     text: &str,
+    may_decide: bool,
     say: impl Fn(&str) + Send + 'static,
 ) -> bool {
     let Some(node) = node(slot) else {
         return false;
     };
     let (pending, only) = node.voice_target();
-    match intercept(text, pending, only) {
+    let found = intercept(text, pending, only);
+    match if may_decide { found } else { from_board(found) } {
         Intercept::Pass => false,
+        Intercept::NotHere => {
+            say(DECIDE_IN_MAIN);
+            true
+        }
         Intercept::AskToTap => {
             say(ASK_TO_TAP);
             true
@@ -197,6 +217,17 @@ pub async fn forward(app: AppHandle, slot: NodeSlot, mut events: mpsc::Receiver<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_phrase_typed_on_the_board_never_decides() {
+        let card = Uuid::new_v4();
+        assert_eq!(from_board(Intercept::Pass), Intercept::Pass);
+        assert_eq!(
+            from_board(intercept("approve", 1, Some(card))),
+            Intercept::NotHere
+        );
+        assert_eq!(from_board(Intercept::AskToTap), Intercept::NotHere);
+    }
 
     #[test]
     fn spoken_decisions_need_exactly_one_open_card() {
