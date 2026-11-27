@@ -102,7 +102,7 @@ def _under(path: str, pattern: str) -> bool:
     return pattern.endswith("/**") and path == pattern[:-3]
 
 
-def _plain(path: str) -> bool:
+def is_plain(path: str) -> bool:
     if not path or "\\" in path or path.startswith("/"):
         return False
     return all(part not in ("", ".", "..") for part in path.split("/"))
@@ -140,7 +140,7 @@ def check(
         return ["the patch changes nothing"]
 
     for path in patch.changed:
-        if not _plain(path):
+        if not is_plain(path):
             problems.append(f"{path!r} is not a plain repo path")
         elif is_protected(path):
             problems.append(f"{path} is protected and can only be changed by hand")
