@@ -69,7 +69,7 @@ jobs:
           apk=$(find app/src-tauri/gen/android -name '*.apk' | head -1)
           ls -l "$apk"
           unzip -l "$apk" | grep -E '\.so$|AndroidManifest'
-          for lib in libjarvis_app.so libsherpa-onnx-c-api.so libonnxruntime.so; do
+          for lib in libjarvis_app.so libsherpa-onnx-c-api.so libonnxruntime.so libc++_shared.so; do
             unzip -l "$apk" | grep -q "lib/${{ matrix.abi }}/$lib" || { echo "missing $lib"; exit 1; }
           done
       - name: Let the emulator use hardware acceleration

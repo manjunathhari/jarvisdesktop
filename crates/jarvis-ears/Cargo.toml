@@ -15,5 +15,7 @@ sherpa-onnx-sys = "=1.13.2"
 
 # SPIKE (slice 0): Android links sherpa-onnx's prebuilt shared libraries (SHERPA_ONNX_LIB_DIR).
 [target.'cfg(target_os = "android")'.dependencies]
+# The audio library's C++ part (oboe) needs the C++ runtime, shipped in the app as libc++_shared.so.
+cpal = { version = "0.15", features = ["oboe-shared-stdcxx"] }
 sherpa-onnx = { version = "=1.13.2", default-features = false, features = ["shared"] }
 sherpa-onnx-sys = { version = "=1.13.2", default-features = false, features = ["shared"] }
