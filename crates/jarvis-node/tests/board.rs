@@ -1243,3 +1243,35 @@ mod window {
         );
     }
 }
+
+mod links {
+    use jarvis_node::board::view::openable_link;
+
+    #[test]
+    fn only_a_plain_https_address_may_be_opened() {
+        assert!(openable_link("https://example.org/a?b=1#c"));
+        assert!(openable_link("HTTPS://Example.org"));
+        for bad in [
+            "",
+            "http://example.org",
+            "javascript:alert(1)",
+            "file:///C:/Windows/System32/calc.exe",
+            "C:\\Windows\\System32\\calc.exe",
+            "ms-settings:privacy",
+            "mailto:a@example.org",
+            "https://",
+            "https:///path",
+            "https://user:pw@example.org/",
+            "https://example.org@evil.example/",
+            "https://exa mple.org",
+            " https://example.org",
+            "https://example.org\n",
+            "https://example.org\\@evil.example",
+            "https://example.org/\u{0}",
+        ] {
+            assert!(!openable_link(bad), "{bad:?}");
+        }
+        let long = format!("https://example.org/{}", "a".repeat(2100));
+        assert!(!openable_link(&long));
+    }
+}

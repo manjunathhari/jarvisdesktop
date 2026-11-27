@@ -568,4 +568,32 @@ pub mod view {
             panels,
         }
     }
+
+    /// The longest address the Board will hand to the system browser.
+    pub const LINK_MAX: usize = 2048;
+
+    /// Whether a link clicked in a panel may be opened in the system browser. Panel content
+    /// is untrusted, and "open" on Windows runs whatever a string names (a program, a file,
+    /// a settings page), so only a plain web address passes: `https://`, then a host with no
+    /// name or password before it, and no space, control character or backslash anywhere.
+    pub fn openable_link(url: &str) -> bool {
+        if url.len() > LINK_MAX {
+            return false;
+        }
+        let Some(scheme) = url.get(..8) else {
+            return false;
+        };
+        if !scheme.eq_ignore_ascii_case("https://") {
+            return false;
+        }
+        if url
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+        {
+            return false;
+        }
+        let rest = &url[8..];
+        let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+        !host.is_empty() && !host.contains('@')
+    }
 }

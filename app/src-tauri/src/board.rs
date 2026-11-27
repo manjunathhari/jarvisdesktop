@@ -15,16 +15,20 @@
 //!   page has asked for its first snapshot are held and passed on then: an event sent to a
 //!   page that is not listening yet would be lost.
 //! - The commands are the window's only way to change anything: `board_set_state` (a click),
-//!   `board_clear_closed` (after the person confirms), `board_snapshot` and `board_open`.
+//!   `board_clear_closed` (after the person confirms), `board_snapshot`, `board_open` and
+//!   `board_open_link` (an `https:` link in a Text panel, opened in the system browser).
 //!   Without a node (the app is not in server mode) there is no Board: the snapshot is empty
 //!   and the other commands refuse.
 //! - The store does file work under a mutex, so it is only touched through `spawn_blocking`.
 
-use jarvis_node::board::view::{pick_placement, snapshot, BoardSnapshot, MonitorInfo, Placement};
+use jarvis_node::board::view::{
+    openable_link, pick_placement, snapshot, BoardSnapshot, MonitorInfo, Placement,
+};
 use jarvis_node::board::{BoardEvent, PanelState};
 use jarvis_node::node::NodeHandle;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow, Window, WindowEvent};
+use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 
 use crate::approvals::NodeSlot;
@@ -237,6 +241,19 @@ pub async fn board_clear_closed(node_slot: State<'_, NodeSlot>) -> Result<usize,
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// The person clicked a link in a Text panel: open it in the system browser. Panel content is
+/// untrusted, so the address is checked here whatever the page already checked.
+#[tauri::command]
+pub fn board_open_link(app: AppHandle, url: String) -> Result<(), String> {
+    if !openable_link(&url) {
+        tracing::warn!("the Board asked to open an address that is not a plain https one");
+        return Err("not_openable".to_owned());
+    }
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
