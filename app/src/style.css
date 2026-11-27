@@ -359,6 +359,7 @@ body[data-mode="mic_off"] #orb::after { opacity: 0; }
 
 #voicestatus { margin: 0.4rem 0 0; color: var(--ash); font-size: var(--s-1); }
 #voicestatus[hidden] { display: none; }
+#voicestatus .line { display: block; }
 #voiceretry {
   pointer-events: auto;
   font: 600 var(--s-1) var(--text);

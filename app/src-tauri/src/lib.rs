@@ -298,8 +298,8 @@ struct VoiceStatus {
     percent: u8,
 }
 
-/// The voice's latest status, for a page that started listening late. Off Windows there is
-/// no supervisor and the stand-in voice is always there: `ready`.
+/// The voice's latest status, for a page that started listening late. Without a supervisor:
+/// `unavailable` on Windows (no data folder), `ready` elsewhere (the stand-in voice).
 #[tauri::command]
 fn voice_status(supervisor: State<'_, VoiceSupervisor>) -> VoiceStatus {
     match supervisor.inner() {
@@ -310,8 +310,14 @@ fn voice_status(supervisor: State<'_, VoiceSupervisor>) -> VoiceStatus {
                 percent: status.percent(),
             }
         }
+        // Windows without a supervisor (no data folder): nothing can speak. Elsewhere the
+        // stand-in voice is always there.
         None => VoiceStatus {
-            state: "ready",
+            state: if cfg!(windows) {
+                "unavailable"
+            } else {
+                "ready"
+            },
             percent: 0,
         },
     }
@@ -689,6 +695,9 @@ pub fn run() {
                         }
                         prepare_ears(app_handle, ears, voice, models, jarvis, node, mode).await;
                     });
+                }
+                Err(e) if cfg!(windows) => {
+                    tracing::warn!(error = %e, "no data folder; JARVIS has no voice")
                 }
                 Err(e) => tracing::warn!(error = %e, "no data folder; using the stand-in voice"),
             }
