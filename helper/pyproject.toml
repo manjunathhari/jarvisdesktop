@@ -13,6 +13,7 @@ audio = ["pipecat-ai[local]==1.17.0"]
 [dependency-groups]
 dev = [
     "pytest>=8.3",
+    "pyinstaller>=6.11",
     "pytest-asyncio>=0.24",
     "ruff>=0.8",
 ]

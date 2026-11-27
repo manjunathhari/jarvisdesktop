@@ -422,3 +422,33 @@ async def test_runner_dying_after_ready_makes_the_loop_report_and_return_1():
     lines = [json.loads(line) for line in out]
     assert [m["type"] for m in lines] == ["ready", "error"]
     assert lines[1] == {"type": "error", "code": "internal", "message": "PipelineEnded"}
+
+
+def test_selftest_require_audio_lib_passes_when_pyaudio_imports(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "pyaudio", types.ModuleType("pyaudio"))
+    from jarvis_voice_helper import selftest
+
+    code = selftest.run(
+        tmp_path / "out.wav",
+        "m",
+        "v",
+        tts_factory=lambda _s: FakeTTS(seconds=1.0),
+        require_audio_lib=True,
+    )
+    assert code == 0
+
+
+def test_selftest_require_audio_lib_fails_when_pyaudio_is_missing(tmp_path, monkeypatch, capsys):
+    monkeypatch.setitem(sys.modules, "pyaudio", None)  # makes `import pyaudio` raise ImportError
+    from jarvis_voice_helper import selftest
+
+    code = selftest.run(
+        tmp_path / "out.wav",
+        "m",
+        "v",
+        tts_factory=lambda _s: FakeTTS(seconds=1.0),
+        require_audio_lib=True,
+    )
+    assert code == 1
+    assert "pyaudio" in capsys.readouterr().err
+    assert not (tmp_path / "out.wav").exists()

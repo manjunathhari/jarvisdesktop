@@ -1,0 +1,129 @@
+name: Voice helper
+# Tests the voice helper on Linux and Windows, freezes it with PyInstaller on Windows, proves the
+# FROZEN program can speak (its self-test), and publishes it as a release asset when a
+# voice-helper-v* tag is pushed.
+on:
+  push:
+    # `branches` must be listed too: with only `tags` set, branch pushes would not run at all.
+    # The paths filter applies to branch pushes only; a tag push runs whatever the paths are.
+    branches: ['**']
+    paths: ['helper/**', '.github/workflows/helper.yml']
+    tags: ['voice-helper-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  KOKORO_BASE: https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: helper
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+      - name: Linux deps for PyAudio
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y portaudio19-dev
+      - name: Install
+        run: uv sync --extra audio
+      - name: Lint
+        run: uv run ruff check
+      - name: Format
+        run: uv run ruff format --check
+      - name: Test
+        run: uv run pytest -q
+
+  freeze:
+    needs: test
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: helper
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: uv sync --extra audio
+      - name: Freeze
+        run: uv run pyinstaller jarvis-voice-helper.spec --noconfirm
+      - name: Cache Kokoro model files
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/kokoro
+          key: kokoro-onnx-v1.0
+      - name: Download Kokoro model files
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/kokoro"
+          for f in kokoro-v1.0.onnx voices-v1.0.bin; do
+            if [ ! -s "$RUNNER_TEMP/kokoro/$f" ]; then
+              curl -L --fail -o "$RUNNER_TEMP/kokoro/$f" "$KOKORO_BASE/$f"
+            fi
+          done
+          ls -l "$RUNNER_TEMP/kokoro"
+      - name: Self-test the frozen program
+        # Fails the job unless the frozen exe speaks and its sound library is bundled.
+        shell: bash
+        run: |
+          dist/jarvis-voice-helper/jarvis-voice-helper.exe --selftest "$RUNNER_TEMP/out.wav" \
+            --model "$RUNNER_TEMP/kokoro/kokoro-v1.0.onnx" \
+            --voices "$RUNNER_TEMP/kokoro/voices-v1.0.bin" \
+            --require-audio-lib
+      - name: Pack
+        shell: bash
+        run: |
+          tar -cjf jarvis-voice-helper-win-x64.tar.bz2 -C dist jarvis-voice-helper
+          tar -tjf jarvis-voice-helper-win-x64.tar.bz2 | grep -x 'jarvis-voice-helper/jarvis-voice-helper.exe'
+          sha=$(sha256sum jarvis-voice-helper-win-x64.tar.bz2 | cut -d' ' -f1)
+          size=$(stat -c %s jarvis-voice-helper-win-x64.tar.bz2)
+          {
+            echo "### jarvis-voice-helper-win-x64.tar.bz2"
+            echo ""
+            echo "- SHA-256: \`$sha\`"
+            echo "- Size: $size bytes"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "SHA-256: $sha"
+          echo "Size: $size bytes"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-voice-helper-win-x64
+          path: helper/jarvis-voice-helper-win-x64.tar.bz2
+          if-no-files-found: error
+
+  release:
+    needs: freeze
+    if: startsWith(github.ref, 'refs/tags/voice-helper-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: jarvis-voice-helper-win-x64
+      - name: Publish pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sha=$(sha256sum jarvis-voice-helper-win-x64.tar.bz2 | cut -d' ' -f1)
+          gh release create "$TAG" jarvis-voice-helper-win-x64.tar.bz2 \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
+            --title "JARVIS voice helper $TAG" \
+            --notes "Windows x64 build of the JARVIS voice helper.
+
+          SHA-256 of jarvis-voice-helper-win-x64.tar.bz2: $sha"

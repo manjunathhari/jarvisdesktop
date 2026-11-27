@@ -57,8 +57,18 @@ def run(
     model_path: str | Path,
     voices_path: str | Path,
     tts_factory: Callable[[Settings], FrameProcessor] = kokoro_tts,
+    require_audio_lib: bool = False,
 ) -> int:
-    """Speak PHRASE to `out_wav` (16-bit mono). Returns 0 if audible and long enough, else 1."""
+    """Speak PHRASE to `out_wav` (16-bit mono). Returns 0 if audible and long enough, else 1.
+
+    With `require_audio_lib` it also fails if the sound library (pyaudio) cannot be imported; it
+    only imports the module and never opens a device.
+    """
+    if require_audio_lib:
+        try:
+            import pyaudio  # noqa: F401
+        except ImportError as exc:
+            return _fail(f"the sound library (pyaudio) cannot be imported: {exc}")
     settings = Settings(VOICE, 1.0, str(model_path), str(voices_path), None)
     try:
         tts = tts_factory(settings)

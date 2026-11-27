@@ -226,6 +226,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--selftest", metavar="PATH", help="speak a test phrase into a WAV file")
     parser.add_argument("--model")
     parser.add_argument("--voices")
+    parser.add_argument(
+        "--require-audio-lib",
+        action="store_true",
+        help="with --selftest: also fail if the sound library (pyaudio) cannot be imported",
+    )
     args = parser.parse_args(argv)
 
     if args.selftest:
@@ -234,7 +239,9 @@ def main(argv: list[str] | None = None) -> int:
         configure_logging()
         from jarvis_voice_helper import selftest
 
-        return selftest.run(Path(args.selftest), args.model, args.voices)
+        return selftest.run(
+            Path(args.selftest), args.model, args.voices, require_audio_lib=args.require_audio_lib
+        )
 
     protocol_out = protect_stdout()
     configure_logging()
