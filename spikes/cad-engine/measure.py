@@ -255,10 +255,26 @@ def run(args: argparse.Namespace) -> dict:
         (out / "plan.png").write_bytes(png)
     results["render_png_bytes"] = len(png)
     results["render_is_png"] = png[:8] == b"\x89PNG\r\n\x1a\n"
+    if results["render_is_png"] and len(png) >= 24:
+        results["render_pixels"] = f"{int.from_bytes(png[16:20], 'big')} x {int.from_bytes(png[20:24], 'big')}"
 
     _, after_text, _ = call("inspect_drawing", {"entities": True, "limit": 50}, "inspect (after drawing)")
     (out / "inspect-after.json").write_text(after_text)
     after = entity_total(after_text)
+    results["inspect_after_excerpt"] = " ".join(after_text.split())[:900]
+    if "query_entities" in names:
+        _, listed_text, _ = call("query_entities", {"limit": 200}, "list entities")
+        (out / "entities.json").write_text(listed_text)
+        listed = as_json(listed_text)
+        rows = listed if isinstance(listed, list) else (listed.get("entities") if isinstance(listed, dict) else None)
+        if isinstance(rows, list):
+            kinds: dict[str, int] = {}
+            for row in rows:
+                kind = str(row.get("type") or row.get("kind") or "?") if isinstance(row, dict) else "?"
+                kinds[kind] = kinds.get(kind, 0) + 1
+            results["entity_kinds"] = kinds
+        else:
+            results["entities_excerpt"] = " ".join(listed_text.split())[:600]
     results["entities_before"] = before
     results["entities_after"] = after
     results["geometry_calls_ok"] = sum(geometry_ok)
@@ -269,6 +285,9 @@ def run(args: argparse.Namespace) -> dict:
         for word in ("text", "dim"):
             _, listing, _ = call("list_commands", {"filter": word}, f"list commands matching '{word}'")
             (out / f"commands-{word}.json").write_text(listing)
+            found = as_json(listing)
+            if isinstance(found, list):
+                results.setdefault("command_ids", {})[word] = [str(c.get("id")) for c in found if isinstance(c, dict)][:25]
 
     saved = {}
     for ext in ("dxf", "svg", "pdf"):
@@ -338,6 +357,13 @@ def summary(results: dict, facts: dict) -> str:
     lines.append(f"- Tools offered: {', '.join(str(n) for n in results.get('tools', [])) or 'none'}")
     lines.append(f"- Geometry calls that worked: {results.get('geometry_calls_ok')} of 3; text typed: {results.get('text_typed_ok')}; dimension typed: {results.get('dimension_typed_ok')}")
     lines.append(f"- Entities before, after, reopened: {results.get('entities_before')}, {results.get('entities_after')}, {results.get('entities_reopened')}")
+    lines.append(f"- Entity kinds listed after drawing: {results.get('entity_kinds', results.get('entities_excerpt', 'not listed'))}")
+    lines.append(f"- Rendered PNG: {results.get('render_png_bytes')} bytes, {results.get('render_pixels', 'size unknown')} pixels")
+    lines.append(f"- Command ids matching 'text' and 'dim': {results.get('command_ids', 'not listed')}")
+    lines.append(f"- Reply when the saved DXF was reopened: {' '.join(str(results.get('reopen_reply', '')).split())[:300]}")
+    lines.append(f"- Drawing summary after drawing (start of the reply): {results.get('inspect_after_excerpt', '')}")
+    for failure in results.get("start_failures", []):
+        lines.append(f"- Start with folder limits = {failure.get('folder_limits')} failed, exit {failure.get('exit')}: {' / '.join(failure.get('stderr', []))[:500]}")
     lines.append(f"- Saved file sizes in bytes: {results.get('saved_bytes')}")
     lines.append(f"- One-shot sample render under trace: {facts.get('oneshot_note', 'not run')}")
     lines += ["", "### Steps", "", "| Step | Worked | Seconds | Note |", "|---|---|---|---|"]
