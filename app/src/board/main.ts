@@ -3,9 +3,16 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Conversation, conversationModel, renderConversation, renderTyping } from "./conversation";
 import { fillBody, LINK_REFUSED } from "./frames";
 import { tile } from "./layout";
-import { BoardModel, type BoardEvent, type BoardSnapshot, type PanelState } from "./model";
+import {
+  BoardModel,
+  type BoardEvent,
+  type BoardSnapshot,
+  type ConversationEntry,
+  type PanelState,
+} from "./model";
 import { formatRupees, renderClosed, renderDock, renderPanel } from "./panels";
 import { Receipts } from "./receipts";
 
@@ -24,6 +31,9 @@ const mounted = new Map<string, Mounted>();
 const receipts = new Receipts();
 
 let model = new BoardModel([]);
+let talk = new Conversation([]);
+/// What the Conversation column was last built from (lines and panel titles).
+let talkBuiltFor = "";
 /// What the shelf (dock and closed list) was last built from. It is rebuilt only when that
 /// changes, so a redraw for any other reason never wipes an open "Clear closed panels?".
 let shelfBuiltFor = "";
@@ -156,9 +166,42 @@ function draw() {
       renderClosed(model.closed(), actions),
     );
   }
+  drawTalk(); // panel titles may have changed
   const docked = model.docked().length;
   $("counts").textContent = `${inView.length} open` + (docked ? `, ${docked} minimised` : "");
   $("spend").textContent = `Today: ${formatRupees(model.spendTodayPaise(new Date()))}`;
+}
+
+/// A panel's button in the Conversation column: bring that panel back if it is put away,
+/// and point at it.
+function showFromTalk(id: string) {
+  const panel = model.get(id);
+  if (!panel) return;
+  if (panel.state === "minimised" || panel.state === "closed") void setState(id, "open");
+  uncover(id);
+  model.focused = id;
+  pointAt(id);
+}
+
+function drawTalk() {
+  const turns = conversationModel(talk.entries(), model.all());
+  const built = JSON.stringify(turns);
+  if (built === talkBuiltFor) return;
+  talkBuiltFor = built;
+  const column = $("talk");
+  column.replaceChildren(renderConversation(turns, { onPanel: showFromTalk }));
+  const aside = $("conversation");
+  aside.scrollTop = aside.scrollHeight; // the newest line in sight
+}
+
+async function say(text: string) {
+  try {
+    await invoke("board_say", { text });
+    problem(null);
+  } catch (e) {
+    problem("That could not be sent.");
+    throw e;
+  }
 }
 
 /// Bring the panel Jarvis pointed at into sight and mark it for a moment.
@@ -192,6 +235,9 @@ async function load() {
   try {
     const snapshot = await invoke<BoardSnapshot>("board_snapshot");
     model = new BoardModel(snapshot.panels);
+    const stored = new Conversation(snapshot.conversation);
+    for (const entry of talk.entries()) stored.add(entry); // lines that came while loading
+    talk = stored;
     // A store that somehow holds two maximised panels: the newest keeps it.
     const top = model.inView().find((p) => p.state === "maximised");
     if (top) for (const other of model.covering(top.panel_id)) model.setState(other, "open");
@@ -206,6 +252,10 @@ async function load() {
 }
 
 document.addEventListener(LINK_REFUSED, () => problem("That link could not be opened."));
+$("typing").replaceChildren(renderTyping({ onSay: say }));
 await listen<BoardEvent>("jarvis://board", (e) => onEvent(e.payload));
+await listen<ConversationEntry>("jarvis://board-talk", (e) => {
+  if (talk.add(e.payload)) drawTalk();
+});
 await load();
 new ResizeObserver(() => layout()).observe(area);

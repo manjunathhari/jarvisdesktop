@@ -25,5 +25,6 @@ pub mod session;
 pub mod sign;
 pub mod speech;
 pub mod state;
+pub mod talk;
 pub mod trust;
 pub mod wire;

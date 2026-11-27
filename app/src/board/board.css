@@ -496,3 +496,87 @@ iframe.canvas {
   background: var(--surface);
   color-scheme: dark;
 }
+
+/* The Conversation column */
+#conversation {
+  display: flex;
+  flex-direction: column;
+}
+
+#talk {
+  flex: 1;
+}
+
+.turns {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.turns li {
+  margin: 0 0 14px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+}
+
+.turns li.person {
+  margin-left: 28px;
+  background: var(--surface-2);
+  border-color: var(--line-2);
+}
+
+.turns .head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.turns .said {
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.turns .marker {
+  display: block;
+  max-width: 100%;
+  margin-top: 8px;
+  color: var(--accent);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.typing {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 10px;
+  background: var(--surface);
+}
+
+.typing label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.typing input {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.typing input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

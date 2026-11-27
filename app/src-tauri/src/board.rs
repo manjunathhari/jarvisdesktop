@@ -18,6 +18,9 @@
 //! - The commands are the window's only way to change anything: `board_set_state` (a click),
 //!   `board_clear_closed` (after the person confirms), `board_snapshot`, `board_open` and
 //!   `board_open_link` (an `https:` link in a Text panel, opened in the system browser).
+//! - **The conversation.** What was heard, typed and spoken is recorded for the Conversation
+//!   column by `jarvis_node::talk` ([`heard`], [`typed`], [`spoke`]); `board_say` (in
+//!   `lib.rs`, beside `say`) is the column's box for typing instead of speaking.
 //! - **Canvas panels.** Their pages are untrusted and are never served by the app itself: the
 //!   window gets an address on the loopback Canvas server (`board_canvas_address`) for a
 //!   sandboxed frame, and asks `board_canvas_served` before reporting one drawn.
@@ -30,7 +33,8 @@ use jarvis_node::board::view::{
 };
 use jarvis_node::board::{BoardEvent, PanelState};
 use jarvis_node::node::NodeHandle;
-use std::sync::Mutex;
+use jarvis_node::talk::Recorder;
+use std::sync::{Mutex, OnceLock};
 use tauri::{
     AppHandle, Emitter, Manager, State, WebviewWindow, WebviewWindowBuilder, Window, WindowEvent,
 };
@@ -47,6 +51,43 @@ const NO_BOARD: &str = "The Board needs the Jarvis server.";
 static HELD: Mutex<Option<Vec<BoardEvent>>> = Mutex::new(Some(Vec::new()));
 /// More than this before the page is ready and the oldest wait for their timeout instead.
 const HELD_MAX: usize = 64;
+
+/// The Conversation column's event: one line of the conversation, already in the store.
+pub const TALK_EVENT: &str = "jarvis://board-talk";
+/// The conversation recorder, once the node (whose store it writes to) is running.
+static RECORDER: OnceLock<Recorder> = OnceLock::new();
+
+/// Start keeping the conversation for the Board (`jarvis_node::talk`). Each line goes to the
+/// store first and then to the window; a line the window missed is in its next snapshot.
+pub fn start_recorder(app: &AppHandle, node: &NodeHandle) {
+    let app = app.clone();
+    let _ = RECORDER.set(Recorder::start(node.board(), move |entry| {
+        if let Err(e) = app.emit_to(WINDOW, TALK_EVENT, entry.clone()) {
+            tracing::warn!(error = %e, "couldn't pass a line of the conversation to the Board");
+        }
+    }));
+}
+
+/// The person said this (heard by the microphone, or typed: see [`typed`]).
+pub fn heard(text: &str) {
+    if let Some(recorder) = RECORDER.get() {
+        recorder.heard(text);
+    }
+}
+
+/// This text is about to be handed on as an utterance, and it was typed.
+pub fn typed(text: &str) {
+    if let Some(recorder) = RECORDER.get() {
+        recorder.typed(text);
+    }
+}
+
+/// Jarvis said this aloud.
+pub fn spoke(text: &str) {
+    if let Some(recorder) = RECORDER.get() {
+        recorder.spoke(text);
+    }
+}
 
 fn node(slot: &NodeSlot) -> Option<NodeHandle> {
     slot.lock().ok().and_then(|n| n.clone())
@@ -174,6 +215,11 @@ pub fn open_at_start(app: &AppHandle) {
 pub fn on_event(app: &AppHandle, event: BoardEvent) -> tauri::Result<()> {
     if !matches!(event, BoardEvent::State { .. }) {
         ensure_open(app);
+    }
+    if let (BoardEvent::Show(panel) | BoardEvent::Update(panel), Some(recorder)) =
+        (&event, RECORDER.get())
+    {
+        recorder.panel_shown(panel.panel_id);
     }
     let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(waiting) = held.as_mut() {

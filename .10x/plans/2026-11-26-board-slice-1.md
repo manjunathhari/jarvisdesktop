@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-*Status: approved by Manj on 26 Nov 2026, with the seven changes below. Tasks 1 to 8 are built on branch `board-slice-1` and independently reviewed, with the reviews' fixes applied; the branch is pushed through Task 7 and passes CI on Windows and Linux (nothing merged or deployed). Task 9 is not started. Repo `manjunathhari/jarvisdesktop`, `main` = `983c2cf`.*
+*Status: approved by Manj on 26 Nov 2026, with the seven changes below. Tasks 1 to 8 are built on branch `board-slice-1` and independently reviewed, with the reviews' fixes applied; the branch is pushed through Task 8 and passes CI on Windows and Linux (nothing merged or deployed). Task 9's code is built; its live check on Manj's PC (Step 6) is what remains. Repo `manjunathhari/jarvisdesktop`, `main` = `983c2cf`.*
 
 **Goal:** Manj asks by voice; Jarvis answers briefly, does the work, and shows the result as a panel on a Board window on monitor 2, with a running conversation and minimise, maximise and close on every panel, by click or by voice.
 
@@ -330,6 +330,16 @@ As in Plan B: contracts and the spec own shared interfaces. If the code shows a 
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run everything:** the full server suite with the probe built, `cargo test --workspace`, clippy, `npx vitest run`, `npm run build`. Expected: PASS. Existing tests for the orb, reply line, news wall and approvals are unchanged and green.
 - [ ] **Step 5: Commit:** `desktop: Conversation frame; Board end-to-end tests`.
+**As built (code part):**
+- The recording is `crates/jarvis-node/src/talk.rs` (`Recorder::start(store, on_entry)`, `heard`, `typed`, `spoke`, `panel_shown`; `TEXT_MAX = 2000`), tested in `tests/talk.rs`, because the app crate cannot be tested off Windows. One worker thread writes each line to the store and then hands it to the window (event `jarvis://board-talk`). The app calls it where it already shows what was heard and speaks (`TauriUi::emit`, `speak_locally`), and when a panel is shown.
+- A typed line is marked by its text: `typed(text)` just before it is handed on; the mark is used once, for that text only.
+- `app/src/board/conversation.ts`: `Conversation` (the page's lines, 300 at most, no line twice), `conversationModel(entries, panels) -> Turn[]` (Jarvis's sentences within 15 s of each other are one turn; a turn names the panels its lines brought that the Board still has), `renderConversation`, `renderTyping` ("Type instead of speaking", 500 characters). All words are shown as text.
+- New command `board_say(text)`, the same code as `say`.
+- **Each window may call only its own commands** (moved here from Task 6): `build.rs` declares every command (`AppManifest::commands`), `capabilities/default.json` allows the main window its 14 and `capabilities/board.json` allows the Board its 8. `crates/jarvis-node/tests/app_permissions.rs` checks the lists against `generate_handler!` and against what each window's pages call. Whether the app honours it is first seen in the live check.
+- **Not built: the "Jarvis is working…" line.** The step above assumed the desktop can tell that a reply queued Board work. Nothing on the wire says so (the acknowledgement is an ordinary spoken reply, in Jarvis's own words), and guessing from wording would be wrong some of the time. It needs one small addition to the contracts (for example the server telling the desktop "a Board job has started / ended"), which is Manj's decision under the operating rule.
+- No new end-to-end test in `test_rust_node_board.py`: the conversation is recorded by the app, not by the probe. The restart is tested at the recorder (`the_conversation_is_back_after_a_restart`) and the store.
+- Checked: 67 front-end tests; the node crate's tests, clippy and format; the whole server suite with the real node (1,474 passed, 2 skipped).
+
 - [ ] **Step 6: Live check on Manj's PC, by hand, each server step with his approval.** Order: install the desktop build first (it understands `board.*`), then deploy the server (migration 0016).
   1. With two monitors, the Board opens on monitor 2; with one, as a normal window. Closing it leaves JARVIS running.
   2. A fictional request for a comparison: acknowledgement within 3 s, a Text panel with sources, then the headline. The server shows the panel as rendered.
@@ -340,6 +350,8 @@ As in Plan B: contracts and the spec own shared interfaces. If the code shows a 
   7. Restart the app: panels and conversation are back.
   8. Orb, "Hey Jarvis", the reply line, the news wall and a test-folder delete with approval all work as before.
   9. Record the cost of steps 2, 3 and 5 from the Board's top bar, for Manj.
+  10. Every button and key of the main window still works (each window is now limited to its own commands; a slip shows as a button that does nothing): tap, typing, F11, Esc, F9, the news wall's next channel, an approval card, the status line, first-run key and enrol screens if reachable.
+  11. The Canvas seal checklist, `.10x/reviews/2026-11-27-board-canvas-hostile-page.md` (11 steps, console build).
 
 ---
 

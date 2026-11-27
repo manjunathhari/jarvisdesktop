@@ -49,6 +49,24 @@ The status line at the bottom right shows the link. In server mode the Anthropic
 
 Deletes only ever go to the Recycle Bin, only from `test_folder`, and only after you approve the card (tap, or say "approve" when one card is showing).
 
+## The Board
+
+In server mode JARVIS has a second window, the Board, for anything worth looking at: an answer written out, a comparison, a chart. Ask for something to be shown, looked up, compared or drawn. Jarvis answers at once, does the work on the server, puts a panel on the Board, and then says one sentence about it.
+
+- **Where it opens.** With two monitors, full screen on the one JARVIS is not on, when the app starts. With one monitor, as an ordinary window when a panel arrives. **F9** in the JARVIS window opens it at any time. Closing the Board only hides it.
+- **Panels.** A *text* panel is formatted writing; a *canvas* panel is a small page Jarvis draws. Each has Minimise, Maximise and Close, by click or by voice ("minimise the chart", "bring back the comparison"). Minimised panels wait in the dock; closed ones are listed under Recently closed. Nothing is deleted on the server.
+- **Conversation.** The left column shows what you said and what Jarvis said, with a button for each panel a reply brought. You can type there instead of speaking.
+- **Spend.** The top bar shows what today's panels cost. Every Board request counts against the monthly cap.
+- **After a restart** the panels and the conversation are back as they were.
+
+What Jarvis puts on the Board is treated as untrusted, because it is partly written from web pages:
+
+- In a text panel, HTML is shown as text, no image is loaded, and only a plain `https` link is a link. It shows its real address, and a click opens your browser after the app has checked the address again.
+- A canvas page is served from a small server on this PC only and shown in a sealed frame. It cannot reach the network, the app, your files or the other panels, and the Board window is muted. `.10x/reviews/2026-11-27-board-canvas-hostile-page.md` describes the seal and how it is checked.
+- Each window can call only its own commands of the app.
+
+Tests for the page: `cd app && npx vitest run`.
+
 The Rust node's end-to-end tests run against the real server code:
 
 ```bash

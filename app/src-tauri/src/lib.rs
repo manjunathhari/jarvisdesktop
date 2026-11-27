@@ -67,6 +67,7 @@ impl Ui for TauriUi {
         let r = match ev {
             UiEvent::Screen(v) => app.emit("jarvis://screen", v),
             UiEvent::Speak(s) => {
+                board::spoke(&s);
                 self.clock.speaking();
                 let _ = app.emit("jarvis://caption", &s);
                 match self.voice.lock().ok().as_deref().and_then(Option::as_ref) {
@@ -84,6 +85,7 @@ impl Ui for TauriUi {
                 app.emit("jarvis://stop_speaking", ())
             }
             UiEvent::Heard(s) => {
+                board::heard(&s);
                 self.clock.heard();
                 app.emit("jarvis://heard", s)
             }
@@ -138,18 +140,44 @@ fn say(
     voice: State<'_, VoiceSlot>,
     app: AppHandle,
 ) {
+    say_text(text, &jarvis, &node, &voice, &app);
+}
+
+/// The Board's "Type instead of speaking" box: exactly what `say` does. Its own command so
+/// that the Board window can be allowed this and not the main window's `say`.
+#[tauri::command]
+fn board_say(
+    text: String,
+    jarvis: State<'_, Handle>,
+    node: State<'_, approvals::NodeSlot>,
+    voice: State<'_, VoiceSlot>,
+    app: AppHandle,
+) {
+    say_text(text, &jarvis, &node, &voice, &app);
+}
+
+/// A typed line, from either window.
+fn say_text(
+    text: String,
+    jarvis: &Handle,
+    node: &approvals::NodeSlot,
+    voice: &VoiceSlot,
+    app: &AppHandle,
+) {
     // Typed stand-in for the microphone until Milestone B; length-capped.
     let text: String = text.chars().take(500).collect();
-    let (app, voice) = (app.clone(), voice.inner().clone());
-    if approvals::take_spoken_decision(&node, &text, move |line| speak_locally(&app, &voice, line))
-    {
+    let (app, voice) = (app.clone(), voice.clone());
+    if approvals::take_spoken_decision(node, &text, move |line| speak_locally(&app, &voice, line)) {
         return;
     }
+    // For the Board's conversation: this line, when it is heard, was typed.
+    board::typed(&text);
     jarvis.send(Event::Utterance(text));
 }
 
 /// Say a line in George's voice (or the stand-in), outside the coordinator.
 fn speak_locally(app: &AppHandle, voice: &VoiceSlot, text: &str) {
+    board::spoke(text);
     let _ = app.emit("jarvis://caption", text);
     match voice.lock().ok().as_deref().and_then(Option::as_ref) {
         Some(v) => v.speak(text),
@@ -582,7 +610,9 @@ pub fn run() {
             board::create(app.handle());
             // The Board (slice 1) is the server's: it opens only when the node runs, and by
             // itself only on a monitor of its own.
-            if node.lock().ok().is_some_and(|n| n.is_some()) {
+            let running = node.lock().ok().and_then(|n| n.clone());
+            if let Some(running) = running {
+                board::start_recorder(app.handle(), &running);
                 board::open_at_start(app.handle());
             }
             app.manage(node.clone());
@@ -636,7 +666,8 @@ pub fn run() {
             board::board_open,
             board::board_open_link,
             board::board_canvas_address,
-            board::board_canvas_served
+            board::board_canvas_served,
+            board_say
         ])
         .on_window_event(board::on_window_event)
         .run(tauri::generate_context!())
