@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 import struct
 import sys
@@ -248,7 +249,17 @@ def test_pyaudio_is_not_imported_with_the_module():
         "assert 'pyaudio' not in sys.modules and "
         "'pipecat.transports.local.audio' not in sys.modules"
     )
-    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,  # run() kills the child on timeout
+            env={**os.environ, "JARVIS_HELPER_DEBUG_STACKS": "20"},
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"child timed out after 30 s\nstdout: {exc.stdout!r}\nstderr: {exc.stderr!r}")
     assert done.returncode == 0, done.stderr
 
 

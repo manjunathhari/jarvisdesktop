@@ -39,6 +39,7 @@ ignore = ["S101"]  # assert is fine in tests
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+faulthandler_timeout = 120
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 pythonpath = ["."]
