@@ -111,6 +111,14 @@ def local_output(settings: Settings) -> FrameProcessor:
         raise NoOutputDevice(f"cannot open the sound output ({type(exc).__name__})") from exc
 
 
+async def _reap(task: asyncio.Task[None]) -> None:
+    """Cancel a runner task and retrieve its outcome so asyncio never reports it as lost."""
+    task.cancel()
+    await asyncio.wait({task}, timeout=CLOSE_TIMEOUT_SECS)
+    if task.done() and not task.cancelled():
+        task.exception()
+
+
 class PipecatSpeaker:
     """Speaks queued text. `say` and `stop` only queue frames and return at once."""
 
@@ -126,6 +134,7 @@ class PipecatSpeaker:
         self._sink_factory = sink_factory
         self._worker: PipelineWorker | None = None
         self._runner_task: asyncio.Task[None] | None = None
+        self._closing = False
 
     async def start(self, settings: Settings) -> None:
         tts = self._tts_factory(settings)
@@ -150,9 +159,21 @@ class PipecatSpeaker:
         finally:
             waiter.cancel()
         if not started.is_set():
-            runner_task.cancel()
+            await _reap(runner_task)
             raise RuntimeError("speech pipeline did not start")
         self._worker, self._runner_task = worker, runner_task
+
+    async def wait_failure(self) -> str:
+        """Return the reason (an exception class name, never text) once the pipeline has ended
+        without `close()` having been called. Never returns if `close()` ends it."""
+        task = self._runner_task
+        if task is None:
+            await asyncio.Event().wait()
+        await asyncio.wait({task})
+        if self._closing:
+            await asyncio.Event().wait()
+        exc = None if task.cancelled() else task.exception()
+        return type(exc).__name__ if exc else "PipelineEnded"
 
     async def say(self, turn: int, text: str) -> None:
         if self._worker is None:
@@ -166,6 +187,7 @@ class PipecatSpeaker:
 
     async def close(self) -> None:
         worker, task = self._worker, self._runner_task
+        self._closing = True
         self._worker = self._runner_task = None
         if worker is None or task is None:
             return

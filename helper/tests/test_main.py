@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -36,6 +37,8 @@ class FakeSpeaker:
         self.start_error = start_error
         self.events = []
         self.said = []
+        self.failed = asyncio.Event()
+        self.failure = "PipelineEnded"
 
     async def start(self, settings):
         self.events.append("start")
@@ -49,6 +52,10 @@ class FakeSpeaker:
 
     async def stop(self):
         self.events.append("stop")
+
+    async def wait_failure(self):
+        await self.failed.wait()
+        return self.failure
 
     async def close(self):
         self.events.append("close")
@@ -177,3 +184,34 @@ async def test_internal_error_message_is_the_class_name_only(where):
     error = json.loads(out[-1])
     assert error["code"] == "internal" and error["message"] == "ValueError"
     assert all(secret not in line for line in out)
+
+
+async def test_speaker_failing_while_running_reports_once_and_returns_1():
+    out, holder = [], []
+
+    class Blocking:
+        def __aiter__(self):
+            return self._gen()
+
+        async def _gen(self):
+            yield HELLO + "\n"
+            holder[0].failure = "OSError"
+            holder[0].failed.set()
+            await asyncio.Event().wait()
+
+    def factory(on_speaking):
+        holder.append(FakeSpeaker(on_speaking))
+        return holder[0]
+
+    code = await asyncio.wait_for(run(Blocking(), out.append, factory), 5)
+    lines = [json.loads(x) for x in out]
+    assert code == 1 and [m["type"] for m in lines] == ["ready", "error"]
+    assert lines[1]["code"] == "internal" and lines[1]["message"] == "OSError"
+    assert holder[0].events == ["start", "close"]
+
+
+async def test_shutdown_and_end_of_file_still_return_0_without_an_error_line():
+    for tail in (['{"type":"shutdown"}'], []):
+        code, out, sp = await drive([HELLO, *tail])
+        assert code == 0 and [m["type"] for m in out] == ["ready"]
+        assert sp.events == ["start", "close"]

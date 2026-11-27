@@ -27,12 +27,14 @@ class FakeTTS(TTSService):
     Sentence n uses the level LEVELS[n], so the order is visible in the audio.
     """
 
-    def __init__(self, seconds=0.5, scale=1.0):
+    def __init__(self, seconds=0.5, scale=1.0, silent_word=None):
+        self.silent_word = silent_word
         self.seconds = seconds
         self.scale = scale
         super().__init__(
             push_start_frame=True,
             push_stop_frames=True,
+            stop_frame_timeout_s=0.3,
             settings=TTSSettings(model=None, voice="fake", language=None),
         )
         self.sentences = []
@@ -42,6 +44,8 @@ class FakeTTS(TTSService):
 
     async def run_tts(self, text, context_id):
         for sentence in re.split(r"(?<=[.!?])\s+", text.strip()):
+            if self.silent_word and self.silent_word in sentence:
+                continue  # a sentence the voice cannot speak: no audio at all
             level = int(LEVELS[len(self.sentences) % len(LEVELS)] * self.scale)
             self.sentences.append(sentence)
             half = [level if (i // 24) % 2 else -level for i in range(int(RATE * self.seconds))]
@@ -56,7 +60,8 @@ class FakeTTS(TTSService):
 class CollectingSink(BaseOutputTransport):
     """Stands in for the sound device: records each chunk with its arrival time."""
 
-    def __init__(self, seconds=0.5, scale=1.0):
+    def __init__(self, seconds=0.5, scale=1.0, silent_word=None):
+        self.silent_word = silent_word
         self.seconds = seconds
         self.scale = scale
         super().__init__(TransportParams(audio_out_enabled=True, audio_out_sample_rate=RATE))
@@ -287,3 +292,133 @@ def test_selftest_with_missing_model_fails_without_downloading(tmp_path, capsys)
     code = selftest.run(tmp_path / "o.wav", tmp_path / "no.onnx", tmp_path / "no.bin")
     assert code == 1 and "not found" in capsys.readouterr().err
     assert not (tmp_path / "o.wav").exists() and not (tmp_path / "no.onnx").exists()
+
+
+async def test_a_sentence_with_no_audio_is_not_logged_at_warning_or_above():
+    from io import StringIO
+
+    from jarvis_voice_helper.main import configure_logging
+
+    phrase = "Zanzibar quokka umbrella"
+    production, raw = StringIO(), []
+    configure_logging(production)  # the same level and filter as the helper uses
+    raw_id = logger.add(raw.append, level="WARNING")
+    events = []
+    sink = CollectingSink()
+    speaker = PipecatSpeaker(
+        lambda on, turn: events.append((on, turn)),
+        tts_factory=lambda _s: FakeTTS(silent_word="Zanzibar"),
+        sink_factory=lambda _s: sink,
+    )
+    try:
+        await speaker.start(SETTINGS)
+        await speaker.say(1, f"{phrase}.")
+        await asyncio.sleep(1.5)
+        await speaker.say(2, "Spoken sentence.")
+        await wait_for(lambda: (False, 2) in events)
+        await speaker.close()
+    finally:
+        logger.remove(raw_id)
+    assert any(phrase in str(m) for m in raw), "unfiltered, Pipecat does log it at WARNING"
+    assert phrase not in production.getvalue()
+
+
+def test_pipecat_error_records_are_scrubbed_but_other_errors_are_kept():
+    from io import StringIO
+
+    from jarvis_voice_helper.main import configure_logging
+
+    out = StringIO()
+    configure_logging(out)
+    secret = "the secret sentence"
+    from_pipecat = logger.patch(lambda r: r.update(name="pipecat.services.ai_service"))
+    from_pipecat.error(f"exception processing TTSSpeakFrame(text={secret})")
+    from_pipecat.warning(secret)
+    from_pipecat.debug(secret)
+    logger.error("helper's own error")
+    text = out.getvalue()
+    assert secret not in text and "helper's own error" in text
+    assert text.count("message withheld") == 2  # the pipecat error and warning, not the debug
+
+
+class RaisingRunner:
+    def __init__(self, **_kwargs):
+        pass
+
+    async def add_workers(self, *_workers):
+        pass
+
+    async def run(self):
+        raise RuntimeError("the runner died")
+
+
+class StuckRunner(RaisingRunner):
+    async def run(self):
+        await asyncio.Event().wait()
+
+
+async def _lost_task_errors(monkeypatch, **patches):
+    import gc
+
+    from jarvis_voice_helper import pipeline
+
+    for name, value in patches.items():
+        monkeypatch.setattr(pipeline, name, value)
+    lost = []
+    asyncio.get_running_loop().set_exception_handler(lambda _loop, ctx: lost.append(ctx))
+    speaker = PipecatSpeaker(
+        lambda on, turn: None,
+        tts_factory=lambda _s: FakeTTS(),
+        sink_factory=lambda _s: CollectingSink(),
+    )
+    with pytest.raises(RuntimeError):
+        await speaker.start(SETTINGS)
+    gc.collect()
+    await asyncio.sleep(0.1)
+    gc.collect()
+    return lost
+
+
+async def test_failing_start_leaves_no_unretrieved_task_exception(monkeypatch):
+    lost = await _lost_task_errors(monkeypatch, WorkerRunner=RaisingRunner)
+    assert lost == []
+
+
+async def test_start_timeout_leaves_no_unretrieved_task_exception(monkeypatch):
+    lost = await _lost_task_errors(monkeypatch, WorkerRunner=StuckRunner, START_TIMEOUT_SECS=0.2)
+    assert lost == []
+
+
+async def test_runner_dying_after_ready_makes_the_loop_report_and_return_1():
+    import json
+
+    from jarvis_voice_helper import protocol
+    from jarvis_voice_helper.main import run
+    from jarvis_voice_helper.protocol import Hello
+
+    holder, out = [], []
+
+    class OpenReader:
+        def __aiter__(self):
+            return self._gen()
+
+        async def _gen(self):
+            yield protocol.encode(Hello(protocol=1, settings=SETTINGS)) + "\n"
+            await holder[0]._worker.cancel()  # Pipecat ends the pipeline under the helper
+            await asyncio.Event().wait()
+
+    def factory(on_speaking):
+        holder.append(
+            PipecatSpeaker(
+                on_speaking,
+                tts_factory=lambda _s: FakeTTS(),
+                sink_factory=lambda _s: CollectingSink(),
+            )
+        )
+        return holder[0]
+
+    code = await asyncio.wait_for(run(OpenReader(), out.append, factory), 20)
+    assert code == 1
+    lines = [json.loads(line) for line in out]
+    assert [m["type"] for m in lines] == ["ready", "error"]
+    assert lines[1] == {"type": "error", "code": "internal", "message": "PipelineEnded"}

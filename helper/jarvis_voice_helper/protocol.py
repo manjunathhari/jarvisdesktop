@@ -161,4 +161,11 @@ class Speaker(Protocol):
 
     async def stop(self) -> None: ...
 
+    async def wait_failure(self) -> str:
+        """Return an exception class name (never text) if the speaker dies while running.
+
+        Never returns while the speaker works, or after `close()` has been called.
+        """
+        ...
+
     async def close(self) -> None: ...

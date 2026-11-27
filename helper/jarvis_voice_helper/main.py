@@ -72,8 +72,24 @@ async def run(reader: AsyncIterable[str], writer: Writer, speaker_factory: Speak
         return _fail(writer, INTERNAL, type(exc).__name__, 1)
     writer(protocol.encode(Ready(voice=hello.settings.voice)))
 
+    failure = asyncio.create_task(speaker.wait_failure())
+
+    async def next_line() -> str:
+        return await anext(lines)
+
     try:
-        async for raw in lines:
+        while True:
+            pending = asyncio.create_task(next_line())
+            await asyncio.wait({pending, failure}, return_when=asyncio.FIRST_COMPLETED)
+            if failure.done():
+                pending.cancel()
+                reason = failure.result()
+                await _close_quietly(speaker)
+                return _fail(writer, INTERNAL, reason, 1)
+            try:
+                raw = pending.result()
+            except StopAsyncIteration:
+                break
             msg = protocol.parse(raw.strip())
             if isinstance(msg, Shutdown):
                 break
@@ -82,8 +98,10 @@ async def run(reader: AsyncIterable[str], writer: Writer, speaker_factory: Speak
             elif isinstance(msg, Stop):
                 await speaker.stop()
     except Exception as exc:
+        failure.cancel()
         await _close_quietly(speaker)
         return _fail(writer, INTERNAL, type(exc).__name__, 1)
+    failure.cancel()
     await speaker.close()
     return 0
 
@@ -154,12 +172,47 @@ def protect_stdout() -> BinaryIO:
     return protocol_out
 
 
+WARNING_NO = 30  # loguru's severity number for WARNING
+
+
+_FORMAT = (
+    "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - "
+    "{message}\n{exception}"
+)
+_WITHHELD = (
+    "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - "
+    "(message withheld: it may contain spoken text)\n"
+)
+
+
+def _is_pipecat(record) -> bool:
+    return record["name"].startswith("pipecat")
+
+
+def _keep(record) -> bool:
+    """Pipecat's DEBUG logs hold the spoken text, so its records below WARNING are dropped."""
+    return not (_is_pipecat(record) and record["level"].no < WARNING_NO)
+
+
+def _format(record) -> str:
+    """Pipecat's WARNING and ERROR messages can carry the spoken text.
+
+    Examples in 1.17.0: tts_service "not speaking [{text}]" and "produced no audio, not adding
+    [{dropped_text}]" (WARNING); ai_service "exception processing {frame}" and the pipeline
+    worker's "Something went wrong: {frame}" (frames and exceptions that hold the text). From
+    WARNING up only where a Pipecat call came from is kept: never its message or traceback.
+    """
+    return _WITHHELD if _is_pipecat(record) else _FORMAT
+
+
 def configure_logging(stream=None) -> None:
-    """Logs go to stderr at INFO or above. What is spoken is only ever logged at DEBUG."""
+    """Logs go to stderr at INFO or above, and what is spoken is never in them."""
     from loguru import logger
 
     logger.remove()
-    logger.add(stream if stream is not None else sys.stderr, level="INFO")
+    logger.add(
+        stream if stream is not None else sys.stderr, level="INFO", filter=_keep, format=_format
+    )
 
 
 def _real_speaker_factory(on_speaking: Callable[[bool, int], None]) -> Speaker:
