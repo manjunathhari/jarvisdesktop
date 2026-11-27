@@ -239,18 +239,50 @@ def run(args: argparse.Namespace) -> dict:
     geometry_ok.append(call("execute", {"command": "line", "params": {"points": [[0, 0], [8000, 0], [8000, 6000], [0, 6000], [0, 0]]}}, "draw outer walls")[0])
     geometry_ok.append(call("execute", {"command": "line", "params": {"points": [[5000, 0], [5000, 6000]]}}, "draw partition wall")[0])
     geometry_ok.append(call("execute", {"command": "circle", "params": {"center": [2500, 3000], "radius": 600}}, "draw round table")[0])
-    # Text and a dimension are typed at the prompt, since their JSON parameters are not known here.
+    # The text label is typed at the prompt, the way a person would.
     text_ok = call("script", {"text": "text\n600,5200\n250\n0\nLIVING ROOM\n\n"}, "type a text label")[0]
     call("cancel", {}, "cancel after text")
-    dim_ok = call("script", {"text": "dimlinear\n0,0\n8000,0\n4000,-900\n"}, "type a dimension")[0]
-    call("cancel", {}, "cancel after dimension")
-    worked, _, render_reply = call("render", {"width": 1600, "height": 1000, "background": "white"}, "render to PNG", timeout=120)
+    # Dimension text is 2.5 units in the ISO-25 style, far too small for a drawing 8000 units wide.
+    # Set the dimension scale first, as a draughtsman would (the first run left it out).
+    scale_by = None
+    if call("execute", {"command": "setvar", "params": {"name": "DIMSCALE", "value": 100}}, "set the dimension scale (setvar)")[0]:
+        scale_by = "execute setvar DIMSCALE 100"
+    elif call("script", {"text": "dimscale\n100\n"}, "set the dimension scale (typed)")[0]:
+        scale_by = "typed dimscale 100"
+    call("cancel", {}, "cancel after dimension scale")
+    results["dimension_scale_set_by"] = scale_by
+    dims = [
+        ("width", {"p1": [0, 0], "p2": [8000, 0], "at": [4000, -900]}, "dimlinear\n0,0\n8000,0\n4000,-900\n"),
+        ("depth", {"p1": [8000, 0], "p2": [8000, 6000], "at": [8900, 3000]}, "dimlinear\n8000,0\n8000,6000\n8900,3000\n"),
+    ]
+    dim_results = []
+    for label, params, typed in dims:
+        done = call("execute", {"command": "dimlinear", "params": params}, f"dimension the {label}")[0]
+        if not done:
+            done = call("script", {"text": typed}, f"dimension the {label} (typed)")[0]
+            call("cancel", {}, "cancel after dimension")
+        dim_results.append(done)
+    dim_ok = all(dim_results)
+    worked, _, render_reply = call("render", {"width": 1600, "height": 1000}, "render to PNG", timeout=120)
     results["draw_render_s"] = round(time.monotonic() - began, 3)
-    png = b""
-    if worked and render_reply:
-        for item in render_reply.get("result", {}).get("content", []):
+
+    def image_of(reply: dict | None) -> bytes:
+        for item in (reply or {}).get("result", {}).get("content", []):
             if item.get("type") == "image":
-                png = base64.b64decode(item.get("data", ""))
+                return base64.b64decode(item.get("data", ""))
+        return b""
+
+    png = image_of(render_reply) if worked else b""
+    # Two small pictures for the run log, so the result can be looked at without the artifact.
+    for name, arguments in (
+        ("overview", {"width": 800, "height": 600}),
+        ("width-dimension", {"width": 1000, "height": 220, "window": [[-300, -1500], [8300, 300]]}),
+    ):
+        ok_small, _, small_reply = call("render", arguments, f"render the {name} picture")
+        small = image_of(small_reply) if ok_small else b""
+        if small:
+            (out / f"{name}.png").write_bytes(small)
+            results.setdefault("log_pictures", {})[name] = base64.b64encode(small).decode()
     if png:
         (out / "plan.png").write_bytes(png)
     results["render_png_bytes"] = len(png)
@@ -278,6 +310,10 @@ def run(args: argparse.Namespace) -> dict:
     results["entities_before"] = before
     results["entities_after"] = after
     results["geometry_calls_ok"] = sum(geometry_ok)
+    dimension_rows = [r for r in (as_json(after_text) or {}).get("entities", []) if isinstance(r, dict) and r.get("type") == "Dimension"]
+    results["dimension_records"] = [
+        {k: r.get("geometry", {}).get(k) for k in ("measurement", "text", "style")} for r in dimension_rows
+    ]
     results["text_typed_ok"] = text_ok
     results["dimension_typed_ok"] = dim_ok
 
@@ -355,7 +391,9 @@ def summary(results: dict, facts: dict) -> str:
     lines.append(f"- Folder limits (read and write roots) accepted by this version: {results.get('folder_limits_used')}")
     lines.append(f"- A save outside the allowed folder was refused: {results.get('outside_write_refused')}")
     lines.append(f"- Tools offered: {', '.join(str(n) for n in results.get('tools', [])) or 'none'}")
-    lines.append(f"- Geometry calls that worked: {results.get('geometry_calls_ok')} of 3; text typed: {results.get('text_typed_ok')}; dimension typed: {results.get('dimension_typed_ok')}")
+    lines.append(f"- Geometry calls that worked: {results.get('geometry_calls_ok')} of 3; text typed: {results.get('text_typed_ok')}; both dimensions placed: {results.get('dimension_typed_ok')}")
+    lines.append(f"- Dimension scale set by: {results.get('dimension_scale_set_by') or 'NOT SET (both ways failed)'}")
+    lines.append(f"- Dimension records after drawing: {results.get('dimension_records')}")
     lines.append(f"- Entities before, after, reopened: {results.get('entities_before')}, {results.get('entities_after')}, {results.get('entities_reopened')}")
     lines.append(f"- Entity kinds listed after drawing: {results.get('entity_kinds', results.get('entities_excerpt', 'not listed'))}")
     lines.append(f"- Rendered PNG: {results.get('render_png_bytes')} bytes, {results.get('render_pixels', 'size unknown')} pixels")
@@ -384,10 +422,15 @@ def main() -> None:
     Path(args.out).mkdir(parents=True, exist_ok=True)
     facts = json.loads(Path(args.facts).read_text()) if args.facts and Path(args.facts).exists() else {}
     results = run(args)
+    pictures = results.pop("log_pictures", {})
     Path(args.out, "measurements.json").write_text(json.dumps({"facts": facts, "results": results}, indent=2))
     text = summary(results, facts)
     Path(args.out, "summary.md").write_text(text)
     print(text)
+    # The small pictures, as base64 lines in the log only (fictional drawing; nothing private).
+    for name, data in pictures.items():
+        for start_at in range(0, len(data), 3000):
+            print(f"PICTURE {name} {data[start_at:start_at + 3000]}")
 
 
 if __name__ == "__main__":
