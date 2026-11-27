@@ -105,7 +105,7 @@ def _run_args(service: dict[str, Any], name: str, network: str) -> list[str]:
         args += ["--user", service["user"]]
     for group in service.get("group_add", []):
         args += ["--group-add", group]
-    if "entrypoint" in service:
+    if service.get("entrypoint"):  # compose renders an unset entrypoint as null
         args += ["--entrypoint", service["entrypoint"][0]]
     return args
 
