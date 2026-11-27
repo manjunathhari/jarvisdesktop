@@ -1,7 +1,8 @@
-// What goes inside a panel's body, by kind. A text panel gets the Text frame. A canvas panel
-// is still shown as its source text: the sealed Canvas frame (Task 8) replaces that.
+// What goes inside a panel's body, by kind: the Text frame for a text panel, the sealed
+// Canvas frame for a canvas panel.
 
 import { invoke } from "@tauri-apps/api/core";
+import { mountCanvas, type CanvasApp } from "./canvas";
 import type { Panel } from "./model";
 import { mountText, renderText } from "./text";
 
@@ -15,22 +16,23 @@ function openLink(url: string): void {
   });
 }
 
+/// The app's Canvas server, through its commands.
+const canvasApp: CanvasApp = {
+  address: (panelId, revision) => invoke<string>("board_canvas_address", { panelId, revision }),
+  served: (panelId, revision) => invoke<boolean>("board_canvas_served", { panelId, revision }),
+};
+
 /// Draw `panel` into `body`. Resolves true once it is on the page, false if it could not be
 /// drawn (the body then says so). Never throws.
 export async function fillBody(
   body: HTMLElement,
   panel: Panel,
   render: (content: string) => string = renderText,
+  canvas: CanvasApp = canvasApp,
 ): Promise<boolean> {
+  if (panel.kind === "canvas") return mountCanvas(body, panel, canvas);
   try {
-    if (panel.kind === "text") {
-      mountText(body, panel.content, openLink, render);
-    } else {
-      const pre = document.createElement("pre");
-      pre.className = "unframed";
-      pre.textContent = panel.content; // text, never markup
-      body.replaceChildren(pre);
-    }
+    mountText(body, panel.content, openLink, render);
     return true;
   } catch {
     body.replaceChildren();

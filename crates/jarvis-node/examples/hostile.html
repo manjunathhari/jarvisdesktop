@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Canvas seal check (fictional test page)</title>
+<style>
+  body { margin: 0; padding: 14px 18px; background: #141a20; color: #e6edf3; font: 14px/1.5 system-ui, sans-serif; }
+  h1 { font-size: 16px; margin: 0 0 8px; }
+  li { margin: 2px 0; }
+  .ok { color: #5fd38d; } .bad { color: #ff6b6b; font-weight: 700; } .wait { color: #9aa7b4; }
+  button { font: inherit; margin: 8px 8px 0 0; padding: 4px 10px; }
+</style>
+<h1>Canvas seal check: every line must say CONTAINED</h1>
+<ul id="out"></ul>
+<p id="verdict" class="wait">Running…</p>
+<button id="loop">Start an endless loop</button>
+<button id="leave">Try to leave this page</button>
+<form id="f" method="post" action="https://example.org/post"><input name="a" value="b"></form>
+<script>
+(() => {
+  const out = document.getElementById("out");
+  const rows = [];
+  // contained === true: the attempt failed, as it must.
+  function row(name, contained, detail) {
+    const li = document.createElement("li");
+    li.className = contained ? "ok" : "bad";
+    li.dataset.name = name;
+    li.dataset.contained = String(contained);
+    li.textContent = (contained ? "CONTAINED  " : "ESCAPED  ") + name + (detail ? " — " + detail : "");
+    out.append(li);
+    rows.push(contained);
+  }
+  const msg = (e) => String((e && e.message) || e).slice(0, 90);
+  function mustThrow(name, attempt) {
+    try { const got = attempt(); row(name, false, "returned " + String(got).slice(0, 60)); }
+    catch (e) { row(name, true, msg(e)); }
+  }
+  async function mustReject(name, attempt, ms = 4000) {
+    try {
+      const got = await Promise.race([attempt(), new Promise((_, no) => setTimeout(() => no(new Error("no answer")), ms))]);
+      row(name, false, "resolved " + String(got).slice(0, 60));
+    } catch (e) { row(name, true, msg(e)); }
+  }
+  // Some attempts fail quietly. The page's policy reports each one it stops: contained means
+  // the report came (or the call threw); escaped means nothing stopped it.
+  function mustBeStopped(name, mark, attempt, ms = 2500) {
+    return new Promise((done) => {
+      let over = false;
+      const end = (contained, detail) => { if (over) return; over = true; document.removeEventListener("securitypolicyviolation", seen); row(name, contained, detail); done(); };
+      const seen = (e) => { if (String(e.blockedURI).includes(mark)) end(true, "stopped by the page's policy (" + e.effectiveDirective + ")"); };
+      document.addEventListener("securitypolicyviolation", seen);
+      try { attempt(); } catch (e) { end(true, msg(e)); }
+      setTimeout(() => end(false, "nothing stopped it"), ms);
+    });
+  }
+  const loads = (make) => new Promise((yes, no) => { const el = make(); el.onload = () => yes("loaded"); el.onerror = () => no(new Error("blocked")); });
+
+  mustThrow("read the Board's document (window.parent.document)", () => window.parent.document.title);
+  mustThrow("read the top window's address", () => window.top.location.href);
+  mustThrow("reach a function of the Board (window.parent.eval)", () => window.parent.eval("1"));
+  mustThrow("localStorage", () => { localStorage.setItem("a", "b"); return localStorage.getItem("a"); });
+  mustThrow("sessionStorage", () => { sessionStorage.setItem("a", "b"); return "stored"; });
+  mustThrow("cookies", () => { document.cookie = "a=b"; return document.cookie || (() => { throw new Error("no cookie kept"); })(); });
+  mustThrow("indexedDB", () => { const r = indexedDB.open("x"); return r ? "opened" : ""; });
+  mustThrow("open a new window", () => { const w = window.open("https://example.org/"); if (!w) throw new Error("blocked"); return "opened"; });
+  mustThrow("submit a form", () => {
+    let blocked = false;
+    document.addEventListener("securitypolicyviolation", () => { blocked = true; }, { once: true });
+    document.getElementById("f").submit();
+    // A sandbox without allow-forms drops the submission without an error.
+    throw new Error("submission dropped by the sandbox" + (blocked ? " and the policy" : ""));
+  });
+
+  (async () => {
+    await mustReject("fetch an outside address", () => fetch("https://example.org/").then((r) => "status " + r.status));
+    await mustReject("fetch this page's own server", () => fetch(location.origin + "/").then((r) => "status " + r.status));
+    await mustReject("fetch the app's command channel", () => fetch("http://ipc.localhost/board_snapshot", { method: "POST" }).then((r) => "status " + r.status));
+    await mustReject("load an outside image", () => loads(() => Object.assign(new Image(), { src: "https://example.org/x.png?" + Date.now() })));
+    await mustReject("load an outside script", () => loads(() => { const s = document.createElement("script"); s.src = "https://example.org/x.js"; document.head.append(s); return s; }));
+    await mustReject("load an outside stylesheet", () => loads(() => { const l = document.createElement("link"); l.rel = "stylesheet"; l.href = "https://example.org/x.css"; document.head.append(l); return l; }));
+    await mustBeStopped("send a beacon", "example.org/beacon", () => { navigator.sendBeacon("https://example.org/beacon", "x"); });
+    await mustBeStopped("open a WebSocket", "example.org/socket", () => { new WebSocket("wss://example.org/socket"); });
+    await mustBeStopped("open an event stream", "example.org/stream", () => { new EventSource("https://example.org/stream"); });
+    await mustBeStopped("frame an outside page", "example.org", () => { const f = document.createElement("iframe"); f.hidden = true; f.src = "https://example.org/frame"; document.body.append(f); });
+    await mustBeStopped("start a worker from an outside script", "example.org/worker", () => { new Worker("https://example.org/worker.js"); });
+
+    // The app's command interface. On Windows the framework loads it into every frame, so
+    // finding it here is expected; what matters is that every call is refused.
+    const internals = window.__TAURI_INTERNALS__;
+    row("the app's command interface answers nothing" + (internals ? " (interface present)" : " (interface absent)"), true, "");
+    rows.pop(); out.lastChild.className = "wait";
+    for (const command of ["board_snapshot", "board_clear_closed", "quit", "say", "plugin:event|listen", "plugin:opener|open_url"]) {
+      await mustReject("call the app: " + command, () => {
+        if (!internals || typeof internals.invoke !== "function") return Promise.reject(new Error("no interface"));
+        return internals.invoke(command, { text: "x", event: "jarvis://board", target: { kind: "Any" }, handler: 1, url: "https://example.org/" });
+      }, 3000);
+    }
+    mustThrow("post straight to the app's message channel", () => {
+      if (!window.chrome || !window.chrome.webview) throw new Error("no channel");
+      window.chrome.webview.postMessage(JSON.stringify({ cmd: "quit", callback: 1, error: 2, payload: {}, __TAURI_INVOKE_KEY__: "guess" }));
+      throw new Error("posted without the key; the app must ignore it (check that JARVIS is still running)");
+    });
+
+    const verdict = document.getElementById("verdict");
+    const escaped = rows.filter((c) => !c).length;
+    verdict.dataset.done = "1";
+    verdict.className = escaped ? "bad" : "ok";
+    verdict.textContent = escaped ? escaped + " ESCAPED. The seal is broken." : "All " + rows.length + " attempts contained.";
+  })();
+
+  document.getElementById("loop").onclick = () => { for (;;) {} };
+  document.getElementById("leave").onclick = () => { location.href = "https://example.org/"; };
+})();
+</script>
+</html>

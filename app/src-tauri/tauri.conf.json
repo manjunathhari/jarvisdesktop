@@ -44,7 +44,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src https://www.youtube.com; connect-src ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src https://www.youtube.com http://127.0.0.1:47821 http://127.0.0.1:47822 http://127.0.0.1:47823; connect-src ipc: http://ipc.localhost"
     }
   },
   "bundle": {

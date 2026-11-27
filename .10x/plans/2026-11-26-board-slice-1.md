@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-*Status: approved by Manj on 26 Nov 2026, with the seven changes below. Tasks 1 to 6 are built on local branch `board-slice-1` and independently reviewed, with the reviews' fixes applied (Task 6's app code is not yet compiled: it needs the Windows build); Tasks 7 to 9 are not started. Repo `manjunathhari/jarvisdesktop`, `main` = `983c2cf`.*
+*Status: approved by Manj on 26 Nov 2026, with the seven changes below. Tasks 1 to 8 are built on branch `board-slice-1` and independently reviewed, with the reviews' fixes applied; the branch is pushed through Task 7 and passes CI on Windows and Linux (nothing merged or deployed). Task 9 is not started. Repo `manjunathhari/jarvisdesktop`, `main` = `983c2cf`.*
 
 **Goal:** Manj asks by voice; Jarvis answers briefly, does the work, and shows the result as a panel on a Board window on monitor 2, with a running conversation and minimise, maximise and close on every panel, by click or by voice.
 
@@ -279,7 +279,7 @@ As in Plan B: contracts and the spec own shared interfaces. If the code shows a 
 ### Task 8: Sealed Canvas frame
 
 **Files:**
-- Create: `app/src-tauri/src/canvas.rs`, `app/src/board/canvas.ts`, `app/src/board/canvas.test.ts`, `.10x/reviews/2026-11-26-board-canvas-hostile-page.md` (the checklist and the test page's source)
+- Create: `app/src-tauri/src/canvas.rs`, `app/src/board/canvas.ts`, `app/src/board/canvas.test.ts`, `.10x/reviews/2026-11-27-board-canvas-hostile-page.md` (the checklist and the test page's source)
 - Modify: `app/src-tauri/src/lib.rs` (register the scheme), `app/src-tauri/tauri.conf.json` (`frame-src` gains the canvas origin only)
 
 **Interfaces:**
@@ -297,6 +297,15 @@ As in Plan B: contracts and the spec own shared interfaces. If the code shows a 
 - [ ] **Step 4: Run** the Rust and vitest tests. Expected: PASS.
 - [ ] **Step 5: Hostile-page checklist on Windows** (CI artefact build on Manj's PC, with his go-ahead; results in the task report). A fictional page that tries each of these, and each must fail: a `fetch` and an image to an outside address; reading `window.parent.document` and `window.top.location`; `window.__TAURI__` and `window.__TAURI_INTERNALS__`; `window.open`; a form post; `localStorage`. And an endless loop: the Board's other panels and the conversation column stay responsive, and Close ends it. If the loop freezes the Board, stop and report under the operating rule (the fallback is a separate webview per Canvas panel).
 - [ ] **Step 6: Commit:** `desktop: sealed Canvas frame on its own origin`.
+
+**As built. The design above was changed, with Manj's approval on 27 Nov 2026, because it would not have sealed the page** (details and sources: `.10x/reviews/2026-11-27-board-canvas-hostile-page.md`). Tauri counts a page from any URI scheme the app registers as local, with the app's right to call commands, and on Windows it loads its command interface into every frame. So there is no `jarvis-canvas` scheme and no `app/src-tauri/src/canvas.rs`:
+- `crates/jarvis-node/src/canvas.rs`: a small server on the loopback. `PORTS = [47821, 47822, 47823]` (first free); `POLICY` (the plan's policy plus `form-action 'none'; base-uri 'none'`); `respond(store, token, port, method, host, path) -> Response` (pure); `serve(store, ports) -> io::Result<Arc<CanvasServer>>`; `CanvasServer::{port, url(panel_id, revision), was_served(panel_id, revision)}`; `shared(store) -> Option<Arc<CanvasServer>>` (the app's one server, started on first use).
+- An address is `http://127.0.0.1:<port>/<secret>/<panel_id>/<revision>`; the secret is 32 hex characters made fresh each run. Only `GET` with `Host: 127.0.0.1:<port>` for a canvas panel at the revision the store holds gets the page; anything else is an empty 404 (405 for another method). Every answer carries the policy, `nosniff`, `no-referrer`, `no-store` and `Cross-Origin-Resource-Policy: same-origin`.
+- `tauri.conf.json`: `frame-src` gains the three loopback origins only (a test checks they match `PORTS`).
+- App commands `board_canvas_address(panel_id, revision) -> String` and `board_canvas_served(panel_id, revision) -> bool`.
+- `app/src/board/canvas.ts`: `canvasAddress(address, panelId, revision)`, `canvasFrame(address, title)` (`sandbox="allow-scripts"` only, `referrerpolicy="no-referrer"`), `mountCanvas(body, panel, app, {timeoutMs = 5000})`. Drawn is reported only when the frame has loaded **and** the server confirms it handed out that page (a frame also "loads" an empty refusal).
+- The hostile page is `crates/jarvis-node/examples/hostile.html`, served or written to a store by the example `canvas-hostile`. In headless Chrome, from the real server: all 27 attempts contained, no request left the page, leaving was blocked, an endless loop did not freeze the embedding page. **The app-command attempts can only be proved on Windows** (Step 5, now part of the Task 9 live check).
+- Limiting which commands each window may call is moved to Task 9, just before the live check (Manj, 27 Nov 2026): the Canvas page is refused by its origin, and a slip in that list could only be seen by running the app.
 
 ### Task 9: Conversation frame, end-to-end test, live check
 

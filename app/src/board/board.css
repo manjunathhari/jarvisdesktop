@@ -481,3 +481,18 @@ button:focus-visible {
   color: var(--text);
   font-weight: 600;
 }
+
+/* The Canvas frame: the page fills the panel's body, edge to edge. */
+.panel > .body.framed {
+  padding: 0;
+  overflow: hidden;
+}
+
+iframe.canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: var(--surface);
+  color-scheme: dark;
+}

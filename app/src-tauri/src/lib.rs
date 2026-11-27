@@ -633,7 +633,9 @@ pub fn run() {
             board::board_rendered,
             board::board_clear_closed,
             board::board_open,
-            board::board_open_link
+            board::board_open_link,
+            board::board_canvas_address,
+            board::board_canvas_served
         ])
         .on_window_event(board::on_window_event)
         .run(tauri::generate_context!())

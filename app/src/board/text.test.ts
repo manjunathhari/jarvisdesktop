@@ -210,13 +210,6 @@ describe("the Text frame in a panel", () => {
     expect(body.querySelector(".text h1")?.textContent).toBe("Heading");
   });
 
-  it("a canvas panel is not run as a page yet: its source is shown as text", async () => {
-    const body = document.createElement("div");
-    expect(await fillBody(body, panel({ kind: "canvas", content: "<svg onload='x()'></svg>" }))).toBe(true);
-    expect(body.querySelector("svg")).toBeNull();
-    expect(body.textContent).toContain("<svg onload='x()'></svg>");
-  });
-
   it("a render failure reports false and says so", async () => {
     const body = document.createElement("div");
     const broken = () => {

@@ -17,6 +17,9 @@
 //! - The commands are the window's only way to change anything: `board_set_state` (a click),
 //!   `board_clear_closed` (after the person confirms), `board_snapshot`, `board_open` and
 //!   `board_open_link` (an `https:` link in a Text panel, opened in the system browser).
+//! - **Canvas panels.** Their pages are untrusted and are never served by the app itself: the
+//!   window gets an address on the loopback Canvas server (`board_canvas_address`) for a
+//!   sandboxed frame, and asks `board_canvas_served` before reporting one drawn.
 //!   Without a node (the app is not in server mode) there is no Board: the snapshot is empty
 //!   and the other commands refuse.
 //! - The store does file work under a mutex, so it is only touched through `spawn_blocking`.
@@ -227,6 +230,41 @@ pub async fn board_rendered(
     let node = node(&node_slot).ok_or_else(|| NO_BOARD.to_owned())?;
     node.board_rendered(id, revision, ok).await;
     Ok(())
+}
+
+/// The address of a Canvas panel's page on the app's Canvas server (`jarvis_node::canvas`,
+/// which says why the page is served from the loopback). The server starts on first use.
+#[tauri::command]
+pub async fn board_canvas_address(
+    panel_id: String,
+    revision: u32,
+    node_slot: State<'_, NodeSlot>,
+) -> Result<String, String> {
+    let id = Uuid::parse_str(&panel_id).map_err(|_| "unknown_panel".to_owned())?;
+    let node = node(&node_slot).ok_or_else(|| NO_BOARD.to_owned())?;
+    let server = jarvis_node::canvas::shared(node.board())
+        .await
+        .ok_or_else(|| "canvas_unavailable".to_owned())?;
+    Ok(server.url(id, revision))
+}
+
+/// Whether the Canvas server really handed out that panel's page at that revision. The window
+/// asks before it reports a Canvas panel drawn.
+#[tauri::command]
+pub async fn board_canvas_served(
+    panel_id: String,
+    revision: u32,
+    node_slot: State<'_, NodeSlot>,
+) -> Result<bool, String> {
+    let Ok(id) = Uuid::parse_str(&panel_id) else {
+        return Ok(false);
+    };
+    let Some(node) = node(&node_slot) else {
+        return Ok(false);
+    };
+    Ok(jarvis_node::canvas::shared(node.board())
+        .await
+        .is_some_and(|server| server.was_served(id, revision)))
 }
 
 /// Remove the closed panels from this desktop's copy (the person confirmed). The server keeps

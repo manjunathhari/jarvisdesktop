@@ -11,6 +11,7 @@
 
 pub mod approval;
 pub mod board;
+pub mod canvas;
 pub mod client;
 pub mod code;
 pub mod delivery;
