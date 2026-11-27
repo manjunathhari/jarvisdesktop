@@ -87,6 +87,8 @@ class Patch:
     commit_messages: tuple[str, ...]
     # For each changed lock file: (text on main, text with the patch applied).
     lock_texts: Mapping[str, tuple[str, str]] = field(default_factory=dict)
+    # Paths the patch makes into a symlink or a submodule.
+    special: tuple[str, ...] = ()
 
 
 def fingerprint(data: bytes) -> str:
@@ -149,16 +151,26 @@ def check(
         elif path not in design.files:
             problems.append(f"{path} is not named in the approved design")
 
+    problems.extend(
+        f"{path} is a symlink or submodule, which is never allowed" for path in patch.special
+    )
     for path, expected in sorted(fingerprints.items()):
         if current_hashes.get(path) != expected:
             problems.append(f"{path} changed after the Test writer fingerprinted it")
 
-    needles = [_squash(e) for e in evidence if len(_squash(e)) >= _MIN_EVIDENCE]
-    if any(n in _squash(_diff_text(patch.diff)) for n in needles):
+    if quotes(_diff_text(patch.diff), evidence):
         problems.append("the diff quotes the ticket's private evidence")
-    if any(n in _squash(m) for m in patch.commit_messages for n in needles):
+    if any(quotes(m, evidence) for m in patch.commit_messages):
         problems.append("a commit message quotes the ticket's private evidence")
     return problems
+
+
+def quotes(text: str, evidence: Sequence[str]) -> bool:
+    """Whether `text` contains any piece of the ticket's private evidence, ignoring spacing."""
+    squashed = _squash(text)
+    return any(
+        len(needle) >= _MIN_EVIDENCE and needle in squashed for needle in map(_squash, evidence)
+    )
 
 
 def _diff_text(diff: str) -> str:

@@ -237,3 +237,17 @@ def test_evidence_split_across_diff_lines_is_still_found() -> None:
         evidence=("call my sister about the loan",),
     )
     assert problems == ["the diff quotes the ticket's private evidence"]
+
+
+def test_a_symlink_or_submodule_is_refused() -> None:
+    problems = gate.check(
+        DESIGN,
+        _patch(special=("server/src/jarvis_server/brain/research.py",)),
+        fingerprints={},
+        current_hashes={},
+        evidence=(),
+    )
+    assert problems == [
+        "server/src/jarvis_server/brain/research.py is a symlink or submodule,"
+        " which is never allowed"
+    ]

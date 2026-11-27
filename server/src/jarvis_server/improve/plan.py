@@ -114,3 +114,8 @@ def _packages(data: dict[str, Any]) -> tuple[Package, ...]:
             raise BadPlan(f"package {item['name']} needs a licence")
         out.append(Package(item["name"], licence.strip()))
     return tuple(out)
+
+
+def strip_block(design_text: str) -> str:
+    """The design's prose without its plan block."""
+    return _BLOCK.sub("", design_text).strip()
