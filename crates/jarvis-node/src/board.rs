@@ -638,14 +638,16 @@ pub mod view {
     /// Whether a link's host is out on the internet, as far as its name or number shows. A
     /// panel is written from web pages and has no business linking to the person's own
     /// devices, so these are refused: any IPv6 number; an IPv4 number that is loopback,
-    /// private, link-local, shared (100.64/10), multicast, reserved or zero; a name with no
-    /// dot; and names under `localhost`, `local`, `lan` and the like. (A public name that
+    /// private, link-local, shared (100.64/10), multicast, zero, or set aside for
+    /// documentation and testing; a name with no dot, with an empty label, or whose last label
+    /// is a number; and names under `localhost`, `local`, `lan` and the like. (A public name that
     /// resolves to a private number cannot be told from here.)
     fn public_host(host: &url::Host<&str>) -> bool {
         match host {
             url::Host::Ipv6(_) => false,
             url::Host::Ipv4(ip) => {
                 let [a, b, ..] = ip.octets();
+                let c = ip.octets()[2];
                 !(a == 0
                     || a == 10
                     || a == 127
@@ -653,19 +655,30 @@ pub mod view {
                     || (a == 100 && (64..128).contains(&b))
                     || (a == 169 && b == 254)
                     || (a == 172 && (16..32).contains(&b))
-                    || (a == 192 && b == 168))
+                    || (a == 192 && b == 168)
+                    // Set aside for protocols, documentation and testing: never a real site.
+                    || (a == 192 && b == 0 && (c == 0 || c == 2))
+                    || (a == 198 && (b == 18 || b == 19))
+                    || (a == 198 && b == 51 && c == 100)
+                    || (a == 203 && b == 0 && c == 113))
             }
             url::Host::Domain(name) => {
-                let name = name.trim_end_matches('.').to_ascii_lowercase();
+                // One trailing dot is the root; an empty label anywhere else is not a name
+                // (and with two trailing dots a number is no longer parsed as one).
+                let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+                let numeric = |label: &str| {
+                    let digits = label.strip_prefix("0x").unwrap_or(label);
+                    digits.bytes().all(|b| b.is_ascii_hexdigit())
+                        && (label.starts_with("0x") || label.bytes().all(|b| b.is_ascii_digit()))
+                };
                 name.contains('.')
+                    && !name.split('.').any(str::is_empty)
                     && !LOCAL_SUFFIXES
                         .iter()
                         .any(|s| name == *s || name.ends_with(&format!(".{s}")))
-                    // A last label of digits is a number the parser did not take as one.
-                    && !name
-                        .rsplit('.')
-                        .next()
-                        .is_some_and(|last| last.bytes().all(|b| b.is_ascii_digit()))
+                    // A last label that is a number (digits or 0x…) is a numeric address the
+                    // parser did not take as one.
+                    && !name.rsplit('.').next().is_some_and(numeric)
             }
         }
     }

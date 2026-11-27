@@ -36,6 +36,8 @@ let talk = new Conversation([]);
 let talkBuiltFor = "";
 /// Whether Jarvis is working on something for the Board (the app says when it starts and ends).
 let working = false;
+/// Counts the app's "working" events, so a snapshot taken before one cannot undo it.
+let workingEvents = 0;
 /// What the shelf (dock and closed list) was last built from. It is rebuilt only when that
 /// changes, so a redraw for any other reason never wipes an open "Clear closed panels?".
 let shelfBuiltFor = "";
@@ -237,12 +239,13 @@ function onEvent(event: BoardEvent) {
 async function load() {
   loading = true;
   try {
+    const before = workingEvents;
     const snapshot = await invoke<BoardSnapshot>("board_snapshot");
     model = new BoardModel(snapshot.panels);
     const stored = new Conversation(snapshot.conversation);
     for (const entry of talk.entries()) stored.add(entry); // lines that came while loading
     talk = stored;
-    working = snapshot.working === true;
+    if (workingEvents === before) working = snapshot.working === true;
     // A store that somehow holds two maximised panels: the newest keeps it.
     const top = model.inView().find((p) => p.state === "maximised");
     if (top) for (const other of model.covering(top.panel_id)) model.setState(other, "open");
@@ -260,6 +263,7 @@ document.addEventListener(LINK_REFUSED, () => problem("That link could not be op
 $("typing").replaceChildren(renderTyping({ onSay: say }));
 await listen<BoardEvent>("jarvis://board", (e) => onEvent(e.payload));
 await listen<boolean>("jarvis://board-working", (e) => {
+  workingEvents += 1;
   working = e.payload === true;
   drawTalk();
   if (working) $("talk-latest").textContent = "Jarvis is working";

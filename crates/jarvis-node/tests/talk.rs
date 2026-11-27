@@ -242,15 +242,29 @@ fn working_ends_by_itself_after_its_time() {
 
 #[test]
 fn a_second_start_while_working_renews_the_time_and_says_nothing_new() {
-    let rig = rig_with(tempfile::tempdir().unwrap(), Duration::from_millis(600));
+    let lasts = Duration::from_secs(2);
+    let rig = rig_with(tempfile::tempdir().unwrap(), lasts);
+    rig.recorder.working_started();
+    assert!(working(&rig));
+    std::thread::sleep(Duration::from_millis(500));
+    let renewed = std::time::Instant::now();
+    rig.recorder.working_started();
+    // Nothing new is said for the second start, and the line comes down a full life after
+    // it, not after the first. (Only lower bounds: a slow machine cannot fail this.)
+    assert!(!working(&rig));
+    assert!(renewed.elapsed() >= lasts);
+}
+
+#[test]
+fn a_stream_of_lines_cannot_keep_working_up_past_its_time() {
+    let rig = rig_with(tempfile::tempdir().unwrap(), Duration::from_millis(300));
     rig.recorder.working_started();
     assert!(working(&rig));
     std::thread::sleep(Duration::from_millis(400));
-    rig.recorder.working_started();
-    std::thread::sleep(Duration::from_millis(400));
-    assert!(
-        rig.recorder.is_working(),
-        "the second request is still being worked on"
-    );
+    for i in 0..50 {
+        rig.recorder.spoke(&format!("line {i}"));
+    }
     assert!(!working(&rig));
+    // It came down before the queued lines were all written, not after them.
+    assert!(rig.seen.try_iter().count() < 50);
 }

@@ -203,8 +203,10 @@ impl Coordinator {
             }
             Event::Utterance(text) => self.on_utterance(text, &mut fx),
             Event::Typed(text) => {
-                if self.mode == Mode::MicOff && !text.trim().is_empty() {
+                let stays_off = local_command(&text) == Some(LocalCommand::StopListening);
+                if self.mode == Mode::MicOff && !text.trim().is_empty() && !stays_off {
                     // As a tap would, without the greeting: this is the request itself.
+                    // (Typing "stop listening" while already off wakes nothing.)
                     fx.push(Effect::Mic(true));
                     self.set_mode(Mode::Idle, &mut fx);
                 }
@@ -737,6 +739,14 @@ mod tests {
         assert_eq!(c.mode(), Mode::Thinking);
         // It is a request, not a tap: no greeting first.
         assert!(!fx.iter().any(|f| matches!(f, Effect::Speak(_))));
+    }
+
+    #[test]
+    fn typing_stop_listening_while_already_off_changes_nothing() {
+        let mut c = Coordinator::new("Manj");
+        c.step(Event::Utterance("stop listening".into()));
+        assert!(c.step(Event::Typed("Stop listening.".into())).is_empty());
+        assert_eq!(c.mode(), Mode::MicOff);
     }
 
     #[test]

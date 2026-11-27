@@ -104,6 +104,12 @@ impl Recorder {
                             Err(_) => return,
                         },
                         Some(until) => {
+                            // The time is checked first, so that a steady stream of lines
+                            // cannot keep "working" up past its time.
+                            if Instant::now() >= until {
+                                stop_working(&mut working_until);
+                                continue;
+                            }
                             match work.recv_timeout(until.saturating_duration_since(Instant::now()))
                             {
                                 Ok(job) => job,

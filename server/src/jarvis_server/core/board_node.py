@@ -87,8 +87,10 @@ def on_live_receipt(
         release_headline(conn, reply_id)
 
     if action_kind == _WORKING:
-        # A courtesy to the Board, not a record: taken quietly either way. A refusal is noted
-        # (the desktop is older than this action, or the args were damaged) and never said.
+        # A courtesy to the Board, not a record: taken quietly either way. A refusal in this
+        # action's own shape is noted and never said. (A desktop built before this action
+        # answers in another receipt's shape, which is audited as `malformed` like any other
+        # ill-shaped receipt: nothing is said then either. The desktop is installed first.)
         try:
             contracts.BoardWorkingArgs.model_validate(args)
             noted = contracts.BoardWorkingReceipt.model_validate(payload)

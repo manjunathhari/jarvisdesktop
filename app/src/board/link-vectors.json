@@ -11,7 +11,11 @@
     "https://172.32.0.1/",
     "https://100.128.0.1/",
     "https://11.0.0.1/",
-    "https://localhost.example.org/"
+    "https://localhost.example.org/",
+    "https://example.org./",
+    "https://198.20.0.1/",
+    "https://192.0.3.1/",
+    "https://1.2.3.4./"
   ],
   "refuse": [
     "",
@@ -90,6 +94,21 @@
     "https://127.1/",
     "https://017700000001/",
     "https://224.0.0.1/",
-    "https://255.255.255.255/"
+    "https://255.255.255.255/",
+    "https://0x7f.0x1../",
+    "https://192.168.0x1../",
+    "https://10.0x1../",
+    "https://1.2.3.4../x",
+    "https://64.192.64.7..",
+    "https://example.org../",
+    "https://example..org/",
+    "https://example.0x1f/",
+    "https://192.0.0.1/",
+    "https://192.0.2.5/",
+    "https://198.18.0.1/",
+    "https://198.19.255.255/",
+    "https://198.51.100.7/",
+    "https://203.0.113.9/",
+    "https://240.0.0.1/"
   ]
 }

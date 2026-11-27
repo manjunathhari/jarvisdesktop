@@ -216,6 +216,8 @@ def test_a_turn_queues_at_most_one_board_job(
     tid = _turn(app, owner, node, person)
     assert [j["request"] for j in _board_jobs(app, person)] == ["First fictional request"]
     assert _messages(app, tid)[-1] == ("JARVIS", turn.BOARD_ACK_TEXT)
+    # One job, so the desktop is told once that work has started.
+    assert _actions(app, _session(app, tid)) == [("board.working", {"state": "started"})]
 
 
 @pytest.mark.parametrize("args", [{}, {"request": "  "}, {"request": 7}, {"request": ["a"]}])
@@ -228,6 +230,7 @@ def test_board_make_without_a_request_is_refused(
     assert _board_jobs(app, person) == []
     assert _refusals(app, tid) == [{"reason": "bad_args", "action_kind": "board.make"}]
     assert _messages(app, tid)[-1] == ("JARVIS", turn.BOARD_UNCLEAR_TEXT)
+    assert _actions(app, _session(app, tid)) == []  # no work queued: nothing "started"
 
 
 def test_a_long_request_is_cut_to_the_limit(

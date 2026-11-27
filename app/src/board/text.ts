@@ -75,10 +75,13 @@ const LOCAL_SUFFIXES = ["localhost", "local", "lan", "internal", "intranet", "ho
 /// business linking to the person's own devices: this PC, the home network, a router.
 function publicHost(hostname: string): boolean {
   if (hostname.startsWith("[")) return false; // any IPv6 number
-  const name = hostname.replace(/\.+$/, "").toLowerCase();
+  // One trailing dot is the root; an empty label anywhere else is not a name (and with two
+  // trailing dots a number is no longer parsed as one).
+  const name = hostname.replace(/\.$/, "").toLowerCase();
+  if (name.split(".").includes("")) return false;
   const quad = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(name);
   if (quad) {
-    const [a, b] = [Number(quad[1]), Number(quad[2])];
+    const [a, b, c] = [Number(quad[1]), Number(quad[2]), Number(quad[3])];
     return !(
       a === 0 ||
       a === 10 ||
@@ -87,12 +90,19 @@ function publicHost(hostname: string): boolean {
       (a === 100 && b >= 64 && b < 128) ||
       (a === 169 && b === 254) ||
       (a === 172 && b >= 16 && b < 32) ||
-      (a === 192 && b === 168)
+      (a === 192 && b === 168) ||
+      // Set aside for protocols, documentation and testing: never a real site.
+      (a === 192 && b === 0 && (c === 0 || c === 2)) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      (a === 198 && b === 51 && c === 100) ||
+      (a === 203 && b === 0 && c === 113)
     );
   }
   if (!name.includes(".")) return false;
   if (LOCAL_SUFFIXES.some((s) => name === s || name.endsWith(`.${s}`))) return false;
-  return !/^\d+$/.test(name.slice(name.lastIndexOf(".") + 1)); // a number the parser did not take as one
+  // A last label that is a number (digits or 0x…) is a numeric address the parser did not
+  // take as one.
+  return !/^(\d+|0x[0-9a-f]*)$/.test(name.slice(name.lastIndexOf(".") + 1));
 }
 
 const md = new MarkdownIt({
