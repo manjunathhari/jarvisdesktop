@@ -86,6 +86,14 @@ jobs:
             --model "$RUNNER_TEMP/kokoro/kokoro-v1.0.onnx" \
             --voices "$RUNNER_TEMP/kokoro/voices-v1.0.bin" \
             --require-audio-lib
+      - name: Smoke-test the frozen program's loop
+        # The real stdin/stdout loop with the real voice and a null audio output: catches native
+        # libraries that hang while the stdin reader is blocked.
+        shell: bash
+        run: |
+          uv run python tests/smoke_loop.py --exe dist/jarvis-voice-helper/jarvis-voice-helper.exe \
+            --model "$RUNNER_TEMP/kokoro/kokoro-v1.0.onnx" \
+            --voices "$RUNNER_TEMP/kokoro/voices-v1.0.bin"
       - name: Pack
         shell: bash
         run: |

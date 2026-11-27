@@ -111,6 +111,34 @@ def local_output(settings: Settings) -> FrameProcessor:
         raise NoOutputDevice(f"cannot open the sound output ({type(exc).__name__})") from exc
 
 
+def null_output(settings: Settings) -> FrameProcessor:
+    """Diagnostic output (`--output null`): behaves like the sound output but plays nothing.
+
+    It is a real output transport, so the speaking-started and speaking-stopped events happen as
+    usual, and it takes as long as the audio would to play. It needs no sound device or PyAudio.
+    (selftest.AudioCollector is not an output transport and would produce no such events.)
+    """
+    from pipecat.frames.frames import OutputAudioRawFrame, StartFrame
+    from pipecat.transports.base_output import BaseOutputTransport
+    from pipecat.transports.base_transport import TransportParams
+
+    class NullOutputTransport(BaseOutputTransport):
+        def __init__(self):
+            super().__init__(
+                TransportParams(audio_out_enabled=True, audio_out_sample_rate=SAMPLE_RATE)
+            )
+
+        async def start(self, frame: StartFrame):
+            await super().start(frame)
+            await self.set_transport_ready(frame)
+
+        async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
+            await asyncio.sleep(len(frame.audio) / 2 / SAMPLE_RATE)  # as long as playing takes
+            return True
+
+    return NullOutputTransport()
+
+
 async def _reap(task: asyncio.Task[None]) -> None:
     """Cancel a runner task and retrieve its outcome so asyncio never reports it as lost."""
     task.cancel()

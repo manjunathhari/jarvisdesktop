@@ -163,6 +163,30 @@ def make_writer(stream: BinaryIO) -> Writer:
     return write
 
 
+def protect_stdin() -> BinaryIO:
+    """Give the reader thread a private copy of stdin; everything else gets the null device.
+
+    On Windows a blocking read on a synchronous pipe makes every other operation on that pipe
+    wait for it. Native libraries (numpy's runtime, for one) look at the standard input handle
+    while they load, so with the reader blocked they wait for ever and the helper hangs after
+    the hello. Descriptor 0 and the Win32 standard input handle therefore point at the null
+    device, and only the reader holds the pipe. Do not remove this, and do not hide it by
+    importing the heavy modules earlier: later native loads would still hang.
+    """
+    private = os.dup(0)  # not inheritable, and only the reader uses it
+    null = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(null, 0)
+    if null != 0:
+        os.close(null)
+    if sys.platform == "win32":
+        import ctypes
+        import msvcrt
+
+        ctypes.windll.kernel32.SetStdHandle(-10, msvcrt.get_osfhandle(0))  # STD_INPUT_HANDLE
+    sys.stdin = open(os.devnull, encoding="utf-8")  # noqa: SIM115 (lives as long as the process)
+    return os.fdopen(private, "rb", buffering=0)
+
+
 def protect_stdout() -> BinaryIO:
     """Keep the real stdout for protocol lines only; everything else is sent to stderr."""
     sys.stdout.flush()
@@ -215,10 +239,14 @@ def configure_logging(stream=None) -> None:
     )
 
 
-def _real_speaker_factory(on_speaking: Callable[[bool, int], None]) -> Speaker:
-    from jarvis_voice_helper.pipeline import PipecatSpeaker
+def _real_speaker_factory(output: str = "device") -> SpeakerFactory:
+    def factory(on_speaking: Callable[[bool, int], None]) -> Speaker:
+        from jarvis_voice_helper.pipeline import PipecatSpeaker, local_output, null_output
 
-    return PipecatSpeaker(on_speaking)
+        sink = null_output if output == "null" else local_output
+        return PipecatSpeaker(on_speaking, sink_factory=sink)
+
+    return factory
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -226,6 +254,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--selftest", metavar="PATH", help="speak a test phrase into a WAV file")
     parser.add_argument("--model")
     parser.add_argument("--voices")
+    parser.add_argument(
+        "--output",
+        choices=["device", "null"],
+        default="device",
+        help="diagnostic: 'null' discards the audio in real time instead of using the sound "
+        "device (default: device)",
+    )
     parser.add_argument(
         "--require-audio-lib",
         action="store_true",
@@ -243,8 +278,11 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.selftest), args.model, args.voices, require_audio_lib=args.require_audio_lib
         )
 
+    private_stdin = protect_stdin()  # first, before any thread or heavy import
     protocol_out = protect_stdout()
     configure_logging()
     return asyncio.run(
-        run(StdinLines(sys.stdin.buffer), make_writer(protocol_out), _real_speaker_factory)
+        run(
+            StdinLines(private_stdin), make_writer(protocol_out), _real_speaker_factory(args.output)
+        )
     )

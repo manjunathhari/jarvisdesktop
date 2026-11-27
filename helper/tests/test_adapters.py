@@ -165,3 +165,31 @@ def test_a_hung_child_is_killed_and_reported_with_its_stderr():
     code = "import sys,time; sys.stderr.write('where I was'); sys.stderr.flush(); time.sleep(60)"
     with pytest.raises(pytest.fail.Exception, match="where I was"):
         run_child([], code=code, timeout=2)
+
+
+def test_stdin_is_private_to_the_reader_and_descriptor_0_is_the_null_device():
+    code = (
+        "import os, sys;"
+        "from jarvis_voice_helper.main import protect_stdin;"
+        "private = protect_stdin();"
+        "line1 = private.readline();"
+        "line2 = private.readline();"
+        "rest = private.readline();"
+        "sys.stdout.write(repr((os.read(0, 10), sys.stdin.read(), line1, line2, rest)))"
+    )
+    done = run_child([], code=code, stdin=b"first\nsecond\xe2\x80\xa8x\n", close_stdin=True)
+    assert done.returncode == 0, done.stderr
+    # fd 0 and sys.stdin read end of file at once; the reader still gets both lines, split on \n
+    assert done.stdout == repr((b"", "", b"first\n", b"second\xe2\x80\xa8x\n", b"")).encode()
+
+
+def test_descriptor_0_reads_end_of_file_at_once_while_stdin_stays_open():
+    code = (
+        "import os, sys;"
+        "from jarvis_voice_helper.main import protect_stdin;"
+        "private = protect_stdin();"
+        "sys.stdout.write(repr(os.read(0, 10)))"
+    )
+    done = run_child([], code=code, close_stdin=False)  # the parent never closes stdin
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == b"b''"

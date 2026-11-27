@@ -463,3 +463,20 @@ def test_selftest_require_audio_lib_fails_when_pyaudio_is_missing(tmp_path, monk
     assert code == 1
     assert "pyaudio" in capsys.readouterr().err
     assert not (tmp_path / "out.wav").exists()
+
+
+async def test_null_output_reports_speaking_like_a_real_output_and_takes_real_time():
+    from jarvis_voice_helper.pipeline import null_output
+
+    events = []
+    speaker = PipecatSpeaker(
+        lambda on, turn: events.append((on, turn, time.monotonic())),
+        tts_factory=lambda _s: FakeTTS(seconds=0.6),
+        sink_factory=null_output,
+    )
+    await speaker.start(SETTINGS)
+    await speaker.say(1, "One sentence.")
+    await wait_for(lambda: any(e[:2] == (False, 1) for e in events))
+    await speaker.close()
+    assert [e[:2] for e in events] == [(True, 1), (False, 1)]
+    assert events[1][2] - events[0][2] >= 0.5
