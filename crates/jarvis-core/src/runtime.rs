@@ -313,7 +313,7 @@ mod tests {
         };
         let (h, ui) = start(Some(Arc::new(brain)));
         h.send(Event::Utterance("hello".into()));
-        // Still listening just before the window ends, idle just after (30 s, owner, 25 Nov).
+        // Still listening just before the window ends, idle just after (60 s, owner, 27 Nov).
         tokio::time::sleep(crate::coordinator::FOLLOW_UP_WINDOW - Duration::from_secs(1)).await;
         settle().await;
         assert_eq!(ui.last_status(), Some(Mode::FollowUp));

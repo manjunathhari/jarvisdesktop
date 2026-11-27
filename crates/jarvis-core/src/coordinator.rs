@@ -10,8 +10,9 @@ use serde::Serialize;
 use std::time::Duration;
 
 pub const LISTEN_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long JARVIS keeps listening after a reply before the mic goes off (owner, 25 Nov: 30 s).
-pub const FOLLOW_UP_WINDOW: Duration = Duration::from_secs(30);
+/// How long JARVIS keeps listening after a reply before the mic goes off (owner, 27 Nov: 60 s;
+/// 30 s was too short to read a Board panel and ask about it).
+pub const FOLLOW_UP_WINDOW: Duration = Duration::from_secs(60);
 const MAX_HISTORY: usize = 6;
 /// How many channels to try in a row when live video refuses to play.
 pub const MAX_VIDEO_SKIPS: u8 = 4;
@@ -506,6 +507,11 @@ mod tests {
         assert_eq!(spoken(&fx), vec!["Goodbye, Manj."]);
         assert_eq!(fx.last(), Some(&Effect::Quit));
         assert!(think_of(&fx).is_none());
+    }
+
+    #[test]
+    fn jarvis_keeps_listening_for_a_minute_after_a_reply() {
+        assert_eq!(FOLLOW_UP_WINDOW, Duration::from_secs(60));
     }
 
     #[test]
