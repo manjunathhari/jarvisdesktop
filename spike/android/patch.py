@@ -95,13 +95,7 @@ out = main / "spikeLibs" / libs.name  # arm64-v8a or x86_64
 out.mkdir(parents=True, exist_ok=True)
 for name in ("libsherpa-onnx-c-api.so", "libonnxruntime.so"):
     shutil.copy(libs / name, out / name)
-# The C++ runtime the audio library (oboe) needs, from the NDK.
-import os
-triple = {"arm64-v8a": "aarch64-linux-android", "x86_64": "x86_64-linux-android"}[libs.name]
-ndk = pathlib.Path(os.environ["NDK_HOME"])
-found = list(ndk.glob(f"toolchains/llvm/prebuilt/*/sysroot/usr/lib/{triple}/libc++_shared.so"))
-assert len(found) == 1, found
-shutil.copy(found[0], out / "libc++_shared.so")
+# (The Tauri build adds libc++_shared.so itself once the Rust library needs it.)
 gradle = gen / "app" / "build.gradle.kts"
 gradle.write_text(
     gradle.read_text()
