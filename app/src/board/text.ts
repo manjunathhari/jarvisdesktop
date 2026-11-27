@@ -49,7 +49,8 @@ const ELEMENTS_MAX = 40_000;
 ///   backslash, and every `%` followed by two hex digits;
 /// - `https://` in lower case, then a host that starts with a letter, digit or `[`;
 /// - no `@` and no `%` before the path (no name, no password, no disguised host);
-/// - and a URL parser agrees it is an https address with a host.
+/// - a URL parser agrees it is an https address with a host;
+/// - and the host is out on the internet, not this PC or a private network.
 export function linkTarget(raw: string): string | null {
   if (raw.length > LINK_MAX) return null;
   if (!/^https:\/\/[A-Za-z0-9[][\x21-\x7e]*$/.test(raw)) return null;
@@ -63,7 +64,35 @@ export function linkTarget(raw: string): string | null {
     return null;
   }
   if (url.protocol !== "https:" || !url.hostname || url.username || url.password) return null;
-  return raw;
+  return publicHost(url.hostname) ? raw : null;
+}
+
+/// Names that never mean a host on the internet.
+const LOCAL_SUFFIXES = ["localhost", "local", "lan", "internal", "intranet", "home", "corp", "home.arpa"];
+
+/// Whether a link's host is out on the internet, as far as its name or number shows (the
+/// app's `public_host` has the same rules). A panel is written from web pages and has no
+/// business linking to the person's own devices: this PC, the home network, a router.
+function publicHost(hostname: string): boolean {
+  if (hostname.startsWith("[")) return false; // any IPv6 number
+  const name = hostname.replace(/\.+$/, "").toLowerCase();
+  const quad = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(name);
+  if (quad) {
+    const [a, b] = [Number(quad[1]), Number(quad[2])];
+    return !(
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      a >= 224 ||
+      (a === 100 && b >= 64 && b < 128) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b < 32) ||
+      (a === 192 && b === 168)
+    );
+  }
+  if (!name.includes(".")) return false;
+  if (LOCAL_SUFFIXES.some((s) => name === s || name.endsWith(`.${s}`))) return false;
+  return !/^\d+$/.test(name.slice(name.lastIndexOf(".") + 1)); // a number the parser did not take as one
 }
 
 const md = new MarkdownIt({

@@ -801,3 +801,10 @@ def test_titles_and_addresses_from_a_search_cannot_write_markdown(
         "- [code bbold/b x !(img)](https://example.org/b)\n"
         "- [Source](https://example.org/c)"
     )
+
+
+def test_the_canvas_rules_say_the_page_is_silent() -> None:
+    """The Board window is muted and a Canvas frame has no audio or speech interfaces, so a
+    page written to use them would only show an error."""
+    assert "no sound, speech or video" in board_job.BOARD_PROMPT
+    assert "no network" in board_job.BOARD_PROMPT

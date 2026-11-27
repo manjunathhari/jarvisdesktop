@@ -207,6 +207,10 @@ pub async fn forward(app: AppHandle, slot: NodeSlot, mut events: mpsc::Receiver<
             // The reconnect summary is display-only; its items also arrive as notices.
             NodeEvent::Summary(_) => Ok(()),
             NodeEvent::Board(event) => crate::board::on_event(&app, event),
+            NodeEvent::BoardWorking => {
+                crate::board::on_working(&app);
+                Ok(())
+            }
         };
         if let Err(e) = r {
             tracing::warn!(error = %e, "emit failed");

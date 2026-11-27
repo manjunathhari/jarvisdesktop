@@ -59,6 +59,7 @@ TIERS: Mapping[str, Tier] = MappingProxyType(
         "board.update": Tier.READ_ONLY,
         "board.set_state": Tier.READ_ONLY,
         "board.focus": Tier.READ_ONLY,
+        "board.working": Tier.READ_ONLY,
     }
 )
 
@@ -77,6 +78,7 @@ _NODE_KINDS: Mapping[str, frozenset[str]] = MappingProxyType(
         "board.update": frozenset({"DESKTOP"}),
         "board.set_state": frozenset({"DESKTOP"}),
         "board.focus": frozenset({"DESKTOP"}),
+        "board.working": frozenset({"DESKTOP"}),
     }
 )
 

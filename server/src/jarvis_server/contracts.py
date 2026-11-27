@@ -689,6 +689,12 @@ class BoardFocusArgs(_Contract):
     panel_id: UUID
 
 
+class BoardWorkingArgs(_Contract):
+    """Board work has started (the voice turn queued a job). There is no "ended"."""
+
+    state: Literal["started"]
+
+
 class _Check(_Contract):
     check: Code | None = None  # omitted when there is none; never null, as in the schema
 
@@ -739,6 +745,13 @@ class BoardSetStateReceipt(_Contract):
         if self.result == "OK" and self.evidence.panel_id is None:
             raise ValueError("an OK receipt names the panel")
         return self
+
+
+class BoardWorkingReceipt(_Contract):
+    reply_id: UUID
+    seq: Seq
+    result: Literal["OK", "REFUSED"]
+    evidence: _Check
 
 
 class BoardState(_Contract):
@@ -829,6 +842,8 @@ DESKTOP_MODELS: dict[str, type[BaseModel]] = {
     "board.update.args": BoardUpdateArgs,
     "board.set_state.args": BoardSetStateArgs,
     "board.focus.args": BoardFocusArgs,
+    "board.working.args": BoardWorkingArgs,
     "board.show.receipt": BoardShowReceipt,
     "board.set_state.receipt": BoardSetStateReceipt,
+    "board.working.receipt": BoardWorkingReceipt,
 }

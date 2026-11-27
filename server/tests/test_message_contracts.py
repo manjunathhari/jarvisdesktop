@@ -28,8 +28,10 @@ DESKTOP = [
     "board.update.args",
     "board.set_state.args",
     "board.focus.args",
+    "board.working.args",
     "board.show.receipt",
     "board.set_state.receipt",
+    "board.working.receipt",
 ]
 
 KINDS = [

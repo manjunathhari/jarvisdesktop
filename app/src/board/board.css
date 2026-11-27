@@ -590,3 +590,21 @@ iframe.canvas {
   clip-path: inset(50%);
   white-space: nowrap;
 }
+
+.turns li.working {
+  border-style: dashed;
+  color: var(--muted);
+  font-style: italic;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .turns li.working {
+    animation: working 1.6s ease-in-out infinite;
+  }
+}
+
+@keyframes working {
+  50% {
+    opacity: 0.55;
+  }
+}

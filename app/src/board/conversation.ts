@@ -92,9 +92,9 @@ function clock(at: string): string {
 
 export function renderConversation(
   turns: Turn[],
-  { onPanel }: { onPanel: (panelId: string) => void },
+  { onPanel, working = false }: { onPanel: (panelId: string) => void; working?: boolean },
 ): HTMLElement {
-  if (turns.length === 0) {
+  if (turns.length === 0 && !working) {
     const empty = document.createElement("p");
     empty.className = "empty";
     empty.textContent = EMPTY;
@@ -127,6 +127,13 @@ export function renderConversation(
       marker.addEventListener("click", () => onPanel(id));
       item.append(marker);
     }
+    list.append(item);
+  }
+  if (working) {
+    // Between "On it" and the panel: the desktop was told Board work has started.
+    const item = document.createElement("li");
+    item.className = "working";
+    item.textContent = "Jarvis is working…";
     list.append(item);
   }
   return list;

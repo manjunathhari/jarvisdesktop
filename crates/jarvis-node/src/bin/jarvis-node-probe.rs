@@ -180,6 +180,7 @@ async fn print_ui(
             UiEvent::Board(BoardEvent::Focus { panel_id }) => {
                 say(json!({"event": "board_focus", "panel_id": panel_id}))
             }
+            UiEvent::BoardWorking => say(json!({"event": "board_working"})),
         }
     }
 }

@@ -713,6 +713,40 @@ async fn set_state_for_an_unknown_panel_is_refused() {
 }
 
 #[tokio::test]
+async fn work_started_is_passed_to_the_app_and_answered_at_once() {
+    let mut r = rig().await;
+    let args = json!({"state": "started"});
+    assert_conforms("board.working.args", &args);
+    push(&mut r, 1, "board.working", &args).await;
+    let receipt = sent(&mut r, "action.receipt").await;
+    assert_conforms("board.working.receipt", &receipt);
+    assert_eq!(receipt["result"], "OK");
+    assert_eq!(receipt["evidence"], json!({}));
+    assert!(matches!(
+        r.ui_event(Duration::from_secs(2)).await,
+        Some(UiEvent::BoardWorking)
+    ));
+    // Nothing is stored: it is not a panel.
+    assert!(r.node.board().lock().unwrap().panels().is_empty());
+}
+
+#[tokio::test]
+async fn a_damaged_work_started_is_refused_and_not_passed_on() {
+    let mut r = rig().await;
+    for bad in [
+        json!({"state": "ended"}),
+        json!({}),
+        json!({"state": "started", "extra": 1}),
+    ] {
+        push(&mut r, 1, "board.working", &bad).await;
+        let receipt = sent(&mut r, "action.receipt").await;
+        assert_conforms("board.working.receipt", &receipt);
+        assert_eq!(evidence(&receipt), ("REFUSED", Some("malformed")));
+    }
+    assert!(r.ui_event(Duration::from_millis(200)).await.is_none());
+}
+
+#[tokio::test]
 async fn an_unknown_board_kind_is_refused_once() {
     let mut r = rig().await;
     push(

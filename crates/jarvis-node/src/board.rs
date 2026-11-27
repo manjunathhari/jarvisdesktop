@@ -558,6 +558,9 @@ pub mod view {
         pub panels: Vec<Panel>,
         pub conversation: Vec<ConversationEntry>,
         pub spend_today_paise: u64,
+        /// Whether Jarvis is working on something for the Board now. The store does not know:
+        /// the app fills it in from the conversation recorder.
+        pub working: bool,
     }
 
     /// The newest lines of the conversation a snapshot carries: what the window shows.
@@ -567,6 +570,7 @@ pub mod view {
         let panels = store.panels();
         BoardSnapshot {
             spend_today_paise: spend_today_paise(&panels, now),
+            working: false,
             conversation: {
                 let mut all = store.conversation();
                 all.split_off(all.len().saturating_sub(SNAPSHOT_LINES))
@@ -586,7 +590,8 @@ pub mod view {
     ///   backslash, and every `%` followed by two hex digits;
     /// - `https://` in lower case, then a host that starts with a letter, digit or `[`;
     /// - no `@` and no `%` before the path (no name, no password, no disguised host);
-    /// - and a URL parser agrees it is an https address with a host.
+    /// - a URL parser agrees it is an https address with a host;
+    /// - and the host is out on the internet, not this PC or a private network.
     pub fn openable_link(raw: &str) -> Option<String> {
         if raw.len() > LINK_MAX || !raw.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
             return None;
@@ -612,9 +617,56 @@ pub mod view {
         }
         let parsed = url::Url::parse(raw).ok()?;
         let plain = parsed.scheme() == "https"
-            && parsed.host_str().is_some_and(|h| !h.is_empty())
             && parsed.username().is_empty()
-            && parsed.password().is_none();
+            && parsed.password().is_none()
+            && parsed.host().is_some_and(|host| public_host(&host));
         plain.then(|| raw.to_owned())
+    }
+
+    /// Names that never mean a host on the internet.
+    const LOCAL_SUFFIXES: [&str; 8] = [
+        "localhost",
+        "local",
+        "lan",
+        "internal",
+        "intranet",
+        "home",
+        "corp",
+        "home.arpa",
+    ];
+
+    /// Whether a link's host is out on the internet, as far as its name or number shows. A
+    /// panel is written from web pages and has no business linking to the person's own
+    /// devices, so these are refused: any IPv6 number; an IPv4 number that is loopback,
+    /// private, link-local, shared (100.64/10), multicast, reserved or zero; a name with no
+    /// dot; and names under `localhost`, `local`, `lan` and the like. (A public name that
+    /// resolves to a private number cannot be told from here.)
+    fn public_host(host: &url::Host<&str>) -> bool {
+        match host {
+            url::Host::Ipv6(_) => false,
+            url::Host::Ipv4(ip) => {
+                let [a, b, ..] = ip.octets();
+                !(a == 0
+                    || a == 10
+                    || a == 127
+                    || a >= 224
+                    || (a == 100 && (64..128).contains(&b))
+                    || (a == 169 && b == 254)
+                    || (a == 172 && (16..32).contains(&b))
+                    || (a == 192 && b == 168))
+            }
+            url::Host::Domain(name) => {
+                let name = name.trim_end_matches('.').to_ascii_lowercase();
+                name.contains('.')
+                    && !LOCAL_SUFFIXES
+                        .iter()
+                        .any(|s| name == *s || name.ends_with(&format!(".{s}")))
+                    // A last label of digits is a number the parser did not take as one.
+                    && !name
+                        .rsplit('.')
+                        .next()
+                        .is_some_and(|last| last.bytes().all(|b| b.is_ascii_digit()))
+            }
+        }
     }
 }

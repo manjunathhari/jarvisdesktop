@@ -1,13 +1,17 @@
 {
-  "note": "Addresses a Board link may or may not open. The page (text.ts linkTarget) and the app (jarvis-node openable_link) must agree on every one.",
+  "note": "Addresses a Board link may or may not open. The page (text.ts linkTarget) and the app (jarvis-node openable_link) must agree on every one. An address on this PC or a private network is refused: a panel written from web pages has no business linking to the person's own devices.",
   "open": [
     "https://example.org",
     "https://example.org/a?b=1#c",
     "https://example.org:8443/path/%E2%82%B9?q=a%20b&r=1",
     "https://sub.example.co.in/a_b-c.~d",
     "https://xn--bcher-kva.example/",
-    "https://127.0.0.1:8080/",
-    "https://[::1]/"
+    "https://8.8.8.8/",
+    "https://example.co.uk/",
+    "https://172.32.0.1/",
+    "https://100.128.0.1/",
+    "https://11.0.0.1/",
+    "https://localhost.example.org/"
   ],
   "refuse": [
     "",
@@ -32,7 +36,7 @@
     " https://example.org",
     "https://example.org\n",
     "https://example.org/\u0000",
-    "https://example.org/\u0085",
+    "https://example.org/",
     "https://example.org\\@evil.example",
     "https://example.org/a\\b",
     "https://%",
@@ -58,6 +62,34 @@
     "https://‮evil.example",
     "https://example.org/﻿x",
     "https://bücher.example/",
-    "https://example.org/₹"
+    "https://example.org/₹",
+    "https://127.0.0.1:8080/",
+    "https://[::1]/",
+    "https://[fe80::1]/",
+    "https://[2001:db8::1]/",
+    "https://localhost/",
+    "https://LOCALHOST/",
+    "https://localhost./",
+    "https://foo.localhost/",
+    "https://printer.local/",
+    "https://router.lan/x",
+    "https://nas.home.arpa/",
+    "https://box.internal/",
+    "https://router/",
+    "https://10.0.0.1/",
+    "https://172.16.5.4/",
+    "https://172.31.255.255/",
+    "https://192.168.1.1/admin",
+    "https://192.168.1.1./",
+    "https://169.254.169.254/latest",
+    "https://100.64.0.1/",
+    "https://100.127.255.255/",
+    "https://0.0.0.0/",
+    "https://0x7f.1/",
+    "https://2130706433/",
+    "https://127.1/",
+    "https://017700000001/",
+    "https://224.0.0.1/",
+    "https://255.255.255.255/"
   ]
 }

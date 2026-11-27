@@ -33,7 +33,7 @@ use jarvis_node::board::view::{
 };
 use jarvis_node::board::{BoardEvent, PanelState};
 use jarvis_node::node::NodeHandle;
-use jarvis_node::talk::Recorder;
+use jarvis_node::talk::{Recorder, Talk};
 use std::sync::{Mutex, OnceLock};
 use tauri::{
     AppHandle, Emitter, Manager, State, WebviewWindow, WebviewWindowBuilder, Window, WindowEvent,
@@ -54,6 +54,8 @@ const HELD_MAX: usize = 64;
 
 /// The Conversation column's event: one line of the conversation, already in the store.
 pub const TALK_EVENT: &str = "jarvis://board-talk";
+/// Whether Jarvis is working on something for the Board: `true` or `false`.
+pub const WORKING_EVENT: &str = "jarvis://board-working";
 /// The conversation recorder, once the node (whose store it writes to) is running.
 static RECORDER: OnceLock<Recorder> = OnceLock::new();
 
@@ -61,11 +63,32 @@ static RECORDER: OnceLock<Recorder> = OnceLock::new();
 /// store first and then to the window; a line the window missed is in its next snapshot.
 pub fn start_recorder(app: &AppHandle, node: &NodeHandle) {
     let app = app.clone();
-    let _ = RECORDER.set(Recorder::start(node.board(), move |entry| {
-        if let Err(e) = app.emit_to(WINDOW, TALK_EVENT, entry.clone()) {
-            tracing::warn!(error = %e, "couldn't pass a line of the conversation to the Board");
+    let _ = RECORDER.set(Recorder::start(node.board(), move |talk| {
+        let sent = match talk {
+            Talk::Line(entry) => app.emit_to(WINDOW, TALK_EVENT, entry.clone()),
+            Talk::Working(on) => app.emit_to(WINDOW, WORKING_EVENT, on),
+        };
+        if let Err(e) = sent {
+            tracing::warn!(error = %e, "couldn't pass the conversation on to the Board");
         }
     }));
+}
+
+/// The server said Board work has started: open the Board, which shows "Jarvis is working…"
+/// until a panel is up, Jarvis speaks unasked, or three minutes pass (`jarvis_node::talk`).
+pub fn on_working(app: &AppHandle) {
+    ensure_open(app);
+    if let Some(recorder) = RECORDER.get() {
+        recorder.working_started();
+    }
+}
+
+/// Jarvis said this unasked (an announcement). A line of the conversation; it also ends
+/// "Jarvis is working".
+pub fn announced(text: &str) {
+    if let Some(recorder) = RECORDER.get() {
+        recorder.announced(text);
+    }
 }
 
 /// The person said this (heard by the microphone, or typed: see [`typed`]).
@@ -289,7 +312,10 @@ pub async fn board_snapshot(
     .map_err(|e| e.to_string());
     // The page asks only once it listens (and it queues events until this answer arrives).
     release_held(&app);
-    taken
+    taken.map(|mut snapshot| {
+        snapshot.working = RECORDER.get().is_some_and(Recorder::is_working);
+        snapshot
+    })
 }
 
 /// The person minimised, maximised, restored, closed or reopened a panel by hand.

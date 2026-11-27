@@ -42,8 +42,11 @@ pub enum Event {
     Tap {
         hour: u32,
     },
-    /// What the user said (or typed, in dev mode).
+    /// What the user said.
     Utterance(String),
+    /// What the user typed. An utterance, except that it also wakes Jarvis after "stop
+    /// listening": someone who types a request wants it taken.
+    Typed(String),
     BrainSpeech(String),
     BrainAction(Action),
     BrainDone,
@@ -199,6 +202,14 @@ impl Coordinator {
                 }
             }
             Event::Utterance(text) => self.on_utterance(text, &mut fx),
+            Event::Typed(text) => {
+                if self.mode == Mode::MicOff && !text.trim().is_empty() {
+                    // As a tap would, without the greeting: this is the request itself.
+                    fx.push(Effect::Mic(true));
+                    self.set_mode(Mode::Idle, &mut fx);
+                }
+                self.on_utterance(text, &mut fx);
+            }
             Event::BrainSpeech(text) => {
                 if !self.reply_so_far.is_empty() {
                     self.reply_so_far.push(' ');
@@ -704,6 +715,42 @@ mod tests {
         let fx = c.step(Event::Utterance("stop".into()));
         assert!(fx.contains(&Effect::StopSpeaking));
         assert!(think_of(&fx).is_none());
+    }
+
+    #[test]
+    fn a_typed_line_wakes_jarvis_after_stop_listening() {
+        let mut c = Coordinator::new("Manj");
+        c.step(Event::Utterance("stop listening".into()));
+        assert_eq!(c.mode(), Mode::MicOff);
+
+        // Nothing typed: nothing happens.
+        assert!(c.step(Event::Typed("   ".into())).is_empty());
+        assert_eq!(c.mode(), Mode::MicOff);
+
+        let fx = c.step(Event::Typed("  bring me the news ".into()));
+        assert!(fx.contains(&Effect::Mic(true)), "typing wakes Jarvis");
+        assert!(fx.contains(&Effect::Heard("bring me the news".into())));
+        assert_eq!(
+            think_of(&fx).map(|t| t.0).as_deref(),
+            Some("bring me the news")
+        );
+        assert_eq!(c.mode(), Mode::Thinking);
+        // It is a request, not a tap: no greeting first.
+        assert!(!fx.iter().any(|f| matches!(f, Effect::Speak(_))));
+    }
+
+    #[test]
+    fn a_typed_line_is_an_ordinary_utterance_otherwise() {
+        let mut c = Coordinator::new("Manj");
+        let fx = c.step(Event::Typed("bring me the news".into()));
+        assert!(!fx.contains(&Effect::Mic(true)));
+        assert_eq!(
+            think_of(&fx).map(|t| t.0).as_deref(),
+            Some("bring me the news")
+        );
+        // While a turn is under way it is not taken, typed or spoken.
+        assert!(c.step(Event::Typed("and the weather".into())).is_empty());
+        assert_eq!(c.mode(), Mode::Thinking);
     }
 
     #[test]

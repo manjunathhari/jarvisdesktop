@@ -34,6 +34,8 @@ let model = new BoardModel([]);
 let talk = new Conversation([]);
 /// What the Conversation column was last built from (lines and panel titles).
 let talkBuiltFor = "";
+/// Whether Jarvis is working on something for the Board (the app says when it starts and ends).
+let working = false;
 /// What the shelf (dock and closed list) was last built from. It is rebuilt only when that
 /// changes, so a redraw for any other reason never wipes an open "Clear closed panels?".
 let shelfBuiltFor = "";
@@ -185,13 +187,13 @@ function showFromTalk(id: string) {
 
 function drawTalk() {
   const turns = conversationModel(talk.entries(), model.all());
-  const built = JSON.stringify(turns);
+  const built = JSON.stringify([turns, working]);
   if (built === talkBuiltFor) return;
   talkBuiltFor = built;
   const aside = $("conversation");
   // Follow the newest line only if the person was already at the end, not while reading back.
   const atEnd = aside.scrollHeight - aside.scrollTop - aside.clientHeight < 40;
-  $("talk").replaceChildren(renderConversation(turns, { onPanel: showFromTalk }));
+  $("talk").replaceChildren(renderConversation(turns, { onPanel: showFromTalk, working }));
   if (atEnd) aside.scrollTop = aside.scrollHeight;
 }
 
@@ -240,6 +242,7 @@ async function load() {
     const stored = new Conversation(snapshot.conversation);
     for (const entry of talk.entries()) stored.add(entry); // lines that came while loading
     talk = stored;
+    working = snapshot.working === true;
     // A store that somehow holds two maximised panels: the newest keeps it.
     const top = model.inView().find((p) => p.state === "maximised");
     if (top) for (const other of model.covering(top.panel_id)) model.setState(other, "open");
@@ -256,6 +259,11 @@ async function load() {
 document.addEventListener(LINK_REFUSED, () => problem("That link could not be opened."));
 $("typing").replaceChildren(renderTyping({ onSay: say }));
 await listen<BoardEvent>("jarvis://board", (e) => onEvent(e.payload));
+await listen<boolean>("jarvis://board-working", (e) => {
+  working = e.payload === true;
+  drawTalk();
+  if (working) $("talk-latest").textContent = "Jarvis is working";
+});
 await listen<ConversationEntry>("jarvis://board-talk", (e) => {
   if (!talk.add(e.payload)) return;
   drawTalk();

@@ -9,10 +9,14 @@
 //! - A Jarvis line carries the panels shown since the previous Jarvis line. A Board event
 //!   does not say which reply made a panel, and the headline is its own reply, so this is the
 //!   nearest honest link: the line spoken after a panel went up points at it.
+//! - "Jarvis is working": the server says when Board work starts (`board.working`) and
+//!   nothing says when it ends, so it ends here: when a panel is shown, when Jarvis speaks
+//!   unasked (the headline, or what went wrong), or after [`WORKING_LASTS`].
 //! - A typed line reaches the coordinator like a spoken one, so the app says "this text was
 //!   typed" first; the mark is for that text only, is used once, and lasts a few seconds.
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,7 +30,23 @@ pub const TEXT_MAX: usize = 2000;
 /// whose line was dropped (Jarvis was busy) must not label the same words spoken later.
 pub const TYPED_MARK_LASTS: Duration = Duration::from_secs(3);
 
+/// How long "Jarvis is working" is shown if nothing ends it. Board work takes 30 to 90
+/// seconds; after this the line is taken down, not left up for ever.
+pub const WORKING_LASTS: Duration = Duration::from_secs(180);
+
+/// What the recorder tells the app, for the window.
+pub enum Talk<'a> {
+    /// A line of the conversation, already written to the store.
+    Line(&'a ConversationEntry),
+    /// Jarvis started (`true`) or stopped (`false`) working on something for the Board.
+    Working(bool),
+}
+
 enum Job {
+    /// The server said Board work has started (`board.working`).
+    Working,
+    /// Jarvis spoke unasked (the headline, or what went wrong): a line, and the work is over.
+    Announced(String),
     Heard(String),
     Typed(String, Instant),
     Spoke(String),
@@ -36,6 +56,7 @@ enum Job {
 /// Hand lines to the recorder; cheap to call from anywhere.
 pub struct Recorder {
     jobs: Mutex<mpsc::Sender<Job>>,
+    working: Arc<AtomicBool>,
 }
 
 fn kept(text: &str) -> Option<String> {
@@ -44,20 +65,66 @@ fn kept(text: &str) -> Option<String> {
 }
 
 impl Recorder {
-    /// Start recording into `store`. `on_entry` is called, on the recorder's own thread, with
-    /// each line once it has been written (or could not be: it is still shown).
+    /// Start recording into `store`. `on_talk` is called, on the recorder's own thread, with
+    /// each line once it has been written (or could not be: it is still shown), and with each
+    /// change of "Jarvis is working".
     pub fn start(
         store: Arc<Mutex<BoardStore>>,
-        on_entry: impl Fn(&ConversationEntry) + Send + 'static,
+        on_talk: impl Fn(Talk<'_>) + Send + 'static,
+    ) -> Self {
+        Self::start_with(store, WORKING_LASTS, on_talk)
+    }
+
+    /// As [`Recorder::start`], with how long "working" lasts unanswered (for tests).
+    pub fn start_with(
+        store: Arc<Mutex<BoardStore>>,
+        working_lasts: Duration,
+        on_talk: impl Fn(Talk<'_>) + Send + 'static,
     ) -> Self {
         let (jobs, work) = mpsc::channel::<Job>();
+        let working = Arc::new(AtomicBool::new(false));
+        let flag = working.clone();
         let spawned = std::thread::Builder::new()
             .name("board-conversation".into())
             .spawn(move || {
                 let mut typed: Option<(String, Instant)> = None;
                 let mut shown: Vec<Uuid> = Vec::new();
-                for job in work {
+                // While working: when the line is taken down if nothing ends it.
+                let mut working_until: Option<Instant> = None;
+                let stop_working = |until: &mut Option<Instant>| {
+                    if until.take().is_some() {
+                        flag.store(false, Ordering::SeqCst);
+                        on_talk(Talk::Working(false));
+                    }
+                };
+                loop {
+                    let job = match working_until {
+                        None => match work.recv() {
+                            Ok(job) => job,
+                            Err(_) => return,
+                        },
+                        Some(until) => {
+                            match work.recv_timeout(until.saturating_duration_since(Instant::now()))
+                            {
+                                Ok(job) => job,
+                                Err(RecvTimeoutError::Timeout) => {
+                                    stop_working(&mut working_until);
+                                    continue;
+                                }
+                                Err(RecvTimeoutError::Disconnected) => return,
+                            }
+                        }
+                    };
                     let (who, how, text, panels) = match job {
+                        Job::Working => {
+                            let already = working_until.is_some();
+                            working_until = Some(Instant::now() + working_lasts);
+                            if !already {
+                                flag.store(true, Ordering::SeqCst);
+                                on_talk(Talk::Working(true));
+                            }
+                            continue;
+                        }
                         Job::Typed(text, at) => {
                             typed = Some((text, at));
                             continue;
@@ -66,6 +133,7 @@ impl Recorder {
                             if !shown.contains(&id) {
                                 shown.push(id);
                             }
+                            stop_working(&mut working_until); // the work is on the Board
                             continue;
                         }
                         Job::Heard(text) => {
@@ -85,6 +153,10 @@ impl Recorder {
                         Job::Spoke(text) => {
                             (Who::Jarvis, How::Spoken, text, std::mem::take(&mut shown))
                         }
+                        Job::Announced(text) => {
+                            stop_working(&mut working_until);
+                            (Who::Jarvis, How::Spoken, text, std::mem::take(&mut shown))
+                        }
                     };
                     let entry = ConversationEntry {
                         at: chrono::Local::now().fixed_offset(),
@@ -100,7 +172,7 @@ impl Recorder {
                     if let Err(e) = written {
                         tracing::warn!(error = %e, "couldn't keep a line of the conversation");
                     }
-                    on_entry(&entry);
+                    on_talk(Talk::Line(&entry));
                 }
             });
         if let Err(e) = spawned {
@@ -108,6 +180,7 @@ impl Recorder {
         }
         Recorder {
             jobs: Mutex::new(jobs),
+            working,
         }
     }
 
@@ -139,6 +212,26 @@ impl Recorder {
         if let Some(text) = kept(text) {
             self.send(Job::Spoke(text));
         }
+    }
+
+    /// Jarvis said this unasked (an announcement: the headline when a panel is up, or a
+    /// sentence saying what went wrong). Recorded as a line, and it ends "working".
+    pub fn announced(&self, text: &str) {
+        if let Some(text) = kept(text) {
+            self.send(Job::Announced(text));
+        }
+    }
+
+    /// The server said Board work has started. "Working" lasts until a panel is shown, an
+    /// announcement is spoken, or its time runs out.
+    pub fn working_started(&self) {
+        self.send(Job::Working);
+    }
+
+    /// Whether Jarvis is working on something for the Board now (for a window that opens
+    /// part-way through).
+    pub fn is_working(&self) -> bool {
+        self.working.load(Ordering::SeqCst)
     }
 
     /// A panel was shown or updated on the Board.

@@ -110,6 +110,7 @@ def test_tier_table_exact() -> None:
         "board.update": Tier.READ_ONLY,
         "board.set_state": Tier.READ_ONLY,
         "board.focus": Tier.READ_ONLY,
+        "board.working": Tier.READ_ONLY,
     }
     with pytest.raises(TypeError):
         policy.TIERS["shell.run"] = Tier.READ_ONLY  # type: ignore[index]
@@ -119,7 +120,9 @@ def test_tier_table_exact() -> None:
         assert policy.tier_of(kind) is None, kind
 
 
-BOARD_KINDS = ("board.make", "board.show", "board.update", "board.set_state", "board.focus")
+BOARD_KINDS = (
+    "board.make", "board.show", "board.update", "board.set_state", "board.focus", "board.working",
+)  # fmt: skip
 
 
 def test_board_kinds_are_read_only_and_desktop_only(

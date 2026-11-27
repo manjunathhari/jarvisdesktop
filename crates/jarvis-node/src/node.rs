@@ -105,6 +105,9 @@ pub enum UiEvent {
     /// A verified Board action, already in the local store. For `Show` and `Update`, draw the
     /// panel and then call `NodeHandle::board_rendered`.
     Board(BoardEvent),
+    /// The voice turn queued Board work (`board.working`): show that Jarvis is working. There
+    /// is no "ended": a panel arriving, an announcement or time ends it (`talk::Recorder`).
+    BoardWorking,
 }
 
 /// A shown panel whose receipt waits for the Board to report it drawn.
@@ -801,6 +804,27 @@ impl Router {
 impl Router {
     /// A verified live Board action (see the module comment).
     async fn on_board(&self, reply_id: Uuid, seq: i64, kind: &str, args: &Map<String, Value>) {
+        if kind == "board.working" {
+            // The voice turn queued Board work (R12-42). Not a panel: nothing is stored. The
+            // app shows that Jarvis is working and ends the line itself.
+            let started = args.len() == 1 && args.get("state") == Some(&json!("started"));
+            let receipt = if started {
+                json!({"reply_id": reply_id, "seq": seq, "result": "OK", "evidence": {}})
+            } else {
+                tracing::warn!(%reply_id, seq, "board.working refused: malformed");
+                json!({
+                    "reply_id": reply_id, "seq": seq, "result": "REFUSED",
+                    "evidence": {"check": "malformed"},
+                })
+            };
+            if self.client.send("action.receipt", receipt).await.is_err() {
+                tracing::warn!(%reply_id, seq, "receipt not sent: not connected");
+            }
+            if started {
+                let _ = self.ui.send(UiEvent::BoardWorking).await;
+            }
+            return;
+        }
         let refuse = |check: &str| {
             tracing::warn!(%reply_id, seq, action_kind = kind, check, "Board action refused");
             json!({

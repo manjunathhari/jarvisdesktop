@@ -41,6 +41,7 @@ BOARD_NOT_DONE_TEXT = "I couldn't do that on the board."
 
 _SHOWN = frozenset({"board.show", "board.update"})
 _STATE = frozenset({"board.set_state", "board.focus"})
+_WORKING = "board.working"
 
 
 def on_live_receipt(
@@ -84,6 +85,24 @@ def on_live_receipt(
         if said is None and drawn is None:  # once, and never about a chunk reported drawn
             actions.speak(conn, session_id, text)
         release_headline(conn, reply_id)
+
+    if action_kind == _WORKING:
+        # A courtesy to the Board, not a record: taken quietly either way. A refusal is noted
+        # (the desktop is older than this action, or the args were damaged) and never said.
+        try:
+            contracts.BoardWorkingArgs.model_validate(args)
+            noted = contracts.BoardWorkingReceipt.model_validate(payload)
+        except ValidationError:
+            malformed()
+            return
+        actions.set_outcome(conn, inbound_id, "ANSWERED")
+        if noted.result != "OK":
+            comm.record_event(
+                conn, "board.working_refused", subject_type="stream",
+                subject_id=f"{reply_id}:{seq}", person_id=person_id,
+                details={"result": noted.result, "check": noted.evidence.check or "none"},
+            )  # fmt: skip
+        return
 
     try:
         if action_kind in _SHOWN:

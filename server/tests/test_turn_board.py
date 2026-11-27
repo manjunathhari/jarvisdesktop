@@ -175,7 +175,7 @@ def test_tool_table_has_the_three_board_tools() -> None:
     assert not {"board.show", "board.update"} & set(prompt.TOOL_ACTIONS.values())
 
 
-def test_board_make_queues_one_job_and_no_action(
+def test_board_make_queues_one_job_and_tells_the_desktop_work_has_started(
     app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine
 ) -> None:
     request = "Compare three fictional hill stations for a December trip"
@@ -188,7 +188,9 @@ def test_board_make_queues_one_job_and_no_action(
         "session_id": str(session), "person_id": str(person), "node_id": str(node),
         "inbound_id": str(tid), "request": request,
     }  # fmt: skip
-    assert _actions(app, session) == []
+    # Nothing is shown yet; the desktop is only told that work has started (R12-42).
+    assert _actions(app, session) == [("board.working", {"state": "started"})]
+    flow.conform("board.working.args", {"state": "started"})
     assert app.execute("SELECT count(*) FROM board.panel").fetchone() == (0,)
     assert _messages(app, tid)[-1] == ("JARVIS", "On it, I'll put it on the board.")
     assert _outcome(app, tid) == "ANSWERED"
@@ -597,6 +599,26 @@ def test_state_receipts(
     assert _events(app, "board.state_refused", person)[0] == {
         "panel_id": str(panel.panel_id), "result": "REFUSED", "check": "unknown_panel",
     }  # fmt: skip
+
+
+def test_working_receipts_are_taken_quietly(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID
+) -> None:
+    """The "work has started" action is a courtesy: OK and REFUSED are both taken, nothing is
+    said and nothing is left for the person; a refusal is noted. Another shape is malformed."""
+    reply, seq = _issue(app, node, person, session, "board.working", {"state": "started"})
+    base = {"reply_id": str(reply), "seq": seq}
+    ok = _receive(app, owner, node, person, {**base, "result": "OK", "evidence": {}})
+    assert flow.outcome_of(app, ok) == "ANSWERED"
+    refused = {**base, "result": "REFUSED", "evidence": {"check": "unknown_action_kind"}}
+    no = _receive(app, owner, node, person, refused)
+    assert flow.outcome_of(app, no) == "ANSWERED"
+    assert _events(app, "board.working_refused", person) == [
+        {"result": "REFUSED", "check": "unknown_action_kind"}
+    ]
+    assert _spoken(app, session) == [] and flow.items(app, person, "action.readonly_ok") == []
+    odd = _receive(app, owner, node, person, {**base, "result": "RENDERED", "evidence": {}})
+    assert flow.receipt_audit(app, odd) == [("REJECTED", "malformed", {"node_id": str(node)})]
 
 
 def test_other_live_receipts_are_unchanged(

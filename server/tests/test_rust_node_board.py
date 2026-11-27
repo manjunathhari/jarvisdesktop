@@ -87,6 +87,10 @@ def test_request_becomes_a_rendered_panel_then_voice_and_click_and_restart(
     spoken = " ".join(e["text"] for e in p.events if e["event"] == "speech")
     assert spoken == turn.BOARD_ACK_TEXT
     shown = p.wait_for(lambda e: e["event"] == "board_show", timeout=40)
+    # The desktop was told work had started, in the turn's own reply, before the panel came.
+    order = [e["event"] for e in p.events]
+    assert "board_working" in order
+    assert order.index("board_working") < order.index("board_show")
     assert (shown["title"], shown["kind"], shown["revision"]) == ("December trip", "text", 1)
     assert shown["content_sha256"] == board_content_sha256(TEXT)
     assert shown["cost_paise"] > 0

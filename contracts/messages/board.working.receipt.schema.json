@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/board.working.receipt.schema.json",
+  "title": "Receipt of `board.working`",
+  "description": "The `action.receipt` payload (its live form) for a `board.working` action. `OK`: the node took note. `REFUSED`: a check failed (for example `malformed`). Nothing depends on it: the line is a courtesy, not a record.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "reply_id",
+    "seq",
+    "result",
+    "evidence"
+  ],
+  "properties": {
+    "reply_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "result": {
+      "enum": [
+        "OK",
+        "REFUSED"
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "check": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.]{0,63}$",
+          "description": "The check that failed. Omitted when there is none, never null."
+        }
+      }
+    }
+  }
+}

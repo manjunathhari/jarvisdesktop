@@ -113,6 +113,21 @@ describe("the Conversation column", () => {
     expect(onPanel).toHaveBeenCalledWith("a");
   });
 
+  it("shows that Jarvis is working, after the last line, only while it is", () => {
+    const turns = conversationModel([line(1, "person", "compare them"), line(2, "jarvis", "On it.")], []);
+    const idle = renderConversation(turns, { onPanel: () => {} });
+    expect(idle.querySelector(".working")).toBeNull();
+    const busy = renderConversation(turns, { onPanel: () => {}, working: true });
+    const last = busy.querySelector("li:last-child")!;
+    expect(last.className).toBe("working");
+    expect(last.textContent).toBe("Jarvis is working…");
+    expect(busy.querySelectorAll("li").length).toBe(3);
+    // Even before anything has been said.
+    const first = renderConversation([], { onPanel: () => {}, working: true });
+    expect(first.querySelector(".working")?.textContent).toBe("Jarvis is working…");
+    expect(first.textContent).not.toContain("will appear here");
+  });
+
   it("says so when nothing has been said yet", () => {
     const box = renderConversation([], { onPanel: () => {} });
     expect(box.textContent).toBe("What you and Jarvis say will appear here.");

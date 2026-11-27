@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use jarvis_node::board::{BoardStore, ConversationEntry, How, Who};
-use jarvis_node::talk::{Recorder, TEXT_MAX};
+use jarvis_node::talk::{Recorder, Talk, TEXT_MAX};
 use uuid::Uuid;
 
 struct Rig {
@@ -14,20 +14,45 @@ struct Rig {
     store: Arc<Mutex<BoardStore>>,
     recorder: Recorder,
     seen: mpsc::Receiver<ConversationEntry>,
+    working: mpsc::Receiver<bool>,
 }
 
-fn rig_in(dir: tempfile::TempDir) -> Rig {
+fn rig_with(dir: tempfile::TempDir, working_lasts: Duration) -> Rig {
     let store = Arc::new(Mutex::new(BoardStore::open(dir.path())));
     let (tx, seen) = mpsc::channel();
-    let recorder = Recorder::start(store.clone(), move |entry| {
-        let _ = tx.send(entry.clone());
+    let (wtx, working) = mpsc::channel();
+    let recorder = Recorder::start_with(store.clone(), working_lasts, move |talk| match talk {
+        Talk::Line(entry) => {
+            let _ = tx.send(entry.clone());
+        }
+        Talk::Working(on) => {
+            let _ = wtx.send(on);
+        }
     });
     Rig {
         _dir: dir,
         store,
         recorder,
         seen,
+        working,
     }
+}
+
+fn rig_in(dir: tempfile::TempDir) -> Rig {
+    rig_with(dir, Duration::from_secs(180))
+}
+
+fn working(rig: &Rig) -> bool {
+    rig.working
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a working change")
+}
+
+fn no_working_change(rig: &Rig) {
+    assert!(rig
+        .working
+        .recv_timeout(Duration::from_millis(250))
+        .is_err());
 }
 
 fn rig() -> Rig {
@@ -173,4 +198,59 @@ fn many_lines_from_many_threads_all_arrive_and_none_is_torn() {
     got.dedup();
     assert_eq!(got.len(), 100);
     assert_eq!(rig.store.lock().unwrap().conversation().len(), 100);
+}
+
+#[test]
+fn working_starts_on_the_signal_and_ends_when_a_panel_is_shown() {
+    let rig = rig();
+    assert!(!rig.recorder.is_working());
+    rig.recorder.working_started();
+    assert!(working(&rig));
+    assert!(rig.recorder.is_working());
+    // What Jarvis says in answer ("On it") does not end it.
+    rig.recorder.spoke("On it. I'll put it on the board.");
+    rig.recorder.heard("thank you");
+    no_working_change(&rig);
+    rig.recorder.panel_shown(Uuid::new_v4());
+    assert!(!working(&rig));
+    assert!(!rig.recorder.is_working());
+    // A panel when nothing was being worked on changes nothing.
+    rig.recorder.panel_shown(Uuid::new_v4());
+    no_working_change(&rig);
+}
+
+#[test]
+fn working_ends_when_jarvis_speaks_unasked_and_that_line_is_recorded() {
+    let rig = rig();
+    rig.recorder.working_started();
+    assert!(working(&rig));
+    rig.recorder.announced("I couldn't reach Claude just now.");
+    assert!(!working(&rig));
+    let line = next(&rig);
+    assert_eq!((line.who, line.how), (Who::Jarvis, How::Spoken));
+    assert_eq!(line.text, "I couldn't reach Claude just now.");
+}
+
+#[test]
+fn working_ends_by_itself_after_its_time() {
+    let rig = rig_with(tempfile::tempdir().unwrap(), Duration::from_millis(300));
+    rig.recorder.working_started();
+    assert!(working(&rig));
+    assert!(!working(&rig)); // nothing came: it gives up, it does not hang for ever
+    assert!(!rig.recorder.is_working());
+}
+
+#[test]
+fn a_second_start_while_working_renews_the_time_and_says_nothing_new() {
+    let rig = rig_with(tempfile::tempdir().unwrap(), Duration::from_millis(600));
+    rig.recorder.working_started();
+    assert!(working(&rig));
+    std::thread::sleep(Duration::from_millis(400));
+    rig.recorder.working_started();
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        rig.recorder.is_working(),
+        "the second request is still being worked on"
+    );
+    assert!(!working(&rig));
 }

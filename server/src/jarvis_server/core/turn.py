@@ -638,6 +638,12 @@ def _board(
             queued = jobs.enqueue_once(c, "board.make", str(turn.id), payload)
         if queued is None:
             log.info("turn %s: Board work is already queued; a second request is left out", turn.id)
+        else:
+            # So the Board can show that Jarvis is working until the panel is up (R12-42).
+            stream.action(
+                target=turn.node_id, person_id=turn.person_id, kind="board.working",
+                args={"state": "started"}, now=_now(c),
+            )  # fmt: skip
         stream.queued = True
         return
     try:

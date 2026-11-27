@@ -37,6 +37,8 @@ export interface BoardSnapshot {
   panels: Panel[];
   conversation: ConversationEntry[];
   spend_today_paise: number;
+  /// Whether Jarvis is working on something for the Board now.
+  working?: boolean;
 }
 
 const IST_MS = (5 * 60 + 30) * 60 * 1000;

@@ -102,7 +102,7 @@ impl Ui for TauriUi {
                 let r = app.emit("jarvis://status", m);
                 // Results Jarvis reported on its own, held until JARVIS was free.
                 for line in self.announcer.mode(m) {
-                    speak_locally(app, &self.voice, &line);
+                    announce_locally(app, &self.voice, &line);
                 }
                 r
             }
@@ -147,7 +147,8 @@ fn say(
 /// be allowed this and not the main window's `say`, and with two differences:
 /// - it never decides an approval (the Board shows untrusted content);
 /// - it says why when the line would be dropped (the coordinator takes nothing while it is
-///   thinking or the microphone is off), so the text stays in the box.
+///   thinking), so the text stays in the box. A typed line wakes Jarvis after "stop
+///   listening" (`Event::Typed`).
 #[tauri::command]
 fn board_say(
     text: String,
@@ -157,12 +158,8 @@ fn board_say(
     mode: State<'_, ModeCell>,
     app: AppHandle,
 ) -> Result<(), String> {
-    match mode.lock().map(|m| *m) {
-        Ok(Mode::Thinking) => return Err("Jarvis is busy. Try again in a moment.".to_owned()),
-        Ok(Mode::MicOff) => {
-            return Err("Jarvis is not listening. Say or tap to wake it first.".to_owned())
-        }
-        _ => {}
+    if matches!(mode.lock().map(|m| *m), Ok(Mode::Thinking)) {
+        return Err("Jarvis is busy. Try again in a moment.".to_owned());
     }
     say_text(text, false, &jarvis, &node, &voice, &app);
     Ok(())
@@ -189,12 +186,25 @@ fn say_text(
         board::heard(&text);
         return;
     }
-    jarvis.send(Event::Utterance(text));
+    // Typed, so it also wakes Jarvis after "stop listening".
+    jarvis.send(Event::Typed(text));
 }
 
 /// Say a line in George's voice (or the stand-in), outside the coordinator.
 fn speak_locally(app: &AppHandle, voice: &VoiceSlot, text: &str) {
     board::spoke(text);
+    say_aloud(app, voice, text);
+}
+
+/// Say something Jarvis reports on its own (the result of earlier work, a Board headline, or
+/// what went wrong). For the Board it is a line of the conversation that also ends "Jarvis is
+/// working".
+fn announce_locally(app: &AppHandle, voice: &VoiceSlot, text: &str) {
+    board::announced(text);
+    say_aloud(app, voice, text);
+}
+
+fn say_aloud(app: &AppHandle, voice: &VoiceSlot, text: &str) {
     let _ = app.emit("jarvis://caption", text);
     match voice.lock().ok().as_deref().and_then(Option::as_ref) {
         Some(v) => v.speak(text),
@@ -615,7 +625,7 @@ pub fn run() {
                 tauri::async_runtime::spawn(announce::run(
                     n.subscribe_replies(),
                     announcer.clone(),
-                    move |line| speak_locally(&app, &voice, line),
+                    move |line| announce_locally(&app, &voice, line),
                 ));
             }
             let ui = Arc::new(TauriUi {
