@@ -2,6 +2,8 @@
 
 use crate::resample::to_mono_16k;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Switches the microphone stream on and off (off = Windows shows no
 /// "microphone in use" indicator).
@@ -21,6 +23,16 @@ impl Mic {
 pub fn start_microphone(sink: impl Fn(Vec<f32>) + Send + 'static) -> Result<Mic, String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let (ctl_tx, ctl_rx) = std::sync::mpsc::channel::<bool>();
+    // SPIKE: Android's audio library cannot pause a microphone stream ("Pause called on the
+    // input stream"). There the stream is started on first use and left running, and this
+    // gate drops the sound while the microphone is meant to be off.
+    let gate = Arc::new(AtomicBool::new(!cfg!(target_os = "android")));
+    let open = gate.clone();
+    let sink = move |chunk: Vec<f32>| {
+        if open.load(Ordering::Relaxed) {
+            sink(chunk)
+        }
+    };
     std::thread::Builder::new()
         .name("jarvis-mic".into())
         .spawn(move || {
@@ -52,6 +64,7 @@ pub fn start_microphone(sink: impl Fn(Vec<f32>) + Send + 'static) -> Result<Mic,
                     other => return Err(format!("unsupported microphone format {other:?}")),
                 }
                 .map_err(|e| e.to_string())?;
+                #[cfg(not(target_os = "android"))]
                 stream.pause().map_err(|e| e.to_string())?;
                 Ok(stream)
             })();
@@ -59,7 +72,20 @@ pub fn start_microphone(sink: impl Fn(Vec<f32>) + Send + 'static) -> Result<Mic,
                 Ok(stream) => {
                     let _ = ready_tx.send(Ok(()));
                     // The stream lives as long as the app; switch it on/off on request.
+                    #[cfg(target_os = "android")]
+                    let mut started = false;
                     for on in ctl_rx {
+                        #[cfg(target_os = "android")]
+                        let r = {
+                            gate.store(on, Ordering::Relaxed);
+                            if on && !started {
+                                started = true;
+                                stream.play().map_err(|e| e.to_string())
+                            } else {
+                                Ok(())
+                            }
+                        };
+                        #[cfg(not(target_os = "android"))]
                         let r = if on {
                             stream.play().map_err(|e| e.to_string())
                         } else {
@@ -71,6 +97,7 @@ pub fn start_microphone(sink: impl Fn(Vec<f32>) + Send + 'static) -> Result<Mic,
                     }
                 }
                 Err(e) => {
+                    let _ = &gate;
                     let _ = ready_tx.send(Err(e));
                 }
             }
