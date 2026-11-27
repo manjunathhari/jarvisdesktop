@@ -91,7 +91,7 @@ print(xml)
 
 # The sherpa-onnx libraries the Rust core links against, in their own source folder so the
 # Tauri build (which manages jniLibs) never removes them.
-out = main / "spikeLibs" / "arm64-v8a"
+out = main / "spikeLibs" / libs.name  # arm64-v8a or x86_64
 out.mkdir(parents=True, exist_ok=True)
 for name in ("libsherpa-onnx-c-api.so", "libonnxruntime.so"):
     shutil.copy(libs / name, out / name)
