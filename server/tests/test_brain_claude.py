@@ -1096,6 +1096,35 @@ def test_an_error_result_is_marked() -> None:
     assert "is_error" not in good
 
 
+def test_an_empty_result_is_never_sent() -> None:
+    """The provider refuses an empty text block and an empty image: build neither."""
+    call = ToolCall("cad_step", STEP_ARGS, call_id="toolu_a")
+
+    def content(result: ToolResult) -> list[dict[str, Any]]:
+        ex = Exchange("", (call,), (result,))
+        sent: list[dict[str, Any]] = build_payload(_with(ex))["messages"][-1]["content"][0][
+            "content"
+        ]
+        return sent
+
+    only_picture = content(ToolResult("toolu_a", "  ", image_png=PNG))
+    assert [block["type"] for block in only_picture] == ["image"]
+    only_text = content(ToolResult("toolu_a", "Step kept.", image_png=b""))
+    assert [block["type"] for block in only_text] == ["text"]
+    for nothing in (ToolResult("toolu_a", ""), ToolResult("toolu_a", " ", image_png=b"")):
+        with pytest.raises(ValueError):
+            content(nothing)
+
+
+def test_exchanges_need_a_user_message_before_them() -> None:
+    """With no words from the person there is nothing for a tool call to follow: refused, never a
+    payload that starts with the assistant."""
+    call = ToolCall("cad_step", STEP_ARGS, call_id="toolu_a")
+    ex = Exchange("", (call,), (ToolResult("toolu_a", "Step kept."),))
+    with pytest.raises(ValueError):
+        build_payload(make_request(utterance="", tools=[DRAW_TOOL], exchanges=[ex]))
+
+
 def test_results_must_match_calls() -> None:
     call_a = ToolCall("cad_step", STEP_ARGS, call_id="toolu_a")
     call_b = ToolCall("cad_step", STEP_ARGS, call_id="toolu_b")

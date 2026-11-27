@@ -178,12 +178,17 @@ def _results_in_call_order(exchange: Exchange) -> list[ToolResult]:
 
 
 def _result_block(result: ToolResult) -> dict[str, Any]:
-    content: list[dict[str, Any]] = [{"type": "text", "text": result.text}]
-    if result.image_png is not None:
+    # The provider refuses an empty text block and an empty image, so neither is ever built.
+    content: list[dict[str, Any]] = []
+    if result.text.strip():
+        content.append({"type": "text", "text": result.text})
+    if result.image_png:
         data = base64.b64encode(result.image_png).decode("ascii")
         content.append(
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}}
         )
+    if not content:
+        raise ValueError("a tool result needs text or a picture")
     block: dict[str, Any] = {
         "type": "tool_result",
         "tool_use_id": result.call_id,
