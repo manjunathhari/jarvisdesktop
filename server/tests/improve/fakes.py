@@ -33,6 +33,9 @@ class FakeStore:
     items: list[inbox.Item] = field(default_factory=list)
     jobs: list[dict[str, Any]] = field(default_factory=list)
 
+    def in_state(self, *states: State) -> list[Ticket]:
+        return [t for t in self.tickets.values() if t.state in states]
+
     def open_ticket(self, words: str, slug: str, evidence: Mapping[str, Any]) -> int:
         tid = len(self.tickets) + 1
         self.tickets[tid] = Ticket(tid, words, slug, dict(evidence), State.OPEN)
@@ -169,10 +172,3 @@ class FakeGitHub:
 
     def snapshot(self, pr_number: int) -> Pr:
         return self.prs[pr_number]
-
-
-def _in_state(self: FakeStore, *states: State) -> list[Ticket]:
-    return [t for t in self.tickets.values() if t.state in states]
-
-
-FakeStore.in_state = _in_state  # type: ignore[attr-defined]
