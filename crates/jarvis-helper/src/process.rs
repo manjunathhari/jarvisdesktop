@@ -86,6 +86,7 @@ impl Running {
     pub fn shutdown(mut self) {
         self.link.send(&ToHelper::Shutdown);
         self.link.close_writer();
+        // If the helper never reads, killing it (in `end_child`) breaks the blocked write.
         if let Some(child) = self.child.take() {
             end_child(child);
         }
@@ -96,7 +97,8 @@ impl Drop for Running {
     fn drop(&mut self) {
         self.link.close_writer();
         if let Some(child) = self.child.take() {
-            // Don't block the dropping thread: reap in the background.
+            // Never blocks: closing the queue only drops a sender, and the wait, kill and reap
+            // (which also frees a writer stuck on a helper that stopped reading) run in the background.
             let _ = thread::Builder::new()
                 .name("jarvis-helper-reaper".into())
                 .spawn(move || end_child(child));

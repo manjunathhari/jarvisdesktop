@@ -1,8 +1,8 @@
 //! The pipe link: a reader thread turns the helper's lines into events, writes go through a mutex.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use jarvis_core::Speaks;
@@ -23,10 +23,16 @@ pub enum LinkEvent {
     Closed,
 }
 
-type Writer = Box<dyn Write + Send>;
+/// When this many messages are waiting unsent (the helper has stopped reading), new `say`
+/// messages are dropped. `stop` and `shutdown` are always queued.
+const MAX_QUEUED_SAY: usize = 256;
 
+/// The link to the helper. Callers never touch the pipe: `send` only queues a message for the
+/// writer thread, which is the only thing that can block on a wedged helper.
 pub struct HelperLink {
-    writer: Mutex<Option<Writer>>,
+    queue: Mutex<Option<mpsc::Sender<ToHelper>>>,
+    pending: Arc<AtomicUsize>,
+    warned: AtomicBool,
     speaking: AtomicBool,
     closed: AtomicBool,
 }
@@ -37,11 +43,19 @@ impl HelperLink {
         writer: impl Write + Send + 'static,
         on_event: Box<dyn Fn(LinkEvent) + Send>,
     ) -> Arc<HelperLink> {
+        let (tx, rx) = mpsc::channel::<ToHelper>();
+        let pending = Arc::new(AtomicUsize::new(0));
         let link = Arc::new(HelperLink {
-            writer: Mutex::new(Some(Box::new(writer))),
+            queue: Mutex::new(Some(tx)),
+            pending: pending.clone(),
+            warned: AtomicBool::new(false),
             speaking: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         });
+        thread::Builder::new()
+            .name("jarvis-helper-writer".into())
+            .spawn(move || write_loop(rx, writer, &pending))
+            .expect("spawn helper writer thread");
         let for_thread = link.clone();
         thread::Builder::new()
             .name("jarvis-helper-reader".into())
@@ -81,27 +95,34 @@ impl HelperLink {
         on_event(LinkEvent::Closed);
     }
 
-    /// Write one message as one line. A failed write (the helper has gone) is dropped;
+    /// Queue one message for the writer thread; never blocks on the pipe. After `Closed`
+    /// nothing is queued. A failed write (the helper has gone) ends the writer quietly;
     /// `Closed` comes from the reader.
     pub fn send(&self, msg: &ToHelper) {
-        let Ok(mut line) = serde_json::to_string(msg) else {
+        if self.is_closed() {
             return;
-        };
-        line.push('\n');
-        let mut guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(w) = guard.as_mut() {
-            if w.write_all(line.as_bytes())
-                .and_then(|_| w.flush())
-                .is_err()
-            {
-                tracing::debug!("write to helper failed; dropped");
+        }
+        if matches!(msg, ToHelper::Say { .. })
+            && self.pending.load(Ordering::SeqCst) > MAX_QUEUED_SAY
+        {
+            if !self.warned.swap(true, Ordering::SeqCst) {
+                tracing::warn!("voice helper is not reading; dropping speech until it catches up");
+            }
+            return;
+        }
+        let guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = guard.as_ref() {
+            self.pending.fetch_add(1, Ordering::SeqCst);
+            if tx.send(msg.clone()).is_err() {
+                self.pending.fetch_sub(1, Ordering::SeqCst);
             }
         }
     }
 
-    /// Drop the writing end (closes the helper's stdin).
+    /// Stop accepting messages. The writer sends what is queued, then drops the pipe (which
+    /// closes the helper's stdin). Never blocks.
     pub fn close_writer(&self) {
-        *self.writer.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.queue.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     pub fn is_speaking(&self) -> bool {
@@ -110,6 +131,24 @@ impl HelperLink {
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+}
+
+fn write_loop(rx: mpsc::Receiver<ToHelper>, mut writer: impl Write, pending: &AtomicUsize) {
+    for msg in rx {
+        let Ok(mut line) = serde_json::to_string(&msg) else {
+            pending.fetch_sub(1, Ordering::SeqCst);
+            continue;
+        };
+        line.push('\n');
+        let result = writer
+            .write_all(line.as_bytes())
+            .and_then(|_| writer.flush());
+        pending.fetch_sub(1, Ordering::SeqCst);
+        if result.is_err() {
+            tracing::debug!("write to helper failed; writer ends");
+            break;
+        }
     }
 }
 
@@ -199,6 +238,15 @@ mod tests {
         }
     }
 
+    /// Wait (bounded) until the sink holds `n` complete lines.
+    fn wait_for_lines(sink: &Sink, n: usize) {
+        let deadline = std::time::Instant::now() + WAIT;
+        while sink.text().matches('\n').count() < n {
+            assert!(std::time::Instant::now() < deadline, "{n} lines in time");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn lines(sink: &Sink) -> Vec<serde_json::Value> {
         sink.text()
             .split_inclusive('\n')
@@ -214,6 +262,7 @@ mod tests {
         let r = rig();
         let text = format!("a\n\"b\" 🙂{}", "x".repeat(2000));
         r.voice.speak(&text);
+        wait_for_lines(&r.sink, 1);
         let out = r.sink.text();
         assert_eq!(out.matches('\n').count(), 1);
         assert!(out.ends_with('\n'));
@@ -228,7 +277,11 @@ mod tests {
         let r = rig();
         r.voice.speak("");
         r.voice.speak("  \n\t ");
-        assert_eq!(r.sink.text(), "");
+        r.voice.speak("real"); // queued after the blanks: if they had been sent they would come first
+        wait_for_lines(&r.sink, 1);
+        let v = lines(&r.sink);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["text"], "real");
     }
 
     #[test]
@@ -262,6 +315,7 @@ mod tests {
         // exactly once, and speak/stop are now silent no-ops
         r.voice.speak("hello");
         r.voice.stop();
+        thread::sleep(Duration::from_millis(100));
         assert_eq!(r.sink.text(), "");
         assert!(r.events.recv_timeout(Duration::from_millis(200)).is_err());
     }
@@ -272,6 +326,7 @@ mod tests {
         r.voice.speak("one");
         r.voice.stop();
         r.voice.speak("two");
+        wait_for_lines(&r.sink, 3);
         let v = lines(&r.sink);
         assert_eq!(v.len(), 3);
         assert_eq!(
@@ -317,6 +372,53 @@ mod tests {
                 message: "m".into()
             }
         );
+    }
+
+    /// A writer that blocks every write until the gate opens (or 10 s pass).
+    struct Gated {
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        sink: Sink,
+    }
+    impl Write for Gated {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let (open, cv) = &*self.gate;
+            let guard = open.lock().unwrap();
+            let _ = cv.wait_timeout_while(guard, WAIT, |o| !*o).unwrap();
+            self.sink.write(b)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_queue_cap_drops_say_but_still_accepts_stop() {
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let sink = Sink::default();
+        let (r, _keep) = pipe().unwrap();
+        let link = HelperLink::start(
+            r,
+            Gated {
+                gate: gate.clone(),
+                sink: sink.clone(),
+            },
+            Box::new(|_| {}),
+        );
+        let voice = HelperVoice::new(link);
+        for _ in 0..400 {
+            voice.speak("hello"); // returns at once although the writer is blocked
+        }
+        voice.stop();
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let deadline = std::time::Instant::now() + WAIT;
+        while std::time::Instant::now() < deadline && !sink.text().contains("\"stop\"") {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let v = lines(&sink);
+        let says = v.iter().filter(|m| m["type"] == "say").count();
+        assert_eq!(says, MAX_QUEUED_SAY + 1);
+        assert_eq!(v.last().unwrap()["type"], "stop");
     }
 
     #[test]

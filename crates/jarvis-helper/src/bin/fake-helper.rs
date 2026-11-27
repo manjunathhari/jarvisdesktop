@@ -1,7 +1,8 @@
 //! A stand-in for the voice helper, for tests. Std only.
 //!
 //! Flags: `--never-ready` (reads but never answers), `--die-while-speaking` (on the first `say`
-//! writes `speaking` on, then exits 1 without writing off).
+//! writes `speaking` on, then exits 1 without writing off), `--never-read` (never reads stdin or
+//! answers; sleeps until killed, or two minutes so a failed test cannot leave it behind).
 
 use std::io::{BufRead, Write};
 
@@ -40,6 +41,10 @@ fn main() {
     let never_ready = args.iter().any(|a| a == "--never-ready");
     let die = args.iter().any(|a| a == "--die-while-speaking");
     eprintln!("fake-helper started");
+    if args.iter().any(|a| a == "--never-read") {
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        return;
+    }
 
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };

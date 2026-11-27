@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use jarvis_core::Speaks;
 use jarvis_helper::{spawn, HelperSettings, LinkEvent, Running};
@@ -110,19 +110,62 @@ fn dropping_running_ends_the_child() {
         },
     );
     drop(running);
-    let t = Instant::now();
-    assert_eq!(
-        events.recv_timeout(Duration::from_secs(5)).unwrap(),
-        LinkEvent::Closed
-    );
-    assert!(t.elapsed() < Duration::from_secs(5));
+    expect(&events, LinkEvent::Closed);
 }
 
 #[test]
 fn a_helper_that_never_answers_can_still_be_shut_down() {
     let (running, events, _e) = start(&["--never-ready"]);
     assert!(events.recv_timeout(Duration::from_millis(300)).is_err());
-    let t = Instant::now();
-    running.shutdown();
-    assert!(t.elapsed() < Duration::from_secs(3));
+    run_bounded(move || running.shutdown());
+    expect(&events, LinkEvent::Closed);
+}
+
+/// Run `f` on its own thread and fail (not hang) if it does not finish in time.
+fn run_bounded(f: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(WAIT).expect("finished in time");
+}
+
+/// Start a helper that never reads stdin and flood it with long sentences.
+fn flooded() -> (Running, Receiver<LinkEvent>) {
+    let (running, events, _e) = start(&["--never-read"]);
+    let voice = running.voice.clone();
+    run_bounded(move || {
+        let text = "x".repeat(2000);
+        for _ in 0..2000 {
+            voice.speak(&text);
+        }
+    });
+    (running, events)
+}
+
+#[test]
+fn a_helper_that_never_reads_cannot_block_the_caller() {
+    let (running, _events) = flooded();
+    drop(running);
+}
+
+#[test]
+fn shutdown_returns_even_when_the_helper_never_reads() {
+    let (running, events) = flooded();
+    run_bounded(move || running.shutdown());
+    expect(&events, LinkEvent::Closed);
+}
+
+#[test]
+fn drop_returns_at_once_even_when_the_helper_never_reads() {
+    let (running, events) = flooded();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        drop(running);
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(Duration::from_secs(1))
+        .expect("drop returned within 1 s");
+    expect(&events, LinkEvent::Closed);
 }
