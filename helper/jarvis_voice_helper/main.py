@@ -1,7 +1,14 @@
 """Helper main loop: hello handshake, then say/stop/shutdown until shutdown or end of file."""
 
+import argparse
+import asyncio
+import contextlib
+import os
 import sys
+import threading
 from collections.abc import AsyncIterable, Callable
+from pathlib import Path
+from typing import BinaryIO
 
 from jarvis_voice_helper import protocol
 from jarvis_voice_helper.protocol import (
@@ -41,7 +48,10 @@ async def run(reader: AsyncIterable[str], writer: Writer, speaker_factory: Speak
         first = await anext(lines)
     except StopAsyncIteration:
         return _fail(writer, BAD_HELLO, "input ended before hello", 2)
-    hello = protocol.parse(first.strip())
+    try:
+        hello = protocol.parse(first.strip())
+    except Exception:
+        hello = None
     if not isinstance(hello, Hello) or hello.protocol != protocol.PROTOCOL_VERSION:
         return _fail(writer, BAD_HELLO, "first line must be a protocol 1 hello with settings", 2)
 
@@ -52,11 +62,14 @@ async def run(reader: AsyncIterable[str], writer: Writer, speaker_factory: Speak
     try:
         await speaker.start(hello.settings)
     except NoOutputDevice as exc:
+        await _close_quietly(speaker)
         return _fail(writer, NO_OUTPUT_DEVICE, str(exc), 3)
     except ModelMissing as exc:
+        await _close_quietly(speaker)
         return _fail(writer, MODEL_MISSING, str(exc), 4)
     except Exception as exc:
-        return _fail(writer, INTERNAL, str(exc), 1)
+        await _close_quietly(speaker)
+        return _fail(writer, INTERNAL, type(exc).__name__, 1)
     writer(protocol.encode(Ready(voice=hello.settings.voice)))
 
     try:
@@ -70,7 +83,7 @@ async def run(reader: AsyncIterable[str], writer: Writer, speaker_factory: Speak
                 await speaker.stop()
     except Exception as exc:
         await _close_quietly(speaker)
-        return _fail(writer, INTERNAL, str(exc), 1)
+        return _fail(writer, INTERNAL, type(exc).__name__, 1)
     await speaker.close()
     return 0
 
@@ -79,4 +92,99 @@ async def _close_quietly(speaker: Speaker) -> None:
     try:
         await speaker.close()
     except Exception as exc:
-        print(f"close failed: {exc}", file=sys.stderr)
+        print(f"close failed: {type(exc).__name__}", file=sys.stderr)
+
+
+class StdinLines:
+    """Lines from a binary stream, read on a background thread and handed to the event loop.
+
+    Splits on b"\\n" only (reply text may hold U+2028, U+2029 or U+0085) and ignores lines that
+    are not valid UTF-8. Reading stdin through asyncio pipes is unreliable on Windows.
+    """
+
+    def __init__(self, stream: BinaryIO):
+        self._stream = stream
+
+    def __aiter__(self):
+        return self._lines()
+
+    async def _lines(self):
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def pump() -> None:
+            try:
+                for raw in iter(self._stream.readline, b""):
+                    try:
+                        text = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        continue
+                    loop.call_soon_threadsafe(queue.put_nowait, text)
+            except (OSError, ValueError):
+                pass
+            with contextlib.suppress(RuntimeError):  # the loop may already be closed
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        threading.Thread(target=pump, name="stdin-reader", daemon=True).start()
+        while (line := await queue.get()) is not None:
+            yield line
+
+
+def make_writer(stream: BinaryIO) -> Writer:
+    """A writer that sends each protocol line as UTF-8 plus a newline and flushes at once."""
+    lock = threading.Lock()
+
+    def write(line: str) -> None:
+        with lock:
+            try:
+                stream.write(line.encode("utf-8") + b"\n")
+                stream.flush()
+            except (OSError, ValueError):
+                pass  # the app has gone; its end of stdin follows
+
+    return write
+
+
+def protect_stdout() -> BinaryIO:
+    """Keep the real stdout for protocol lines only; everything else is sent to stderr."""
+    sys.stdout.flush()
+    protocol_out = os.fdopen(os.dup(1), "wb", buffering=0)
+    os.dup2(2, 1)  # C-level prints go to stderr too
+    sys.stdout = sys.stderr
+    return protocol_out
+
+
+def configure_logging(stream=None) -> None:
+    """Logs go to stderr at INFO or above. What is spoken is only ever logged at DEBUG."""
+    from loguru import logger
+
+    logger.remove()
+    logger.add(stream if stream is not None else sys.stderr, level="INFO")
+
+
+def _real_speaker_factory(on_speaking: Callable[[bool, int], None]) -> Speaker:
+    from jarvis_voice_helper.pipeline import PipecatSpeaker
+
+    return PipecatSpeaker(on_speaking)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="jarvis_voice_helper")
+    parser.add_argument("--selftest", metavar="PATH", help="speak a test phrase into a WAV file")
+    parser.add_argument("--model")
+    parser.add_argument("--voices")
+    args = parser.parse_args(argv)
+
+    if args.selftest:
+        if not (args.model and args.voices):
+            parser.error("--selftest needs --model and --voices")
+        configure_logging()
+        from jarvis_voice_helper import selftest
+
+        return selftest.run(Path(args.selftest), args.model, args.voices)
+
+    protocol_out = protect_stdout()
+    configure_logging()
+    return asyncio.run(
+        run(StdinLines(sys.stdin.buffer), make_writer(protocol_out), _real_speaker_factory)
+    )

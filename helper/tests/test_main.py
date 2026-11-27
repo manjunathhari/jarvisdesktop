@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from jarvis_voice_helper import protocol
 from jarvis_voice_helper.main import run
 from jarvis_voice_helper.protocol import (
@@ -126,3 +128,52 @@ async def test_speaker_start_error_maps_to_its_exit_code():
     assert code == 4 and out[0]["code"] == "model_missing"
     code, out, _ = await drive([HELLO], start_error=RuntimeError("boom"))
     assert code == 1 and out[0]["code"] == "internal"
+
+
+async def test_awkward_text_reaches_the_speaker_unchanged():
+    text = 'He said "hi".\\n New\nline \U0001f642 and\u2028separator ' + "x" * 2000
+    code, _, sp = await drive([HELLO, protocol.encode(Say(1, text)), '{"type":"shutdown"}'])
+    assert code == 0 and sp.said == [(1, text)]
+
+
+async def test_hostile_first_line_is_bad_hello_not_a_crash(monkeypatch):
+    def explode(_line):
+        raise RuntimeError("parse blew up")
+
+    monkeypatch.setattr(protocol, "parse", explode)
+    code, out, sp = await drive([HELLO])
+    assert code == 2 and out[0]["code"] == "bad_hello" and sp is None
+    monkeypatch.undo()
+    code, out, _ = await drive(['{"type":"hello","protocol":1e999,"settings":{}}'])
+    assert code == 2 and out[0]["code"] == "bad_hello"
+
+
+async def test_speaker_is_closed_when_start_fails():
+    for error in (NoOutputDevice("x"), ModelMissing("y"), RuntimeError("z")):
+        _, _, sp = await drive([HELLO], start_error=error)
+        assert sp.events == ["start", "close"]
+
+
+@pytest.mark.parametrize("where", ["start", "say"])
+async def test_internal_error_message_is_the_class_name_only(where):
+    secret = "the patient has a secret diagnosis"
+    out, holder = [], []
+
+    class Exploding(FakeSpeaker):
+        async def start(self, settings):
+            if where == "start":
+                raise ValueError(secret)
+
+        async def say(self, turn, text):
+            raise ValueError(text)
+
+    def factory(on_speaking):
+        holder.append(Exploding(on_speaking))
+        return holder[0]
+
+    lines = [HELLO, protocol.encode(Say(1, secret))]
+    code = await run(FakeReader(lines), lambda line: out.append(line), factory)
+    assert code == 1
+    error = json.loads(out[-1])
+    assert error["code"] == "internal" and error["message"] == "ValueError"
+    assert all(secret not in line for line in out)

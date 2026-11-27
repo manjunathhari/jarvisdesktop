@@ -1,6 +1,7 @@
 """JSON-lines message format between the desktop app and the voice helper."""
 
 import json
+import math
 from dataclasses import asdict, dataclass
 from typing import Protocol
 
@@ -90,34 +91,64 @@ def encode(msg: Message) -> str:
     return json.dumps(body, ensure_ascii=False, separators=(",", ":"))
 
 
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _str(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("expected a string")
+    return value
+
+
 def parse(line: str) -> Hello | Say | Stop | Shutdown | None:
-    """Parse an app-to-helper line; None for bad JSON, unknown type or malformed fields."""
+    """Parse an app-to-helper line; None for anything unusable. Never raises.
+
+    Field types are strict: a wrong type makes the whole line unparseable.
+    """
     try:
-        data = json.loads(line)
-    except ValueError:
+        return _parse(line)
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError, RecursionError):
         return None
+
+
+def _parse(line: str) -> Hello | Say | Stop | Shutdown | None:
+    data = json.loads(line)
     if not isinstance(data, dict):
         return None
-    try:
-        kind = data.get("type")
-        if kind == "hello":
-            raw = data["settings"]
-            settings = Settings(
-                voice=str(raw["voice"]),
-                tts_speed=float(raw["tts_speed"]),
-                model_path=str(raw["model_path"]),
-                voices_path=str(raw["voices_path"]),
-                output_device=raw.get("output_device"),
-            )
-            return Hello(protocol=data["protocol"], settings=settings)
-        if kind == "say":
-            return Say(turn=int(data["turn"]), text=str(data["text"]))
-        if kind == "stop":
-            return Stop()
-        if kind == "shutdown":
-            return Shutdown()
-    except (KeyError, TypeError, ValueError, AttributeError):
-        return None
+    kind = data.get("type")
+    if kind == "hello":
+        raw = data["settings"]
+        speed = raw["tts_speed"]
+        device = raw.get("output_device")
+        protocol_number = data["protocol"]
+        if not _is_int(protocol_number):
+            return None
+        if not _is_number(speed) or not math.isfinite(speed):
+            return None
+        if device is not None and not _is_int(device):
+            return None
+        settings = Settings(
+            voice=_str(raw["voice"]),
+            tts_speed=speed,
+            model_path=_str(raw["model_path"]),
+            voices_path=_str(raw["voices_path"]),
+            output_device=device,
+        )
+        return Hello(protocol=protocol_number, settings=settings)
+    if kind == "say":
+        turn = data["turn"]
+        if not _is_int(turn):
+            return None
+        return Say(turn=turn, text=_str(data["text"]))
+    if kind == "stop":
+        return Stop()
+    if kind == "shutdown":
+        return Shutdown()
     return None
 
 
