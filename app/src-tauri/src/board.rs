@@ -1,8 +1,9 @@
 //! The Board window (Board slice 1, Task 6): a second window that draws what the node's
 //! `BoardStore` holds.
 //!
-//! - The window is declared in `tauri.conf.json` (label `board`, page `board.html`), created
-//!   hidden with the app, and shown by `ensure_open`: when a panel arrives and on F9 in the
+//! - The window is declared in `tauri.conf.json` (label `board`, page `board.html`), built
+//!   hidden by [`create`] when the app starts (with the seal its Canvas pages need), and shown
+//!   by `ensure_open`: when a panel arrives and on F9 in the
 //!   main window. With two or more monitors it goes full screen on the largest one the main
 //!   window is not on, opens there when the node starts, and hands the keyboard back to the
 //!   main window; with one monitor it is an ordinary window that waits for a panel or F9
@@ -30,7 +31,9 @@ use jarvis_node::board::view::{
 use jarvis_node::board::{BoardEvent, PanelState};
 use jarvis_node::node::NodeHandle;
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow, Window, WindowEvent};
+use tauri::{
+    AppHandle, Emitter, Manager, State, WebviewWindow, WebviewWindowBuilder, Window, WindowEvent,
+};
 use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 
@@ -47,6 +50,43 @@ const HELD_MAX: usize = 64;
 
 fn node(slot: &NodeSlot) -> Option<NodeHandle> {
     slot.lock().ok().and_then(|n| n.clone())
+}
+
+/// Build the Board window, hidden. It is declared in `tauri.conf.json` with `create: false`
+/// and built here because it shows Canvas pages, which are untrusted, and so needs what the
+/// configuration file cannot give it (`jarvis_node::canvas` says why):
+/// - its own browser data folder, so it can run with its own browser arguments (no outside
+///   network at all, no WebRTC outside a proxy, no prerendering, no autoplay), while the main
+///   window keeps the network its news wall needs;
+/// - a script that runs first in every frame and removes WebRTC, sound and speech there.
+pub fn create(app: &AppHandle) {
+    let Some(config) = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == WINDOW)
+        .cloned()
+    else {
+        tracing::warn!("the Board window is not in the configuration");
+        return;
+    };
+    let data = match app.path().app_local_data_dir() {
+        Ok(dir) => dir.join("board-webview"),
+        Err(e) => {
+            tracing::warn!(error = %e, "no data folder for the Board window");
+            return;
+        }
+    };
+    let built = WebviewWindowBuilder::from_config(app, &config).and_then(|builder| {
+        builder
+            .data_directory(data)
+            .initialization_script_for_all_frames(jarvis_node::canvas::SEAL_SCRIPT)
+            .build()
+    });
+    if let Err(e) = built {
+        tracing::warn!(error = %e, "couldn't build the Board window");
+    }
 }
 
 /// Where the Board belongs now, and the monitor to fill if that is a whole one.
@@ -264,7 +304,7 @@ pub async fn board_canvas_served(
     };
     Ok(jarvis_node::canvas::shared(node.board())
         .await
-        .is_some_and(|server| server.was_served(id, revision)))
+        .is_some_and(|server| server.take_served(id, revision)))
 }
 
 /// Remove the closed panels from this desktop's copy (the person confirmed). The server keeps

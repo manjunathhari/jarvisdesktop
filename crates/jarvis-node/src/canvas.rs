@@ -46,12 +46,32 @@ pub const POLICY: &str = "default-src 'none'; script-src 'unsafe-inline'; \
     style-src 'unsafe-inline'; img-src data:; font-src data:; form-action 'none'; \
     base-uri 'none'; sandbox allow-scripts";
 
+/// The Board window's browser arguments (`tauri.conf.json` must match; a test checks). The
+/// Board needs no outside network at all, and a page's policy cannot stop everything:
+/// - a proxy that is not there: nothing leaves this PC, not even the name lookup and
+///   connection a blocked navigation or a `prerender` hint still makes (the loopback, where
+///   the app and this server are, does not go through a proxy);
+/// - no WebRTC outside a proxy;
+/// - no prerendering, which also reached other loopback ports.
+///
+/// No autoplay argument: a Canvas page must not make sound unasked. Different arguments need
+/// a different browser data folder from the main window's, which the app gives it.
+pub const BOARD_BROWSER_ARGS: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+    --proxy-server=http://127.0.0.1:1 --webrtc-ip-handling-policy=disable_non_proxied_udp \
+    --enable-features=NoStatePrefetchHoldback";
+
+/// Runs first in every frame of the Board window: removes WebRTC, sound, speech and the old
+/// clipboard command from Canvas pages and anything they make.
+pub const SEAL_SCRIPT: &str = include_str!("canvas_seal.js");
+
 /// The longest request head read. The address is under 100 bytes; WebView2's headers fit.
 const HEAD_MAX: usize = 8 * 1024;
 /// How long a caller has to send its request, and to take the answer.
-const PATIENCE: Duration = Duration::from_secs(5);
-/// Connections handled at once; more wait.
-const AT_ONCE: usize = 16;
+const PATIENCE: Duration = Duration::from_secs(2);
+/// Connections handled at once; more wait. Many more than a Board has panels, so idle
+/// callers cannot hold up a real one for long.
+const AT_ONCE: usize = 64;
 /// "Served" marks kept (one per panel revision shown this run).
 const SERVED_MAX: usize = 4096;
 
@@ -131,9 +151,14 @@ pub fn respond(
     if !same(secret, token) {
         return not_found();
     }
-    let (Ok(id), Some(rev)) = (Uuid::try_parse(id), revision(rev)) else {
+    let (Ok(parsed), Some(rev)) = (Uuid::try_parse(id), revision(rev)) else {
         return not_found();
     };
+    // One address for a page: the id exactly as the Board writes it.
+    if parsed.to_string() != id {
+        return not_found();
+    }
+    let id = parsed;
     match store.panel(id) {
         Some(panel) if panel.kind == PanelKind::Canvas && panel.revision == rev => {
             answer(200, panel.content.clone().into_bytes(), Some((id, rev)))
@@ -163,13 +188,14 @@ impl CanvasServer {
         )
     }
 
-    /// Whether that panel's page at that revision was really handed out. The Board asks this
-    /// before it reports a Canvas panel drawn: a frame that "loaded" an empty 404 is not one.
-    pub fn was_served(&self, panel_id: Uuid, revision: u32) -> bool {
+    /// Whether that panel's page at that revision was handed out since this was last asked.
+    /// The Board asks before it reports a Canvas panel drawn: a frame that "loaded" an empty
+    /// 404 is not one. Asking takes the mark, so each drawing needs its own page.
+    pub fn take_served(&self, panel_id: Uuid, revision: u32) -> bool {
         self.served
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(&(panel_id, revision))
+            .remove(&(panel_id, revision))
     }
 
     fn mark(&self, key: (Uuid, u32)) {
@@ -218,7 +244,7 @@ pub async fn serve(store: Arc<Mutex<BoardStore>>, ports: &[u16]) -> io::Result<A
             let (server, store) = (serving.clone(), store.clone());
             tokio::spawn(async move {
                 let _slot = slot;
-                let _ = tokio::time::timeout(PATIENCE * 2, handle(stream, &server, &store)).await;
+                let _ = tokio::time::timeout(PATIENCE * 2, handle(stream, &server, store)).await;
             });
         }
     });
@@ -229,7 +255,7 @@ pub async fn serve(store: Arc<Mutex<BoardStore>>, ports: &[u16]) -> io::Result<A
 async fn handle(
     mut stream: TcpStream,
     server: &CanvasServer,
-    store: &Mutex<BoardStore>,
+    store: Arc<Mutex<BoardStore>>,
 ) -> io::Result<()> {
     let mut head = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
@@ -247,8 +273,28 @@ async fn handle(
     };
     let response = match parse(&head).filter(|_| complete) {
         Some((method, path, host)) => {
-            let store = store.lock().unwrap_or_else(|e| e.into_inner());
-            respond(&store, &server.token, server.port, method, host, path)
+            let (token, port) = (server.token.clone(), server.port);
+            let (method, path, host) =
+                (method.to_owned(), path.to_owned(), host.map(str::to_owned));
+            // The store does file work under its lock: never wait for it on the runtime.
+            tokio::task::spawn_blocking(move || {
+                let store = store.lock().unwrap_or_else(|e| e.into_inner());
+                let response = respond(&store, &token, port, &method, host.as_deref(), &path);
+                if response.status != 200 {
+                    // Something asked for what is not a page: worth seeing in the log. Only
+                    // the start of the path, and never one that carries the secret.
+                    let shown: String = if path.contains(token.as_str()) {
+                        "(a path with the secret)".to_owned()
+                    } else {
+                        path.chars().take(40).collect()
+                    };
+                    tracing::warn!(status = response.status, %method, path = %shown,
+                        "the Canvas server refused a request");
+                }
+                response
+            })
+            .await
+            .map_err(io::Error::other)?
         }
         None => answer(400, Vec::new(), None),
     };

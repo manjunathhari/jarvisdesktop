@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from "vitest";
-import { canvasAddress, canvasFrame, mountCanvas, type CanvasApp } from "./canvas";
+import { canvasAddress, canvasFrame, mountCanvas, POLICY, type CanvasApp } from "./canvas";
 import { fillBody } from "./frames";
 import type { Panel } from "./model";
 
@@ -61,7 +61,10 @@ describe("canvasFrame", () => {
     expect(frame.getAttribute("referrerpolicy")).toBe("no-referrer");
     expect(frame.getAttribute("src")).toBe(URL_OK);
     expect(frame.title).toBe("Rainfall (fictional)");
-    for (const never of ["allow", "srcdoc", "allowfullscreen", "name", "csp"]) {
+    expect(frame.getAttribute("csp")).toBe(POLICY);
+    expect(POLICY).toContain("default-src 'none'");
+    expect(POLICY).toContain("sandbox allow-scripts");
+    for (const never of ["allow", "srcdoc", "allowfullscreen", "name"]) {
       expect(frame.hasAttribute(never), never).toBe(false);
     }
   });
@@ -101,6 +104,15 @@ describe("a canvas panel", () => {
     loaded(body);
     expect(await drawn).toBe(true);
     expect(served).toHaveBeenCalledTimes(2);
+  });
+
+  it("counts only a plain true from the app as served", async () => {
+    const body = document.body.appendChild(document.createElement("div"));
+    const served = vi.fn(async () => "Command not allowed" as unknown as boolean);
+    const drawn = mountCanvas(body, panel(), app({ served }), { retryMs: 1 });
+    await vi.waitFor(() => expect(body.querySelector("iframe")).not.toBeNull());
+    loaded(body);
+    expect(await drawn).toBe(false);
   });
 
   it("is not drawn if it never loads", async () => {

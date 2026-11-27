@@ -13,6 +13,11 @@ import type { Panel } from "./model";
 /// The three ports the Canvas server may use (`canvas::PORTS`); the app's content policy
 /// allows frames from these origins only.
 const PORTS = "47821|47822|47823";
+/// The policy the Canvas server sends with every page (`canvas::POLICY`, word for word; a
+/// test checks). The frame demands it too, so that if some other program were answering on
+/// one of the three ports, the browser would refuse to show its page.
+export const POLICY =
+  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; form-action 'none'; base-uri 'none'; sandbox allow-scripts";
 const FAILED = "This panel couldn't be shown.";
 
 /// What the frame needs from the app.
@@ -36,6 +41,7 @@ export function canvasFrame(address: string, title: string): HTMLIFrameElement {
   const frame = document.createElement("iframe");
   frame.setAttribute("sandbox", "allow-scripts");
   frame.setAttribute("referrerpolicy", "no-referrer");
+  frame.setAttribute("csp", POLICY);
   frame.title = title;
   frame.className = "canvas";
   frame.setAttribute("src", address);
@@ -68,9 +74,13 @@ export async function mountCanvas(
 
   const frame = canvasFrame(address, panel.title);
   const arrived = new Promise<boolean>((done) => {
-    frame.addEventListener("load", () => done(true), { once: true });
-    frame.addEventListener("error", () => done(false), { once: true });
-    setTimeout(() => done(false), timeoutMs);
+    const timer = setTimeout(() => done(false), timeoutMs);
+    const end = (ok: boolean) => {
+      clearTimeout(timer);
+      done(ok);
+    };
+    frame.addEventListener("load", () => end(true), { once: true });
+    frame.addEventListener("error", () => end(false), { once: true });
   });
   body.classList.add("framed");
   body.replaceChildren(frame);
@@ -79,10 +89,11 @@ export async function mountCanvas(
   // body is no longer this frame's to write in.
   if (!frame.isConnected) return false;
   try {
-    let served = await app.served(panel.panel_id, panel.revision);
+    // Exactly `true`: nothing else the app's channel might hand back counts.
+    let served = (await app.served(panel.panel_id, panel.revision)) === true;
     if (!served) {
       await wait(retryMs); // the answer may still be on its way out
-      served = await app.served(panel.panel_id, panel.revision);
+      served = (await app.served(panel.panel_id, panel.revision)) === true;
     }
     if (served) return frame.isConnected;
   } catch {

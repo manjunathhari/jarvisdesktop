@@ -2,6 +2,12 @@
 <html lang="en-GB">
   <head>
     <meta charset="UTF-8" />
+    <!-- Narrows the app-wide policy for this window: a frame here may only be a Canvas page
+         from the app's own loopback server, never YouTube (which the main window frames). -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="frame-src http://127.0.0.1:47821 http://127.0.0.1:47822 http://127.0.0.1:47823"
+    />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>JARVIS Board</title>
     <link rel="stylesheet" href="/src/board/board.css" />

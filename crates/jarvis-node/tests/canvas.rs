@@ -91,6 +91,18 @@ fn everything_else_is_turned_away_with_nothing_in_it() {
         ("GET", host, format!("{good}/extra"), 404),
         ("GET", host, format!("{good}?x=1"), 404),
         ("GET", host, format!("/{TOKEN}/{canvas_id}/02"), 404),
+        (
+            "GET",
+            host,
+            format!("/{TOKEN}/{}/2", canvas_id.simple()),
+            404,
+        ), // one address a page
+        (
+            "GET",
+            host,
+            format!("/{TOKEN}/{}/2", canvas_id.to_string().to_uppercase()),
+            404,
+        ),
         ("GET", host, format!("/{TOKEN}/{canvas_id}/+2"), 404),
         ("GET", host, format!("/{TOKEN}/{canvas_id}/two"), 404),
         ("GET", host, "/".to_owned(), 404),
@@ -140,7 +152,7 @@ async fn the_server_answers_over_the_loopback_and_records_what_it_served() {
         .strip_prefix(&format!("http://127.0.0.1:{port}"))
         .expect("an address on the loopback");
     assert_eq!(path.split('/').nth(1).unwrap().len(), 32);
-    assert!(!server.was_served(id, 1));
+    assert!(!server.take_served(id, 1));
 
     let answer = fetch(
         port,
@@ -152,8 +164,10 @@ async fn the_server_answers_over_the_loopback_and_records_what_it_served() {
     assert!(answer.contains("Connection: close\r\n"));
     assert!(answer.contains(&format!("Content-Length: {}\r\n", PAGE.len())));
     assert!(answer.ends_with(PAGE));
-    assert!(server.was_served(id, 1));
-    assert!(!server.was_served(id, 2));
+    assert!(!server.take_served(id, 2));
+    assert!(server.take_served(id, 1));
+    // Once: a later "loaded" needs a page really handed out again.
+    assert!(!server.take_served(id, 1));
 }
 
 #[tokio::test]
@@ -169,7 +183,7 @@ async fn a_request_without_the_secret_gets_nothing_and_counts_for_nothing() {
     .await;
     assert!(answer.starts_with("HTTP/1.1 404 "), "{answer}");
     assert!(!answer.contains("Fictional"));
-    assert!(!server.was_served(id, 1));
+    assert!(!server.take_served(id, 1));
 }
 
 #[tokio::test]
@@ -239,11 +253,119 @@ async fn it_takes_the_next_port_when_one_is_in_use_and_none_is_an_error() {
     assert!(canvas::serve(store, &[busy]).await.is_err());
 }
 
+#[tokio::test(start_paused = true)]
+async fn silent_callers_cannot_keep_a_real_request_waiting_long() {
+    let id = Uuid::new_v4();
+    let (_dir, server) = started(&[show(id, 1, "canvas", PAGE)]).await;
+    let port = server.port();
+    let mut idle = Vec::new();
+    for _ in 0..40 {
+        idle.push(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+    }
+    let path = server
+        .url(id, 1)
+        .replace(&format!("http://127.0.0.1:{port}"), "");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+    let began = tokio::time::Instant::now();
+    let answer = fetch(port, &request).await;
+    assert!(answer.starts_with("HTTP/1.1 200 OK"));
+    assert!(began.elapsed() < std::time::Duration::from_secs(1));
+}
+
+const CONF: &str = include_str!("../../../app/src-tauri/tauri.conf.json");
+const BOARD_HTML: &str = include_str!("../../../app/board.html");
+const CANVAS_TS: &str = include_str!("../../../app/src/board/canvas.ts");
+
+fn frame_sources(policy: &str) -> Vec<&str> {
+    policy
+        .split(';')
+        .map(str::trim)
+        .find_map(|d| d.strip_prefix("frame-src "))
+        .expect("a frame-src")
+        .split_whitespace()
+        .collect()
+}
+
 #[test]
-fn the_fixed_ports_are_the_ones_the_board_may_frame() {
+fn the_board_page_may_frame_the_three_canvas_ports_and_nothing_else() {
     assert_eq!(canvas::PORTS, [47821, 47822, 47823]);
-    let conf = include_str!("../../../app/src-tauri/tauri.conf.json");
-    for port in canvas::PORTS {
-        assert!(conf.contains(&format!("http://127.0.0.1:{port}")), "{port}");
+    let ours: Vec<String> = canvas::PORTS
+        .iter()
+        .map(|p| format!("http://127.0.0.1:{p}"))
+        .collect();
+    // The app-wide policy (a response header) allows them, beside the main window's YouTube.
+    let conf: serde_json::Value = serde_json::from_str(CONF).unwrap();
+    let app_wide = frame_sources(conf["app"]["security"]["csp"].as_str().unwrap());
+    for origin in &ours {
+        assert!(app_wide.contains(&origin.as_str()), "{origin}");
+    }
+    // A page of the app in a frame would be local to Tauri, with the app's rights.
+    for never in [
+        "'self'",
+        "*",
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+        "tauri:",
+    ] {
+        assert!(!app_wide.contains(&never), "{never}");
+    }
+    // The Board's own page narrows it to the three: a Canvas page must not be able to turn
+    // its frame into a YouTube page.
+    let meta = BOARD_HTML
+        .split("http-equiv=\"Content-Security-Policy\"")
+        .nth(1)
+        .and_then(|rest| rest.split("content=\"").nth(1))
+        .and_then(|rest| rest.split('"').next())
+        .expect("a policy in board.html");
+    assert_eq!(
+        frame_sources(meta),
+        ours.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn the_frame_demands_the_same_policy_the_server_sends() {
+    assert!(
+        CANVAS_TS.contains(&format!("\"{POLICY}\"")),
+        "canvas.ts must carry POLICY word for word"
+    );
+}
+
+#[test]
+fn the_board_window_is_built_with_the_seal() {
+    let conf: serde_json::Value = serde_json::from_str(CONF).unwrap();
+    let board = conf["app"]["windows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["label"] == "board")
+        .unwrap();
+    // Built in code, so it can have its own browser data folder and the all-frames script.
+    assert_eq!(board["create"], false);
+    let args = board["additionalBrowserArgs"].as_str().unwrap();
+    assert_eq!(args, canvas::BOARD_BROWSER_ARGS);
+    for needed in [
+        "--proxy-server=http://127.0.0.1:1",
+        "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+        "--enable-features=NoStatePrefetchHoldback",
+        "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection",
+    ] {
+        assert!(args.contains(needed), "{needed}");
+    }
+    assert!(!args.contains("autoplay"));
+    // The main window keeps its own arguments, untouched.
+    let main = &conf["app"]["windows"][0];
+    assert_eq!(main["label"], "main");
+    assert_eq!(
+        main["additionalBrowserArgs"],
+        "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required"
+    );
+    for gone in [
+        "RTCPeerConnection",
+        "speechSynthesis",
+        "AudioContext",
+        "window.top !== window",
+    ] {
+        assert!(canvas::SEAL_SCRIPT.contains(gone), "{gone}");
     }
 }

@@ -6,14 +6,18 @@
   body { margin: 0; padding: 14px 18px; background: #141a20; color: #e6edf3; font: 14px/1.5 system-ui, sans-serif; }
   h1 { font-size: 16px; margin: 0 0 8px; }
   li { margin: 2px 0; }
-  .ok { color: #5fd38d; } .bad { color: #ff6b6b; font-weight: 700; } .wait { color: #9aa7b4; }
+  .ok { color: #5fd38d; } .bad { color: #ff6b6b; font-weight: 700; } .wait { color: #9aa7b4; } .check { color: #f0a35e; }
   button { font: inherit; margin: 8px 8px 0 0; padding: 4px 10px; }
 </style>
-<h1>Canvas seal check: every line must say CONTAINED</h1>
+<h1>Canvas seal check: no line may say ESCAPED</h1>
+<p class="wait">Lines marked CHECK cannot be judged from inside this page: the checklist says how.</p>
 <ul id="out"></ul>
 <p id="verdict" class="wait">Running…</p>
 <button id="loop">Start an endless loop</button>
 <button id="leave">Try to leave this page</button>
+<button id="tube">Try to become a YouTube page</button>
+<button id="port">Try another local port</button>
+<button id="flood">Flood the app with messages</button>
 <form id="f" method="post" action="https://example.org/post"><input name="a" value="b"></form>
 <script>
 (() => {
@@ -28,6 +32,17 @@
     li.textContent = (contained ? "CONTAINED  " : "ESCAPED  ") + name + (detail ? " — " + detail : "");
     out.append(li);
     rows.push(contained);
+  }
+  // An attempt this page cannot judge: whether it got out is seen from outside.
+  function check(name, how) {
+    const li = document.createElement("li");
+    li.className = "check";
+    li.dataset.name = name;
+    li.textContent = "CHECK  " + name + " — " + how;
+    out.append(li);
+  }
+  function mustBeGone(name) {
+    row("no " + name, typeof window[name] === "undefined", typeof window[name] === "undefined" ? "removed" : "still there");
   }
   const msg = (e) => String((e && e.message) || e).slice(0, 90);
   function mustThrow(name, attempt) {
@@ -62,13 +77,8 @@
   mustThrow("cookies", () => { document.cookie = "a=b"; return document.cookie || (() => { throw new Error("no cookie kept"); })(); });
   mustThrow("indexedDB", () => { const r = indexedDB.open("x"); return r ? "opened" : ""; });
   mustThrow("open a new window", () => { const w = window.open("https://example.org/"); if (!w) throw new Error("blocked"); return "opened"; });
-  mustThrow("submit a form", () => {
-    let blocked = false;
-    document.addEventListener("securitypolicyviolation", () => { blocked = true; }, { once: true });
-    document.getElementById("f").submit();
-    // A sandbox without allow-forms drops the submission without an error.
-    throw new Error("submission dropped by the sandbox" + (blocked ? " and the policy" : ""));
-  });
+  for (const api of ["RTCPeerConnection", "webkitRTCPeerConnection", "AudioContext", "webkitAudioContext", "speechSynthesis", "Audio"]) mustBeGone(api);
+  mustThrow("copy to the clipboard", () => { if (!document.execCommand("copy")) throw new Error("refused"); return "copied"; });
 
   (async () => {
     await mustReject("fetch an outside address", () => fetch("https://example.org/").then((r) => "status " + r.status));
@@ -80,35 +90,69 @@
     await mustBeStopped("send a beacon", "example.org/beacon", () => { navigator.sendBeacon("https://example.org/beacon", "x"); });
     await mustBeStopped("open a WebSocket", "example.org/socket", () => { new WebSocket("wss://example.org/socket"); });
     await mustBeStopped("open an event stream", "example.org/stream", () => { new EventSource("https://example.org/stream"); });
-    await mustBeStopped("frame an outside page", "example.org", () => { const f = document.createElement("iframe"); f.hidden = true; f.src = "https://example.org/frame"; document.body.append(f); });
+    await mustBeStopped("frame an outside page", "frame.example.org", () => { const f = document.createElement("iframe"); f.hidden = true; f.src = "https://frame.example.org/frame"; document.body.append(f); });
     await mustBeStopped("start a worker from an outside script", "example.org/worker", () => { new Worker("https://example.org/worker.js"); });
 
-    // The app's command interface. On Windows the framework loads it into every frame, so
-    // finding it here is expected; what matters is that every call is refused.
-    const internals = window.__TAURI_INTERNALS__;
-    row("the app's command interface answers nothing" + (internals ? " (interface present)" : " (interface absent)"), true, "");
-    rows.pop(); out.lastChild.className = "wait";
-    for (const command of ["board_snapshot", "board_clear_closed", "quit", "say", "plugin:event|listen", "plugin:opener|open_url"]) {
-      await mustReject("call the app: " + command, () => {
-        if (!internals || typeof internals.invoke !== "function") return Promise.reject(new Error("no interface"));
-        return internals.invoke(command, { text: "x", event: "jarvis://board", target: { kind: "Any" }, handler: 1, url: "https://example.org/" });
-      }, 3000);
-    }
-    mustThrow("post straight to the app's message channel", () => {
-      if (!window.chrome || !window.chrome.webview) throw new Error("no channel");
-      window.chrome.webview.postMessage(JSON.stringify({ cmd: "quit", callback: 1, error: 2, payload: {}, __TAURI_INVOKE_KEY__: "guess" }));
-      throw new Error("posted without the key; the app must ignore it (check that JARVIS is still running)");
+    // A frame this page makes for itself has the same seal.
+    await new Promise((done) => {
+      const child = document.createElement("iframe");
+      child.hidden = true;
+      child.srcdoc = "<script>parent.postMessage({ rtc: typeof RTCPeerConnection, audio: typeof AudioContext, speech: typeof speechSynthesis }, '*')<\/script>";
+      const timer = setTimeout(() => { row("a frame made by this page is sealed too", true, "the child frame did not run"); done(); }, 2500);
+      window.addEventListener("message", (e) => {
+        clearTimeout(timer);
+        const d = e.data || {};
+        const sealed = d.rtc === "undefined" && d.audio === "undefined" && d.speech === "undefined";
+        row("a frame made by this page is sealed too", sealed, JSON.stringify(d));
+        done();
+      }, { once: true });
+      document.body.append(child);
     });
+
+    // Attempts that fail quietly or succeed quietly: only an outside listener can tell.
+    for (const [rel, href] of [["prerender", "http://prerender.example.org/p?leak=1"], ["prerender", "https://prerender.example.org/p?leak=1"], ["prerender", location.origin + "/probe-prerender"], ["preconnect", "https://preconnect.example.org/"], ["dns-prefetch", "https://dns.example.org/"]]) {
+      const l = document.createElement("link"); l.rel = rel; l.href = href; document.head.append(l);
+    }
+    try { const f = document.getElementById("f"); f.action = "http://form.example.org/post"; f.submit(); } catch { /* refused */ }
+    check("prerender, preconnect and DNS hints, and a form sent", "nothing may arrive outside; the app's log must show no refused request for /probe-prerender");
+    try {
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.example.org:3478" }, { urls: "turn:turn.example.org:3478?transport=tcp", username: "leak", credential: "x" }] });
+      pc.createDataChannel("x"); pc.createOffer().then((o) => pc.setLocalDescription(o));
+      row("WebRTC", false, "a connection was created");
+    } catch (e) { row("WebRTC", true, msg(e)); }
+
+    // The app's command interface. On Windows the framework loads it into every frame, so
+    // finding it here is expected. A refusal is answered in the Board's page, not here, so
+    // this page cannot tell a refused call from one that ran: the checklist judges these by
+    // what the app did.
+    const internals = window.__TAURI_INTERNALS__;
+    for (const command of ["board_snapshot", "board_clear_closed", "quit", "say", "plugin:event|listen", "plugin:opener|open_url"]) {
+      try {
+        if (internals && typeof internals.invoke === "function") {
+          internals.invoke(command, { text: "seal check", event: "jarvis://board", target: { kind: "Any" }, handler: 1, url: "https://opened.example.org/" }).then(
+            (got) => row("call the app: " + command, false, "answered " + String(JSON.stringify(got)).slice(0, 60)), () => {});
+        }
+      } catch { /* refused here already */ }
+    }
+    check("six calls to the app (" + (internals ? "interface present" : "interface absent") + ")", "JARVIS keeps running, says nothing, opens no browser, and closed panels are still listed");
+    try {
+      if (window.chrome && window.chrome.webview) window.chrome.webview.postMessage(JSON.stringify({ cmd: "quit", callback: 1, error: 2, payload: {}, __TAURI_INVOKE_KEY__: "guess" }));
+    } catch { /* no channel */ }
+    check("a message straight to the app's channel (" + (window.chrome && window.chrome.webview ? "channel present" : "channel absent") + ")", "JARVIS keeps running");
+    await new Promise((done) => setTimeout(done, 1500));
 
     const verdict = document.getElementById("verdict");
     const escaped = rows.filter((c) => !c).length;
     verdict.dataset.done = "1";
     verdict.className = escaped ? "bad" : "ok";
-    verdict.textContent = escaped ? escaped + " ESCAPED. The seal is broken." : "All " + rows.length + " attempts contained.";
+    verdict.textContent = escaped ? escaped + " ESCAPED. The seal is broken." : "All " + rows.length + " judged attempts contained. Now do the CHECK lines.";
   })();
 
   document.getElementById("loop").onclick = () => { for (;;) {} };
-  document.getElementById("leave").onclick = () => { location.href = "https://example.org/"; };
+  document.getElementById("leave").onclick = () => { location.href = "http://leave.example.org/?leak=1"; };
+  document.getElementById("tube").onclick = () => { location.href = "https://www.youtube.com/embed/x?leak=1"; };
+  document.getElementById("port").onclick = () => { const p = location.port === "47823" ? "47822" : "47823"; location.href = "http://127.0.0.1:" + p + "/probe-port"; };
+  document.getElementById("flood").onclick = () => { const send = (window.chrome && window.chrome.webview) ? (m) => window.chrome.webview.postMessage(m) : (m) => parent.postMessage(m, "*"); for (;;) send("flood"); };
 })();
 </script>
 </html>
