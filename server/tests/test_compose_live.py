@@ -1,10 +1,11 @@
-"""The two read-only sidecars really start (first deploy, 24 Nov 2026).
+"""The read-only sidecars really start (first deploy, 24 Nov 2026).
 
 The first deploy failed before any container ran: Compose can't place an inline config in a
 read-only container. These tests start the egress proxy and the Tailscale sidecar the way the
 rendered compose file says (same image, entrypoint, environment, read-only root, tmpfs, caps)
-and check that they come up with our rules. They need a Docker daemon that can pull the pinned
-images, so they run only with JARVIS_DOCKER_LIVE=1 (CI's test job sets it).
+and check that they come up with our rules; likewise the improve team's improve-egress,
+claude-proxy and sandbox-db (profile "improve"). They need a Docker daemon that can pull the
+pinned images, so they run only with JARVIS_DOCKER_LIVE=1 (CI's test job sets it).
 
 The render test needs only the `docker compose` CLI and runs wherever it is installed.
 """
@@ -28,6 +29,8 @@ DEPLOY = SERVER / "deploy"
 COMPOSE = DEPLOY / "compose.yaml"
 ENTRYPOINT = DEPLOY / "gateway-ts" / "entrypoint.sh"
 SQUID = DEPLOY / "egress-proxy" / "squid.conf"
+IMPROVE_SQUID = DEPLOY / "improve" / "squid.conf"
+CLAUDE_NGINX = DEPLOY / "improve" / "claude-proxy.conf"
 CHOICE = "/tmp/jarvis-iptables"  # noqa: S108 (inside the sidecar: the backend its entrypoint chose)
 
 live = pytest.mark.skipif(
@@ -45,8 +48,9 @@ def _compose_cli() -> bool:
 def rendered() -> dict[str, Any]:
     if not _compose_cli():
         pytest.skip("docker compose CLI not installed")
+    config = ["docker", "compose", "-f", str(COMPOSE), "--profile", "improve", "config"]
     out = subprocess.run(
-        ["docker", "compose", "-f", str(COMPOSE), "config", "--format", "json"],
+        [*config, "--format", "json"],
         env={**os.environ, "JARVIS_REF": "render-check"},
         capture_output=True,
         text=True,
@@ -72,7 +76,11 @@ def test_rendered_values_are_the_files(rendered: dict[str, Any]) -> None:
     """What each container gets is byte-for-byte the reviewable file."""
     assert rendered["gateway-ts"]["environment"]["JARVIS_TS_ENTRYPOINT"] == ENTRYPOINT.read_text()
     assert rendered["egress-proxy"]["environment"]["JARVIS_SQUID_CONF"] == SQUID.read_text()
-    for name in ("gateway-ts", "egress-proxy"):
+    assert rendered["improve-egress"]["environment"]["JARVIS_SQUID_CONF"] == (
+        IMPROVE_SQUID.read_text()
+    )
+    assert rendered["claude-proxy"]["environment"]["JARVIS_NGINX_CONF"] == CLAUDE_NGINX.read_text()
+    for name in ("gateway-ts", "egress-proxy", "improve-egress", "claude-proxy"):
         start = rendered[name]["entrypoint"][2]
         assert "$$" not in start and "${JARVIS_" in start, name
 
@@ -87,13 +95,18 @@ def _run_args(service: dict[str, Any], name: str, network: str) -> list[str]:
     for mount in service["tmpfs"]:
         args += ["--tmpfs", mount]
     args += ["--cap-drop", "ALL"]
-    for cap in service["cap_add"]:
+    for cap in service.get("cap_add", []):
         args += ["--cap-add", cap]
     for opt in service["security_opt"]:
         args += ["--security-opt", opt]
     for key, value in service["environment"].items():
         args += ["-e", f"{key}={value}"]
-    args += ["--entrypoint", service["entrypoint"][0]]
+    if "user" in service:
+        args += ["--user", service["user"]]
+    for group in service.get("group_add", []):
+        args += ["--group-add", group]
+    if "entrypoint" in service:
+        args += ["--entrypoint", service["entrypoint"][0]]
     return args
 
 
@@ -208,5 +221,141 @@ def test_gateway_sidecar_starts_read_only_and_installs_rules(
         assert len(v6_rules) == len(ip6t)
         for v6 in v6_rules:  # IPv6 rules too, wherever ip6tables works
             assert v6.splitlines()[-1] == "-A JARVIS_GW_OUT -j DROP", v6
+    finally:
+        _docker("rm", "-f", name, check=False)
+
+
+def _ask(network: str, image: str, proxy: str, request: str) -> str:
+    """The first line of the proxy's answer to one raw request, from a client on `network`."""
+    tunnel = f"exec 3<>/dev/tcp/{proxy}/3128; cat >&3; head -n1 <&3"
+    script = f"printf \"$0\" | timeout 10 bash -c '{tunnel}'"
+    done = _docker(
+        "run", "--rm", "--network", network, "--entrypoint", "/bin/bash", image, "-c", script,
+        request, check=False,
+    )  # fmt: skip
+    return done.stdout + done.stderr
+
+
+@live
+def test_improve_egress_allows_public_https_only_and_logs(
+    rendered: dict[str, Any], network: str
+) -> None:
+    proxy = rendered["improve-egress"]
+    name = f"jarvis-improve-egress-{uuid.uuid4().hex[:8]}"
+    try:
+        _docker(*_run_args(proxy, name, network), proxy["image"], *proxy["entrypoint"][1:])
+        time.sleep(3)
+        _wait_running(name)
+        health = proxy["healthcheck"]["test"]
+        _docker("exec", name, "/bin/sh", "-c", health[1])  # check=True: must pass
+        connect = "CONNECT {0} HTTP/1.1\\r\\nHost: {0}\\r\\n\\r\\n"
+        for target, status in (
+            ("example.com:443", " 200 "),  # any public host, on 443
+            ("example.com:80", " 403 "),
+            ("10.214.14.10:443", " 403 "),  # jarvis_internal's Postgres address
+            ("169.254.169.254:443", " 403 "),  # cloud metadata
+            ("100.100.100.100:443", " 403 "),  # the tailnet range
+            ("127.0.0.1:443", " 403 "),
+        ):
+            answer = _ask(network, proxy["image"], name, connect.format(target))
+            assert status in answer, f"{target}: {answer!r}"
+        plain = "GET http://example.com/ HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n"
+        assert " 403 " in _ask(network, proxy["image"], name, plain)  # CONNECT only
+        time.sleep(1)
+        logs = _docker("logs", name, check=False).stdout
+        assert "TCP_TUNNEL/200" in logs and "CONNECT example.com:443" in logs, logs
+        assert "TCP_DENIED/403" in logs and "169.254.169.254:443" in logs, logs
+    finally:
+        _docker("rm", "-f", name, check=False)
+
+
+def _start_claude_proxy(
+    proxy: dict[str, Any], network: str, key: Path
+) -> tuple[str, subprocess.CompletedProcess[str]]:
+    name = f"jarvis-claude-proxy-{uuid.uuid4().hex[:8]}"
+    args = _run_args(proxy, name, network)
+    args += ["-v", f"{key}:/run/secrets/improve_claude_key:ro"]
+    return name, _docker(*args, proxy["image"], *proxy["entrypoint"][1:], check=False)
+
+
+@live
+def test_claude_proxy_adds_the_key_and_reaches_claude(
+    rendered: dict[str, Any], network: str, tmp_path: Path
+) -> None:
+    """With a dummy key, Claude answers 401: the request went out over verified TLS to
+    api.anthropic.com with our x-api-key. Paths outside /v1/ are not forwarded."""
+    proxy = rendered["claude-proxy"]
+    key = tmp_path / "improve_claude_key"
+    key.write_text("sk-ant-dummy-not-a-real-key\n")
+    key.chmod(0o444)
+    name, _ = _start_claude_proxy(proxy, network, key)
+    try:
+        time.sleep(3)
+        _wait_running(name)
+        _docker("exec", name, "/bin/sh", "-c", proxy["healthcheck"]["test"][1])  # must pass
+        conf = _docker("exec", name, "cat", "/tmp/claude-key.conf").stdout  # noqa: S108
+        assert conf == 'proxy_set_header x-api-key "sk-ant-dummy-not-a-real-key";\n'
+
+        def status(path: str) -> str:
+            # The client's own (placeholder) key must not matter: the proxy replaces it.
+            wget = (
+                "wget -S -O /dev/null --header 'anthropic-version: 2023-06-01'"
+                f" --header 'x-api-key: placeholder-not-a-key' http://{name}:8080{path}"
+            )
+            done = _docker(
+                "run", "--rm", "--network", network, "--entrypoint", "/bin/sh", proxy["image"],
+                "-c", f"{wget} 2>&1 || true", check=False,
+            )  # fmt: skip
+            return done.stdout
+
+        assert "401" in status("/v1/models")
+        assert "404" in status("/")
+        assert "200" in status("/healthz")
+    finally:
+        _docker("rm", "-f", name, check=False)
+
+
+@live
+def test_claude_proxy_refuses_a_key_with_other_characters(
+    rendered: dict[str, Any], network: str, tmp_path: Path
+) -> None:
+    proxy = rendered["claude-proxy"]
+    key = tmp_path / "improve_claude_key"
+    key.write_text('sk-ant"; proxy_pass http://elsewhere;\n')
+    key.chmod(0o444)
+    name, _ = _start_claude_proxy(proxy, network, key)
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            state = _docker("inspect", "-f", "{{.State.Status}}", name).stdout.strip()
+            if state == "exited":
+                break
+            time.sleep(0.5)
+        assert _docker("inspect", "-f", "{{.State.ExitCode}}", name).stdout.strip() == "1"
+        logs = _docker("logs", name, check=False)
+        assert "improve_claude_key is empty or not a key; refusing to start" in logs.stderr
+    finally:
+        _docker("rm", "-f", name, check=False)
+
+
+@live
+def test_sandbox_db_starts_read_only_as_postgres(
+    rendered: dict[str, Any], internal_network: str
+) -> None:
+    db = rendered["sandbox-db"]
+    name = f"jarvis-sandbox-db-{uuid.uuid4().hex[:8]}"
+    try:
+        _docker(*_run_args(db, name, internal_network), db["image"])
+        deadline = time.monotonic() + 60
+        ready = None
+        while time.monotonic() < deadline:
+            _wait_running(name)
+            ready = _docker(
+                "exec", name, "/bin/sh", "-c", db["healthcheck"]["test"][1], check=False
+            )
+            if ready.returncode == 0:
+                break
+            time.sleep(1)
+        assert ready is not None and ready.returncode == 0, _docker("logs", name, check=False)
     finally:
         _docker("rm", "-f", name, check=False)

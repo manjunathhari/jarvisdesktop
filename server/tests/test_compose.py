@@ -38,6 +38,11 @@ COMPOSE = DEPLOY / "compose.yaml"
 ENTRYPOINT = DEPLOY / "gateway-ts" / "entrypoint.sh"
 SQUID = DEPLOY / "egress-proxy" / "squid.conf"
 HARDEN = DEPLOY / "harden" / "harden.sh"
+IMPROVE = DEPLOY / "improve"
+IMPROVE_SQUID = IMPROVE / "squid.conf"
+CLAUDE_NGINX = IMPROVE / "claude-proxy.conf"
+SANDBOX_DOCKERFILE = IMPROVE / "sandbox.Dockerfile"
+WORKFLOWS = SERVER.parent / ".github" / "workflows"
 
 TAILSCALE_IMAGE = (
     "tailscale/tailscale:stable"
@@ -47,6 +52,15 @@ SQUID_IMAGE = (
     "ubuntu/squid:6.6-24.04_edge"
     "@sha256:d9c34c5ab74c6dd41cf1070d9b4221aac072e67e983527ca2d41512958f77506"
 )
+NGINX_IMAGE = (
+    "nginxinc/nginx-unprivileged:1.30.6-alpine"
+    "@sha256:f5116ed4606f3eb015dd4a8e28cb9b351476dc0ad4bc6e9f93b19cec130cdf03"
+)
+SANDBOX_DB_IMAGE = (
+    "postgres:17.12-trixie@sha256:97fb53376be3e4fb1a8a61421daa69dcc3bf2fa39bda3259f5245f9a455af1a9"
+)
+AGENT_SDK = "claude-agent-sdk==0.2.189"
+IMPROVE_SERVICES = {"improver", "sandbox", "claude-proxy", "improve-egress", "sandbox-db"}
 P2_ROWS = ["P2-E01", "P2-E04", "P2-E06", "P2-E11", "P2-S1", "P2-S6-db", "P2-B-idx", "P2-fence"]
 
 
@@ -218,7 +232,12 @@ def test_no_inline_configs_in_read_only_services(stack: dict[str, Any]) -> None:
 
 @pytest.mark.parametrize(
     ("block", "path"),
-    [("x-gateway-ts-entrypoint", ENTRYPOINT), ("x-egress-proxy-squid", SQUID)],
+    [
+        ("x-gateway-ts-entrypoint", ENTRYPOINT),
+        ("x-egress-proxy-squid", SQUID),
+        ("x-improve-egress-squid", IMPROVE_SQUID),
+        ("x-claude-proxy-nginx", CLAUDE_NGINX),
+    ],
 )
 def test_inline_copies_match_their_files(stack: dict[str, Any], block: str, path: Path) -> None:
     raw = COMPOSE.read_text()  # yaml loads the escaped text; compose turns $$ into $
@@ -308,6 +327,253 @@ def test_proxy_allows_only_connect_to_claude() -> None:
     assert acls["connect_method"] == ["method", "CONNECT"]
     assert ["cache", "deny", "all"] in directives
     assert not any(d[0] in ("cache_dir", "cache_peer") for d in directives)
+
+
+# --- the self-improvement team (profile "improve") ---------------------------------------------
+#
+# Five services, none started by default: the orchestrator (improver), the sandbox the Claude
+# Agent SDK works in, the proxy that adds the team's own Claude key (claude-proxy), a squid for
+# the team's web access (improve-egress) and a throwaway Postgres for the sandbox's DB tests
+# (sandbox-db). The sandbox holds no key of any kind.
+
+
+def _directives(path: Path) -> list[list[str]]:
+    return [
+        ln.split()
+        for ln in path.read_text().splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+
+
+def _members(stack: dict[str, Any], network: str) -> set[str]:
+    return {n for n, s in _services(stack).items() if network in _networks(s)}
+
+
+def test_improve_services_only_in_the_improve_profile(stack: dict[str, Any]) -> None:
+    services = _services(stack)
+    in_profile = {n for n, s in services.items() if "improve" in s.get("profiles", [])}
+    assert in_profile == IMPROVE_SERVICES
+    for name in IMPROVE_SERVICES:
+        assert services[name]["profiles"] == ["improve"], name
+        assert "ports" not in services[name] and "expose" not in services[name], name
+        assert "network_mode" not in services[name] and "privileged" not in services[name], name
+        assert "devices" not in services[name], name
+
+
+def test_sandbox_holds_no_secret(stack: dict[str, Any]) -> None:
+    sandbox = _services(stack)["sandbox"]
+    assert "secrets" not in sandbox
+    assert sandbox["volumes"] == ["improve_work:/work"]
+    assert not [v for v in sandbox["volumes"] if "/etc/jarvis" in v or "secrets" in v]
+    assert _networks(sandbox) == ["jarvis_improve"]
+    env = sandbox["environment"]
+    for name, value in env.items():
+        if "KEY" in name.upper():
+            assert (name, value) == ("ANTHROPIC_API_KEY", "placeholder-not-a-key"), name
+        assert "sk-ant" not in str(value).lower(), name
+    assert env["ANTHROPIC_BASE_URL"] == "http://claude-proxy:8080"
+    assert env["HTTPS_PROXY"] == "http://improve-egress:3128"
+    assert env["JARVIS_TEST_SUPERUSER_DSN"].startswith("postgresql://postgres:")
+    assert env["JARVIS_TEST_SUPERUSER_DSN"].endswith("@sandbox-db:5432/postgres")
+    assert sandbox["restart"] == "always"  # each stage starts on a clean root and /tmp
+    assert sandbox["read_only"] is True and sandbox["cap_drop"] == ["ALL"]
+    assert "cap_add" not in sandbox
+    assert sandbox["security_opt"] == ["no-new-privileges:true"]
+    assert sandbox["user"] == "10001:10001"
+    tmpfs = [t.split(":", 1)[0] for t in sandbox["tmpfs"]]
+    assert tmpfs == ["/tmp", "/cache", "/home/jarvis"]  # noqa: S108 (container paths)
+    for cache in ("CARGO_HOME", "UV_CACHE_DIR", "npm_config_cache"):  # on the tmpfs, not /work
+        assert env[cache].startswith("/cache/"), cache
+    assert env["HOME"] == "/home/jarvis"
+    assert sandbox["image"].startswith("ghcr.io/manjunathhari/jarvis-sandbox:${JARVIS_REF:?")
+    assert sandbox["depends_on"] == {
+        "claude-proxy": {"condition": "service_healthy"},
+        "improve-egress": {"condition": "service_healthy"},
+        "sandbox-db": {"condition": "service_healthy"},
+    }
+
+
+def test_only_claude_proxy_mounts_the_improve_claude_key(stack: dict[str, Any]) -> None:
+    for name, service in _services(stack).items():
+        assert (name == "claude-proxy") == ("improve_claude_key" in _secrets(service)), name
+        assert (name == "improver") == ("improve_github_app_key" in _secrets(service)), name
+    proxy = _services(stack)["claude-proxy"]
+    assert _secrets(proxy) == {"improve_claude_key"}
+    assert not [k for k in proxy["environment"] if "KEY" in k.upper()]  # read from the file
+    files = {k: v["file"] for k, v in stack["secrets"].items()}
+    assert files["improve_claude_key"] == "/etc/jarvis/secrets/improve_claude_key"
+    assert files["improve_github_app_key"] == "/etc/jarvis/secrets/improve_github_app_key"
+
+
+def test_improver_gets_no_claude_key(stack: dict[str, Any]) -> None:
+    services = _services(stack)
+    improver = services["improver"]
+    # Postgres (its app password) and the GitHub App's private key; never a Claude key.
+    assert _secrets(improver) == {"pg_app_password", "improve_github_app_key"}
+    assert {"anthropic_api_key", "improve_claude_key"}.isdisjoint(_secrets(improver))
+    assert not [k for k in improver["environment"] if "ANTHROPIC" in k or "CLAUDE" in k]
+    assert improver["image"] == services["core"]["image"]
+    assert improver["entrypoint"] == ["jarvis-improver"] and improver["command"] == ["run"]
+    assert _networks(improver) == ["jarvis_improve", "jarvis_internal"]
+    assert improver["environment"]["HTTPS_PROXY"] == "http://improve-egress:3128"
+    assert improver["environment"]["JARVIS_DB_HOST"] == "postgres"
+    assert improver["read_only"] is True and improver["cap_drop"] == ["ALL"]
+    assert improver["volumes"] == ["improve_work:/work"]  # writes the inbox, reads the outbox
+    assert improver["depends_on"]["improve-egress"] == {"condition": "service_healthy"}
+    users = {n for n, s in services.items() if "improve_work" in _volume_sources(s)}
+    assert users == {"improver", "sandbox"}
+    # Both images own an empty /work as 10001, so whichever container mounts the new volume
+    # first, Docker gives the volume to 10001 (sandbox.Dockerfile does the same).
+    owned = (SERVER / "Dockerfile").read_text().split("install -d -o 10001 -g 10001", 1)[1]
+    assert "/work" in owned.split("\n", 1)[0]
+
+
+def test_improve_networks_keep_core_closed(stack: dict[str, Any]) -> None:
+    """jarvis_improve has no internet route. Only improve-egress and claude-proxy have one, each
+    on a network of its own, and neither is on jarvis_internal: core's way out is unchanged."""
+    services = _services(stack)
+    networks = stack["networks"]
+    assert networks["jarvis_improve"]["internal"] is True
+    assert _members(stack, "jarvis_improve") == IMPROVE_SERVICES
+    assert _members(stack, "jarvis_improve_egress") == {"improve-egress"}
+    assert _members(stack, "jarvis_claude_egress") == {"claude-proxy"}
+    for name in ("jarvis_improve_egress", "jarvis_claude_egress"):
+        assert not networks[name].get("internal"), name
+    assert _networks(services["improve-egress"]) == ["jarvis_improve", "jarvis_improve_egress"]
+    assert _networks(services["claude-proxy"]) == ["jarvis_claude_egress", "jarvis_improve"]
+    assert _networks(services["sandbox-db"]) == ["jarvis_improve"]
+    assert _members(stack, "jarvis_internal") & IMPROVE_SERVICES == {"improver"}
+    assert _members(stack, "jarvis_egress") == {"egress-proxy"}
+    assert _members(stack, "jarvis_ts_egress") == {"gateway-ts"}
+
+
+def test_improve_images_pinned(stack: dict[str, Any]) -> None:
+    services = _services(stack)
+    assert services["claude-proxy"]["image"] == NGINX_IMAGE
+    assert services["improve-egress"]["image"] == SQUID_IMAGE
+    assert services["sandbox-db"]["image"] == SANDBOX_DB_IMAGE
+    for name in ("claude-proxy", "improve-egress", "sandbox-db"):
+        assert re.search(r"@sha256:[0-9a-f]{64}$", services[name]["image"]), name
+
+
+def test_sandbox_image_is_pinned_and_keyless() -> None:
+    text = SANDBOX_DOCKERFILE.read_text()
+    lines = [ln.strip() for ln in text.splitlines()]
+    sources = [ln.split()[1] for ln in lines if ln.startswith("FROM ")]
+    sources += re.findall(r"COPY --from=(\S+)", text)
+    stages = {ln.split()[-1] for ln in lines if ln.startswith("FROM ") and " AS " in ln}
+    external = [s for s in sources if s not in stages]
+    assert external and all(re.search(r"@sha256:[0-9a-f]{64}$", s) for s in external), external
+    assert sources[0].startswith("node:22.") and any(s.startswith("python:3.12.") for s in sources)
+    assert f"pip install --no-cache-dir {AGENT_SDK}" in text  # exact, verified on PyPI
+    assert "--profile minimal" in text and "--default-toolchain stable" in text
+    assert "sha256sum -c" in text  # rustup-init is checked before it runs
+    assert (
+        'ENTRYPOINT ["/opt/agent-sdk/bin/python", "-m", "jarvis_server.improve.sandbox_runner"]'
+        in lines
+    )
+    assert "COPY src /opt/jarvis/src" in lines
+    assert [ln for ln in lines if ln.startswith("USER ")] == ["USER 10001:10001"]
+    assert "sk-ant" not in text and not re.search(r"^ENV .*KEY", text, re.MULTILINE)
+    # The Linux libraries the desktop CI installs, so the sandbox can build the Tauri app.
+    ci = (WORKFLOWS / "ci.yml").read_text()
+    wanted = re.search(r"apt-get install -y (lib[^\n]+)", ci)
+    assert wanted is not None
+    for package in wanted.group(1).split():
+        assert re.search(rf"\b{re.escape(package)}\b", text), package
+    for tool in ("git", "build-essential", "pkg-config", "ca-certificates"):
+        assert re.search(rf"\s{re.escape(tool)}\s", text), tool
+    assert "COPY --from=node /usr/local/bin/node /usr/local/bin/node" in lines  # the UI build
+
+
+def test_claude_proxy_adds_the_key_and_forwards_only_to_claude(stack: dict[str, Any]) -> None:
+    proxy = _services(stack)["claude-proxy"]
+    assert proxy["read_only"] is True and proxy["cap_drop"] == ["ALL"]
+    assert "cap_add" not in proxy and "volumes" not in proxy and "configs" not in proxy
+    assert proxy["group_add"] == ["10001"]  # reads the root:10001 0440 secret file
+    assert proxy["environment"]["JARVIS_NGINX_CONF"] == stack["x-claude-proxy-nginx"]
+    assert proxy["entrypoint"][:2] == ["/bin/sh", "-c"] and proxy["command"] == []
+    start = proxy["entrypoint"][2]
+    assert '[ -n "$${JARVIS_NGINX_CONF:-}" ] || {' in start
+    assert "$$(cat /run/secrets/improve_claude_key)" in start
+    assert '*[!A-Za-z0-9_-]*) echo "claude-proxy:' in start  # no quote can reach the config
+    assert "umask 077;" in start and "> /tmp/claude-key.conf" in start
+    assert start.endswith('exec nginx -e /dev/stderr -c /tmp/nginx.conf -g "daemon off;"')
+    assert "/tmp" in proxy["tmpfs"]  # noqa: S108 (a container path)
+    health = " ".join(proxy["healthcheck"]["test"])
+    assert "test -s /tmp/claude-key.conf" in health and "127.0.0.1:8080/healthz" in health
+    conf = CLAUDE_NGINX.read_text()
+    code = [ln.strip() for ln in conf.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    assert "listen 8080;" in code
+    assert code.count("proxy_pass $claude;") == 1  # one upstream, and only under /v1/
+    assert "set $claude https://api.anthropic.com;" in code
+    assert "location /v1/ {" in code and "return 404;" in code
+    assert "proxy_ssl_verify on;" in code and "proxy_ssl_server_name on;" in code
+    assert "proxy_ssl_name api.anthropic.com;" in code
+    assert "proxy_set_header Host api.anthropic.com;" in code
+    assert 'proxy_set_header Authorization "";' in code  # the sandbox's own header never passes
+    assert "include /tmp/claude-key.conf;" in code
+    assert not [ln for ln in code if "x-api-key" in ln]  # the key line is written at start only
+    assert "server_tokens off;" in code and "access_log off;" in code
+
+
+def test_improve_egress_allows_only_public_https(stack: dict[str, Any]) -> None:
+    """The team has web access (it has a Researcher): CONNECT to any public host on 443, logged.
+    Never to a private, link-local, loopback or tailnet address, never another port."""
+    directives = _directives(IMPROVE_SQUID)
+    access = [d[1:] for d in directives if d[0] == "http_access"]
+    assert access == [
+        ["deny", "!connect_method"],
+        ["deny", "!tls_port"],
+        ["deny", "internal_dst"],
+        ["allow", "jarvis_improve", "connect_method", "tls_port"],
+        ["deny", "all"],
+    ]
+    acls = {d[1]: d[2:] for d in directives if d[0] == "acl"}
+    assert acls["tls_port"] == ["port", "443"]
+    assert acls["connect_method"] == ["method", "CONNECT"]
+    assert acls["internal_dst"][0] == "dst"
+    refused = [ipaddress.ip_network(r) for r in acls["internal_dst"][1:]]
+    for net in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "0.0.0.0/8",
+                "169.254.0.0/16", "100.64.0.0/10", "::1/128", "fc00::/7", "fe80::/10"):  # fmt: skip
+        assert ipaddress.ip_network(net) in refused, net
+    for name, network in stack["networks"].items():  # every jarvis subnet is refused
+        for pool in (network or {}).get("ipam", {}).get("config", []):
+            subnet = ipaddress.ip_network(pool["subnet"])
+            assert any(subnet.subnet_of(r) for r in refused if r.version == subnet.version), name
+    assert ["access_log", "stdio:/dev/stdout"] in directives  # every request is logged
+    assert not any(d[0] == "access_log" and d[1] == "none" for d in directives)
+    assert ["cache", "deny", "all"] in directives
+    assert not any(d[0] in ("cache_dir", "cache_peer") for d in directives)
+    assert [d for d in directives if d[0] == "http_port"] == [["http_port", "3128"]]
+    proxy = _services(stack)["improve-egress"]
+    assert proxy["environment"]["JARVIS_SQUID_CONF"] == stack["x-improve-egress-squid"]
+    assert proxy["entrypoint"][:2] == ["/bin/sh", "-c"] and proxy["command"] == []
+    start = proxy["entrypoint"][2]
+    assert '[ -n "$${JARVIS_SQUID_CONF:-}" ] || {' in start and "exit 1; }" in start
+    assert start.endswith("exec /usr/sbin/squid -f /tmp/squid.conf -NYC")
+    assert proxy["read_only"] is True and proxy["cap_drop"] == ["ALL"]
+    # Runs as the image's proxy user from the start, so Docker hands it the log pipe (squid
+    # opens access_log after dropping root, and could not reopen a root-owned stdout).
+    assert proxy["user"] == "13:13" and "cap_add" not in proxy
+    assert "secrets" not in proxy and "configs" not in proxy
+    health = " ".join(proxy["healthcheck"]["test"])
+    assert "http_access deny internal_dst' /tmp/squid.conf" in health
+    assert "http_access deny all' /tmp/squid.conf" in health
+
+
+def test_sandbox_db_is_throwaway(stack: dict[str, Any]) -> None:
+    services = _services(stack)
+    db = services["sandbox-db"]
+    assert "secrets" not in db and "volumes" not in db
+    assert _networks(db) == ["jarvis_improve"]
+    assert db["read_only"] is True and db["cap_drop"] == ["ALL"] and db["user"] == "999:999"
+    assert "/var/lib/postgresql/data:mode=1777" in db["tmpfs"]
+    env = db["environment"]
+    assert env["PGDATA"].startswith("/var/lib/postgresql/data/")
+    dsn = services["sandbox"]["environment"]["JARVIS_TEST_SUPERUSER_DSN"]
+    assert dsn == f"postgresql://postgres:{env['POSTGRES_PASSWORD']}@sandbox-db:5432/postgres"
+    assert "pg_isready" in " ".join(db["healthcheck"]["test"])
 
 
 # --- harden.sh ---------------------------------------------------------------------------------
@@ -567,3 +833,35 @@ def test_compose_config_is_valid() -> None:
     )  # fmt: skip
     assert not re.search(r"^\s*ports\s*:", done.stdout, re.MULTILINE)
     assert "api.anthropic.com" in done.stdout and "JARVIS_GW_OUT" in done.stdout
+
+
+def _workflow(name: str) -> dict[str, Any]:
+    loaded: dict[str, Any] = yaml.safe_load((WORKFLOWS / name).read_text())
+    loaded["on"] = loaded.pop(True, loaded.get("on"))  # YAML 1.1 reads the key `on` as true
+    return loaded
+
+
+def test_desktop_ci_reads_only() -> None:
+    assert _workflow("ci.yml")["permissions"] == {"contents": "read"}
+
+
+def test_installer_publishes_only_from_main() -> None:
+    release = _workflow("release.yml")
+    assert release["on"]["push"]["branches"] == ["main"]
+    # A manual run from another branch builds nothing either: only main publishes.
+    assert release["jobs"]["build"]["if"] == "github.ref == 'refs/heads/main'"
+
+
+def test_server_ci_builds_the_sandbox_image_without_pushing() -> None:
+    import fnmatch
+
+    workflow = _workflow("server.yml")
+    for event in ("push", "pull_request"):
+        paths = workflow["on"][event]["paths"]
+        assert any(fnmatch.fnmatch("server/deploy/improve/sandbox.Dockerfile", p) for p in paths)
+    steps = workflow["jobs"]["test"]["steps"]
+    runs = [s.get("run", "") for s in steps]
+    build = [r for r in runs if "deploy/improve/sandbox.Dockerfile" in r]
+    assert build == ["docker build -f deploy/improve/sandbox.Dockerfile --tag jarvis-sandbox:ci ."]
+    text = (WORKFLOWS / "server.yml").read_text()
+    assert "jarvis-sandbox" not in text.split("publish:", 1)[1]  # never published from here
