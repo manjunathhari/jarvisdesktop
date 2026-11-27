@@ -28,9 +28,10 @@
     "kind": {
       "enum": [
         "text",
-        "canvas"
+        "canvas",
+        "drawing"
       ],
-      "description": "`text`: formatted text (Markdown, no raw HTML). `canvas`: one self-contained HTML page, shown sealed."
+      "description": "`text`: formatted text (Markdown, no raw HTML). `canvas`: one self-contained HTML page, shown sealed. `drawing`: `content` is the canonical JSON description of a picture (engine, version, units, items, steps, and the picture's hash, size and media type); the picture itself arrives in `board.content` chunks. Core and the node check the description; the schema cannot."
     },
     "title": {
       "type": "string",

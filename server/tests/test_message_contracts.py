@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from typing import Any
@@ -29,9 +30,11 @@ DESKTOP = [
     "board.set_state.args",
     "board.focus.args",
     "board.working.args",
+    "board.content.args",
     "board.show.receipt",
     "board.set_state.receipt",
     "board.working.receipt",
+    "board.content.receipt",
 ]
 
 KINDS = [
@@ -458,12 +461,12 @@ def test_board_content_has_no_control_characters_but_tab_and_line_breaks(name: s
         _both(name, _with_content(good, bad), ok=False)
 
 
-def test_board_kinds_are_text_and_canvas() -> None:
+def test_board_kinds_are_text_canvas_and_drawing() -> None:
     for name in PANEL_ARGS:  # an update carries the whole panel, so the node can restore it
         good = _example(name, "valid")
         _both(name, {**good, "kind": "canvas"}, ok=True)
         _both(name, {**good, "kind": "html"}, ok=False)
-        assert _schema(name)["properties"]["kind"]["enum"] == ["text", "canvas"]
+        assert _schema(name)["properties"]["kind"]["enum"] == ["text", "canvas", "drawing"]
         assert _schema(name)["required"] == _schema("board.show.args")["required"]
 
 
@@ -580,5 +583,224 @@ def test_message_kind_enum_is_exactly_the_envelope_kinds() -> None:
 def test_board_receipts_are_live_action_receipts(name: str) -> None:
     """A Board receipt travels as `action.receipt` (its live form), so it must pass that too."""
     good = _example(name, "valid")
+    validator(_schema("action.receipt")).validate(good)
+    c.MESSAGE_MODELS["action.receipt"].model_validate(good)
+
+
+# --- the Drawing panel and picture chunks (CAD board, slice 1, Task 1) ------------------------
+
+PICTURE_SHA = "ab" * 32
+
+
+def _description() -> c.DrawingContent:
+    """A made-up flat plan: nothing here describes a real place."""
+    return c.DrawingContent(
+        engine="cadcraft",
+        engine_version="0.12.0",
+        units="mm",
+        items=14,
+        steps=("Outer walls, 6000 by 4000", "Door in the south wall", "Window labels"),
+        picture=c.DrawingPicture(sha256=PICTURE_SHA, bytes=48_000, media_type="image/svg+xml"),
+    )
+
+
+def _drawing_args(content: str) -> dict[str, Any]:
+    return {**_with_content(_example("board.show.args", "valid"), content), "kind": "drawing"}
+
+
+def test_drawing_content_round_trips_and_is_canonical() -> None:
+    d = _description()
+    text = c.drawing_content(d)
+    assert c.parse_drawing_content(text) == d
+    assert text == json.dumps(
+        json.loads(text), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    assert text.startswith('{"engine":"cadcraft","engine_version":"0.12.0","items":14,')
+    with pytest.raises(ValueError):  # the same JSON with a space added
+        c.parse_drawing_content(text.replace('"items":14', '"items": 14'))
+    with pytest.raises(ValueError):  # keys out of order
+        c.parse_drawing_content(
+            json.dumps(dict(reversed(json.loads(text).items())), separators=(",", ":"))
+        )
+    with pytest.raises(ValueError):
+        c.parse_drawing_content("hello")
+    with pytest.raises(ValueError):  # an unknown field
+        c.parse_drawing_content(text[:-1] + ',"zzz":1}')
+    wide = c.DrawingContent(**{**d.model_dump(), "steps": ("Wall \u00e9\u4e2d",)})
+    assert c.parse_drawing_content(c.drawing_content(wide)) == wide
+    assert "\\u" not in c.drawing_content(wide)  # not ASCII-escaped
+
+
+def test_drawing_description_limits() -> None:
+    base = _description().model_dump()
+
+    def make(**changes: Any) -> c.DrawingContent:
+        return c.DrawingContent(**{**base, **changes})
+
+    make(steps=())
+    make(steps=("s",) * 40)
+    make(steps=("s" * 80,))
+    make(items=0)
+    make(items=100_000)
+    picture = base["picture"]
+    make(picture={**picture, "bytes": 1})
+    make(picture={**picture, "bytes": c.BOARD_PICTURE_MAX_BYTES})
+    bad: list[dict[str, Any]] = [
+        {"steps": ("s",) * 41},
+        {"steps": ("s" * 81,)},
+        {"steps": ("",)},
+        {"steps": ("a\nb",)},
+        {"items": -1},
+        {"items": 100_001},
+        {"units": "inch"},
+        {"engine": "Cad Craft"},
+        {"engine": ""},
+        {"engine": "e" * 31},
+        {"engine_version": ""},
+        {"engine_version": "1" * 31},
+        {"engine_version": "0.12 0"},
+        {"picture": {**picture, "bytes": 0}},
+        {"picture": {**picture, "bytes": c.BOARD_PICTURE_MAX_BYTES + 1}},
+        {"picture": {**picture, "media_type": "image/png"}},
+        {"picture": {**picture, "sha256": "AB" * 32}},
+        {"picture": {**picture, "extra": 1}},
+        {"extra": 1},
+    ]
+    for changes in bad:
+        with pytest.raises(ValidationError):
+            make(**changes)
+
+
+def test_show_args_accept_a_drawing_and_refuse_a_bad_description() -> None:
+    good = _drawing_args(c.drawing_content(_description()))
+    c.BoardShowArgs.model_validate(good)
+    c.BoardUpdateArgs.model_validate(good)
+    for name in PANEL_ARGS:
+        assert validator(_schema(name)).is_valid(good)  # the schema cannot see inside content
+    for bad in ("hello", c.drawing_content(_description()).replace(":", ": ", 1)):
+        with pytest.raises(ValidationError):
+            c.BoardShowArgs.model_validate(_drawing_args(bad))
+        with pytest.raises(ValidationError):
+            c.BoardUpdateArgs.model_validate(_drawing_args(bad))
+    # a text or canvas panel with the same content still passes, as before
+    text = _with_content(_example("board.show.args", "valid"), "hello")
+    for kind in ("text", "canvas"):
+        c.BoardShowArgs.model_validate({**text, "kind": kind})
+        c.BoardShowArgs.model_validate({**good, "kind": kind})
+
+
+def _chunk(raw: bytes = b"x" * 10, **changes: Any) -> dict[str, Any]:
+    return {
+        "sha256": PICTURE_SHA,
+        "media_type": "image/svg+xml",
+        "encoding": "gzip",
+        "bytes": 48_000,
+        "index": 0,
+        "count": 1,
+        "data": base64.b64encode(raw).decode(),
+        **changes,
+    }
+
+
+def test_content_chunk_limits() -> None:
+    name = "board.content.args"
+    _both(name, _example(name, "valid"), ok=True)
+    _both(name, _chunk(), ok=True)
+    _both(name, _chunk(index=63, count=64), ok=True)
+    _both(name, _chunk(index=64, count=64), ok=False)
+    _both(name, _chunk(index=0, count=65), ok=False)
+    _both(name, _chunk(index=-1), ok=False)
+    for index, count in ((1, 1), (2, 1), (5, 3)):  # index not below count: the model alone sees it
+        assert validator(_schema(name)).is_valid(_chunk(index=index, count=count))
+        with pytest.raises(ValidationError):
+            c.BoardContentArgs.model_validate(_chunk(index=index, count=count))
+    _both(name, _chunk(count=0), ok=False)
+    _both(name, _chunk(bytes=0), ok=False)
+    _both(name, _chunk(bytes=c.BOARD_PICTURE_MAX_BYTES), ok=True)
+    _both(name, _chunk(bytes=c.BOARD_PICTURE_MAX_BYTES + 1), ok=False)
+    _both(name, _chunk(sha256="AB" * 32), ok=False)
+    _both(name, _chunk(media_type="image/png"), ok=False)
+    _both(name, _chunk(encoding="identity"), ok=False)
+    _both(name, {**_chunk(), "extra": 1}, ok=False)
+    # data: standard padded base64, 4 to 53,336 characters, at most 40,000 bytes decoded
+    _both(name, _chunk(data=""), ok=False)
+    _both(name, _chunk(data="AAA"), ok=False)  # unpadded
+    _both(name, _chunk(data="AAAA"), ok=True)
+    _both(name, _chunk(data="AA=="), ok=True)
+    _both(name, _chunk(data="AAA="), ok=True)
+    _both(name, _chunk(data="AA=A"), ok=False)
+    # (Python's `re` lets `$` match before a final line feed, so only the model is asked here.)
+    with pytest.raises(ValidationError):
+        c.BoardContentArgs.model_validate(_chunk(data="AAAA\n"))
+    _both(name, _chunk(data="AAA-"), ok=False)  # url-safe alphabet
+    _both(name, _chunk(data="AAA_"), ok=False)
+    _both(name, _chunk(data="!!!!"), ok=False)
+    full = _chunk(b"\x00" * c.BOARD_CHUNK_MAX_BYTES)
+    assert len(full["data"]) == 53_336
+    _both(name, full, ok=True)
+    _both(name, _chunk(data="A" * 53_340), ok=False)  # 53,340 characters decode to 40,005 bytes
+    _both(name, _chunk(data="A" * 53_337), ok=False)
+    # the whole args, as the gateway serialises them, leave 3,500 bytes of a 65,536-byte frame
+    on_the_wire = len(json.dumps(full, ensure_ascii=False).encode())
+    assert on_the_wire + 3_500 <= 65_536
+
+
+def test_content_chunk_model_checks_the_decoded_size() -> None:
+    """The schema counts characters; the model also decodes. Four-character groups that pass the
+    schema's length can still decode to more than 40,000 bytes, and trailing bits must be zero."""
+    over = _chunk(b"\x00" * (c.BOARD_CHUNK_MAX_BYTES + 1))
+    assert len(over["data"]) == 53_336  # 40,001 bytes still fit 53,336 padded characters
+    assert validator(_schema("board.content.args")).is_valid(over)
+    with pytest.raises(ValidationError):
+        c.BoardContentArgs.model_validate(over)
+    with pytest.raises(ValidationError):
+        c.BoardContentArgs.model_validate(_chunk(data="AB=="))  # not the canonical encoding
+
+
+def test_chunk_constants() -> None:
+    assert c.BOARD_PICTURE_MAX_BYTES == 2_000_000
+    assert c.BOARD_CHUNK_MAX_BYTES == 40_000
+    assert c.BOARD_CHUNKS_MAX == 64
+    assert (c.DRAWING_STEPS_MAX, c.DRAWING_STEP_LABEL_MAX) == (40, 80)
+    assert c.PanelKind.DRAWING == "drawing"
+    schema = _schema("board.content.args")["properties"]
+    assert schema["index"]["maximum"] == 63 and schema["count"]["maximum"] == 64
+
+
+def test_stored_receipt_names_the_chunk() -> None:
+    name = "board.content.receipt"
+    good = _example(name, "valid")
+    _both(name, good, ok=True)
+    for result in ("STORED", "REFUSED"):
+        _both(name, {**good, "result": result}, ok=True)
+    for result in ("RENDERED", "OK", "ERROR"):
+        _both(name, {**good, "result": result}, ok=False)
+    for field in ("sha256", "index"):
+        partly = {**good["evidence"], field: None}
+        _both(name, {**good, "evidence": partly}, ok=False)  # STORED names both
+        _both(name, {**good, "result": "REFUSED", "evidence": partly}, ok=True)
+        missing = {k: v for k, v in good["evidence"].items() if k != field}
+        _both(name, {**good, "result": "REFUSED", "evidence": missing}, ok=False)
+    nothing = {"sha256": None, "index": None, "check": "malformed"}
+    _both(name, {**good, "result": "REFUSED", "evidence": nothing}, ok=True)
+    _both(name, {**good, "evidence": {**good["evidence"], "check": None}}, ok=False)
+    _both(name, {**good, "evidence": {**good["evidence"], "index": 64}}, ok=False)
+    _both(name, {**good, "evidence": {**good["evidence"], "index": -1}}, ok=False)
+    _both(name, {**good, "evidence": {**good["evidence"], "sha256": "AB" * 32}}, ok=False)
+    _both(name, {**good, "evidence": {**good["evidence"], "extra": 1}}, ok=False)
+    _both(name, {**good, "evidence": {**good["evidence"], "check": "content_missing"}}, ok=True)
+
+
+def test_content_evidence_fields_match_the_model() -> None:
+    schema = _schema("board.content.receipt")["properties"]["evidence"]
+    model = MODELS["board.content.receipt"].model_fields["evidence"].annotation
+    assert schema["additionalProperties"] is False
+    assert set(model.model_fields) == set(schema["properties"])
+    required = {n for n, f in model.model_fields.items() if f.is_required()}
+    assert required == set(schema["required"]) == set(schema["properties"]) - {"check"}
+
+
+def test_content_receipt_is_a_live_action_receipt() -> None:
+    good = _example("board.content.receipt", "valid")
     validator(_schema("action.receipt")).validate(good)
     c.MESSAGE_MODELS["action.receipt"].model_validate(good)

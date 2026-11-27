@@ -1,0 +1,9 @@
+{
+  "reply_id": "5d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+  "seq": 1,
+  "result": "RENDERED",
+  "evidence": {
+    "sha256": "b460710fe4b0c55c77e128bc37180f76975c51f144ac85781c8c989a6f6bad8b",
+    "index": 0
+  }
+}

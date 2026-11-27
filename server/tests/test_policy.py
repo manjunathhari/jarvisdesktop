@@ -111,6 +111,9 @@ def test_tier_table_exact() -> None:
         "board.set_state": Tier.READ_ONLY,
         "board.focus": Tier.READ_ONLY,
         "board.working": Tier.READ_ONLY,
+        # The CAD board (slice 1): picture chunks and the voice tool.
+        "board.content": Tier.READ_ONLY,
+        "board.draw": Tier.READ_ONLY,
     }
     with pytest.raises(TypeError):
         policy.TIERS["shell.run"] = Tier.READ_ONLY  # type: ignore[index]
@@ -122,6 +125,7 @@ def test_tier_table_exact() -> None:
 
 BOARD_KINDS = (
     "board.make", "board.show", "board.update", "board.set_state", "board.focus", "board.working",
+    "board.content", "board.draw",
 )  # fmt: skip
 
 
@@ -137,6 +141,11 @@ def test_board_kinds_are_read_only_and_desktop_only(
         )
     for kind in ("board", "board.", "board.delete", "board.clear", "board.show.x", "board.*"):
         assert policy.tier_of(kind) is None, kind  # no wildcard: only the five named kinds
+
+
+def test_board_content_targets_desktops_only() -> None:
+    assert policy._NODE_KINDS["board.content"] == frozenset({"DESKTOP"})
+    assert set(policy._NODE_KINDS) == set(policy.TIERS)  # every row says who can run it
 
 
 def test_unknown_action_refused(

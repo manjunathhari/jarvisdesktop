@@ -5,7 +5,10 @@ The schemas are the source of truth; tests/test_contracts.py keeps these models 
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import json
 from datetime import date, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Self
@@ -617,6 +620,7 @@ INT_MAX = 2_147_483_647
 class PanelKind(StrEnum):
     TEXT = "text"
     CANVAS = "canvas"
+    DRAWING = "drawing"
 
 
 class PanelState(StrEnum):
@@ -653,6 +657,58 @@ def board_content_sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+# --- the Drawing panel and its picture (CAD board, slice 1: plan `.10x/plans/2026-11-28-...`) ----
+
+BOARD_PICTURE_MAX_BYTES = 2_000_000  # the whole picture, uncompressed
+BOARD_CHUNK_MAX_BYTES = 40_000  # one chunk, gzip bytes before base64
+BOARD_CHUNKS_MAX = 64
+DRAWING_STEPS_MAX = 40
+DRAWING_STEP_LABEL_MAX = 80
+_BASE64_STD = r"^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+# Base64 of 40,000 bytes is 53,336 characters.
+_CHUNK_DATA_MAX_CHARS = (BOARD_CHUNK_MAX_BYTES + 2) // 3 * 4
+
+PictureBytes = Annotated[int, Field(ge=1, le=BOARD_PICTURE_MAX_BYTES, strict=True)]
+StepLabel = Annotated[
+    str, Field(min_length=1, max_length=DRAWING_STEP_LABEL_MAX, pattern=r"^[^\x00-\x1f\x7f]+$")
+]
+
+
+class DrawingPicture(_Contract):
+    """The picture a Drawing panel shows: named by hash, carried by `board.content` chunks."""
+
+    sha256: Sha256Hex
+    bytes: PictureBytes
+    media_type: Literal["image/svg+xml"]
+
+
+class DrawingContent(_Contract):
+    """The `content` of a Drawing panel: what the picture is, never the picture itself."""
+
+    engine: Annotated[str, Field(pattern=r"^[a-z0-9-]{1,30}$")]
+    engine_version: Annotated[str, Field(min_length=1, max_length=30, pattern=r"^[0-9A-Za-z.+-]+$")]
+    units: Literal["mm"]
+    items: Annotated[int, Field(ge=0, le=100_000, strict=True)]
+    steps: Annotated[tuple[StepLabel, ...], Field(max_length=DRAWING_STEPS_MAX)]
+    picture: DrawingPicture
+
+
+def drawing_content(d: DrawingContent) -> str:
+    """The panel's `content`: one canonical JSON text (sorted keys, no spaces, not ASCII-escaped),
+    so the content hash is the same wherever it is computed."""
+    return json.dumps(
+        d.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+
+
+def parse_drawing_content(content: str) -> DrawingContent:
+    """The description in `content`; `ValueError` unless it is exactly `drawing_content` of it."""
+    d = DrawingContent.model_validate(json.loads(content))
+    if drawing_content(d) != content:
+        raise ValueError("a drawing's content is not in canonical form")
+    return d
+
+
 class BoardShowArgs(_Contract):
     """One whole panel. The schema counts characters; the limit is in bytes, and the hash must
     be the content's, so the model checks both."""
@@ -672,6 +728,8 @@ class BoardShowArgs(_Contract):
             raise ValueError("content is over 30,000 bytes")
         if self.content_sha256 != board_content_sha256(self.content):
             raise ValueError("content_sha256 is not the content's hash")
+        if self.kind is PanelKind.DRAWING:
+            parse_drawing_content(self.content)
         return self
 
 
@@ -687,6 +745,33 @@ class BoardSetStateArgs(_Contract):
 
 class BoardFocusArgs(_Contract):
     panel_id: UUID
+
+
+class BoardContentArgs(_Contract):
+    """One chunk of a picture: the gzip of the whole SVG is cut into `count` chunks, each carried
+    in its own `board.content` action. The schema counts characters; the model also decodes."""
+
+    sha256: Sha256Hex  # of the whole picture, uncompressed
+    media_type: Literal["image/svg+xml"]
+    encoding: Literal["gzip"]
+    bytes: PictureBytes  # uncompressed
+    index: Annotated[int, Field(ge=0, le=BOARD_CHUNKS_MAX - 1, strict=True)]
+    count: Annotated[int, Field(ge=1, le=BOARD_CHUNKS_MAX, strict=True)]
+    data: Annotated[str, Field(min_length=4, max_length=_CHUNK_DATA_MAX_CHARS, pattern=_BASE64_STD)]
+
+    @model_validator(mode="after")
+    def _chunk_is_inside_the_set_and_fits(self) -> Self:
+        if self.index >= self.count:
+            raise ValueError("index is not below count")
+        try:
+            raw = base64.b64decode(self.data, validate=True)
+        except binascii.Error as e:
+            raise ValueError("data is not base64") from e
+        if len(raw) > BOARD_CHUNK_MAX_BYTES:
+            raise ValueError("a chunk is over 40,000 bytes")
+        if base64.b64encode(raw).decode("ascii") != self.data:
+            raise ValueError("data is not the canonical base64 of its bytes")
+        return self
 
 
 class BoardWorkingArgs(_Contract):
@@ -752,6 +837,29 @@ class BoardWorkingReceipt(_Contract):
     seq: Seq
     result: Literal["OK", "REFUSED"]
     evidence: _Check
+
+
+class ContentEvidence(_Check):
+    """Each is null only when the args gave the node no usable value."""
+
+    sha256: Sha256Hex | None
+    index: Annotated[int, Field(ge=0, le=BOARD_CHUNKS_MAX - 1, strict=True)] | None
+
+
+class BoardContentReceipt(_Contract):
+    """`STORED`: the node kept this chunk of this picture (a repeat is stored again, harmlessly)."""
+
+    reply_id: UUID
+    seq: Seq
+    result: Literal["STORED", "REFUSED"]
+    evidence: ContentEvidence
+
+    @model_validator(mode="after")
+    def _stored_names_the_chunk(self) -> Self:
+        e = self.evidence
+        if self.result == "STORED" and None in (e.sha256, e.index):
+            raise ValueError("a STORED receipt names the picture and the chunk")
+        return self
 
 
 class BoardState(_Contract):
@@ -843,7 +951,9 @@ DESKTOP_MODELS: dict[str, type[BaseModel]] = {
     "board.set_state.args": BoardSetStateArgs,
     "board.focus.args": BoardFocusArgs,
     "board.working.args": BoardWorkingArgs,
+    "board.content.args": BoardContentArgs,
     "board.show.receipt": BoardShowReceipt,
     "board.set_state.receipt": BoardSetStateReceipt,
     "board.working.receipt": BoardWorkingReceipt,
+    "board.content.receipt": BoardContentReceipt,
 }

@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/board.content.args.schema.json",
+  "title": "Arguments of `board.content` (one chunk of a picture)",
+  "description": "The `authz.object.args` of a live `board.content` action. The gzip of a whole picture (an SVG) is cut into `count` chunks of at most 40,000 bytes, each sent in its own action ahead of the `board.show` that names the picture. The node stores the chunk and answers `STORED`; when all `count` chunks are there it joins them, un-gzips, and checks the size and the hash `sha256` before keeping the picture. A repeated chunk is stored again, harmlessly. The schema counts characters; core and the node also decode `data` and count bytes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sha256",
+    "media_type",
+    "encoding",
+    "bytes",
+    "index",
+    "count",
+    "data"
+  ],
+  "properties": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of the whole picture, uncompressed, lower-case hex."
+    },
+    "media_type": {
+      "const": "image/svg+xml"
+    },
+    "encoding": {
+      "const": "gzip",
+      "description": "What `data` holds once decoded from base64."
+    },
+    "bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2000000,
+      "description": "Size of the whole picture, uncompressed."
+    },
+    "index": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 63,
+      "description": "This chunk's place, from 0. Below `count`; core and the node check that."
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 64,
+      "description": "How many chunks the picture has."
+    },
+    "data": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 53336,
+      "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+      "description": "Standard padded base64 of at most 40,000 bytes of the gzip stream (53,336 characters at most)."
+    }
+  }
+}
