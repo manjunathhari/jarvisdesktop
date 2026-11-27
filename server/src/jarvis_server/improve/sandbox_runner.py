@@ -26,6 +26,7 @@ import contextlib
 import ctypes
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -37,8 +38,9 @@ from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from jarvis_server.improve import guard, handoff, plan, team
+from jarvis_server.improve import guard, handoff, inbox, plan, team
 from jarvis_server.improve.plan import Plan
 from jarvis_server.improve.ports import StageRequest, StageResult
 
@@ -286,25 +288,90 @@ def _stop_everything_else() -> None:
         os.kill(-1, signal.SIGKILL)
 
 
-def main(work: Path = WORK, scratch: Path = SCRATCH, poll_s: float = 2.0) -> int:
-    _not_dumpable()
+Agent = Callable[[StageRequest, "Copy"], Coroutine[Any, Any, StageResult]]
+
+
+def serve(work: Path, scratch: Path, agent: Agent, *, stop: Callable[[], None]) -> bool:
+    """Run the waiting stage, if there is one, and write its result. False if none was waiting."""
     taken = handoff.take_request(work)
-    while taken is None:
-        time.sleep(poll_s)
-        taken = handoff.take_request(work)
+    if taken is None:
+        return False
     request, base_tar, nonce = taken
     try:
         copy = Copy.build(Path(tempfile.mkdtemp(dir=scratch, prefix="stage-")), base_tar, request)
-        result = asyncio.run(_run_agent(request, copy))
-        _stop_everything_else()
+        result = asyncio.run(agent(request, copy))
+        stop()
         if result.ok and request.stage in ("tests", "build"):
             result = StageResult(**{**result.__dict__, "patch": copy.diff()})
     except Exception as e:  # report it; the orchestrator decides what a failure costs
-        _stop_everything_else()
+        stop()
         result = failed(f"{type(e).__name__}: {e}"[:2000])
     finish(work, job_id=request.job_id, nonce=nonce, result=result)
+    return True
+
+
+# ---- the key check: run in CI inside the sandbox image, with the sandbox's own settings --------
+
+PLACEHOLDER_KEY = "placeholder-not-a-key"
+SECRET_DIRS = (Path("/run/secrets"), Path("/etc/jarvis/secrets"))
+_SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL", re.IGNORECASE)
+_THROWAWAY_DB = "sandbox-db"  # the sandbox's own Postgres, holding nothing but test data
+_CHECK_DESIGN = """# Key check
+
+```improve-plan
+{"files": ["server/src/jarvis_server/brain/research.py"],
+ "tests": ["server/tests/test_research_depth.py"], "packages": [], "done_when": "it builds"}
+```
+"""
+
+
+def _sdk_options_build(stage: str) -> None:
+    p = None if stage == "design" else plan.parse(_CHECK_DESIGN)
+    sdk_options(stage, cwd=SCRATCH, plan=p)
+
+
+def key_check(
+    env: Mapping[str, str],
+    *,
+    secret_dirs: tuple[Path, ...] = SECRET_DIRS,
+    options: Callable[[str], None] = _sdk_options_build,
+) -> list[str]:
+    """What in this environment could let the agent act with a key. Names it, never shows it."""
+    problems = []
+    for name, value in sorted(env.items()):
+        url = urlsplit(value) if "://" in value else None
+        if inbox.looks_like_a_secret(value):
+            problems.append(f"{name} holds something that looks like a key")
+        elif _SECRET_NAME.search(name) and value not in ("", PLACEHOLDER_KEY):
+            problems.append(f"{name} is set to something other than the placeholder")
+        elif url is not None and url.password and url.hostname != _THROWAWAY_DB:
+            problems.append(f"{name} carries a password for {url.hostname}")
+    for d in secret_dirs:
+        if d.is_dir() and any(d.iterdir()):
+            problems.append(f"{d} is mounted and holds files")
+    for stage in ("design", "tests", "build", "review"):
+        try:
+            options(stage)
+        except Exception as e:
+            problems.append(f"the {stage} stage's SDK options don't build: {type(e).__name__}: {e}")
+    return problems
+
+
+def check_main() -> int:
+    problems = key_check(os.environ)
+    for p in problems:
+        print(f"key check: {p}", file=sys.stderr)
+    if not problems:
+        print(f"key check passed: {len(os.environ)} variables, no key, no secret files, SDK ready")
+    return 1 if problems else 0
+
+
+def main(work: Path = WORK, scratch: Path = SCRATCH, poll_s: float = 2.0) -> int:
+    _not_dumpable()
+    while not serve(work, scratch, _run_agent, stop=_stop_everything_else):
+        time.sleep(poll_s)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(check_main() if sys.argv[1:] == ["--check"] else main())

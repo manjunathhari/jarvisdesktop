@@ -204,3 +204,13 @@ def test_the_hook_speaks_for_the_stage_or_its_own_subagent() -> None:
     assert guard.role_for("build", None) is team.ROLES["builder"]
     assert guard.role_for("design", "general-purpose") is None  # not one of the team
     assert guard.role_for("build", "analyst") is None  # only the design stage has subagents
+
+
+def test_every_resource_a_vendored_skill_names_is_vendored_too() -> None:
+    import re
+
+    plugins = team.PLUGINS_DIR
+    for text_file in plugins.rglob("*.md"):
+        root = text_file.relative_to(plugins).parts[0]
+        for ref in re.findall(r"resources/[A-Za-z0-9_./-]*[A-Za-z0-9_/]", text_file.read_text()):
+            assert (plugins / root / ref).exists(), f"{text_file.name} names {ref}"

@@ -865,3 +865,16 @@ def test_server_ci_builds_the_sandbox_image_without_pushing() -> None:
     assert build == ["docker build -f deploy/improve/sandbox.Dockerfile --tag jarvis-sandbox:ci ."]
     text = (WORKFLOWS / "server.yml").read_text()
     assert "jarvis-sandbox" not in text.split("publish:", 1)[1]  # never published from here
+
+
+def test_server_ci_runs_the_key_check_and_the_dry_run_inside_the_sandbox_image() -> None:
+    steps = _workflow("server.yml")["jobs"]["test"]["steps"]
+    runs = [" ".join(s.get("run", "").split()) for s in steps]
+    built = next(i for i, r in enumerate(runs) if "sandbox.Dockerfile" in r)
+    check = next(i for i, r in enumerate(runs) if r.endswith("sandbox --check"))
+    dry = next(i for i, r in enumerate(runs) if "jarvis_server.improve.dry_run" in r)
+    assert built < check and built < dry
+    compose_run = "docker compose -f deploy/compose.yaml --profile improve run --rm --no-deps"
+    for i in (check, dry):  # compose's own settings for the sandbox, not a hand-made docker run
+        assert compose_run in runs[i]
+        assert steps[i]["env"]["JARVIS_REF"] == "${{ github.sha }}"

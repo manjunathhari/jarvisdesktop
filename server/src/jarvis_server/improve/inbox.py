@@ -39,6 +39,10 @@ _SECRET = re.compile(
 )
 
 
+def looks_like_a_secret(text: str) -> bool:
+    return bool(_SECRET.search(text))
+
+
 @dataclass(frozen=True)
 class Item:
     kind: Kind
@@ -49,7 +53,7 @@ class Item:
 
     def __post_init__(self) -> None:
         for text in (self.title, *self.steps):
-            if _SECRET.search(text):
+            if looks_like_a_secret(text):
                 raise LooksLikeASecret("an inbox item may name a key but never show one")
 
 

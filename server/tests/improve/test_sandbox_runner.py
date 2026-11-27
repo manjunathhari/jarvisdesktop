@@ -181,3 +181,98 @@ def test_a_gate_still_refuses_what_the_copy_collected(tmp_path: Path) -> None:
     (copy.root / "server/Dockerfile").write_text("FROM evil\n")
     assert gate.is_protected("server/Dockerfile")
     assert "server/Dockerfile" in copy.diff().decode()
+
+
+def test_serve_runs_one_stage_end_to_end_with_any_agent(tmp_path: Path) -> None:
+    work, scratch = tmp_path / "work", tmp_path / "scratch"
+    work.mkdir()
+    scratch.mkdir()
+    nonce = handoff.write_request(work, _req("tests"), base_tar=BASE)
+    seen: list[str] = []
+
+    async def agent(request: StageRequest, copy: sandbox_runner.Copy) -> sandbox_runner.StageResult:
+        seen.append(request.stage)
+        (copy.root / "server/tests").mkdir(parents=True)
+        (copy.root / "server/tests/test_research_depth.py").write_text("def test(): ...\n")
+        return sandbox_runner.StageResult(ok=True, cost_usd=0.25, turns=3, text="wrote it")
+
+    stopped: list[bool] = []
+    assert sandbox_runner.serve(work, scratch, agent, stop=lambda: stopped.append(True))
+    assert seen == ["tests"] and stopped == [True]
+    assert not (work / "inbox").exists()
+    result = handoff.read_result(work, job_id=1, nonce=nonce)
+    assert result is not None and result.ok and result.cost_usd == 0.25
+    assert b"server/tests/test_research_depth.py" in result.patch
+
+
+def test_serve_returns_false_when_nothing_is_waiting(tmp_path: Path) -> None:
+    async def agent(request: StageRequest, copy: sandbox_runner.Copy) -> sandbox_runner.StageResult:
+        raise AssertionError("no request, no agent")
+
+    assert not sandbox_runner.serve(tmp_path, tmp_path, agent, stop=lambda: None)
+
+
+def test_serve_reports_an_agent_that_crashes(tmp_path: Path) -> None:
+    work, scratch = tmp_path / "work", tmp_path / "scratch"
+    work.mkdir()
+    scratch.mkdir()
+    nonce = handoff.write_request(work, _req("build"), base_tar=BASE)
+
+    async def agent(request: StageRequest, copy: sandbox_runner.Copy) -> sandbox_runner.StageResult:
+        raise RuntimeError("boom")
+
+    assert sandbox_runner.serve(work, scratch, agent, stop=lambda: None)
+    result = handoff.read_result(work, job_id=1, nonce=nonce)
+    assert result is not None and not result.ok and "boom" in (result.error or "")
+
+
+SANDBOX_ENV = {
+    "ANTHROPIC_BASE_URL": "http://claude-proxy:8080",
+    "ANTHROPIC_API_KEY": "placeholder-not-a-key",
+    "HTTPS_PROXY": "http://improve-egress:3128",
+    "JARVIS_TEST_SUPERUSER_DSN": "postgresql://postgres:sandbox-db-throwaway@sandbox-db:5432/postgres",
+    "HOME": "/home/jarvis",
+    "PATH": "/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin",
+}
+
+
+def _check(env: dict[str, str], secrets: Path) -> list[str]:
+    return sandbox_runner.key_check(env, secret_dirs=(secrets,), options=lambda stage: None)
+
+
+def test_the_key_check_passes_the_sandbox_s_own_environment(tmp_path: Path) -> None:
+    assert _check(SANDBOX_ENV, tmp_path / "absent") == []
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("EXTRA", "sk-ant-api03-" + "x" * 30),
+        ("GH", "ghs_" + "a" * 36),
+        ("ANTHROPIC_API_KEY", "abc123def456"),
+        ("JARVIS_DB_PASSWORD", "hunter2"),
+        ("DATABASE_URL", "postgresql://jarvis_app:real-password@postgres:5432/jarvis"),
+    ],
+)
+def test_the_key_check_names_a_key_without_showing_it(
+    tmp_path: Path, name: str, value: str
+) -> None:
+    problems = _check({**SANDBOX_ENV, name: value}, tmp_path / "absent")
+    assert len(problems) == 1 and name in problems[0]
+    assert value not in problems[0]
+
+
+def test_the_key_check_refuses_a_secrets_folder_with_anything_in_it(tmp_path: Path) -> None:
+    (tmp_path / "improve_claude_key").write_text("never read")
+    problems = _check(SANDBOX_ENV, tmp_path)
+    assert problems == [f"{tmp_path} is mounted and holds files"]
+    assert "never read" not in problems[0]
+
+
+def test_the_key_check_reports_options_the_sdk_refuses(tmp_path: Path) -> None:
+    def options(stage: str) -> None:
+        if stage == "review":
+            raise TypeError("bad option")
+
+    problems = sandbox_runner.key_check(SANDBOX_ENV, secret_dirs=(), options=options)
+    assert problems == ["the review stage's SDK options don't build: TypeError: bad option"]
