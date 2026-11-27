@@ -878,3 +878,12 @@ def test_server_ci_runs_the_key_check_and_the_dry_run_inside_the_sandbox_image()
     for i in (check, dry):  # compose's own settings for the sandbox, not a hand-made docker run
         assert compose_run in runs[i]
         assert steps[i]["env"]["JARVIS_REF"] == "${{ github.sha }}"
+
+
+def test_the_sandbox_image_blanks_the_base_image_s_build_values() -> None:
+    # The python base image leaves its release GPG key id and tarball SHA-256 in the environment.
+    # Neither is secret, but the key check refuses anything key-shaped, so the image blanks them.
+    text = SANDBOX_DOCKERFILE.read_text()
+    final = text.split("\nFROM ", 2)[2]
+    assert re.search(r"^\s*(ENV\s+)?GPG_KEY=\s*\\?$", final, re.MULTILINE)
+    assert re.search(r"^\s*PYTHON_SHA256=\s*\\?$", final, re.MULTILINE)

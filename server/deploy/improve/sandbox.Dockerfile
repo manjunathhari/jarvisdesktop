@@ -12,7 +12,11 @@ FROM python:3.12.16-slim-trixie@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77c
 
 COPY --from=ghcr.io/astral-sh/uv:0.9.30@sha256:538e0b39736e7feae937a65983e49d2ab75e1559d35041f9878b7b7e51de91e4 /uv /uvx /usr/local/bin/
 
-ENV PYTHONUNBUFFERED=1 \
+# The base image's GPG_KEY and PYTHON_SHA256 only verified its own Python build; they are public,
+# but blank, so the key check (sandbox_runner --check) finds nothing key-shaped here.
+ENV GPG_KEY= \
+    PYTHON_SHA256= \
+    PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never \
     RUSTUP_HOME=/opt/rustup \
