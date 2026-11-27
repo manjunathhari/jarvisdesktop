@@ -86,6 +86,9 @@ class FakeStore:
     def resolve_inbox(self, ticket_id: int, kind: inbox.Kind) -> None:
         self.items = [i for i in self.items if not (i.ticket_id == ticket_id and i.kind is kind)]
 
+    def resolve_key(self, key_name: str) -> None:
+        self.items = [i for i in self.items if i.key_name != key_name]
+
     def enqueue(self, ticket_id: int, stage: str, *, delay_s: int = 0) -> int:
         self.jobs.append(
             {

@@ -26,11 +26,28 @@ class Decision:
     reason: str = ""
 
 
+def role_for(stage: str, agent_type: str | None) -> team.Role | None:
+    """The role a tool call speaks for: the stage's own, or one of its subagents. None for an
+    agent that is not one of the team (a built-in one the lead tried to start, say)."""
+    if agent_type is None:
+        return team.ROLES[team.STAGES[stage]]
+    if stage == "design" and agent_type in team.SUBAGENTS:
+        return team.ROLES[agent_type]
+    return None
+
+
 def decide(
     role: team.Role, tool: str, tool_input: Mapping[str, Any], *, cwd: Path, plan: Plan | None
 ) -> Decision:
+    if tool == "Skill":
+        skill = tool_input.get("skill")
+        ok = isinstance(skill, str) and skill in role.skills
+        return Decision(ok, "" if ok else f"{skill} is not one of the {role.name}'s skills")
     if tool not in role.tools:
         return Decision(False, f"{tool} is not one of the {role.name}'s tools")
+    if tool == "Agent":
+        ok = tool_input.get("subagent_type") in team.SUBAGENTS
+        return Decision(ok, "" if ok else "the lead may start only the analyst or the researcher")
     if tool in _WRITES:
         return _write(role, _path(tool_input), cwd, plan)
     if tool in _READS:

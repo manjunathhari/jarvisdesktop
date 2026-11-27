@@ -180,3 +180,27 @@ def test_reads_stay_inside_the_copy_and_the_plugins() -> None:
 def test_the_researcher_may_use_the_web() -> None:
     assert _decide("researcher", "WebFetch", url="https://pypi.org/project/x/").allow
     assert _decide("researcher", "WebSearch", query="sherpa-onnx release").allow
+
+
+def test_a_role_may_run_only_its_own_skills() -> None:
+    tdd = "superpowers:test-driven-development"
+    assert _decide("builder", "Skill", skill=tdd).allow
+    d = _decide("builder", "Skill", skill="egm:egm-draft")
+    assert not d.allow and "not one of the builder's skills" in d.reason
+    assert not _decide("analyst", "Skill", skill=tdd).allow
+
+
+def test_the_lead_may_start_only_the_analyst_and_the_researcher() -> None:
+    assert _decide("design_lead", "Agent", subagent_type="analyst", prompt="look").allow
+    assert _decide("design_lead", "Agent", subagent_type="researcher", prompt="look").allow
+    d = _decide("design_lead", "Agent", subagent_type="general-purpose", prompt="look")
+    assert not d.allow and "analyst or the researcher" in d.reason
+
+
+def test_the_hook_speaks_for_the_stage_or_its_own_subagent() -> None:
+    assert guard.role_for("design", None) is team.ROLES["design_lead"]
+    assert guard.role_for("design", "analyst") is team.ROLES["analyst"]
+    assert guard.role_for("design", "researcher") is team.ROLES["researcher"]
+    assert guard.role_for("build", None) is team.ROLES["builder"]
+    assert guard.role_for("design", "general-purpose") is None  # not one of the team
+    assert guard.role_for("build", "analyst") is None  # only the design stage has subagents
