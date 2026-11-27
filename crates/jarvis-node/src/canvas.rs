@@ -48,18 +48,22 @@ pub const POLICY: &str = "default-src 'none'; script-src 'unsafe-inline'; \
 
 /// The Board window's browser arguments (`tauri.conf.json` must match; a test checks). The
 /// Board needs no outside network at all, and a page's policy cannot stop everything:
-/// - a proxy that is not there: nothing leaves this PC, not even the name lookup and
-///   connection a blocked navigation or a `prerender` hint still makes (the loopback, where
-///   the app and this server are, does not go through a proxy);
+/// - a proxy that is not there, so nothing goes out, not even the name lookup and connection
+///   that a blocked navigation or a `prerender` hint still makes. Only `127.0.0.1` and
+///   `*.localhost` (the app's own pages, its command channel and this server) go round it;
+///   the usual exceptions for link-local addresses are taken away;
 /// - no WebRTC outside a proxy;
-/// - no prerendering, which also reached other loopback ports.
+/// - no prerendering, which also reached other loopback ports;
+/// - no sound from this window at all: a Canvas page must not make noise in the room of a
+///   voice assistant, and after a click a page has ways to play that a policy does not cover.
 ///
-/// No autoplay argument: a Canvas page must not make sound unasked. Different arguments need
-/// a different browser data folder from the main window's, which the app gives it.
+/// No autoplay argument either. Different arguments need a different browser data folder
+/// from the main window's, which the app gives it.
 pub const BOARD_BROWSER_ARGS: &str =
     "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
-    --proxy-server=http://127.0.0.1:1 --webrtc-ip-handling-policy=disable_non_proxied_udp \
-    --enable-features=NoStatePrefetchHoldback";
+    --proxy-server=http://127.0.0.1:1 --proxy-bypass-list=<-loopback>;127.0.0.1;*.localhost \
+    --webrtc-ip-handling-policy=disable_non_proxied_udp \
+    --enable-features=NoStatePrefetchHoldback --mute-audio";
 
 /// Runs first in every frame of the Board window: removes WebRTC, sound, speech and the old
 /// clipboard command from Canvas pages and anything they make.
@@ -288,7 +292,7 @@ async fn handle(
                     } else {
                         path.chars().take(40).collect()
                     };
-                    tracing::warn!(status = response.status, %method, path = %shown,
+                    tracing::warn!(status = response.status, method = ?method, path = ?shown,
                         "the Canvas server refused a request");
                 }
                 response

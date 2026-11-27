@@ -53,8 +53,9 @@ fn node(slot: &NodeSlot) -> Option<NodeHandle> {
 }
 
 /// Build the Board window, hidden. It is declared in `tauri.conf.json` with `create: false`
-/// and built here because it shows Canvas pages, which are untrusted, and so needs what the
-/// configuration file cannot give it (`jarvis_node::canvas` says why):
+/// and built here because it shows Canvas pages, which are untrusted, and so needs more than
+/// an ordinary window (`jarvis_node::canvas` says why; only the script needs code, the folder
+/// is set beside it):
 /// - its own browser data folder, so it can run with its own browser arguments (no outside
 ///   network at all, no WebRTC outside a proxy, no prerendering, no autoplay), while the main
 ///   window keeps the network its news wall needs;

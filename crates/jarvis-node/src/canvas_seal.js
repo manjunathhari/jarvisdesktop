@@ -27,6 +27,13 @@
     "SpeechRecognition",
     "webkitSpeechRecognition",
     "Audio",
+    "MediaStreamTrackGenerator",
+    "MediaStreamTrackProcessor",
+    "AudioData",
+    "AudioDecoder",
+    "AudioEncoder",
+    "AudioWorkletNode",
+    "MediaRecorder",
   ];
   for (const name of gone) {
     try {
@@ -38,6 +45,16 @@
         // nothing more to try
       }
     }
+  }
+  // No element may play: there are ways to feed one that a policy does not see.
+  try {
+    Object.defineProperty(HTMLMediaElement.prototype, "play", {
+      value: () => Promise.reject(new DOMException("not allowed here", "NotAllowedError")),
+      writable: false,
+      configurable: false,
+    });
+  } catch {
+    // nothing more to try
   }
   try {
     Object.defineProperty(Document.prototype, "execCommand", {

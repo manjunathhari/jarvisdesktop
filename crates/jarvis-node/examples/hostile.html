@@ -18,6 +18,8 @@
 <button id="tube">Try to become a YouTube page</button>
 <button id="port">Try another local port</button>
 <button id="flood">Flood the app with messages</button>
+<button id="noise">Try to make a sound and copy text</button>
+<span id="noised" class="wait"></span>
 <form id="f" method="post" action="https://example.org/post"><input name="a" value="b"></form>
 <script>
 (() => {
@@ -77,8 +79,7 @@
   mustThrow("cookies", () => { document.cookie = "a=b"; return document.cookie || (() => { throw new Error("no cookie kept"); })(); });
   mustThrow("indexedDB", () => { const r = indexedDB.open("x"); return r ? "opened" : ""; });
   mustThrow("open a new window", () => { const w = window.open("https://example.org/"); if (!w) throw new Error("blocked"); return "opened"; });
-  for (const api of ["RTCPeerConnection", "webkitRTCPeerConnection", "AudioContext", "webkitAudioContext", "speechSynthesis", "Audio"]) mustBeGone(api);
-  mustThrow("copy to the clipboard", () => { if (!document.execCommand("copy")) throw new Error("refused"); return "copied"; });
+  for (const api of ["RTCPeerConnection", "webkitRTCPeerConnection", "RTCDataChannel", "AudioContext", "webkitAudioContext", "OfflineAudioContext", "speechSynthesis", "SpeechSynthesisUtterance", "Audio", "MediaStreamTrackGenerator", "AudioData", "MediaRecorder"]) mustBeGone(api);
 
   (async () => {
     await mustReject("fetch an outside address", () => fetch("https://example.org/").then((r) => "status " + r.status));
@@ -98,7 +99,7 @@
       const child = document.createElement("iframe");
       child.hidden = true;
       child.srcdoc = "<script>parent.postMessage({ rtc: typeof RTCPeerConnection, audio: typeof AudioContext, speech: typeof speechSynthesis }, '*')<\/script>";
-      const timer = setTimeout(() => { row("a frame made by this page is sealed too", true, "the child frame did not run"); done(); }, 2500);
+      const timer = setTimeout(() => { check("a frame made by this page is sealed too", "the child frame did not answer; it could not be judged"); done(); }, 2500);
       window.addEventListener("message", (e) => {
         clearTimeout(timer);
         const d = e.data || {};
@@ -142,16 +143,33 @@
     await new Promise((done) => setTimeout(done, 1500));
 
     const verdict = document.getElementById("verdict");
-    const escaped = rows.filter((c) => !c).length;
+    // Kept current: an answer that comes late still turns the verdict.
+    const judge = () => {
+      const escaped = rows.filter((c) => !c).length;
+      verdict.className = escaped ? "bad" : "ok";
+      verdict.textContent = escaped ? escaped + " ESCAPED. The seal is broken." : "All " + rows.length + " judged attempts contained. Now do the CHECK lines and the buttons.";
+    };
+    judge(); setInterval(judge, 1000);
     verdict.dataset.done = "1";
-    verdict.className = escaped ? "bad" : "ok";
-    verdict.textContent = escaped ? escaped + " ESCAPED. The seal is broken." : "All " + rows.length + " judged attempts contained. Now do the CHECK lines.";
   })();
 
   document.getElementById("loop").onclick = () => { for (;;) {} };
   document.getElementById("leave").onclick = () => { location.href = "http://leave.example.org/?leak=1"; };
   document.getElementById("tube").onclick = () => { location.href = "https://www.youtube.com/embed/x?leak=1"; };
   document.getElementById("port").onclick = () => { const p = location.port === "47823" ? "47822" : "47823"; location.href = "http://127.0.0.1:" + p + "/probe-port"; };
+  // After a click a page is allowed more. Nothing may be heard, and nothing copied.
+  document.getElementById("noise").onclick = async () => {
+    const said = [];
+    try { said.push("copy: " + (document.execCommand("copy") ? "ESCAPED" : "refused")); } catch (e) { said.push("copy: refused"); }
+    try {
+      const gen = new MediaStreamTrackGenerator({ kind: "audio" });
+      const el = document.createElement("audio"); el.srcObject = new MediaStream([gen]);
+      await el.play(); said.push("tone: ESCAPED (playing)");
+    } catch (e) { said.push("tone: refused"); }
+    try { const a = document.createElement("audio"); a.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="; await a.play(); said.push("audio element: ESCAPED"); } catch (e) { said.push("audio element: refused"); }
+    try { speechSynthesis.speak(new SpeechSynthesisUtterance("seal check")); said.push("speech: ESCAPED"); } catch (e) { said.push("speech: refused"); }
+    const o = document.getElementById("noised"); o.textContent = said.join("; "); o.className = said.some((x) => x.includes("ESCAPED")) ? "bad" : "ok";
+  };
   document.getElementById("flood").onclick = () => { const send = (window.chrome && window.chrome.webview) ? (m) => window.chrome.webview.postMessage(m) : (m) => parent.postMessage(m, "*"); for (;;) send("flood"); };
 })();
 </script>

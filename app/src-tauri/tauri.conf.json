@@ -36,7 +36,7 @@
         "decorations": true,
         "resizable": true,
         "backgroundColor": "#0e1216",
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --proxy-server=http://127.0.0.1:1 --webrtc-ip-handling-policy=disable_non_proxied_udp --enable-features=NoStatePrefetchHoldback",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --proxy-server=http://127.0.0.1:1 --proxy-bypass-list=<-loopback>;127.0.0.1;*.localhost --webrtc-ip-handling-policy=disable_non_proxied_udp --enable-features=NoStatePrefetchHoldback --mute-audio",
         "width": 1280,
         "height": 800,
         "minWidth": 900,

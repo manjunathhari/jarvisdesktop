@@ -346,6 +346,8 @@ fn the_board_window_is_built_with_the_seal() {
     assert_eq!(args, canvas::BOARD_BROWSER_ARGS);
     for needed in [
         "--proxy-server=http://127.0.0.1:1",
+        "--proxy-bypass-list=<-loopback>;127.0.0.1;*.localhost",
+        "--mute-audio",
         "--webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--enable-features=NoStatePrefetchHoldback",
         "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection",
@@ -364,6 +366,8 @@ fn the_board_window_is_built_with_the_seal() {
         "RTCPeerConnection",
         "speechSynthesis",
         "AudioContext",
+        "MediaStreamTrackGenerator",
+        "HTMLMediaElement",
         "window.top !== window",
     ] {
         assert!(canvas::SEAL_SCRIPT.contains(gone), "{gone}");

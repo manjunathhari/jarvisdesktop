@@ -66,6 +66,8 @@ async def run(p, sealed):
         try: shown=await pg.frames[1].inner_text("body", timeout=1000)
         except Exception: pass
         print(f"  {what}: frame now {urls}; arrived {sorted(set(h.split(':')[0] for h in hits)) or 'nothing'}; squatter page shown: {'SQUATTER' in shown}")
+    fr=await frame(); await fr.click("#noise"); await pg.wait_for_timeout(1500)
+    print("  after a click:", await fr.inner_text("#noised"))
     fr=await frame()
     try: await fr.click("#flood", timeout=1000, no_wait_after=True)
     except Exception: pass
