@@ -25,10 +25,27 @@
         "minHeight": 600,
         "center": true,
         "theme": "Dark"
+      },
+      {
+        "label": "board",
+        "create": false,
+        "title": "JARVIS Board",
+        "url": "board.html",
+        "visible": false,
+        "fullscreen": false,
+        "decorations": true,
+        "resizable": true,
+        "backgroundColor": "#0e1216",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --proxy-server=http://127.0.0.1:1 --proxy-bypass-list=<-loopback>;127.0.0.1;*.localhost --webrtc-ip-handling-policy=disable_non_proxied_udp --enable-features=NoStatePrefetchHoldback --mute-audio",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "theme": "Dark"
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src https://www.youtube.com; connect-src ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src https://www.youtube.com http://127.0.0.1:47821 http://127.0.0.1:47822 http://127.0.0.1:47823; connect-src ipc: http://ipc.localhost"
     }
   },
   "bundle": {

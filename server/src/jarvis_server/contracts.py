@@ -5,9 +5,10 @@ The schemas are the source of truth; tests/test_contracts.py keeps these models 
 
 from __future__ import annotations
 
+import hashlib
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 from uuid import UUID
 
 from pydantic import (
@@ -314,6 +315,7 @@ class MessageKind(StrEnum):
     APPROVAL_DECISION = "approval.decision"
     NODE_ACTION = "node.action"
     ACTION_RECEIPT = "action.receipt"
+    BOARD_STATE = "board.state"
     KEYSET = "keyset"
     PING = "ping"
     PONG = "pong"
@@ -603,6 +605,164 @@ class DeleteReceipt(_Contract):
     evidence: DeleteEvidence
 
 
+# --- the Board (slice 1: plan `.10x/plans/2026-11-26-board-slice-1.md`) -------------------------
+
+BOARD_TITLE_MAX = 120  # Unicode code points
+# Of UTF-8. With control characters refused, content at most doubles when it is serialised
+# (`"`, `\\`, line breaks), so a panel is under 62,000 bytes of a frame's 65,536.
+BOARD_CONTENT_MAX_BYTES = 30_000
+INT_MAX = 2_147_483_647
+
+
+class PanelKind(StrEnum):
+    TEXT = "text"
+    CANVAS = "canvas"
+
+
+class PanelState(StrEnum):
+    OPEN = "open"
+    MINIMISED = "minimised"
+    MAXIMISED = "maximised"
+    CLOSED = "closed"
+
+
+Revision = Annotated[int, Field(ge=1, le=INT_MAX, strict=True)]
+# One line: no control character (C0 or DEL), and at least one character that is not a space.
+PanelTitle = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=BOARD_TITLE_MAX,
+        pattern=r"^[^\x00-\x1f\x7f]*[^\x00-\x20\x7f][^\x00-\x1f\x7f]*$",
+    ),
+]
+# No control character except tab, line feed and carriage return (Postgres cannot store NUL).
+PanelContent = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=BOARD_CONTENT_MAX_BYTES,
+        pattern=r"^[^\x00-\x08\x0b\x0c\x0e-\x1f]+$",
+    ),
+]
+Paise = Annotated[int, Field(ge=0, le=INT_MAX, strict=True)]
+
+
+def board_content_sha256(content: str) -> str:
+    """The `content_sha256` of a panel: SHA-256 of the content's UTF-8 bytes, lower-case hex."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+class BoardShowArgs(_Contract):
+    """One whole panel. The schema counts characters; the limit is in bytes, and the hash must
+    be the content's, so the model checks both."""
+
+    panel_id: UUID
+    revision: Revision
+    kind: PanelKind
+    title: PanelTitle
+    content: PanelContent
+    content_sha256: Sha256Hex
+    cost_paise: Paise
+    created_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _content_fits_and_matches(self) -> Self:
+        if len(self.content.encode("utf-8")) > BOARD_CONTENT_MAX_BYTES:
+            raise ValueError("content is over 30,000 bytes")
+        if self.content_sha256 != board_content_sha256(self.content):
+            raise ValueError("content_sha256 is not the content's hash")
+        return self
+
+
+class BoardUpdateArgs(BoardShowArgs):
+    """The whole panel at its new revision, in the shape of `board.show`, so a node that has
+    lost the panel can restore it."""
+
+
+class BoardSetStateArgs(_Contract):
+    panel_id: UUID
+    state: PanelState
+
+
+class BoardFocusArgs(_Contract):
+    panel_id: UUID
+
+
+class BoardWorkingArgs(_Contract):
+    """Board work has started (the voice turn queued a job). There is no "ended"."""
+
+    state: Literal["started"]
+
+
+class _Check(_Contract):
+    check: Code | None = None  # omitted when there is none; never null, as in the schema
+
+    @field_validator("check", mode="before")
+    @classmethod
+    def _check_not_null(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("`check` is omitted when there is none, never null")
+        return value
+
+
+class RenderEvidence(_Check):
+    """Each is null only when the args gave the node no usable value."""
+
+    panel_id: UUID | None
+    revision: Revision | None
+    content_sha256: Sha256Hex | None
+
+
+class BoardShowReceipt(_Contract):
+    """`RENDERED`: the Board drew this panel at this revision (not: it was handed over)."""
+
+    reply_id: UUID
+    seq: Seq
+    result: Literal["RENDERED", "REFUSED", "ERROR"]
+    evidence: RenderEvidence
+
+    @model_validator(mode="after")
+    def _rendered_names_what_was_drawn(self) -> Self:
+        e = self.evidence
+        if self.result == "RENDERED" and None in (e.panel_id, e.revision, e.content_sha256):
+            raise ValueError("a RENDERED receipt names the panel, revision and hash")
+        return self
+
+
+class PanelEvidence(_Check):
+    panel_id: UUID | None
+
+
+class BoardSetStateReceipt(_Contract):
+    reply_id: UUID
+    seq: Seq
+    result: Literal["OK", "REFUSED"]
+    evidence: PanelEvidence
+
+    @model_validator(mode="after")
+    def _ok_names_the_panel(self) -> Self:
+        if self.result == "OK" and self.evidence.panel_id is None:
+            raise ValueError("an OK receipt names the panel")
+        return self
+
+
+class BoardWorkingReceipt(_Contract):
+    reply_id: UUID
+    seq: Seq
+    result: Literal["OK", "REFUSED"]
+    evidence: _Check
+
+
+class BoardState(_Contract):
+    """Node to core: the person changed a panel's state on the Board by hand."""
+
+    panel_id: UUID
+    state: PanelState
+    revision: Revision
+    at: AwareDatetime
+
+
 class KeyRole(StrEnum):
     CORE = "core"
     GATEWAY = "gateway"
@@ -662,6 +822,7 @@ MESSAGE_MODELS: dict[str, type[BaseModel]] = {
     "approval.decision": ApprovalDecisionMessage,
     "node.action": NodeAction,
     "action.receipt": ActionReceipt,
+    "board.state": BoardState,
     "keyset": Keyset,
     "ping": Ping,
     "pong": Pong,
@@ -669,11 +830,20 @@ MESSAGE_MODELS: dict[str, type[BaseModel]] = {
     "authz": Authz,
 }
 
-# Schemas in contracts/messages that are not message kinds: the test-folder actions' args and
-# receipts (R12-25), validated by core, not by the gateway.
+# Schemas in contracts/messages that are not message kinds: the args and receipts of the
+# test-folder actions (R12-25) and of the Board's actions, validated by core, not by the gateway.
 DESKTOP_MODELS: dict[str, type[BaseModel]] = {
     "pc.list_test_folder.args": ListTestFolderArgs,
     "pc.delete_test_file.args": FolderFile,
     "pc.list_test_folder.receipt": ListingReceipt,
     "pc.delete_test_file.receipt": DeleteReceipt,
+    # The Board's live actions: `authz.object.args`, and their `action.receipt` payloads.
+    "board.show.args": BoardShowArgs,
+    "board.update.args": BoardUpdateArgs,
+    "board.set_state.args": BoardSetStateArgs,
+    "board.focus.args": BoardFocusArgs,
+    "board.working.args": BoardWorkingArgs,
+    "board.show.receipt": BoardShowReceipt,
+    "board.set_state.receipt": BoardSetStateReceipt,
+    "board.working.receipt": BoardWorkingReceipt,
 }

@@ -6,6 +6,7 @@ license.workspace = true
 description = "The JARVIS desktop node: the Phase 2 protocol, journal and actions (Plan B)."
 
 [dependencies]
+url = "2"
 jarvis-core.workspace = true
 async-trait.workspace = true
 serde.workspace = true
@@ -24,7 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 tokio-tungstenite = "0.30.0"
 futures-util = "0.3.34"
 getrandom = "0.3"
-tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "sync", "time"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
 
 # DPAPI key storage and write-through renames (Windows only).
 [target.'cfg(windows)'.dependencies]

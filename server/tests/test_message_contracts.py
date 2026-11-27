@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -22,6 +23,15 @@ DESKTOP = [
     "pc.delete_test_file.args",
     "pc.list_test_folder.receipt",
     "pc.delete_test_file.receipt",
+    # The Board (slice 1): the live actions' `authz.object.args` and their receipts.
+    "board.show.args",
+    "board.update.args",
+    "board.set_state.args",
+    "board.focus.args",
+    "board.working.args",
+    "board.show.receipt",
+    "board.set_state.receipt",
+    "board.working.receipt",
 ]
 
 KINDS = [
@@ -38,6 +48,7 @@ KINDS = [
     "approval.decision",
     "node.action",
     "action.receipt",
+    "board.state",
     "keyset",
     "ping",
     "pong",
@@ -379,3 +390,195 @@ def test_delete_evidence_check_is_omitted_never_null(check: Any, ok: bool) -> No
     else:
         with pytest.raises(ValidationError):
             c.DeleteReceipt.model_validate(payload)
+
+
+# --- the Board (slice 1) ---------------------------------------------------------------------
+
+
+def _both(name: str, payload: Any, *, ok: bool) -> None:
+    """The schema and the model agree on `payload`."""
+    assert validator(_schema(name)).is_valid(payload) is ok
+    if ok:
+        MODELS[name].model_validate(payload)
+    else:
+        with pytest.raises(ValidationError):
+            MODELS[name].model_validate(payload)
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+PANEL_ARGS = ["board.show.args", "board.update.args"]
+INT_MAX = 2_147_483_647
+
+
+def _with_content(good: dict[str, Any], content: str) -> dict[str, Any]:
+    return {**good, "content": content, "content_sha256": _sha(content)}
+
+
+@pytest.mark.parametrize("name", PANEL_ARGS)
+def test_board_panel_limits(name: str) -> None:
+    good = _example(name, "valid")
+    _both(name, good, ok=True)
+    _both(name, {**good, "title": "t" * 120}, ok=True)
+    _both(name, {**good, "title": "t" * 121}, ok=False)
+    _both(name, {**good, "title": ""}, ok=False)
+    _both(name, _with_content(good, "c" * 30_000), ok=True)
+    _both(name, _with_content(good, "c" * 30_001), ok=False)
+    _both(name, _with_content(good, ""), ok=False)
+    _both(name, {**good, "revision": 0}, ok=False)
+    _both(name, {**good, "revision": INT_MAX}, ok=True)
+    _both(name, {**good, "revision": INT_MAX + 1}, ok=False)
+    _both(name, {**good, "cost_paise": -1}, ok=False)
+    _both(name, {**good, "cost_paise": INT_MAX}, ok=True)
+    _both(name, {**good, "cost_paise": INT_MAX + 1}, ok=False)
+    _both(name, {**good, "extra": 1}, ok=False)
+
+
+@pytest.mark.parametrize("name", PANEL_ARGS)
+def test_board_title_is_one_line_of_at_most_120_code_points(name: str) -> None:
+    """A title goes on one line of Jarvis's prompt (Task 3), so it has no line break or other
+    control character and is not blank. Its length is counted in Unicode code points."""
+    good = _example(name, "valid")
+    _both(name, {**good, "title": "\U0001f600" * 120}, ok=True)  # 120 code points, 480 bytes
+    _both(name, {**good, "title": "\U0001f600" * 121}, ok=False)
+    for bad in ("a\nb", "a\rb", "a\tb", "a\x00b", "a\x1bb", "a\x7fb", "   ", "\u00a0"):
+        _both(name, {**good, "title": bad}, ok=bad == "\u00a0")
+    _both(name, {**good, "title": " Trip "}, ok=True)
+
+
+@pytest.mark.parametrize("name", PANEL_ARGS)
+def test_board_content_has_no_control_characters_but_tab_and_line_breaks(name: str) -> None:
+    """Postgres cannot store U+0000, and a control character is six bytes on the wire: with
+    them refused, 30,000 bytes of content is at most 60,000 in a frame (limit 65,536)."""
+    good = _example(name, "valid")
+    _both(name, _with_content(good, "a\tb\nc\r\nd"), ok=True)
+    for bad in ("a\x00b", "a\x01b", "a\x0bb", "a\x0cb", "a\x1fb"):
+        _both(name, _with_content(good, bad), ok=False)
+
+
+def test_board_kinds_are_text_and_canvas() -> None:
+    for name in PANEL_ARGS:  # an update carries the whole panel, so the node can restore it
+        good = _example(name, "valid")
+        _both(name, {**good, "kind": "canvas"}, ok=True)
+        _both(name, {**good, "kind": "html"}, ok=False)
+        assert _schema(name)["properties"]["kind"]["enum"] == ["text", "canvas"]
+        assert _schema(name)["required"] == _schema("board.show.args")["required"]
+
+
+@pytest.mark.parametrize("name", PANEL_ARGS)
+def test_board_content_is_limited_in_bytes_by_the_model(name: str) -> None:
+    """JSON Schema counts characters; the limit is 30,000 bytes of UTF-8, so the model (and the
+    node) also count bytes. 15,001 two-byte characters pass the schema and fail the model."""
+    good = _example(name, "valid")
+    wide = _with_content(good, "é" * 15_001)
+    assert validator(_schema(name)).is_valid(wide)
+    with pytest.raises(ValidationError):
+        MODELS[name].model_validate(wide)
+    MODELS[name].model_validate(_with_content(good, "é" * 15_000))
+    MODELS[name].model_validate(_with_content(good, "\U0001f600" * 7_500))
+    with pytest.raises(ValidationError):
+        MODELS[name].model_validate(_with_content(good, "\U0001f600" * 7_501))
+
+
+@pytest.mark.parametrize("name", PANEL_ARGS)
+def test_board_hash_must_be_of_the_content(name: str) -> None:
+    good = _example(name, "valid")
+    assert good["content_sha256"] == _sha(good["content"])
+    with pytest.raises(ValidationError):
+        MODELS[name].model_validate({**good, "content_sha256": _sha("something else")})
+    _both(name, {**good, "content_sha256": good["content_sha256"].upper()}, ok=False)
+
+
+def test_worst_case_panel_fits_a_frame() -> None:
+    """The largest panel core may issue, with content and title that double on the wire, as the
+    gateway serialises it (`ensure_ascii=False`), with room for the envelope and signatures."""
+    content, title = '"' * c.BOARD_CONTENT_MAX_BYTES, '"' * c.BOARD_TITLE_MAX
+    args = {**_example("board.show.args", "valid"), "title": title}
+    args = c.BoardShowArgs.model_validate(_with_content(args, content)).model_dump(mode="json")
+    on_the_wire = len(json.dumps(args, ensure_ascii=False).encode())
+    assert on_the_wire + 2_000 < 65_536  # 2,000: envelope, authz object and two signatures
+
+
+STATES = ["open", "minimised", "maximised", "closed"]
+
+
+@pytest.mark.parametrize("name", ["board.set_state.args", "board.state"])
+def test_board_states_are_the_four(name: str) -> None:
+    good = _example(name, "valid")
+    assert _schema(name)["properties"]["state"]["enum"] == STATES
+    for state in STATES:
+        _both(name, {**good, "state": state}, ok=True)
+    _both(name, {**good, "state": "hidden"}, ok=False)
+
+
+def test_board_receipt_results() -> None:
+    show = _example("board.show.receipt", "valid")
+    for result in ("RENDERED", "REFUSED", "ERROR"):
+        _both("board.show.receipt", {**show, "result": result}, ok=True)
+    _both("board.show.receipt", {**show, "result": "OK"}, ok=False)
+    state = _example("board.set_state.receipt", "valid")
+    for result in ("OK", "REFUSED"):
+        _both("board.set_state.receipt", {**state, "result": result}, ok=True)
+    _both("board.set_state.receipt", {**state, "result": "RENDERED"}, ok=False)
+
+
+RECEIPTS = ["board.show.receipt", "board.set_state.receipt"]
+
+
+@pytest.mark.parametrize("name", RECEIPTS)
+def test_board_receipt_check_is_omitted_never_null(name: str) -> None:
+    good = _example(name, "valid")
+    evidence = {k: v for k, v in good["evidence"].items() if k != "check"}
+    _both(name, {**good, "evidence": evidence}, ok=True)
+    _both(name, {**good, "evidence": {**evidence, "check": "too_large"}}, ok=True)
+    _both(name, {**good, "evidence": {**evidence, "check": None}}, ok=False)
+
+
+def test_refused_receipt_for_unusable_args_has_nothing_to_echo() -> None:
+    """Malformed args give the node no panel, revision or hash to echo: they are null in a
+    REFUSED or ERROR receipt. RENDERED and OK always name what was drawn or changed."""
+    show = _example("board.show.receipt", "valid")
+    nothing = {"panel_id": None, "revision": None, "content_sha256": None, "check": "malformed"}
+    _both("board.show.receipt", {**show, "result": "REFUSED", "evidence": nothing}, ok=True)
+    _both("board.show.receipt", {**show, "result": "ERROR", "evidence": nothing}, ok=True)
+    for field in ("panel_id", "revision", "content_sha256"):
+        partly = {**show["evidence"], field: None}
+        _both("board.show.receipt", {**show, "result": "RENDERED", "evidence": partly}, ok=False)
+        missing = {k: v for k, v in show["evidence"].items() if k != field}
+        _both("board.show.receipt", {**show, "result": "REFUSED", "evidence": missing}, ok=False)
+    state = _example("board.set_state.receipt", "valid")
+    unknown = {"panel_id": None, "check": "malformed"}
+    _both("board.set_state.receipt", {**state, "result": "REFUSED", "evidence": unknown}, ok=True)
+    _both("board.set_state.receipt", {**state, "result": "OK", "evidence": unknown}, ok=False)
+
+
+@pytest.mark.parametrize("name", RECEIPTS)
+def test_board_receipt_evidence_fields_match_the_model(name: str) -> None:
+    schema = _schema(name)["properties"]["evidence"]
+    model = MODELS[name].model_fields["evidence"].annotation
+    assert schema["additionalProperties"] is False
+    assert set(model.model_fields) == set(schema["properties"])
+    required = {n for n, f in model.model_fields.items() if f.is_required()}
+    assert required == set(schema["required"]) == set(schema["properties"]) - {"check"}
+    _both(name, {**_example(name, "valid"), "evidence": {"extra": 1}}, ok=False)
+
+
+def test_board_state_revision_is_bounded() -> None:
+    good = _example("board.state", "valid")
+    _both("board.state", {**good, "revision": INT_MAX}, ok=True)
+    _both("board.state", {**good, "revision": INT_MAX + 1}, ok=False)
+    _both("board.state", {**good, "revision": 0}, ok=False)
+
+
+def test_message_kind_enum_is_exactly_the_envelope_kinds() -> None:
+    assert [k.value for k in c.MessageKind] == KINDS
+
+
+@pytest.mark.parametrize("name", RECEIPTS)
+def test_board_receipts_are_live_action_receipts(name: str) -> None:
+    """A Board receipt travels as `action.receipt` (its live form), so it must pass that too."""
+    good = _example(name, "valid")
+    validator(_schema("action.receipt")).validate(good)
+    c.MESSAGE_MODELS["action.receipt"].model_validate(good)

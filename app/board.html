@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en-GB">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Narrows the app-wide policy for this window: a frame here may only be a Canvas page
+         from the app's own loopback server, never YouTube (which the main window frames). -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="frame-src http://127.0.0.1:47821 http://127.0.0.1:47822 http://127.0.0.1:47823"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JARVIS Board</title>
+    <link rel="stylesheet" href="/src/board/board.css" />
+  </head>
+  <body>
+    <header id="topbar">
+      <h1>JARVIS Board</h1>
+      <p id="counts" aria-live="polite"></p>
+      <p id="spend" aria-label="Spent on the Board today"></p>
+    </header>
+
+    <aside id="conversation" aria-label="Conversation">
+      <h2>Conversation</h2>
+      <div id="talk"></div>
+      <p id="talk-latest" class="sr-only" aria-live="polite"></p>
+      <div id="typing"></div>
+    </aside>
+
+    <main id="board">
+      <p id="problem" role="alert" hidden></p>
+      <div id="panels" aria-label="Panels"></div>
+      <p id="nothing" class="empty">Nothing on the board yet. Ask Jarvis to show something.</p>
+    </main>
+
+    <footer id="shelf"></footer>
+
+    <script type="module" src="/src/board/main.ts"></script>
+  </body>
+</html>

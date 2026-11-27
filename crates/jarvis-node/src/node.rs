@@ -20,6 +20,24 @@
 //!   actions come in outbox items). `seq` is the chunk's, unsigned (R12-36), and only names
 //!   the action in its live receipt. Accepted ones are broadcast. A core signature under a key this node doesn't trust asks
 //!   for re-enrolment (R12-29). Rule 5 and execution are Task 8's.
+//! - A live `board.*` action (Board slice 1) is the node's own, never broadcast, so
+//!   `ServerBrain` cannot answer it too: exactly one receipt for each action. Its args are read
+//!   by `board::parse` and applied to the local `BoardStore`. A failed check or an event the
+//!   store refuses is answered `REFUSED` with that check, and nothing changes. `board.show`
+//!   and `board.update` then go to the app (`UiEvent::Board`) and wait for
+//!   `NodeHandle::board_rendered`: `RENDERED` only when the Board window reports the panel
+//!   drawn at that revision (receipts, not claims), `ERROR` `render_failed` if it reports it
+//!   could not, and `ERROR` `render_timeout` if it reports nothing in time. When a newer
+//!   revision of the same panel is reported drawn, an older one still waiting gets no receipt:
+//!   it was neither drawn nor did it fail. The same action delivered twice waits once. A
+//!   waiting receipt does not survive a restart: the panel is restored from the store and no
+//!   receipt is sent. A receipt that cannot be sent (the link is down) is logged and lost.
+//!   The store's file work runs off the routing path (`spawn_blocking`).
+//!   `board.set_state` and `board.focus` are answered `OK` at once. A focus or an update that
+//!   brings a minimised or closed panel back changes its state, so the server is told
+//!   (`board.state`). The event the app gets carries the panel as the store now holds it.
+//! - `NodeHandle::board_state`: the person changed a panel by hand. The store is updated and
+//!   `board.state` sent; if the link is down the server is not told (the resync is later work).
 //! - `welcome` summary: shown as lines, display only, so a summary line never marks an
 //!   approval card seen. The gateway sends the summary (every open item) and then, as
 //!   `outbox.item`, the items never sent to this node, so one id can appear in both: the app
@@ -33,12 +51,14 @@
 //!   failed reply.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use tokio::sync::{broadcast, mpsc, watch};
 use uuid::Uuid;
 
 use crate::approval::{Added, ApprovalCard, CardStore, Decision, CARDS_FILE};
+use crate::board::{self, BoardEvent, BoardStore, Panel, PanelState};
 use crate::client::{self, Client, ClientConfig, EnrolError, LinkStatus, NotConnected};
 use crate::delivery::{Inbox, ItemFate};
 use crate::folder::{Executor, FolderOps, LISTING};
@@ -82,7 +102,37 @@ pub enum UiEvent {
         outbox_id: Uuid,
         reason: String,
     },
+    /// A verified Board action, already in the local store. For `Show` and `Update`, draw the
+    /// panel and then call `NodeHandle::board_rendered`.
+    Board(BoardEvent),
+    /// The voice turn queued Board work (`board.working`): show that Jarvis is working. There
+    /// is no "ended": a panel arriving, an announcement or time ends it (`talk::Recorder`).
+    BoardWorking,
 }
+
+/// A shown panel whose receipt waits for the Board to report it drawn.
+struct PendingRender {
+    reply_id: Uuid,
+    seq: i64,
+    panel_id: Uuid,
+    revision: u32,
+    content_sha256: String,
+}
+
+impl PendingRender {
+    fn receipt(&self, result: &str, check: Option<&str>) -> Value {
+        let mut evidence = json!({
+            "panel_id": self.panel_id, "revision": self.revision,
+            "content_sha256": self.content_sha256,
+        });
+        if let Some(check) = check {
+            evidence["check"] = json!(check);
+        }
+        json!({"reply_id": self.reply_id, "seq": self.seq, "result": result, "evidence": evidence})
+    }
+}
+
+type Pending = Arc<Mutex<Vec<PendingRender>>>;
 
 /// Why `NodeHandle::decide` sent nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -131,9 +181,60 @@ pub struct NodeHandle {
     inbox: Inbox,
     cards: Arc<CardStore>,
     ui: mpsc::Sender<UiEvent>,
+    board: Arc<Mutex<BoardStore>>,
+    pending: Pending,
 }
 
 impl NodeHandle {
+    /// The desktop's copy of the Board: panels and conversation.
+    pub fn board(&self) -> Arc<Mutex<BoardStore>> {
+        self.board.clone()
+    }
+
+    /// The Board window drew this panel at this revision (`ok`), or could not. Sends the
+    /// receipt that was waiting for it; a report nothing waits for sends nothing.
+    pub async fn board_rendered(&self, panel_id: Uuid, revision: u32, ok: bool) {
+        let waiting: Vec<PendingRender> = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *pending)
+                .into_iter()
+                .partition(|p| p.panel_id == panel_id && p.revision == revision);
+            *pending = rest;
+            if ok && !mine.is_empty() {
+                // The newer revision is on screen: an older one of this panel will never be.
+                pending.retain(|p| p.panel_id != panel_id || p.revision > revision);
+            }
+            mine
+        };
+        for p in waiting {
+            let receipt = if ok {
+                p.receipt("RENDERED", None)
+            } else {
+                p.receipt("ERROR", Some("render_failed"))
+            };
+            if self.client.send("action.receipt", receipt).await.is_err() {
+                tracing::warn!(%panel_id, "rendering receipt not sent: not connected");
+            }
+        }
+    }
+
+    /// The person minimised, maximised, restored or closed a panel by hand: record it and tell
+    /// the server. `Err` names why nothing changed (`unknown_panel`, `store_failed`).
+    pub async fn board_state(&self, panel_id: Uuid, state: PanelState) -> Result<(), &'static str> {
+        let board = self.board.clone();
+        let revision = tokio::task::spawn_blocking(move || {
+            let mut store = board.lock().unwrap_or_else(|e| e.into_inner());
+            store.apply(&BoardEvent::State { panel_id, state })?;
+            Ok(store.panel(panel_id).map(|p| p.revision))
+        })
+        .await
+        .unwrap_or(Err("store_failed"))?;
+        if let Some(revision) = revision {
+            send_board_state(&self.client, panel_id, state, revision).await;
+        }
+        Ok(())
+    }
+
     pub fn status(&self) -> watch::Receiver<LinkStatus> {
         self.client.status()
     }
@@ -226,13 +327,19 @@ impl NodeHandle {
 pub fn start(cfg: ClientConfig, deps: NodeDeps) -> Result<NodeHandle, JournalError> {
     let journal = Arc::new(Mutex::new(Journal::open(&cfg.data_dir.join(JOURNAL_FILE))?));
     let cfg_cards = cfg.data_dir.join(CARDS_FILE);
+    let (cfg_board, render_timeout) = (cfg.data_dir.clone(), cfg.board_render_timeout);
     let inbox = Inbox::new(journal.clone());
     let executor = Arc::new(Executor::new(deps.folder, journal));
     let (frames_tx, frames) = mpsc::unbounded_channel();
     let client = client::spawn(cfg, deps.keystore, frames_tx);
     let (replies, _) = broadcast::channel(256);
     let cards = Arc::new(CardStore::open(&cfg_cards));
+    let board = Arc::new(Mutex::new(BoardStore::open(&cfg_board)));
+    let pending: Pending = Arc::default();
     let router = Router {
+        board: board.clone(),
+        pending: pending.clone(),
+        render_timeout,
         inbox: inbox.clone(),
         client: client.clone(),
         replies: replies.clone(),
@@ -249,7 +356,22 @@ pub fn start(cfg: ClientConfig, deps: NodeDeps) -> Result<NodeHandle, JournalErr
         inbox,
         cards,
         ui,
+        board,
+        pending,
     })
+}
+
+/// `board.state`: this node's panel is now in `state`.
+async fn send_board_state(client: &Client, panel_id: Uuid, state: PanelState, revision: u32) {
+    let at = chrono::Utc::now()
+        .fixed_offset()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let report = json!({
+        "panel_id": panel_id, "state": state.as_str(), "revision": revision, "at": at,
+    });
+    if client.send("board.state", report).await.is_err() {
+        tracing::warn!(%panel_id, "panel state not sent: not connected");
+    }
 }
 
 async fn forward_status(mut status: watch::Receiver<LinkStatus>, ui: mpsc::Sender<UiEvent>) {
@@ -268,6 +390,9 @@ struct Router {
     ui: mpsc::Sender<UiEvent>,
     cards: Arc<CardStore>,
     executor: Arc<Executor>,
+    board: Arc<Mutex<BoardStore>>,
+    pending: Pending,
+    render_timeout: Duration,
 }
 
 /// `in_reply_to` (R12-37): must be present, a UUID or null. `Some(None)` is null.
@@ -646,6 +771,11 @@ impl Router {
                     }
                 });
             }
+            Ok(obj) if obj.action_kind.starts_with("board.") => {
+                let reply_id = obj.reply_id.expect("checked live above");
+                self.on_board(reply_id, seq, &obj.action_kind, &obj.args)
+                    .await;
+            }
             Ok(obj) if obj.action_kind.starts_with("pc.") => {
                 // No other live pc.* action exists: answer it, run nothing.
                 let receipt = json!({
@@ -668,6 +798,135 @@ impl Router {
             }
             Err(Rejected(reason)) => Self::refused("node.action", reason),
         }
+    }
+}
+
+impl Router {
+    /// A verified live Board action (see the module comment).
+    async fn on_board(&self, reply_id: Uuid, seq: i64, kind: &str, args: &Map<String, Value>) {
+        if kind == "board.working" {
+            // The voice turn queued Board work (R12-42). Not a panel: nothing is stored. The
+            // app shows that Jarvis is working and ends the line itself.
+            let started = args.len() == 1 && args.get("state") == Some(&json!("started"));
+            let receipt = if started {
+                json!({"reply_id": reply_id, "seq": seq, "result": "OK", "evidence": {}})
+            } else {
+                tracing::warn!(%reply_id, seq, "board.working refused: malformed");
+                json!({
+                    "reply_id": reply_id, "seq": seq, "result": "REFUSED",
+                    "evidence": {"check": "malformed"},
+                })
+            };
+            if self.client.send("action.receipt", receipt).await.is_err() {
+                tracing::warn!(%reply_id, seq, "receipt not sent: not connected");
+            }
+            if started {
+                let _ = self.ui.send(UiEvent::BoardWorking).await;
+            }
+            return;
+        }
+        let refuse = |check: &str| {
+            tracing::warn!(%reply_id, seq, action_kind = kind, check, "Board action refused");
+            json!({
+                "reply_id": reply_id, "seq": seq, "result": "REFUSED",
+                "evidence": board::refused_evidence(kind, args, check),
+            })
+        };
+        // Parsing hashes the content and applying writes the file: off the routing path.
+        let (store, k, a) = (self.board.clone(), kind.to_owned(), args.clone());
+        let applied = tokio::task::spawn_blocking(move || {
+            let event = board::parse(&k, &a)?;
+            let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
+            let before = store.panel(event.panel_id()).map(|p| p.state);
+            store.apply(&event)?;
+            let after = store.panel(event.panel_id()).cloned();
+            Ok((event, before, after.ok_or("store_failed")?))
+        })
+        .await
+        .unwrap_or(Err("store_failed"));
+        let (event, before, after) = match applied {
+            Ok(done) => done,
+            Err(check) => {
+                if self
+                    .client
+                    .send("action.receipt", refuse(check))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(%reply_id, seq, "refusal not sent: not connected");
+                }
+                return;
+            }
+        };
+        // The app is given the panel as the store holds it (its real state), not as parsed.
+        let event = match event {
+            BoardEvent::Show(_) => BoardEvent::Show(after.clone()),
+            BoardEvent::Update(_) => BoardEvent::Update(after.clone()),
+            other => other,
+        };
+        match &event {
+            BoardEvent::Show(p) | BoardEvent::Update(p) => self.await_render(reply_id, seq, p),
+            BoardEvent::State { panel_id, .. } | BoardEvent::Focus { panel_id } => {
+                let receipt = json!({
+                    "reply_id": reply_id, "seq": seq, "result": "OK",
+                    "evidence": {"panel_id": panel_id},
+                });
+                if self.client.send("action.receipt", receipt).await.is_err() {
+                    tracing::warn!(%reply_id, seq, "receipt not sent: not connected");
+                }
+            }
+        }
+        // A focus or an update that brought the panel back changed its state: the server's
+        // record follows. (It is not told of a state it set itself, nor of a new panel's.)
+        let brought_back = !matches!(event, BoardEvent::State { .. })
+            && before.is_some_and(|was| was != after.state);
+        if brought_back {
+            send_board_state(&self.client, after.panel_id, after.state, after.revision).await;
+        }
+        let _ = self.ui.send(UiEvent::Board(event)).await;
+    }
+
+    /// Keep the receipt of a shown panel until the Board reports it drawn, or time runs out.
+    fn await_render(&self, reply_id: Uuid, seq: i64, panel: &Panel) {
+        let waiting = PendingRender {
+            reply_id,
+            seq,
+            panel_id: panel.panel_id,
+            revision: panel.revision,
+            content_sha256: panel.content_sha256.clone(),
+        };
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if pending
+                .iter()
+                .any(|p| p.reply_id == reply_id && p.seq == seq)
+            {
+                return; // the same action again: it already waits, with its own timeout
+            }
+            pending.push(waiting);
+        }
+        let (pending, client, timeout) = (
+            self.pending.clone(),
+            self.client.clone(),
+            self.render_timeout,
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            let late = {
+                let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+                let at = pending
+                    .iter()
+                    .position(|p| p.reply_id == reply_id && p.seq == seq);
+                at.map(|i| pending.remove(i))
+            };
+            if let Some(p) = late {
+                tracing::warn!(%reply_id, seq, "the Board did not report the panel drawn in time");
+                let receipt = p.receipt("ERROR", Some("render_timeout"));
+                if client.send("action.receipt", receipt).await.is_err() {
+                    tracing::warn!(%reply_id, seq, "timeout receipt not sent: not connected");
+                }
+            }
+        });
     }
 }
 

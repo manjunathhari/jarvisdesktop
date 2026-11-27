@@ -43,6 +43,7 @@ jobs:
         run: |
           npm ci
           npm run build
+          npx vitest run
       - name: Format
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check

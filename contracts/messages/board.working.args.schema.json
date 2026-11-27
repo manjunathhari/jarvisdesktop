@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/board.working.args.schema.json",
+  "title": "Arguments of `board.working` (Board work has started)",
+  "description": "The `authz.object.args` of a live `board.working` action. Core sends it in the reply of the voice turn that queued a Board job, so the desktop can show that Jarvis is working. There is no \"ended\" action: the desktop ends the line itself when a panel arrives, when Jarvis next speaks unasked (the headline, or a sentence saying what went wrong), or after three minutes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "state"
+  ],
+  "properties": {
+    "state": {
+      "const": "started"
+    }
+  }
+}

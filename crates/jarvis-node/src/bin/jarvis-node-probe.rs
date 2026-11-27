@@ -6,8 +6,13 @@
 //!
 //! ```text
 //! jarvis-node-probe --gateway HOST:PORT --state-dir DIR [--memory-folder NAME=TEXT]...
-//!                   (--enrol CODE | --say TEXT | --approve-next | --wait SECS)...
+//!                   (--enrol CODE | --say TEXT | --approve-next | --render-next
+//!                    | --refuse-render | --set-state STATE | --wait SECS)...
 //! ```
+//! The Board (slice 1): every Board event is printed, and the panels the store holds at start
+//! (`board_restored`). `--render-next` waits for the next shown or updated panel and reports
+//! it drawn, as the Board window would; `--refuse-render` reports that it could not be drawn;
+//! `--set-state` changes the newest panel's state as a click would.
 //! Steps run in order; `--memory-folder` files exist from the start. Logs go to stderr. The
 //! enrolment code is never printed.
 
@@ -18,6 +23,7 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use jarvis_core::brain::{Brain, BrainEvent, BrainRequest};
 use jarvis_node::approval::{ApprovalCard, Decision};
+use jarvis_node::board::{BoardEvent, Panel, PanelState};
 use jarvis_node::client::{ClientConfig, LinkStatus};
 use jarvis_node::folder::memory::MemoryFolder;
 use jarvis_node::keystore::{KeyStore, KeyStoreError};
@@ -30,6 +36,8 @@ enum Step {
     Enrol(String),
     Say(String),
     ApproveNext,
+    RenderNext(bool),
+    SetState(PanelState),
     Wait(u64),
 }
 
@@ -56,6 +64,15 @@ fn parse() -> Result<Args, String> {
             "--enrol" => steps.push(Step::Enrol(value()?)),
             "--say" => steps.push(Step::Say(value()?)),
             "--approve-next" => steps.push(Step::ApproveNext),
+            "--render-next" => steps.push(Step::RenderNext(true)),
+            "--refuse-render" => steps.push(Step::RenderNext(false)),
+            "--set-state" => steps.push(Step::SetState(match value()?.as_str() {
+                "open" => PanelState::Open,
+                "minimised" => PanelState::Minimised,
+                "maximised" => PanelState::Maximised,
+                "closed" => PanelState::Closed,
+                _ => return Err("--set-state open|minimised|maximised|closed".into()),
+            })),
             "--wait" => steps.push(Step::Wait(value()?.parse().map_err(|_| "--wait SECS")?)),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -108,8 +125,20 @@ fn link(s: &LinkStatus) -> String {
     }
 }
 
-/// Print every UI event; pass cards on for `--approve-next`.
-async fn print_ui(mut ui: mpsc::Receiver<UiEvent>, cards: mpsc::UnboundedSender<ApprovalCard>) {
+fn panel_line(event: &str, p: &Panel) -> Value {
+    json!({
+        "event": event, "panel_id": p.panel_id, "revision": p.revision, "kind": p.kind,
+        "title": p.title, "state": p.state, "content_sha256": p.content_sha256,
+        "cost_paise": p.cost_paise,
+    })
+}
+
+/// Print every UI event; pass cards on for `--approve-next` and panels for `--render-next`.
+async fn print_ui(
+    mut ui: mpsc::Receiver<UiEvent>,
+    cards: mpsc::UnboundedSender<ApprovalCard>,
+    panels: mpsc::UnboundedSender<Panel>,
+) {
     while let Some(ev) = ui.recv().await {
         match ev {
             UiEvent::Notice {
@@ -137,6 +166,21 @@ async fn print_ui(mut ui: mpsc::Receiver<UiEvent>, cards: mpsc::UnboundedSender<
             UiEvent::ApprovalCleared { outbox_id, reason } => {
                 say(json!({"event": "card_cleared", "outbox_id": outbox_id, "reason": reason}))
             }
+            UiEvent::Board(BoardEvent::Show(p)) => {
+                say(panel_line("board_show", &p));
+                let _ = panels.send(p);
+            }
+            UiEvent::Board(BoardEvent::Update(p)) => {
+                say(panel_line("board_update", &p));
+                let _ = panels.send(p);
+            }
+            UiEvent::Board(BoardEvent::State { panel_id, state }) => {
+                say(json!({"event": "board_state", "panel_id": panel_id, "state": state}))
+            }
+            UiEvent::Board(BoardEvent::Focus { panel_id }) => {
+                say(json!({"event": "board_focus", "panel_id": panel_id}))
+            }
+            UiEvent::BoardWorking => say(json!({"event": "board_working"})),
         }
     }
 }
@@ -182,7 +226,16 @@ async fn run(args: Args) -> Result<(), String> {
     let handle = node::start(ClientConfig::new(args.gateway, &args.state_dir), deps)
         .map_err(|e| e.to_string())?;
     let (cards_tx, mut cards) = mpsc::unbounded_channel();
-    tokio::spawn(print_ui(ui, cards_tx));
+    let (panels_tx, mut panels) = mpsc::unbounded_channel();
+    let restored = handle
+        .board()
+        .lock()
+        .map_err(|_| "the Board store is unusable")?
+        .panels();
+    for p in &restored {
+        say(panel_line("board_restored", p));
+    }
+    tokio::spawn(print_ui(ui, cards_tx, panels_tx));
     tokio::spawn(print_replies(handle.subscribe_replies()));
     let brain = Arc::new(ServerBrain::new(Arc::new(handle.clone())));
     for step in args.steps {
@@ -251,6 +304,32 @@ async fn run(args: Args) -> Result<(), String> {
                 say(
                     json!({"event": "decided", "outbox_id": card.outbox_id, "decision": "APPROVED"}),
                 );
+            }
+            Step::RenderNext(ok) => {
+                let p = tokio::time::timeout(Duration::from_secs(60), panels.recv())
+                    .await
+                    .map_err(|_| "no panel arrived")?
+                    .ok_or("the node stopped")?;
+                handle.board_rendered(p.panel_id, p.revision, ok).await;
+                say(json!({
+                    "event": "board_rendered", "panel_id": p.panel_id, "revision": p.revision,
+                    "ok": ok,
+                }));
+            }
+            Step::SetState(state) => {
+                let newest = handle
+                    .board()
+                    .lock()
+                    .map_err(|_| "the Board store is unusable")?
+                    .panels()
+                    .last()
+                    .map(|p| p.panel_id)
+                    .ok_or("no panel to change")?;
+                handle
+                    .board_state(newest, state)
+                    .await
+                    .map_err(|e| format!("set-state: {e}"))?;
+                say(json!({"event": "board_state_set", "panel_id": newest, "state": state}));
             }
             Step::Wait(secs) => tokio::time::sleep(Duration::from_secs(secs)).await,
         }

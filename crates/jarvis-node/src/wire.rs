@@ -171,7 +171,7 @@ pub fn parse_authz(v: &Value) -> Option<Authz> {
 pub const NIL_UUID: Uuid = Uuid::nil();
 
 /// Every message kind `contracts/node-envelope.schema.json` allows.
-pub const MESSAGE_KINDS: [&str; 17] = [
+pub const MESSAGE_KINDS: [&str; 18] = [
     "challenge",
     "enrol",
     "hello",
@@ -185,6 +185,7 @@ pub const MESSAGE_KINDS: [&str; 17] = [
     "approval.decision",
     "node.action",
     "action.receipt",
+    "board.state",
     "keyset",
     "ping",
     "pong",

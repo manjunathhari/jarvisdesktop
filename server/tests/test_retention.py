@@ -33,6 +33,7 @@ from psycopg.types.json import Jsonb
 
 from jarvis_server import comm, jobs, migrate, retention
 from jarvis_server.comm import Priority
+from jarvis_server.core import board
 from jarvis_server.dbcall import NotInJob, job_transaction
 
 from .conftest import Dsns, fresh_database
@@ -535,6 +536,63 @@ def test_0015_down_and_up() -> None:
                 " FROM pg_proc WHERE oid = %s::regprocedure",
                 (fn, fn, fn, fn),
             ).fetchone() == (True, True, False, False)
+
+
+# --- migration 0016 (the Board's panel store) ---------------------------------------------------
+
+
+def test_0016_down_and_up() -> None:
+    """Down to 0015: the `board` schema is gone and `board.state` is no longer an inbound
+    kind. Up: both are back, with the same grants on `conv.record_inbound`. With a panel
+    stored, the downgrade refuses (nothing is destroyed)."""
+    fn = "conv.record_inbound(bigint, uuid, text, jsonb, jsonb)"
+    grants = (
+        "SELECT prosecdef, has_function_privilege('jarvis_gateway', %s, 'EXECUTE'),"
+        " has_function_privilege('jarvis_app', %s, 'EXECUTE'),"
+        " has_function_privilege('public', %s, 'EXECUTE') FROM pg_proc WHERE oid = %s::regprocedure"
+    )
+    # Owner, search_path and the body: at 0015 the body is 0009's, word for word.
+    shape = (
+        "SELECT pg_get_userbyid(proowner), proconfig, prosrc FROM pg_proc"
+        " WHERE oid = %s::regprocedure"
+    )
+    schema = "SELECT count(*) FROM pg_namespace WHERE nspname = 'board'"
+    kinds = (
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint"
+        " WHERE conrelid = 'conv.inbound'::regclass AND contype = 'c'"
+        " AND pg_get_constraintdef(oid) LIKE '%%utterance%%'"
+    )
+    with fresh_database() as d:
+        with psycopg.connect(d.owner, autocommit=True) as conn:
+            before = conn.execute(grants, (fn, fn, fn, fn)).fetchone()
+            assert before == (True, True, False, False)
+            owner_, config, at_head = conn.execute(shape, (fn,)).fetchone()  # type: ignore[misc]
+            assert (owner_, config) == ("jarvis_owner", ["search_path=pg_catalog, pg_temp"])
+            assert at_head.count("WHEN 'board.state' THEN 'board.state'") == 1
+            assert "board.state" in str(conn.execute(kinds).fetchone())
+        migrate.downgrade(d.owner, "0015")
+        with psycopg.connect(d.owner, autocommit=True) as conn:
+            assert conn.execute(schema).fetchone() == (0,)
+            assert conn.execute(grants, (fn, fn, fn, fn)).fetchone() == before
+            owner_, config, at_0015 = conn.execute(shape, (fn,)).fetchone()  # type: ignore[misc]
+            assert (owner_, config) == ("jarvis_owner", ["search_path=pg_catalog, pg_temp"])
+            assert at_0015 == at_head.replace("        WHEN 'board.state' THEN 'board.state'\n", "")
+            assert "board" not in at_0015
+            assert "board.state" not in str(conn.execute(kinds).fetchone())
+        migrate.upgrade(d.owner, "head")
+        with psycopg.connect(d.owner, autocommit=True) as conn:
+            assert conn.execute(schema).fetchone() == (1,)
+            assert conn.execute(grants, (fn, fn, fn, fn)).fetchone() == before
+            person = uuid.UUID(
+                str(conn.execute("SELECT id FROM ledger.person LIMIT 1").fetchone()[0])
+            )  # type: ignore[index]
+        with psycopg.connect(d.app, autocommit=True) as conn:
+            board.create(conn, person_id=person, session_id=None, kind="text",
+                         title="A fictional panel", content="Fictional.", cost_paise=0)  # fmt: skip
+        with pytest.raises(Exception, match="Board panels exist"):
+            migrate.downgrade(d.owner, "0015")
+        with psycopg.connect(d.app, autocommit=True) as conn:
+            assert conn.execute("SELECT count(*) FROM board.panel").fetchone() == (1,)
 
 
 # --- migration 0014 (R12-37) -------------------------------------------------------------------

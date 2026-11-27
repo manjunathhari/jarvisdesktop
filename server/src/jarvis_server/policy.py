@@ -42,7 +42,8 @@ class Tier(StrEnum):
     IRREVERSIBLE = "IRREVERSIBLE"
 
 
-# §9.1, exactly. `screen.*` is every `screen.<name>` kind. Anything else is refused.
+# §9.1, exactly, and the Board's five kinds (R12-39). `screen.*` is every `screen.<name>` kind.
+# Anything else is refused.
 TIERS: Mapping[str, Tier] = MappingProxyType(
     {
         "module.news": Tier.READ_ONLY,
@@ -51,6 +52,14 @@ TIERS: Mapping[str, Tier] = MappingProxyType(
         "memory.write": Tier.REVERSIBLE,
         "pc.list_test_folder": Tier.READ_ONLY,
         "pc.delete_test_file": Tier.IRREVERSIBLE,
+        # The Board (slice 1): each kind is named; there is no `board.*` row. They only change
+        # what is displayed, and a closed panel is kept, so all are READ_ONLY.
+        "board.make": Tier.READ_ONLY,
+        "board.show": Tier.READ_ONLY,
+        "board.update": Tier.READ_ONLY,
+        "board.set_state": Tier.READ_ONLY,
+        "board.focus": Tier.READ_ONLY,
+        "board.working": Tier.READ_ONLY,
     }
 )
 
@@ -64,6 +73,12 @@ _NODE_KINDS: Mapping[str, frozenset[str]] = MappingProxyType(
         "memory.write": frozenset({"DESKTOP", "PHONE"}),
         "pc.list_test_folder": frozenset({"DESKTOP"}),
         "pc.delete_test_file": frozenset({"DESKTOP"}),
+        "board.make": frozenset({"DESKTOP"}),
+        "board.show": frozenset({"DESKTOP"}),
+        "board.update": frozenset({"DESKTOP"}),
+        "board.set_state": frozenset({"DESKTOP"}),
+        "board.focus": frozenset({"DESKTOP"}),
+        "board.working": frozenset({"DESKTOP"}),
     }
 )
 

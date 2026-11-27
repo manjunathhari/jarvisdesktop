@@ -941,6 +941,21 @@ def test_resend_same_message_id_is_noop(gw_client: Gw) -> None:
     assert _jobs(gw_client.dsns, message_id) == [("conv.turn",)]
 
 
+def test_board_state_from_a_node_is_recorded_and_queued(gw_client: Gw) -> None:
+    """Board slice 1, Task 3: a node may send `board.state`; it becomes job `board.state`."""
+    a = gw_client.enrolled()
+    payload = {"panel_id": str(uuid.uuid4()), "state": "closed", "revision": 1,
+               "at": "2026-11-26T19:30:00+05:30"}  # fmt: skip
+    message_id = a.send("board.state", payload)
+    assert _wait_for(lambda: _inbound(gw_client.dsns, message_id))
+    assert _inbound(gw_client.dsns, message_id)[0][2] == "board.state"
+    assert _jobs(gw_client.dsns, message_id) == [("board.state",)]
+    bad = a.send("board.state", {**payload, "state": "hidden"})
+    reply = a.recv()
+    assert (reply["kind"], reply["payload"]["code"]) == ("error", "malformed")
+    assert _inbound(gw_client.dsns, bad) == []
+
+
 def test_oversized_message_gets_error_and_stays_open(gw_client: Gw) -> None:
     a = gw_client.enrolled()
     big = a.envelope("utterance", {"text": "x" * 70_000, "screen_summary": None})

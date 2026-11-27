@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/board.show.receipt.schema.json",
+  "title": "Receipt of `board.show` and `board.update`",
+  "description": "The `action.receipt` payload (its live form) for a `board.show` or `board.update` action. `RENDERED` means the Board window drew this panel at this revision, not that the action was handed over. `REFUSED`: a check failed and nothing changed. `ERROR`: the panel was stored but not drawn (for example `render_timeout`).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "reply_id",
+    "seq",
+    "result",
+    "evidence"
+  ],
+  "properties": {
+    "reply_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "result": {
+      "enum": [
+        "RENDERED",
+        "REFUSED",
+        "ERROR"
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "panel_id",
+        "revision",
+        "content_sha256"
+      ],
+      "properties": {
+        "panel_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "revision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "content_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "The hash the node computed over the content it received."
+        },
+        "check": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.]{0,63}$",
+          "description": "The check that failed. Omitted when there is none, never null."
+        }
+      },
+      "description": "What the node drew or refused. Each of the three is null only when the action's args gave the node no usable value (check `malformed`, `too_large` and the like)."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "result": {
+            "const": "RENDERED"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "evidence": {
+            "properties": {
+              "panel_id": {
+                "type": "string"
+              },
+              "revision": {
+                "type": "integer"
+              },
+              "content_sha256": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

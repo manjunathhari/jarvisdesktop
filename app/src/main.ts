@@ -209,6 +209,8 @@ document.addEventListener("pointerdown", (e) => {
 // Esc always closes JARVIS; F11 switches between window and full screen.
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") invoke("quit");
+  // F9: bring the Board window back after it was closed.
+  if (e.key === "F9") invoke("board_open");
   if (e.key === "F11") {
     e.preventDefault();
     invoke("toggle_fullscreen");

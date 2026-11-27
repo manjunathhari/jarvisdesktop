@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/board.show.args.schema.json",
+  "title": "Arguments of `board.show` (a new panel on the Board)",
+  "description": "The `authz.object.args` of a live `board.show` action: one whole panel, as core stored it. The node checks the limits and the hash, stores the panel, and answers `RENDERED` only after the Board has drawn this revision.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "panel_id",
+    "revision",
+    "kind",
+    "title",
+    "content",
+    "content_sha256",
+    "cost_paise",
+    "created_at"
+  ],
+  "properties": {
+    "panel_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "kind": {
+      "enum": [
+        "text",
+        "canvas"
+      ],
+      "description": "`text`: formatted text (Markdown, no raw HTML). `canvas`: one self-contained HTML page, shown sealed."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]*[^\\u0000-\\u0020\\u007f][^\\u0000-\\u001f\\u007f]*$",
+      "description": "One line: 1 to 120 Unicode code points, no control character, not blank."
+    },
+    "content": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 30000,
+      "pattern": "^[^\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f]+$",
+      "description": "At most 30,000 bytes of UTF-8, with no control character except tab, line feed and carriage return. JSON Schema counts characters, so core and the node also count bytes."
+    },
+    "content_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of `content`'s UTF-8 bytes, lower-case hex."
+    },
+    "cost_paise": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2147483647,
+      "description": "What this panel has cost to make so far, all revisions together, in paise (0 when the cost is carried by another panel of the same job)."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "board",
+  "description": "The Board window may listen for events from Rust and call the Board's commands only. It cannot quit the app, enrol, decide approvals (its typing box is told it may not) or touch the API key.",
+  "windows": [
+    "board"
+  ],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-board-snapshot",
+    "allow-board-set-state",
+    "allow-board-rendered",
+    "allow-board-clear-closed",
+    "allow-board-open-link",
+    "allow-board-canvas-address",
+    "allow-board-canvas-served",
+    "allow-board-say"
+  ]
+}

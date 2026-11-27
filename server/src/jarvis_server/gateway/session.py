@@ -22,7 +22,8 @@ object and is consumed by the first reply, whatever its outcome.
 envelope gets `error malformed`; neither carries a `seq` the gateway counts. An envelope from
 another node, with a bad `node-msg` signature or a `seq` that isn't the previous + 1 closes the
 connection through `gw.close_connection(conn_id, code)`, which writes its DISCONNECT row.
-`utterance`, `approval.decision` and `action.receipt` go to `conv.record_inbound`, with the
+`utterance`, `approval.decision`, `action.receipt` and `board.state` go to
+`conv.record_inbound`, with the
 node's complete signed envelope, which core re-verifies before an irreversible step (R12-34);
 `ping` to
 `gw.touch_connection` and `pong`; `received` and `ack` to `comm.record_received`,
@@ -106,7 +107,12 @@ CLOSE_REFUSED = 4401
 CLOSE_REENROL = 4409
 
 INBOUND_KINDS = frozenset(
-    {MessageKind.UTTERANCE, MessageKind.APPROVAL_DECISION, MessageKind.ACTION_RECEIPT}
+    {
+        MessageKind.UTTERANCE,
+        MessageKind.APPROVAL_DECISION,
+        MessageKind.ACTION_RECEIPT,
+        MessageKind.BOARD_STATE,  # the person changed a panel on the Board by hand
+    }
 )
 NODE_KINDS = INBOUND_KINDS | {
     MessageKind.RECEIVED,

@@ -7,7 +7,7 @@ Prompts and outputs are plain frozen dataclasses so a second provider can sit be
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal, Protocol
 
@@ -41,6 +41,11 @@ class BrainRequest:
     memory: list[MemoryLine]
     tools: list[ToolSpec]
     max_tokens: int
+    # The person's Board, one line per panel (`prompt.board_lines`); untrusted data.
+    board: list[str] = field(default_factory=list)
+    # Tools the provider runs itself (web search), sent as given after `tools`. Their use is
+    # billed per use (`prices.tool_paise`); the brain reports the count in `searches`.
+    server_tools: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -81,8 +86,15 @@ class BrainCallFailed(Exception):
 class Brain(Protocol):
     """A brain call streams events; after a completed stream `usage` is
     `(input_tokens, output_tokens)` as the provider reported them, or None if it did not
-    complete (or reported none, which the caller treats as fail closed)."""
+    complete (or reported none, which the caller treats as fail closed).
+
+    After a completed stream, also: `searches`, the web searches the provider ran and billed;
+    `sources`, the (title, address) of the pages those searches returned; `truncated`, whether
+    the output limit ended the reply."""
 
     usage: tuple[int, int] | None
+    searches: int
+    sources: list[tuple[str, str]]
+    truncated: bool
 
     def think(self, req: BrainRequest) -> Iterator[BrainEvent]: ...

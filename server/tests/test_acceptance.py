@@ -233,12 +233,12 @@ def test_p0_6_migrations_go_down_and_up_cleanly(dsns: Dsns) -> None:
             return conn.execute(
                 "SELECT table_schema, table_name, column_name, data_type FROM"
                 " information_schema.columns"
-                " WHERE table_schema IN ('ledger','audit','ops','gw','conv','comm')"
+                " WHERE table_schema IN ('ledger','audit','ops','gw','conv','comm','board')"
                 " ORDER BY 1, 2, 3"
             ).fetchall()
 
     before = schema_fingerprint()
-    assert {r[0] for r in before} == {"ledger", "audit", "ops", "gw", "conv", "comm"}
+    assert {r[0] for r in before} == {"ledger", "audit", "ops", "gw", "conv", "comm", "board"}
     tables = {f"{r[0]}.{r[1]}" for r in before}
     assert {  # 0010
         "ledger.approval",

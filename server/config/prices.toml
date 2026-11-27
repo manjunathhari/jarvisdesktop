@@ -19,3 +19,11 @@ output = 200000
 [models.claude-sonnet-5-5]
 input = 20000
 output = 100000
+
+# Tools Anthropic runs and bills per use, in paise per use. Web search: $10 per 1,000 searches
+# (platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool, "Usage and pricing",
+# read 26 Nov 2026), at the same ₹100/$: 100 paise a search. A failed search is not billed. The
+# pages a search returns are billed as input tokens, at the model's price. A tool missing here
+# is never offered to the model (UnknownToolPrice).
+[tools.web_search]
+per_use = 100

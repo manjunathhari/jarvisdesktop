@@ -59,6 +59,7 @@
         "approval.decision",
         "node.action",
         "action.receipt",
+        "board.state",
         "keyset",
         "ping",
         "pong",

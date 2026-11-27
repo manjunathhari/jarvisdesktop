@@ -2,6 +2,7 @@
 
 mod announce;
 mod approvals;
+mod board;
 mod key;
 mod node_config;
 mod server_mode;
@@ -66,6 +67,7 @@ impl Ui for TauriUi {
         let r = match ev {
             UiEvent::Screen(v) => app.emit("jarvis://screen", v),
             UiEvent::Speak(s) => {
+                board::spoke(&s);
                 self.clock.speaking();
                 let _ = app.emit("jarvis://caption", &s);
                 match self.voice.lock().ok().as_deref().and_then(Option::as_ref) {
@@ -83,6 +85,7 @@ impl Ui for TauriUi {
                 app.emit("jarvis://stop_speaking", ())
             }
             UiEvent::Heard(s) => {
+                board::heard(&s);
                 self.clock.heard();
                 app.emit("jarvis://heard", s)
             }
@@ -99,7 +102,7 @@ impl Ui for TauriUi {
                 let r = app.emit("jarvis://status", m);
                 // Results Jarvis reported on its own, held until JARVIS was free.
                 for line in self.announcer.mode(m) {
-                    speak_locally(app, &self.voice, &line);
+                    announce_locally(app, &self.voice, &line);
                 }
                 r
             }
@@ -137,18 +140,71 @@ fn say(
     voice: State<'_, VoiceSlot>,
     app: AppHandle,
 ) {
+    say_text(text, true, &jarvis, &node, &voice, &app);
+}
+
+/// The Board's "Type instead of speaking" box. Its own command, so that the Board window can
+/// be allowed this and not the main window's `say`, and with two differences:
+/// - it never decides an approval (the Board shows untrusted content);
+/// - it says why when the line would be dropped (the coordinator takes nothing while it is
+///   thinking), so the text stays in the box. A typed line wakes Jarvis after "stop
+///   listening" (`Event::Typed`).
+#[tauri::command]
+fn board_say(
+    text: String,
+    jarvis: State<'_, Handle>,
+    node: State<'_, approvals::NodeSlot>,
+    voice: State<'_, VoiceSlot>,
+    mode: State<'_, ModeCell>,
+    app: AppHandle,
+) -> Result<(), String> {
+    if matches!(mode.lock().map(|m| *m), Ok(Mode::Thinking)) {
+        return Err("Jarvis is busy. Try again in a moment.".to_owned());
+    }
+    say_text(text, false, &jarvis, &node, &voice, &app);
+    Ok(())
+}
+
+/// A typed line, from either window. `may_decide`: whether an approval phrase may decide.
+fn say_text(
+    text: String,
+    may_decide: bool,
+    jarvis: &Handle,
+    node: &approvals::NodeSlot,
+    voice: &VoiceSlot,
+    app: &AppHandle,
+) {
     // Typed stand-in for the microphone until Milestone B; length-capped.
     let text: String = text.chars().take(500).collect();
-    let (app, voice) = (app.clone(), voice.inner().clone());
-    if approvals::take_spoken_decision(&node, &text, move |line| speak_locally(&app, &voice, line))
-    {
+    // For the Board's conversation: this line, when it is heard, was typed.
+    board::typed(&text);
+    let (app, voice) = (app.clone(), voice.clone());
+    if approvals::take_spoken_decision(node, &text, may_decide, move |line| {
+        speak_locally(&app, &voice, line)
+    }) {
+        // Taken here, so the coordinator never reports it heard: record it ourselves.
+        board::heard(&text);
         return;
     }
-    jarvis.send(Event::Utterance(text));
+    // Typed, so it also wakes Jarvis after "stop listening".
+    jarvis.send(Event::Typed(text));
 }
 
 /// Say a line in George's voice (or the stand-in), outside the coordinator.
 fn speak_locally(app: &AppHandle, voice: &VoiceSlot, text: &str) {
+    board::spoke(text);
+    say_aloud(app, voice, text);
+}
+
+/// Say something Jarvis reports on its own (the result of earlier work, a Board headline, or
+/// what went wrong). For the Board it is a line of the conversation that also ends "Jarvis is
+/// working".
+fn announce_locally(app: &AppHandle, voice: &VoiceSlot, text: &str) {
+    board::announced(text);
+    say_aloud(app, voice, text);
+}
+
+fn say_aloud(app: &AppHandle, voice: &VoiceSlot, text: &str) {
     let _ = app.emit("jarvis://caption", text);
     match voice.lock().ok().as_deref().and_then(Option::as_ref) {
         Some(v) => v.speak(text),
@@ -392,9 +448,11 @@ async fn prepare_ears(
         Box::new(move |text| {
             tracing::info!(%text, "heard");
             let (app, voice) = (decision_app.clone(), decision_voice.clone());
-            if approvals::take_spoken_decision(&node, &text, move |line| {
+            if approvals::take_spoken_decision(&node, &text, true, move |line| {
                 speak_locally(&app, &voice, line)
             }) {
+                // Taken here, so the coordinator never reports it heard.
+                board::heard(&text);
                 return;
             }
             jarvis.send(Event::Utterance(text));
@@ -479,6 +537,13 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             bring_to_front(app);
         }))
+        // Only for `board_open_link` (Rust side). No window is granted the plugin's own
+        // commands, and its script that takes over link clicks in every page is left out.
+        .plugin(
+            tauri_plugin_opener::Builder::new()
+                .open_js_links_on_click(false)
+                .build(),
+        )
         .setup(|app| {
             let cfg = SourcesConfig::default_config();
             let news = Arc::new(NewsModule::new(
@@ -553,13 +618,14 @@ pub fn run() {
             let voice: VoiceSlot = Arc::new(Mutex::new(None));
             let ears: EarsSlot = Arc::new(Mutex::new(None));
             let mode: ModeCell = Arc::new(Mutex::new(Mode::Idle));
+            app.manage(mode.clone());
             let announcer = Arc::new(announce::Announcer::default());
             if let Some(n) = node.lock().ok().and_then(|n| n.clone()) {
                 let (app, voice) = (app.handle().clone(), voice.clone());
                 tauri::async_runtime::spawn(announce::run(
                     n.subscribe_replies(),
                     announcer.clone(),
-                    move |line| speak_locally(&app, &voice, line),
+                    move |line| announce_locally(&app, &voice, line),
                 ));
             }
             let ui = Arc::new(TauriUi {
@@ -571,6 +637,14 @@ pub fn run() {
                 mode: mode.clone(),
             });
             let (handle, fut) = runtime(USER_NAME, brain, Arc::new(registry), ui);
+            board::create(app.handle());
+            // The Board (slice 1) is the server's: it opens only when the node runs, and by
+            // itself only on a monitor of its own.
+            let running = node.lock().ok().and_then(|n| n.clone());
+            if let Some(running) = running {
+                board::start_recorder(app.handle(), &running);
+                board::open_at_start(app.handle());
+            }
             app.manage(node.clone());
             app.manage(voice.clone());
             tauri::async_runtime::spawn(fut);
@@ -614,8 +688,18 @@ pub fn run() {
             server_mode::node_status,
             server_mode::enrol,
             server_mode::forget_claude_key,
-            build_label
+            build_label,
+            board::board_snapshot,
+            board::board_set_state,
+            board::board_rendered,
+            board::board_clear_closed,
+            board::board_open,
+            board::board_open_link,
+            board::board_canvas_address,
+            board::board_canvas_served,
+            board_say
         ])
+        .on_window_event(board::on_window_event)
         .run(tauri::generate_context!())
         .expect("error while running JARVIS");
 }

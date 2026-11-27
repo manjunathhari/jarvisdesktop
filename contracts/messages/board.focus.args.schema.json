@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/manjunathhari/jarvisdesktop/contracts/messages/board.focus.args.schema.json",
+  "title": "Arguments of `board.focus` (bring a panel to the front)",
+  "description": "The `authz.object.args` of a live `board.focus` action.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "panel_id"
+  ],
+  "properties": {
+    "panel_id": {
+      "type": "string",
+      "format": "uuid"
+    }
+  }
+}
