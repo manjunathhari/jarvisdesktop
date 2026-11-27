@@ -21,6 +21,8 @@
     "allow-enrol",
     "allow-forget-claude-key",
     "allow-build-label",
-    "allow-board-open"
+    "allow-board-open",
+    "allow-voice-status",
+    "allow-retry-voice"
   ]
 }

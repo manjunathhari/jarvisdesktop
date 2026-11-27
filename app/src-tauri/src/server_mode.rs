@@ -128,15 +128,19 @@ pub fn forget_claude_key() -> Result<(), String> {
     crate::key::delete()
 }
 
-/// When the last utterance was handed over, for the timing log.
+/// When the last utterance was handed over (`.0`), and when that turn's first sentence was
+/// handed to the voice (`.1`), for the timing log.
 #[derive(Clone, Default)]
-pub struct TurnClock(Arc<Mutex<Option<Instant>>>);
+pub struct TurnClock(Arc<Mutex<Option<Instant>>>, Arc<Mutex<Option<Instant>>>);
 
 impl TurnClock {
     /// The person's words were handed to the coordinator now.
     pub fn heard(&self) {
         if let Ok(mut t) = self.0.lock() {
             *t = Some(Instant::now());
+        }
+        if let Ok(mut t) = self.1.lock() {
+            *t = None;
         }
     }
 
@@ -146,18 +150,41 @@ impl TurnClock {
     /// first `Speak` event. It leaves out two things the §6.2 target (3 s from the end of
     /// speech to the first audio) includes: the recogniser's time (end of speech to
     /// transcript) and the voice's time to make the first sentence's audio. Measuring those
-    /// needs timestamps from jarvis-ears and jarvis-voice, which stay unchanged.
+    /// needs timestamps from jarvis-ears and jarvis-voice, which stay unchanged. With the
+    /// voice helper, the second is `speak_to_sound_ms` (`TurnClock::sound`).
     pub fn speaking(&self) {
         let started = self.0.lock().ok().and_then(|mut t| t.take());
         if let Some(t) = started {
             let ms = t.elapsed().as_millis();
             tracing::info!(transcript_to_speak_ms = ms as u64, "turn_timing");
+            if let Ok(mut s) = self.1.lock() {
+                *s = Some(Instant::now());
+            }
         }
+    }
+
+    /// The voice helper started playing: the first time after a turn's first sentence, log
+    /// `speak_to_sound_ms`.
+    #[cfg(windows)]
+    pub fn sound(&self) {
+        if let Some(d) = self.take_speak_to_sound() {
+            tracing::info!(speak_to_sound_ms = d.as_millis() as u64, "turn_timing");
+        }
+    }
+
+    /// The time from this turn's first `Speak` to now, once per turn.
+    #[cfg(any(windows, test))]
+    fn take_speak_to_sound(&self) -> Option<std::time::Duration> {
+        let spoke = self.1.lock().ok().and_then(|mut t| t.take());
+        spoke.map(|t| t.elapsed())
     }
 
     /// Back to idle with nothing said (a silent local command): no turn to time.
     pub fn cancel(&self) {
         if let Ok(mut t) = self.0.lock() {
+            *t = None;
+        }
+        if let Ok(mut t) = self.1.lock() {
             *t = None;
         }
     }
@@ -181,6 +208,31 @@ mod tests {
             c.0.lock().unwrap().is_none(),
             "a silent turn isn't timed later"
         );
+    }
+
+    #[test]
+    fn sound_logs_once_per_turn() {
+        let c = TurnClock::default();
+        assert!(c.take_speak_to_sound().is_none(), "no turn yet");
+        c.heard();
+        assert!(c.take_speak_to_sound().is_none(), "nothing said yet");
+        c.speaking();
+        assert!(
+            c.take_speak_to_sound().is_some(),
+            "the first sound of the turn"
+        );
+        assert!(c.take_speak_to_sound().is_none(), "only once per turn");
+        c.speaking(); // a later sentence of the same turn starts nothing
+        assert!(c.take_speak_to_sound().is_none());
+    }
+
+    #[test]
+    fn a_cancelled_turn_has_no_speak_to_sound() {
+        let c = TurnClock::default();
+        c.heard();
+        c.speaking();
+        c.cancel();
+        assert!(c.take_speak_to_sound().is_none());
     }
 
     #[test]

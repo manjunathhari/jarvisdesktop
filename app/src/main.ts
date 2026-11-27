@@ -2,6 +2,7 @@
 // itself, and inserts text only via textContent — never HTML.
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { voiceRetryShown, voiceStatusText } from "./voice_status";
 
 type Card = { number?: number; title: string; source: string; summary: string; link: string };
 type SlotView =
@@ -124,24 +125,39 @@ listen<ScreenView>("jarvis://screen", (e) => render(e.payload));
 listen<string>("jarvis://speak", (e) => speak(e.payload));
 listen<string>("jarvis://caption", (e) => (said.textContent = e.payload));
 const voiceStatus = $("voicestatus");
-listen<{ state: string; percent: number }>("jarvis://ears_status", ({ payload }) => {
+const voiceRetry = $<HTMLButtonElement>("voiceretry");
+// The line under the orb: the hearing's status while it has one, otherwise the voice's (so
+// "Voice helper unavailable…" stays once the hearing is ready). "Try again" goes with the
+// voice's "unavailable" only.
+type StatusView = { state: string; percent: number };
+let earsLine = "";
+let voiceLine = "";
+let voiceRetryWanted = false;
+function showStatusLine() {
+  const text = earsLine || voiceLine;
+  voiceStatus.textContent = text;
+  voiceStatus.hidden = !text;
+  voiceRetry.hidden = !(voiceRetryWanted && !earsLine);
+}
+function applyVoiceStatus(s: StatusView) {
+  voiceLine = voiceStatusText(s.state, s.percent);
+  voiceRetryWanted = voiceRetryShown(s.state);
+  showStatusLine();
+}
+listen<StatusView>("jarvis://ears_status", ({ payload }) => {
   const text: Record<string, string> = {
     downloading: `Getting my hearing ready, ${payload.percent}%`,
     loading: "Loading my hearing…",
     no_mic: "I can't find a microphone. You can still type.",
   };
-  voiceStatus.textContent = text[payload.state] ?? "";
-  voiceStatus.hidden = !text[payload.state];
+  earsLine = text[payload.state] ?? "";
+  showStatusLine();
   if (payload.state === "ready") input?.setAttribute("placeholder", "Speak, or type here and press Enter");
 });
-listen<{ state: string; percent: number }>("jarvis://voice_status", ({ payload }) => {
-  const text: Record<string, string> = {
-    downloading: `Getting my voice ready, ${payload.percent}%`,
-    loading: "Loading my voice…",
-  };
-  voiceStatus.textContent = text[payload.state] ?? "";
-  voiceStatus.hidden = !text[payload.state];
-});
+listen<StatusView>("jarvis://voice_status", ({ payload }) => applyVoiceStatus(payload));
+voiceRetry.addEventListener("click", () => invoke("retry_voice"));
+// A status sent before this page was listening (helper_unavailable, say) is still shown.
+invoke<StatusView>("voice_status").then(applyVoiceStatus);
 listen("jarvis://stop_speaking", () => synth?.cancel());
 listen<string>("jarvis://heard", (e) => {
   heard.textContent = e.payload;
@@ -203,7 +219,7 @@ if (await invoke<boolean>("needs_key")) {
 
 // Tapping anywhere wakes JARVIS (except inside the video, which keeps its own controls).
 document.addEventListener("pointerdown", (e) => {
-  if ((e.target as HTMLElement).closest("#devtype, #setup, #enrolment, #approvals, #notices")) return;
+  if ((e.target as HTMLElement).closest("#devtype, #setup, #enrolment, #approvals, #notices, #voiceretry")) return;
   invoke("tap");
 });
 // Esc always closes JARVIS; F11 switches between window and full screen.

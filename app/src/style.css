@@ -359,6 +359,18 @@ body[data-mode="mic_off"] #orb::after { opacity: 0; }
 
 #voicestatus { margin: 0.4rem 0 0; color: var(--ash); font-size: var(--s-1); }
 #voicestatus[hidden] { display: none; }
+#voiceretry {
+  pointer-events: auto;
+  font: 600 var(--s-1) var(--text);
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid var(--ash);
+  border-radius: 0.4rem;
+  padding: 0.35em 1em;
+  cursor: pointer;
+}
+#voiceretry:focus-visible { outline: 2px solid var(--arc); outline-offset: 3px; }
+#voiceretry[hidden] { display: none; }
 
 /* dev-only typed input */
 #devtype { pointer-events: auto; margin-top: 0.8rem; }
