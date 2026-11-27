@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::Layer;
 
 /// How many daily files are kept.
 const MAX_LOG_FILES: usize = 7;
@@ -37,8 +38,10 @@ fn non_empty_var(name: &str) -> Option<std::ffi::OsString> {
 }
 
 /// stderr as before (`RUST_LOG` if set, else `info`) plus, when `dir` is given and usable,
-/// a daily-rolling file `jarvis.<date>.log` there, without colour codes. If the folder can't
-/// be created or the appender can't be built, stderr only, and no guard. Never panics.
+/// a daily-rolling file `jarvis.<date>.log` there, without colour codes. The file is capped
+/// at `info` whatever `RUST_LOG` says, so what was said (logged at `debug`) never reaches it.
+/// If the folder can't be created or the appender can't be built, stderr only, and no
+/// guard. Never panics.
 pub fn subscriber(
     dir: Option<&Path>,
 ) -> (
@@ -47,7 +50,16 @@ pub fn subscriber(
 ) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    subscriber_with(dir, filter)
+}
 
+fn subscriber_with(
+    dir: Option<&Path>,
+    stderr_filter: tracing_subscriber::EnvFilter,
+) -> (
+    impl tracing::Subscriber + Send + Sync + 'static,
+    Option<WorkerGuard>,
+) {
     let (writer, guard) = match dir.and_then(open_appender) {
         Some(appender) => {
             let (writer, guard) = tracing_appender::non_blocking(appender);
@@ -59,11 +71,12 @@ pub fn subscriber(
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .with_writer(w)
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO)
     });
+    let stderr_layer = tracing_subscriber::fmt::layer().with_filter(stderr_filter);
 
     let subscriber = tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(stderr_layer)
         .with(file_layer);
     (subscriber, guard)
 }
@@ -91,12 +104,13 @@ pub fn init(dir: Option<&Path>) -> Option<WorkerGuard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_subscriber::EnvFilter;
 
     #[test]
     fn writes_a_line_into_the_logs_folder() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("logs");
-        let (sub, guard) = subscriber(Some(&dir));
+        let (sub, guard) = subscriber_with(Some(&dir), EnvFilter::new("info"));
         assert!(guard.is_some());
         tracing::subscriber::with_default(sub, || {
             tracing::info!("marker-7f3a91c2");
@@ -114,6 +128,27 @@ mod tests {
         let text = String::from_utf8_lossy(&text);
         assert!(text.contains("marker-7f3a91c2"), "{text}");
         assert!(!text.contains('\u{1b}'), "colour codes in the file");
+    }
+
+    #[test]
+    fn the_file_never_records_debug_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("logs");
+        // stderr would allow debug; the file must not.
+        let (sub, guard) = subscriber_with(Some(&dir), EnvFilter::new("debug"));
+        tracing::subscriber::with_default(sub, || {
+            tracing::debug!("debug-marker-5d2e");
+            tracing::info!("info-marker-8b41");
+        });
+        drop(guard);
+        let mut text = String::new();
+        for e in std::fs::read_dir(&dir).unwrap() {
+            text.push_str(&String::from_utf8_lossy(
+                &std::fs::read(e.unwrap().path()).unwrap(),
+            ));
+        }
+        assert!(text.contains("info-marker-8b41"), "{text}");
+        assert!(!text.contains("debug-marker-5d2e"), "{text}");
     }
 
     #[test]
