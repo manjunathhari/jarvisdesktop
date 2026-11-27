@@ -4,6 +4,7 @@ mod announce;
 mod approvals;
 mod board;
 mod key;
+mod logfile;
 mod node_config;
 mod server_mode;
 
@@ -446,7 +447,7 @@ async fn prepare_ears(
         Box::new(whisper),
         speaking,
         Box::new(move |text| {
-            tracing::info!(%text, "heard");
+            tracing::debug!(%text, "heard");
             let (app, voice) = (decision_app.clone(), decision_voice.clone());
             if approvals::take_spoken_decision(&node, &text, true, move |line| {
                 speak_locally(&app, &voice, line)
@@ -523,11 +524,15 @@ fn bring_to_front(app: &AppHandle) {
 }
 
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // The context first: its identifier names the log folder, and logging starts before
+    // any app handle exists. The guard flushes the log file when `run` returns.
+    let context = tauri::generate_context!();
+    let log_dir = logfile::dir_for(&context.config().identifier);
+    let _log_guard = logfile::init(log_dir.as_deref());
+    match &log_dir {
+        Some(dir) => tracing::info!(path = %dir.display(), "log folder"),
+        None => tracing::warn!("no log folder: the per-user data folder is unknown"),
+    }
 
     tauri::Builder::default()
         // One JARVIS at a time (live check, 25 Nov): a second copy can't open the node's
@@ -544,7 +549,16 @@ pub fn run() {
                 .open_js_links_on_click(false)
                 .build(),
         )
-        .setup(|app| {
+        .setup(move |app| {
+            if let (Some(expected), Ok(data)) = (&log_dir, app.path().app_local_data_dir()) {
+                if *expected != data.join("logs") {
+                    tracing::warn!(
+                        log_folder = %expected.display(),
+                        app_data_logs = %data.join("logs").display(),
+                        "the log folder is not under the app data folder"
+                    );
+                }
+            }
             let cfg = SourcesConfig::default_config();
             let news = Arc::new(NewsModule::new(
                 cfg.feeds.clone(),
@@ -700,6 +714,6 @@ pub fn run() {
             board_say
         ])
         .on_window_event(board::on_window_event)
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running JARVIS");
 }
