@@ -474,7 +474,7 @@ def test_sandbox_image_is_pinned_and_keyless() -> None:
     )
     assert "COPY src /opt/jarvis/src" in lines
     assert [ln for ln in lines if ln.startswith("USER ")] == ["USER 10001:10001"]
-    assert "sk-ant" not in text and not re.search(r"^ENV .*KEY", text, re.MULTILINE)
+    assert "sk-ant" not in text and not re.search(r"KEY=\S", text)  # a KEY may only be blanked
     # The Linux libraries the desktop CI installs, so the sandbox can build the Tauri app.
     ci = (WORKFLOWS / "ci.yml").read_text()
     wanted = re.search(r"apt-get install -y (lib[^\n]+)", ci)
