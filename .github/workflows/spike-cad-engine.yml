@@ -1,0 +1,121 @@
+name: Spike - CAD engine measurement
+# Throwaway. Measures the CADCraft headless tool (third-party, early-stage code) on GitHub's
+# runners only. It does not build, test or deploy JARVIS, and it uses no secrets.
+# Design note: project doc claude/cad-board-spike-note.md. Runs only on its own branch.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [spike-cad-engine]
+    paths: ['spikes/cad-engine/**', '.github/workflows/spike-cad-engine.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spike-cad-engine
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CADCRAFT_VERSION: "0.12.0"
+      # From the release's SHA256SUMS.txt, read on 27 Nov 2026. A different file fails the job.
+      CADCRAFT_SHA256: 6ae27b9eabc3608caef356a00f69b9fdccbf1e408d6308b5614b6e6b256308de
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download the pinned release and verify its checksum
+        run: |
+          set -euo pipefail
+          file="cadcraft-${CADCRAFT_VERSION}-linux-x86_64.tar.gz"
+          curl -fsSL --retry 3 -o "$file" \
+            "https://github.com/storytold/cadcraft/releases/download/v${CADCRAFT_VERSION}/${file}"
+          echo "${CADCRAFT_SHA256}  ${file}" | sha256sum -c -
+          mkdir -p unpack out
+          tar -xzf "$file" -C unpack
+          cli="$(find unpack -type f -name cadcraft-cli | head -n 1)"
+          test -n "$cli"
+          install -m 0755 "$cli" spikes/cad-engine/cadcraft-cli
+
+      - name: Read facts from the file without running it
+        run: |
+          set -euo pipefail
+          cli=spikes/cad-engine/cadcraft-cli
+          objdump -p "$cli" | awk '/NEEDED/ {print $2}' > out/needed-libs.txt
+          { objdump -T "$cli" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1; } > out/glibc-needed.txt || true
+          stat -c %s "$cli" > out/cli-bytes.txt
+          cat out/needed-libs.txt
+
+      - name: Build the bare image and the trace image
+        run: |
+          set -euo pipefail
+          docker build -q -t cad-engine-spike spikes/cad-engine
+          docker build -q -t cad-engine-spike-trace --build-arg TRACE=1 spikes/cad-engine
+          docker image inspect cad-engine-spike --format '{{.Size}}' > out/image-bytes.txt
+
+      - name: One-shot run under trace, with no network
+        # Counts attempts to open an internet connection. With no network they cannot succeed.
+        run: |
+          set -uo pipefail
+          mkdir -p out/trace && chmod 777 out/trace
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m \
+            --cap-drop ALL --cap-add SYS_PTRACE --security-opt no-new-privileges \
+            -e HOME=/tmp -e XDG_CONFIG_HOME=/tmp -e XDG_CACHE_HOME=/tmp -e XDG_DATA_HOME=/tmp -e XDG_STATE_HOME=/tmp \
+            -v "$PWD/out/trace:/work" --entrypoint strace cad-engine-spike-trace \
+            -f -e trace=connect -o /work/connect.log \
+            /usr/local/bin/cadcraft-cli run --sample --export /work/sample.png \
+            > out/trace/stdout.txt 2> out/trace/stderr.txt
+          echo "$?" > out/trace/exit-code.txt
+          tail -n 5 out/trace/stderr.txt || true
+
+      - name: Gather the facts into one file
+        run: |
+          python3 - <<'EOF'
+          import json, pathlib
+          out = pathlib.Path("out")
+          def read(name):
+              p = out / name
+              return p.read_text().strip() if p.exists() else ""
+          def mb(name):
+              text = read(name)
+              return round(int(text) / 1048576, 1) if text.isdigit() else None
+          log = out / "trace" / "connect.log"
+          attempts = None
+          if log.exists():
+              attempts = sum(1 for line in log.read_text(errors="replace").splitlines()
+                             if "connect(" in line and ("AF_INET" in line))
+          sample = out / "trace" / "sample.png"
+          facts = {
+              "version": "0.12.0",
+              "cli_mb": mb("cli-bytes.txt"),
+              "image_mb": mb("image-bytes.txt"),
+              "needed_libs": [l for l in read("needed-libs.txt").splitlines() if l],
+              "glibc_needed": read("glibc-needed.txt") or None,
+              "network_connect_attempts": attempts,
+              "oneshot_note": "exit code %s, sample.png %s bytes" % (
+                  read("trace/exit-code.txt") or "?", sample.stat().st_size if sample.exists() else 0),
+          }
+          (out / "facts.json").write_text(json.dumps(facts, indent=2))
+          print(json.dumps(facts, indent=2))
+          EOF
+
+      - name: Measure over MCP
+        run: python3 spikes/cad-engine/measure.py --out out --image cad-engine-spike --facts out/facts.json
+
+      - name: Write the summary
+        if: always()
+        run: |
+          if [ -f out/summary.md ]; then cat out/summary.md >> "$GITHUB_STEP_SUMMARY"; else echo "No summary was produced." >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cad-engine-spike-results
+          path: out/
+          retention-days: 14
