@@ -480,9 +480,13 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             bring_to_front(app);
         }))
-        // Only for `board_open_link` (Rust side): no window is granted the plugin's own
-        // commands.
-        .plugin(tauri_plugin_opener::init())
+        // Only for `board_open_link` (Rust side). No window is granted the plugin's own
+        // commands, and its script that takes over link clicks in every page is left out.
+        .plugin(
+            tauri_plugin_opener::Builder::new()
+                .open_js_links_on_click(false)
+                .build(),
+        )
         .setup(|app| {
             let cfg = SourcesConfig::default_config();
             let news = Arc::new(NewsModule::new(

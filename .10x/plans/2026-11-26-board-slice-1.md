@@ -267,6 +267,15 @@ As in Plan B: contracts and the spec own shared interfaces. If the code shows a 
 - [ ] **Step 4: Run** vitest and `npm run build`. Expected: PASS.
 - [ ] **Step 5: Commit:** `desktop: Text frame`.
 
+**As built (commits `7a9a403` and the review-fix commit after it):**
+- `text.ts`: `renderText(content) -> string`, `linkTarget(raw) -> string | null`, `mountText(body, content, openLink, render?)`. `frames.ts` `fillBody(body, panel, render?)` uses it for kind `text`; a canvas panel is still shown as its source text until Task 8.
+- A link is `<a role="link" tabindex="0" data-href>` with no `href` (the Board never navigates), followed by its real address unless the link text is exactly that address. A link inside a link is text. A click or Enter calls the new command `board_open_link(url)`, which checks the address again in Rust (`jarvis-node` `board::view::openable_link(raw) -> Option<String>`) and opens the system browser through `tauri-plugin-opener`. **Changed from the plan:** `capabilities/board.json` is not touched; no window is granted the plugin's own commands, and its script that takes over link clicks in every page is switched off.
+- The address rules are the same in the page and the app and are tested against one shared list, `app/src/board/link-vectors.json`: lower-case `https://`, printable ASCII only, no quotes, angle brackets, `|`, `^`, backtick or backslash, every `%` a proper escape, no name or password, at most 2,048 characters. An address that fails stays visible as text.
+- No image is loaded: `[image: its description]` is shown instead.
+- Before anything goes into the page it is checked against a short list of allowed elements and attributes; anything else, or more than 40,000 elements, is a failed drawing ("This panel couldn't be shown.").
+- Code is coloured for nine languages only (bash, css, javascript, json, python, rust, sql, typescript, yaml), and only when it is at most 4,000 characters with no line over 300; otherwise it is shown plain. The review found one 30,000-byte code block that froze the page for over four minutes; a test now draws ten hostile 30,000-byte inputs in under 1.5 s each.
+- Left as they are: an https address on this PC or the home network opens like any other; a refused link shows "That link could not be opened."; the open-link command and the plugin are compiled only by Windows CI.
+
 ### Task 8: Sealed Canvas frame
 
 **Files:**

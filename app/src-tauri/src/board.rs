@@ -246,13 +246,13 @@ pub async fn board_clear_closed(node_slot: State<'_, NodeSlot>) -> Result<usize,
 /// The person clicked a link in a Text panel: open it in the system browser. Panel content is
 /// untrusted, so the address is checked here whatever the page already checked.
 #[tauri::command]
-pub fn board_open_link(app: AppHandle, url: String) -> Result<(), String> {
-    if !openable_link(&url) {
+pub async fn board_open_link(app: AppHandle, url: String) -> Result<(), String> {
+    let Some(address) = openable_link(&url) else {
         tracing::warn!("the Board asked to open an address that is not a plain https one");
         return Err("not_openable".to_owned());
-    }
+    };
     app.opener()
-        .open_url(url, None::<&str>)
+        .open_url(address, None::<&str>)
         .map_err(|e| e.to_string())
 }
 

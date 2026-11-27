@@ -572,28 +572,43 @@ pub mod view {
     /// The longest address the Board will hand to the system browser.
     pub const LINK_MAX: usize = 2048;
 
-    /// Whether a link clicked in a panel may be opened in the system browser. Panel content
-    /// is untrusted, and "open" on Windows runs whatever a string names (a program, a file,
-    /// a settings page), so only a plain web address passes: `https://`, then a host with no
-    /// name or password before it, and no space, control character or backslash anywhere.
-    pub fn openable_link(url: &str) -> bool {
-        if url.len() > LINK_MAX {
-            return false;
+    /// The address to open for a link clicked in a panel, or `None`. Panel content is
+    /// untrusted, and "open" on Windows runs whatever a string names (a program, a file, a
+    /// settings page), so only a plain web address passes. The page checks first with the
+    /// same rules (`text.ts` `linkTarget`; both are tested against `link-vectors.json`):
+    /// - at most 2,048 bytes, all printable ASCII, none of `" ' < > | ^` backtick or
+    ///   backslash, and every `%` followed by two hex digits;
+    /// - `https://` in lower case, then a host that starts with a letter, digit or `[`;
+    /// - no `@` and no `%` before the path (no name, no password, no disguised host);
+    /// - and a URL parser agrees it is an https address with a host.
+    pub fn openable_link(raw: &str) -> Option<String> {
+        if raw.len() > LINK_MAX || !raw.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+            return None;
         }
-        let Some(scheme) = url.get(..8) else {
-            return false;
-        };
-        if !scheme.eq_ignore_ascii_case("https://") {
-            return false;
+        if raw.contains(['"', '\'', '<', '>', '|', '^', '`', '\\']) {
+            return None;
         }
-        if url
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
-        {
-            return false;
+        let bytes = raw.as_bytes();
+        for (at, _) in raw.match_indices('%') {
+            let hex = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_hexdigit);
+            if !(hex(at + 1) && hex(at + 2)) {
+                return None;
+            }
         }
-        let rest = &url[8..];
-        let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-        !host.is_empty() && !host.contains('@')
+        let rest = raw.strip_prefix("https://")?;
+        let first = *rest.as_bytes().first()?;
+        if !(first.is_ascii_alphanumeric() || first == b'[') {
+            return None;
+        }
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if authority.contains(['@', '%']) {
+            return None;
+        }
+        let parsed = url::Url::parse(raw).ok()?;
+        let plain = parsed.scheme() == "https"
+            && parsed.host_str().is_some_and(|h| !h.is_empty())
+            && parsed.username().is_empty()
+            && parsed.password().is_none();
+        plain.then(|| raw.to_owned())
     }
 }

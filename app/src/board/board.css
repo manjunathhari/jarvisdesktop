@@ -434,6 +434,16 @@ button:focus-visible {
   outline-offset: 2px;
 }
 
+/* Writing-direction tricks in a link's text must not reach the address shown after it. */
+.text a,
+.text .address {
+  unicode-bidi: isolate;
+}
+
+.text .address {
+  direction: ltr;
+}
+
 .text .address,
 .text .no-image {
   color: var(--muted);

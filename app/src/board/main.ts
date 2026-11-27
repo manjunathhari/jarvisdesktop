@@ -3,7 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { fillBody } from "./frames";
+import { fillBody, LINK_REFUSED } from "./frames";
 import { tile } from "./layout";
 import { BoardModel, type BoardEvent, type BoardSnapshot, type PanelState } from "./model";
 import { formatRupees, renderClosed, renderDock, renderPanel } from "./panels";
@@ -205,6 +205,7 @@ async function load() {
   for (const event of waiting.splice(0)) onEvent(event);
 }
 
+document.addEventListener(LINK_REFUSED, () => problem("That link could not be opened."));
 await listen<BoardEvent>("jarvis://board", (e) => onEvent(e.payload));
 await load();
 new ResizeObserver(() => layout()).observe(area);

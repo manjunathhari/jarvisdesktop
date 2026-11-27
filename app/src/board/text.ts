@@ -8,15 +8,54 @@
 // - What is about to go into the page is checked once more, and anything unexpected is a
 //   failed drawing, not a drawn one.
 
-import hljs from "highlight.js/lib/common";
+import hljs from "highlight.js/lib/core";
+import bash from "highlight.js/lib/languages/bash";
+import css from "highlight.js/lib/languages/css";
+import javascript from "highlight.js/lib/languages/javascript";
+import json from "highlight.js/lib/languages/json";
+import python from "highlight.js/lib/languages/python";
+import rust from "highlight.js/lib/languages/rust";
+import sql from "highlight.js/lib/languages/sql";
+import typescript from "highlight.js/lib/languages/typescript";
+import yaml from "highlight.js/lib/languages/yaml";
 import MarkdownIt from "markdown-it";
 
-const LINK_MAX = 2048;
+// A short, fixed list: colouring is a nicety, and some grammars are slow on hostile input.
+for (const [name, grammar] of Object.entries({
+  bash,
+  css,
+  javascript,
+  json,
+  python,
+  rust,
+  sql,
+  typescript,
+  yaml,
+})) {
+  hljs.registerLanguage(name, grammar);
+}
 
-/// The address a link may open, or null: `https:` only, with a host, no name or password in
-/// it, no spaces or control characters, and not absurdly long.
+const LINK_MAX = 2048;
+/// Code longer than this, or with a longer line, is shown plain: colouring it could stall
+/// the Board (the work grows faster than the text).
+const HIGHLIGHT_MAX = 4000;
+const HIGHLIGHT_LINE_MAX = 300;
+/// More elements than this is a failed drawing, not a Board that stops answering.
+const ELEMENTS_MAX = 40_000;
+
+/// The address a link may open, or null. The app checks again with the same rules
+/// (`jarvis-node` `openable_link`; both are tested against `link-vectors.json`):
+/// - at most 2,048 characters, all printable ASCII, none of `" ' < > | ^` backtick or
+///   backslash, and every `%` followed by two hex digits;
+/// - `https://` in lower case, then a host that starts with a letter, digit or `[`;
+/// - no `@` and no `%` before the path (no name, no password, no disguised host);
+/// - and a URL parser agrees it is an https address with a host.
 export function linkTarget(raw: string): string | null {
-  if (raw.length > LINK_MAX || !/^https:\/\/[^\s\u0000-\u001f\u007f]+$/i.test(raw)) return null;
+  if (raw.length > LINK_MAX) return null;
+  if (!/^https:\/\/[A-Za-z0-9[][\x21-\x7e]*$/.test(raw)) return null;
+  if (/["'<>|^`\\]/.test(raw) || /%(?![0-9A-Fa-f]{2})/.test(raw)) return null;
+  const authority = raw.slice(8).split(/[/?#]/, 1)[0];
+  if (authority.includes("@") || authority.includes("%")) return null;
   let url: URL;
   try {
     url = new URL(raw);
@@ -32,7 +71,9 @@ const md = new MarkdownIt({
   linkify: false,
   typographer: false,
   highlight(code, language) {
-    if (language && hljs.getLanguage(language)) {
+    const colourable =
+      code.length <= HIGHLIGHT_MAX && code.split("\n").every((l) => l.length <= HIGHLIGHT_LINE_MAX);
+    if (colourable && language && hljs.getLanguage(language)) {
       try {
         return hljs.highlight(code, { language, ignoreIllegals: true }).value;
       } catch {
@@ -52,9 +93,15 @@ md.validateLink = (url) => linkTarget(url) !== null;
 let open: { link: boolean; shown: string | null }[] = [];
 
 md.renderer.rules.link_open = (tokens, idx) => {
-  const target = linkTarget(String(tokens[idx].attrGet("href") ?? ""));
-  // An address written out as its own link text needs no second showing.
-  const bare = tokens[idx + 1]?.type === "text" && tokens[idx + 1].content === target;
+  // A link inside a link is not a link: its text stays, inside the outer one.
+  const nested = open.some((o) => o.link);
+  const target = nested ? null : linkTarget(String(tokens[idx].attrGet("href") ?? ""));
+  // Only an address written out, whole and alone, as its own link text needs no second
+  // showing. Anything else gets the real address beside it.
+  const bare =
+    tokens[idx + 1]?.type === "text" &&
+    tokens[idx + 1].content === target &&
+    tokens[idx + 2]?.type === "link_close";
   open.push({ link: target !== null, shown: bare ? null : target });
   return target === null ? "" : `<a role="link" tabindex="0" data-href="${escape(target)}">`;
 };
@@ -92,7 +139,9 @@ const ATTRIBUTES = new Set(["class", "role", "tabindex", "data-href", "start"]);
 /// Refuse anything the renderer is never meant to produce. A belt to its braces.
 function check(fragment: DocumentFragment): void {
   if (fragment.querySelector(FORBIDDEN)) throw new Error("unexpected element");
-  for (const el of fragment.querySelectorAll("*")) {
+  const all = fragment.querySelectorAll("*");
+  if (all.length > ELEMENTS_MAX) throw new Error("too many elements");
+  for (const el of all) {
     for (const { name } of [...el.attributes]) {
       if (!ATTRIBUTES.has(name)) throw new Error("unexpected attribute");
     }
@@ -122,7 +171,7 @@ export function mountText(
   };
   text.addEventListener("click", follow);
   text.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") follow(event);
+    if (event.key === "Enter" && !event.repeat) follow(event);
   });
   body.replaceChildren(text);
 }

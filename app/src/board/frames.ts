@@ -5,9 +5,14 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Panel } from "./model";
 import { mountText, renderText } from "./text";
 
+/// Sent on `document` when a clicked link could not be opened, so the Board can say so.
+export const LINK_REFUSED = "board-link-refused";
+
 /// Ask the app to open an address in the system browser. The app checks it again.
 function openLink(url: string): void {
-  void invoke("board_open_link", { url }).catch(() => {});
+  void invoke("board_open_link", { url }).catch(() => {
+    document.dispatchEvent(new CustomEvent(LINK_REFUSED));
+  });
 }
 
 /// Draw `panel` into `body`. Resolves true once it is on the page, false if it could not be

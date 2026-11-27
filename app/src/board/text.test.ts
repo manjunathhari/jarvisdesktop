@@ -2,6 +2,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { fillBody } from "./frames";
 import type { Panel } from "./model";
+import vectors from "./link-vectors.json";
 import { linkTarget, mountText, renderText } from "./text";
 
 const dom = (content: string): HTMLElement => {
@@ -88,21 +89,89 @@ describe("renderText", () => {
 });
 
 describe("linkTarget", () => {
-  it("accepts only a plain https address", () => {
-    expect(linkTarget("https://example.org/a")).toBe("https://example.org/a");
-    for (const bad of [
-      "http://example.org",
-      "javascript:alert(1)",
-      "file:///C:/x",
-      "https://",
-      "https://user:pw@example.org/",
-      "https://exa mple.org",
-      " https://example.org",
-      "HTTPS://example.org\n",
-      "https://example.org/" + "a".repeat(2100),
+  it("accepts only a plain https address (the list the app's own check shares)", () => {
+    for (const good of vectors.open) expect(linkTarget(good), good).toBe(good);
+    for (const bad of vectors.refuse) expect(linkTarget(bad), JSON.stringify(bad)).toBeNull();
+    expect(linkTarget("https://example.org/" + "a".repeat(2100))).toBeNull();
+  });
+});
+
+describe("hostile content", () => {
+  it("always shows the real address when the link text is anything but exactly it", () => {
+    for (const source of [
+      "[https://paypal.co*m*/login](https://paypal.co)",
+      "[https://paypal.co`m`](https://paypal.co)",
+      "[https://paypal.co\\\nm](https://paypal.co)",
     ]) {
-      expect(linkTarget(bad), bad).toBeNull();
+      const box = dom(source);
+      expect(box.querySelector("a")?.dataset.href, source).toBe("https://paypal.co");
+      expect(box.querySelector(".address")?.textContent, source).toBe(" (https://paypal.co)");
     }
+    expect(dom("<https://example.org/a>").querySelector(".address")).toBeNull();
+  });
+
+  it("a link inside a link is text: one link, opening what its address says", () => {
+    const box = dom("[<https://evil.example>](https://good.example)");
+    const links = [...box.querySelectorAll<HTMLElement>("a")];
+    expect(links.map((a) => a.dataset.href)).toEqual(["https://good.example"]);
+    expect(links[0].textContent).toContain("evil.example");
+    expect(box.querySelector(".address")?.textContent).toBe(" (https://good.example)");
+  });
+
+  it("reference links, titles and encoded schemes give no other kind of link", () => {
+    const box = dom(
+      '[a][1] [b][2] [c](https://example.org "a title") [d](&#106;avascript:alert(1)) ' +
+        "[e](%6Aavascript:alert(1))\n\n[1]: https://example.org/ref\n[2]: javascript:alert(1)\n",
+    );
+    expect([...box.querySelectorAll<HTMLElement>("a")].map((a) => a.dataset.href)).toEqual([
+      "https://example.org/ref",
+      "https://example.org",
+    ]);
+    expect(box.querySelector("[title]")).toBeNull();
+  });
+
+  it("a fence's language cannot name a class of the Board", () => {
+    const box = dom('```panel confirm" onclick="x\ncode\n```');
+    const code = box.querySelector("pre code")!;
+    expect([...code.classList].every((c) => c.startsWith("language-"))).toBe(true);
+    expect(code.attributes.length).toBe(1);
+  });
+
+  it("draws 30,000 hostile bytes quickly", () => {
+    const fill = (unit: string) => unit.repeat(Math.floor(29_900 / unit.length));
+    const cases = [
+      "```markdown\n" + fill("[a](") + "\n```",
+      "```md\n" + fill("[a](") + "\n```",
+      "```js\n" + fill("a") + "\n```",
+      "```python\n" + fill("0_") + "\n```",
+      "```json\n" + fill('{"a":') + "\n```",
+      fill("> "),
+      fill("*a "),
+      fill("[a]("),
+      fill("|a") + "\n|-|\n",
+      fill("- a\n  "),
+    ];
+    for (const content of cases) {
+      const started = performance.now();
+      renderText(content);
+      expect(performance.now() - started, content.slice(0, 16)).toBeLessThan(1500);
+    }
+  });
+
+  it("a page too large to draw is a failed drawing, not a frozen Board", () => {
+    const body = document.createElement("div");
+    const huge = "<p>x</p>".repeat(40_001);
+    expect(() => mountText(body, "x", () => {}, () => huge)).toThrow();
+  });
+
+  it("a held Enter key opens a link once", () => {
+    const body = document.createElement("div");
+    const open = vi.fn();
+    mountText(body, "[good](https://example.org/a)", open);
+    const link = body.querySelector<HTMLElement>("a")!;
+    link.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    link.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, repeat: true }));
+    expect(open).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -6,6 +6,7 @@ license.workspace = true
 description = "The JARVIS desktop node: the Phase 2 protocol, journal and actions (Plan B)."
 
 [dependencies]
+url = "2"
 jarvis-core.workspace = true
 async-trait.workspace = true
 serde.workspace = true
