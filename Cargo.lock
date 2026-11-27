@@ -2303,6 +2303,7 @@ dependencies = [
  "bzip2 0.5.2",
  "futures",
  "reqwest 0.12.28",
+ "sha2 0.10.9",
  "tar",
  "tempfile",
  "tokio",
@@ -2312,9 +2313,16 @@ dependencies = [
 name = "jarvis-helper"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bzip2 0.5.2",
  "jarvis-core",
+ "jarvis-fetch",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 

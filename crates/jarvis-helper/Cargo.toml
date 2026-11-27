@@ -7,9 +7,18 @@ description = "The app's half of the voice helper bridge: JSON-lines link, Helpe
 
 [dependencies]
 jarvis-core.workspace = true
+jarvis-fetch.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+tar = "0.4"
+bzip2 = "0.5"
+sha2.workspace = true
+tempfile = "3"
 
 [[bin]]
 name = "fake-helper"

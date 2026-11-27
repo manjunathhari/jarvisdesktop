@@ -71,6 +71,76 @@ pub async fn ensure_archive(
     dl: &dyn Download,
     percent: &(dyn Fn(u8) + Send + Sync),
 ) -> Result<PathBuf, String> {
+    install_archive(
+        models_dir, dir_name, url, inner, required, None, dl, percent,
+    )
+    .await
+}
+
+/// Like [`ensure_archive`], but for an archive the app will RUN: once the download finishes,
+/// and before anything is unpacked, the file's SHA-256 is compared with `sha256_hex` (64 hex
+/// characters, either case). On a mismatch the file is deleted, nothing is unpacked or marked
+/// complete, and the error is `the {dir_name} download failed its integrity check`; the next
+/// call downloads again. A malformed `sha256_hex` is rejected before any download.
+#[allow(clippy::too_many_arguments)]
+pub async fn ensure_archive_checked(
+    models_dir: &Path,
+    dir_name: &str,
+    url: &str,
+    inner: &str,
+    required: &[&str],
+    sha256_hex: &str,
+    dl: &dyn Download,
+    percent: &(dyn Fn(u8) + Send + Sync),
+) -> Result<PathBuf, String> {
+    if sha256_hex.len() != 64 || !sha256_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("the expected SHA-256 must be exactly 64 hexadecimal characters".to_string());
+    }
+    install_archive(
+        models_dir,
+        dir_name,
+        url,
+        inner,
+        required,
+        Some(sha256_hex),
+        dl,
+        percent,
+    )
+    .await
+}
+
+/// SHA-256 of a file as lower-case hex, read in chunks (never the whole file in memory).
+fn file_sha256_hex(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn install_archive(
+    models_dir: &Path,
+    dir_name: &str,
+    url: &str,
+    inner: &str,
+    required: &[&str],
+    expected_sha256: Option<&str>,
+    dl: &dyn Download,
+    percent: &(dyn Fn(u8) + Send + Sync),
+) -> Result<PathBuf, String> {
     let dir = models_dir.join(dir_name);
     if dir.join(COMPLETE_MARKER).is_file() {
         return Ok(dir);
@@ -86,6 +156,21 @@ pub async fn ensure_archive(
     if let Err(e) = downloaded {
         let _ = std::fs::remove_file(&archive);
         return Err(e);
+    }
+
+    if let Some(expected) = expected_sha256 {
+        let path = archive.clone();
+        let actual = tokio::task::spawn_blocking(move || file_sha256_hex(&path))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r);
+        let matches = matches!(&actual, Ok(a) if a.eq_ignore_ascii_case(expected));
+        if !matches {
+            let _ = std::fs::remove_file(&archive);
+            return Err(format!(
+                "the {dir_name} download failed its integrity check"
+            ));
+        }
     }
 
     let staging = models_dir.join(format!(".unpacking-{dir_name}"));
@@ -451,5 +536,105 @@ mod tests {
         let err = ensure(tmp.path(), "u", &fake(Some(b"not bzip2".to_vec())), &|_| {}).await;
         assert!(err.is_err());
         assert!(!is_ready(tmp.path()));
+    }
+
+    // ── the integrity check ──────────────────────────────────────
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    async fn checked(dir: &Path, hash: &str, dl: &dyn Download) -> Result<PathBuf, String> {
+        ensure_archive_checked(
+            dir,
+            KOKORO_DIR,
+            "u",
+            KOKORO_DIR,
+            REQUIRED,
+            hash,
+            dl,
+            &|_| {},
+        )
+        .await
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_matching_hash_installs_and_marks_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bytes = archive(REQUIRED);
+        let dl = fake(Some(bytes.clone()));
+        let dir = checked(tmp.path(), &sha256_hex(&bytes), &dl).await.unwrap();
+        assert!(dir.join("model.onnx").is_file());
+        assert!(dir.join(COMPLETE_MARKER).is_file());
+        assert_eq!(entries(tmp.path()), vec![KOKORO_DIR.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_hash_installs_nothing_and_leaves_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = fake(Some(archive(REQUIRED)));
+        let err = checked(tmp.path(), &"0".repeat(64), &dl).await.unwrap_err();
+        assert_eq!(
+            err,
+            format!("the {KOKORO_DIR} download failed its integrity check")
+        );
+        assert!(entries(tmp.path()).is_empty(), "{:?}", entries(tmp.path()));
+        assert!(!tmp.path().join(KOKORO_DIR).exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_install_is_retried_on_the_next_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bytes = archive(REQUIRED);
+        let dl = fake(Some(bytes.clone()));
+        assert!(checked(tmp.path(), &"0".repeat(64), &dl).await.is_err());
+        let dir = checked(tmp.path(), &sha256_hex(&bytes), &dl).await.unwrap();
+        assert!(dir.join(COMPLETE_MARKER).is_file());
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_hash_that_is_not_64_hex_characters_is_rejected_without_downloading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = fake(Some(archive(REQUIRED)));
+        let too_short = "abc123";
+        let not_hex = format!("{}g", "a".repeat(63));
+        for bad in [too_short, not_hex.as_str(), ""] {
+            let err = checked(tmp.path(), bad, &dl).await.unwrap_err();
+            assert!(err.contains("SHA-256"), "{err}");
+        }
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 0);
+        assert!(entries(tmp.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_upper_case_hash_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bytes = archive(REQUIRED);
+        let dl = fake(Some(bytes.clone()));
+        let hash = sha256_hex(&bytes).to_ascii_uppercase();
+        assert!(checked(tmp.path(), &hash, &dl).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_already_complete_folder_is_not_downloaded_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bytes = archive(REQUIRED);
+        let dl = fake(Some(bytes.clone()));
+        checked(tmp.path(), &sha256_hex(&bytes), &dl).await.unwrap();
+        // Even a hash that would fail is not consulted: nothing is fetched.
+        checked(tmp.path(), &"0".repeat(64), &dl).await.unwrap();
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 1);
     }
 }
