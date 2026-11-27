@@ -318,6 +318,19 @@ def run(args: argparse.Namespace) -> dict:
     results["dimension_typed_ok"] = dim_ok
 
     if "list_commands" in names:
+        # The whole command catalogue, for choosing the commands Jarvis may use (slice 0).
+        full_reply, _ = client.request("tools/call", {"name": "list_commands", "arguments": {}}, timeout=60)
+        full_text = "\n".join(
+            c.get("text", "") for c in (full_reply or {}).get("result", {}).get("content", []) if c.get("type") == "text"
+        )
+        (out / "commands-all.json").write_text(full_text)
+        catalogue = as_json(full_text)
+        if isinstance(catalogue, list):
+            results["catalogue"] = [
+                f"{c.get('id')} | {','.join(c.get('aliases') or [])} | {c.get('params') or ''}"
+                for c in catalogue
+                if isinstance(c, dict)
+            ]
         for word in ("text", "dim"):
             _, listing, _ = call("list_commands", {"filter": word}, f"list commands matching '{word}'")
             (out / f"commands-{word}.json").write_text(listing)
@@ -423,10 +436,14 @@ def main() -> None:
     facts = json.loads(Path(args.facts).read_text()) if args.facts and Path(args.facts).exists() else {}
     results = run(args)
     pictures = results.pop("log_pictures", {})
+    catalogue = results.pop("catalogue", [])
     Path(args.out, "measurements.json").write_text(json.dumps({"facts": facts, "results": results}, indent=2))
     text = summary(results, facts)
     Path(args.out, "summary.md").write_text(text)
     print(text)
+    print(f"CATALOGUE {len(catalogue)} commands")
+    for line in catalogue:
+        print(f"CMD {line}"[:600])
     # The small pictures, as base64 lines in the log only (fictional drawing; nothing private).
     for name, data in pictures.items():
         for start_at in range(0, len(data), 3000):
