@@ -5,6 +5,7 @@ pub mod install;
 pub mod link;
 pub mod process;
 pub mod protocol;
+pub mod voice_config;
 
 pub use link::{HelperLink, HelperVoice, LinkEvent};
 pub use process::{spawn, Running};
