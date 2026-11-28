@@ -297,6 +297,12 @@ impl VoiceOps for AppVoiceOps {
             Ok(Err(e)) => return Err(format!("couldn't load the voice: {e}")),
             Err(e) => return Err(format!("voice loader crashed: {e}")),
         };
+        // Voice::start can't report a missing output device, so check for one first.
+        match tokio::task::spawn_blocking(|| Speaker::open().map(drop)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("no sound output: {e}")),
+            Err(e) => return Err(format!("no sound output: {e}")),
+        }
         let voice: Arc<dyn Speaks> = Arc::new(Voice::start(
             Box::new(engine),
             Box::new(|| Speaker::open().map(|s| Box::new(s) as Box<dyn AudioOut>)),
