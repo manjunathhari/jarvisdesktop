@@ -852,7 +852,7 @@ def test_installer_publishes_only_from_main() -> None:
     assert release["jobs"]["build"]["if"] == "github.ref == 'refs/heads/main'"
 
 
-def test_server_ci_builds_the_sandbox_image_without_pushing() -> None:
+def test_server_ci_builds_the_sandbox_image_in_its_tests() -> None:
     import fnmatch
 
     workflow = _workflow("server.yml")
@@ -863,8 +863,23 @@ def test_server_ci_builds_the_sandbox_image_without_pushing() -> None:
     runs = [s.get("run", "") for s in steps]
     build = [r for r in runs if "deploy/improve/sandbox.Dockerfile" in r]
     assert build == ["docker build -f deploy/improve/sandbox.Dockerfile --tag jarvis-sandbox:ci ."]
-    text = (WORKFLOWS / "server.yml").read_text()
-    assert "jarvis-sandbox" not in text.split("publish:", 1)[1]  # never published from here
+
+
+def test_main_publishes_the_sandbox_image_compose_pulls_after_the_tests_pass() -> None:
+    # compose runs ghcr.io/manjunathhari/jarvis-sandbox:${JARVIS_REF}, so main publishes it
+    # with the same commit tag as the server image, and nothing else ever does.
+    publish = _workflow("server.yml")["jobs"]["publish"]
+    assert publish["needs"] == "test"
+    assert publish["if"] == "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    pushes = [s["with"] for s in publish["steps"] if "build-push-action" in s.get("uses", "")]
+    by_tag = {w["tags"]: w for w in pushes}
+    sandbox = by_tag["ghcr.io/manjunathhari/jarvis-sandbox:${{ github.sha }}"]
+    assert sandbox["context"] == "server"
+    assert sandbox["file"] == "server/deploy/improve/sandbox.Dockerfile"
+    assert sandbox["push"] is True
+    assert "ghcr.io/manjunathhari/jarvis-server:${{ github.sha }}" in by_tag
+    test_job = (WORKFLOWS / "server.yml").read_text().split("\n  publish:", 1)[0]
+    assert "docker push" not in test_job and "push: true" not in test_job
 
 
 def test_server_ci_runs_the_key_check_and_the_dry_run_inside_the_sandbox_image() -> None:

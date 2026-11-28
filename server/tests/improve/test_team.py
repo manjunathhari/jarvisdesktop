@@ -214,3 +214,12 @@ def test_every_resource_a_vendored_skill_names_is_vendored_too() -> None:
         root = text_file.relative_to(plugins).parts[0]
         for ref in re.findall(r"resources/[A-Za-z0-9_./-]*[A-Za-z0-9_/]", text_file.read_text()):
             assert (plugins / root / ref).exists(), f"{text_file.name} names {ref}"
+
+
+def test_the_design_lead_knows_its_design_is_published_in_a_public_pr() -> None:
+    # The repo is public: the design's prose becomes the PR description, so a paraphrase of
+    # Manj's conversations would be public too, and the gate only catches verbatim quotes.
+    text = team.prompt("design_lead")
+    assert "The design is for Manj" not in text
+    assert "public pull request" in text
+    assert "don't describe what Manj said" in text
