@@ -28,6 +28,7 @@
 //! | `tts_chunk` | `"sentence"` | `"sentence"` |
 //! | `first_chunk_max_words` | 12 | 0 to 50 |
 //! | `sentence_gap_ms` | 0 | 0 to 1000 |
+//! | `sample_rate_hz` | 24000 | 24000 only (Kokoro's rate; changes nothing) |
 //! | `echo_cancellation` | true | true or false |
 //! | `mic_open_while_speaking` | true | true or false |
 //! | `follow_up_window_s` | 0 | 0 to 3600 |
@@ -64,6 +65,7 @@ pub struct VoiceConfig {
     pub tts_chunk: String,
     pub first_chunk_max_words: u32,
     pub sentence_gap_ms: u32,
+    pub sample_rate_hz: u32,
     pub echo_cancellation: bool,
     pub mic_open_while_speaking: bool,
     pub follow_up_window_s: u32,
@@ -92,6 +94,7 @@ impl Default for VoiceConfig {
             tts_chunk: "sentence".to_string(),
             first_chunk_max_words: 12,
             sentence_gap_ms: 0,
+            sample_rate_hz: 24000,
             echo_cancellation: true,
             mic_open_while_speaking: true,
             follow_up_window_s: 0,
@@ -106,6 +109,8 @@ impl Default for VoiceConfig {
 enum Kind {
     Float(f64, f64, fn(&mut VoiceConfig) -> &mut f32),
     Int(u32, u32, fn(&mut VoiceConfig) -> &mut u32),
+    /// Exactly one whole number is accepted; the key exists so the file keeps its shape.
+    Only(u32, fn(&mut VoiceConfig) -> &mut u32),
     Bool(fn(&mut VoiceConfig) -> &mut bool),
     Engine(fn(&mut VoiceConfig) -> &mut VoiceEngine),
     Chunk(fn(&mut VoiceConfig) -> &mut String),
@@ -114,7 +119,7 @@ enum Kind {
 
 const PHRASE_MAX: usize = 40;
 
-const KEYS: [(&str, Kind); 23] = [
+const KEYS: [(&str, Kind); 24] = [
     ("voice_engine", Kind::Engine(|c| &mut c.voice_engine)),
     (
         "vad_threshold",
@@ -159,6 +164,10 @@ const KEYS: [(&str, Kind); 23] = [
     (
         "sentence_gap_ms",
         Kind::Int(0, 1000, |c| &mut c.sentence_gap_ms),
+    ),
+    (
+        "sample_rate_hz",
+        Kind::Only(24000, |c| &mut c.sample_rate_hz),
     ),
     (
         "echo_cancellation",
@@ -208,6 +217,16 @@ fn apply(cfg: &mut VoiceConfig, kind: &Kind, value: &toml::Value) -> Result<(), 
             }
             _ => Err(format!(
                 "must be a whole number between {min} and {max}; using {}",
+                *field(&mut default)
+            )),
+        },
+        Kind::Only(only, field) => match value {
+            Value::Integer(i) if i64::from(*only) == *i => {
+                *field(cfg) = *only;
+                Ok(())
+            }
+            _ => Err(format!(
+                "only {only} is supported (the voice is made at that rate); using {}",
                 *field(&mut default)
             )),
         },
@@ -362,6 +381,7 @@ mod tests {
         assert_eq!(d.tts_chunk, "sentence");
         assert_eq!(d.first_chunk_max_words, 12);
         assert_eq!(d.sentence_gap_ms, 0);
+        assert_eq!(d.sample_rate_hz, 24000);
         assert!(d.echo_cancellation);
         assert!(d.mic_open_while_speaking);
         assert_eq!(d.follow_up_window_s, 0);
@@ -391,6 +411,7 @@ tts_speed = 1.25
 tts_chunk = "sentence"
 first_chunk_max_words = 10
 sentence_gap_ms = 100
+sample_rate_hz = 24000
 echo_cancellation = false
 mic_open_while_speaking = false
 follow_up_window_s = 15
@@ -420,6 +441,7 @@ ignore_noise_min_words = 3
                 tts_chunk: "sentence".into(),
                 first_chunk_max_words: 10,
                 sentence_gap_ms: 100,
+                sample_rate_hz: 24000,
                 echo_cancellation: false,
                 mic_open_while_speaking: false,
                 follow_up_window_s: 15,
@@ -427,6 +449,91 @@ ignore_noise_min_words = 3
                 ignore_noise_min_words: 3,
             }
         );
+    }
+
+    #[test]
+    fn the_owners_recommended_block_loads_with_no_warning_and_equals_the_defaults() {
+        let (cfg, warnings) = load_text(
+            r##"# JARVIS voice settings (starting values)
+
+# Speech detection (Silero VAD)
+vad_threshold            = 0.5      # 0.6 if the room is noisy
+vad_min_speech_ms        = 250
+vad_pre_roll_ms          = 300      # keep audio from just before speech starts
+
+# End of your turn
+end_of_turn_silence_ms   = 700      # 900 if it cuts you off mid-thought
+max_turn_s               = 30
+
+# Barge-in and fade
+duck_on_speech           = true
+duck_volume              = 0.3      # George drops to 30%
+duck_fade_ms             = 80
+barge_in_after_ms        = 300      # speech this long stops George
+stop_fade_ms             = 60
+resume_if_false_alarm    = true     # cough or "mm-hm": back to full
+resume_fade_ms           = 250
+
+# Speaking (Kokoro George)
+tts_speed                = 1.0
+tts_chunk                = "sentence"   # make the next sentence while one plays
+first_chunk_max_words    = 12           # faster first word
+sentence_gap_ms          = 0
+sample_rate_hz           = 24000
+
+# Mic while speaking
+echo_cancellation        = true
+mic_open_while_speaking  = true
+
+# Staying awake
+follow_up_window_s       = 0        # 0 = never sleeps
+sleep_phrase             = "go to sleep"
+ignore_noise_min_words   = 2"##,
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg, VoiceConfig::default());
+        // The 22 keys of the block, one literal each, so a changed default cannot agree with itself.
+        assert_eq!(cfg.vad_threshold, 0.5);
+        assert_eq!(cfg.vad_min_speech_ms, 250);
+        assert_eq!(cfg.vad_pre_roll_ms, 300);
+        assert_eq!(cfg.end_of_turn_silence_ms, 700);
+        assert_eq!(cfg.max_turn_s, 30);
+        assert!(cfg.duck_on_speech);
+        assert_eq!(cfg.duck_volume, 0.3);
+        assert_eq!(cfg.duck_fade_ms, 80);
+        assert_eq!(cfg.barge_in_after_ms, 300);
+        assert_eq!(cfg.stop_fade_ms, 60);
+        assert!(cfg.resume_if_false_alarm);
+        assert_eq!(cfg.resume_fade_ms, 250);
+        assert_eq!(cfg.tts_speed, 1.0);
+        assert_eq!(cfg.tts_chunk, "sentence");
+        assert_eq!(cfg.first_chunk_max_words, 12);
+        assert_eq!(cfg.sentence_gap_ms, 0);
+        assert_eq!(cfg.sample_rate_hz, 24000);
+        assert!(cfg.echo_cancellation);
+        assert!(cfg.mic_open_while_speaking);
+        assert_eq!(cfg.follow_up_window_s, 0);
+        assert_eq!(cfg.sleep_phrase, "go to sleep");
+        assert_eq!(cfg.ignore_noise_min_words, 2);
+    }
+
+    #[test]
+    fn sample_rate_hz_accepts_only_24000() {
+        let (cfg, warnings) = load_text("sample_rate_hz = 24000\n");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg.sample_rate_hz, 24000);
+        for text in [
+            "sample_rate_hz = 16000",
+            "sample_rate_hz = 48000",
+            "sample_rate_hz = 0",
+            "sample_rate_hz = \"24000\"",
+            "sample_rate_hz = 24000.0",
+        ] {
+            assert_one_warning_for(text, "sample_rate_hz");
+            let (cfg, warnings) = load_text(text);
+            assert_eq!(cfg.sample_rate_hz, 24000, "{text}");
+            assert!(warnings[0].contains("only 24000"), "{warnings:?}");
+        }
     }
 
     #[test]
