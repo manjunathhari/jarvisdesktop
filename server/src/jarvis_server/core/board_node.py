@@ -200,7 +200,7 @@ UPDATE ops.job SET run_at = now()
 WHERE kind = 'board.headline' AND status = 'QUEUED' AND payload->>'job_key' = %(reply)s
   AND NOT EXISTS (
       SELECT 1 FROM conv.stream_chunk k WHERE k.reply_id = %(reply)s::uuid AND k.type = 'ACTION'
-        AND k.authz->'object'->>'action_kind' <> 'board.content'
+        AND k.authz->'object'->>'action_kind' IS DISTINCT FROM 'board.content'
         AND NOT EXISTS (
             SELECT 1 FROM comm.event e WHERE e.subject_type = 'stream'
               AND e.subject_id = k.reply_id::text || ':' || k.seq::text

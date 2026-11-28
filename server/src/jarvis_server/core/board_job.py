@@ -575,7 +575,8 @@ def say_headline(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     row = conn.execute(
         # A drawing's `board.content` chunks carry its picture, not a panel: never counted.
         "SELECT (SELECT count(*) FROM conv.stream_chunk WHERE reply_id = %(r)s"
-        "        AND type = 'ACTION' AND authz->'object'->>'action_kind' <> 'board.content'),"
+        "        AND type = 'ACTION'"
+        "        AND authz->'object'->>'action_kind' IS DISTINCT FROM 'board.content'),"
         " (SELECT count(DISTINCT subject_id) FROM comm.event WHERE kind = 'board.rendered'"
         "  AND subject_type = 'stream' AND subject_id LIKE %(like)s)",
         {"r": reply_id, "like": f"{reply_id}:%"},
