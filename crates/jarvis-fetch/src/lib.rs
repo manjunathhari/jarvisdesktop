@@ -93,9 +93,7 @@ pub async fn ensure_archive_checked(
     dl: &dyn Download,
     percent: &(dyn Fn(u8) + Send + Sync),
 ) -> Result<PathBuf, String> {
-    if sha256_hex.len() != 64 || !sha256_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("the expected SHA-256 must be exactly 64 hexadecimal characters".to_string());
-    }
+    check_sha256_format(sha256_hex)?;
     install_archive(
         models_dir,
         dir_name,
@@ -107,6 +105,14 @@ pub async fn ensure_archive_checked(
         percent,
     )
     .await
+}
+
+/// A pin must be exactly 64 hexadecimal characters (either case).
+fn check_sha256_format(sha256_hex: &str) -> Result<(), String> {
+    if sha256_hex.len() != 64 || !sha256_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("the expected SHA-256 must be exactly 64 hexadecimal characters".to_string());
+    }
+    Ok(())
 }
 
 /// SHA-256 of a file as lower-case hex, read in chunks (never the whole file in memory).
@@ -224,6 +230,49 @@ pub async fn ensure_files(
     dl: &dyn Download,
     percent: &(dyn Fn(u8) + Send + Sync),
 ) -> Result<PathBuf, String> {
+    let files: Vec<(&str, &str, Option<&str>)> =
+        files.iter().map(|f| (f.url, f.name, None)).collect();
+    install_files(models_dir, dir_name, &files, dl, percent).await
+}
+
+/// One file fetched individually whose SHA-256 is pinned.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CheckedFile {
+    pub url: &'static str,
+    pub name: &'static str,
+    pub sha256: &'static str,
+}
+
+/// Like [`ensure_files`], but for files the app will LOAD: each file is downloaded to
+/// `<name>.part`, its SHA-256 compared with its pin (64 hex characters, either case), and only
+/// on a match renamed into place. On a mismatch the `.part` is deleted, nothing is marked
+/// complete, files verified earlier stay, and the error is
+/// `the {dir_name} download failed its integrity check`; the next call fetches again. Every
+/// pin is validated before anything is downloaded. A complete folder is returned as is.
+pub async fn ensure_files_checked(
+    models_dir: &Path,
+    dir_name: &str,
+    files: &[CheckedFile],
+    dl: &dyn Download,
+    percent: &(dyn Fn(u8) + Send + Sync),
+) -> Result<PathBuf, String> {
+    for f in files {
+        check_sha256_format(f.sha256)?;
+    }
+    let files: Vec<(&str, &str, Option<&str>)> = files
+        .iter()
+        .map(|f| (f.url, f.name, Some(f.sha256)))
+        .collect();
+    install_files(models_dir, dir_name, &files, dl, percent).await
+}
+
+async fn install_files(
+    models_dir: &Path,
+    dir_name: &str,
+    files: &[(&str, &str, Option<&str>)],
+    dl: &dyn Download,
+    percent: &(dyn Fn(u8) + Send + Sync),
+) -> Result<PathBuf, String> {
     let dir = models_dir.join(dir_name);
     if dir.join(COMPLETE_MARKER).is_file() {
         return Ok(dir);
@@ -231,12 +280,12 @@ pub async fn ensure_files(
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let n = files.len().max(1) as u64;
     let last = std::sync::atomic::AtomicU8::new(0);
-    for (i, f) in files.iter().enumerate() {
-        let target = dir.join(f.name);
+    for (i, (url, name, expected_sha256)) in files.iter().enumerate() {
+        let target = dir.join(name);
         if target.is_file() {
-            continue; // finished on an earlier attempt
+            continue; // finished (and verified, if pinned) on an earlier attempt
         }
-        let part = dir.join(format!("{}.part", f.name));
+        let part = dir.join(format!("{name}.part"));
         let report = |done: u64, total: Option<u64>| {
             if let Some(t) = total.filter(|t| *t > 0) {
                 let p = ((i as u64 * 100 + done.min(t) * 100 / t) / n) as u8;
@@ -246,9 +295,23 @@ pub async fn ensure_files(
                 }
             }
         };
-        if let Err(e) = dl.download(f.url, &part, &report).await {
+        if let Err(e) = dl.download(url, &part, &report).await {
             let _ = std::fs::remove_file(&part);
             return Err(e);
+        }
+        if let Some(expected) = expected_sha256 {
+            let path = part.clone();
+            let actual = tokio::task::spawn_blocking(move || file_sha256_hex(&path))
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+            let matches = matches!(&actual, Ok(a) if a.eq_ignore_ascii_case(expected));
+            if !matches {
+                let _ = std::fs::remove_file(&part);
+                return Err(format!(
+                    "the {dir_name} download failed its integrity check"
+                ));
+            }
         }
         std::fs::rename(&part, &target).map_err(|e| e.to_string())?;
     }
@@ -636,5 +699,159 @@ mod tests {
         // Even a hash that would fail is not consulted: nothing is fetched.
         checked(tmp.path(), &"0".repeat(64), &dl).await.unwrap();
         assert_eq!(dl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ── individual files with pinned hashes ──────────────────────
+
+    /// A pinned file whose expected content is its own URL text (what `UrlEcho` writes).
+    /// Leaks the hash: fine in a test.
+    fn pinned(url: &'static str, name: &'static str) -> CheckedFile {
+        CheckedFile {
+            url,
+            name,
+            sha256: Box::leak(sha256_hex(url.as_bytes()).into_boxed_str()),
+        }
+    }
+
+    fn echo(fail: Vec<&'static str>) -> UrlEcho {
+        UrlEcho {
+            fail,
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    const MISMATCH: &str = "the whisper download failed its integrity check";
+
+    #[tokio::test]
+    async fn checked_files_with_matching_hashes_install_and_mark_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = [
+            pinned("https://x/encoder", "encoder.onnx"),
+            pinned("https://x/decoder", "decoder.onnx"),
+        ];
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let dl = echo(vec![]);
+        let dir = ensure_files_checked(tmp.path(), "whisper", &files, &dl, &move |p| {
+            s.lock().unwrap().push(p)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("decoder.onnx")).unwrap(),
+            "https://x/decoder"
+        );
+        assert!(dir.join(COMPLETE_MARKER).is_file());
+        let mut names = entries(&dir);
+        names.sort();
+        assert_eq!(names, vec![".complete", "decoder.onnx", "encoder.onnx"]);
+        assert_eq!(seen.lock().unwrap().last(), Some(&100));
+        // A complete folder is returned without another download.
+        ensure_files_checked(tmp.path(), "whisper", &files, &dl, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_checked_file_with_a_wrong_hash_is_deleted_and_nothing_is_marked_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut files = [
+            pinned("https://x/encoder", "encoder.onnx"),
+            pinned("https://x/decoder", "decoder.onnx"),
+        ];
+        files[1].sha256 = "0".repeat(64).leak();
+        let err = ensure_files_checked(tmp.path(), "whisper", &files, &echo(vec![]), &|_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(err, MISMATCH);
+        let dir = tmp.path().join("whisper");
+        assert!(!dir.join("decoder.onnx").exists());
+        assert!(!dir.join("decoder.onnx.part").exists());
+        assert!(!dir.join(COMPLETE_MARKER).exists());
+
+        let good = [
+            pinned("https://x/encoder", "encoder.onnx"),
+            pinned("https://x/decoder", "decoder.onnx"),
+        ];
+        let dir = ensure_files_checked(tmp.path(), "whisper", &good, &echo(vec![]), &|_| {})
+            .await
+            .unwrap();
+        assert!(dir.join("decoder.onnx").is_file());
+        assert!(dir.join(COMPLETE_MARKER).is_file());
+    }
+
+    /// Records every URL requested.
+    struct Recording {
+        urls: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl Download for Recording {
+        async fn download(&self, url: &str, dest: &Path, _: Progress<'_>) -> Result<(), String> {
+            self.urls.lock().unwrap().push(url.to_string());
+            std::fs::write(dest, url).map_err(|e| e.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_verified_file_survives_a_later_files_failure_and_is_not_downloaded_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut files = [
+            pinned("https://x/encoder", "encoder.onnx"),
+            pinned("https://x/decoder", "decoder.onnx"),
+        ];
+        let good_pin = files[1].sha256;
+        files[1].sha256 = "0".repeat(64).leak();
+        let dl = Recording {
+            urls: Mutex::new(Vec::new()),
+        };
+        assert!(
+            ensure_files_checked(tmp.path(), "whisper", &files, &dl, &|_| {})
+                .await
+                .is_err()
+        );
+        let dir = tmp.path().join("whisper");
+        assert!(dir.join("encoder.onnx").is_file(), "verified file stays");
+
+        files[1].sha256 = good_pin;
+        dl.urls.lock().unwrap().clear();
+        ensure_files_checked(tmp.path(), "whisper", &files, &dl, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(*dl.urls.lock().unwrap(), vec!["https://x/decoder"]);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_pin_is_rejected_before_any_download() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut files = [
+            pinned("https://x/encoder", "encoder.onnx"),
+            pinned("https://x/decoder", "decoder.onnx"),
+        ];
+        files[1].sha256 = "abc123";
+        let dl = Recording {
+            urls: Mutex::new(Vec::new()),
+        };
+        let err = ensure_files_checked(tmp.path(), "whisper", &files, &dl, &|_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "the expected SHA-256 must be exactly 64 hexadecimal characters"
+        );
+        assert!(dl.urls.lock().unwrap().is_empty());
+        assert!(entries(tmp.path()).is_empty(), "no folder created");
+    }
+
+    #[tokio::test]
+    async fn an_upper_case_pin_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut f = pinned("https://x/encoder", "encoder.onnx");
+        f.sha256 = Box::leak(f.sha256.to_ascii_uppercase().into_boxed_str());
+        assert!(
+            ensure_files_checked(tmp.path(), "whisper", &[f], &echo(vec![]), &|_| {})
+                .await
+                .is_ok()
+        );
     }
 }

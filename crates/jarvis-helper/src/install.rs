@@ -1,8 +1,9 @@
 //! Putting the voice helper and its voice files on the PC: the helper program (a `.tar.bz2` on
-//! this repo's GitHub Releases, checked against a SHA-256 pinned below before anything is
-//! unpacked) and the two Kokoro model files.
+//! this repo's GitHub Releases) and the two Kokoro model files. Both are checked against SHA-256
+//! values pinned below: the helper before anything is unpacked, each voice file before it is
+//! moved into place.
 
-use jarvis_fetch::{ensure_archive_checked, ensure_files, Download, ModelFile};
+use jarvis_fetch::{ensure_archive_checked, ensure_files_checked, CheckedFile, Download};
 use std::path::{Path, PathBuf};
 
 /// The Release the helper archive is published under.
@@ -23,14 +24,23 @@ pub const HELPER_EXE: &str = "jarvis-voice-helper.exe";
 pub const KOKORO_V1_DIR: &str = "kokoro-onnx-v1_0";
 const KOKORO_MODEL: &str = "kokoro-v1.0.onnx";
 const KOKORO_VOICES: &str = "voices-v1.0.bin";
-const KOKORO_FILES: &[ModelFile] = &[
-    ModelFile {
+/// SHA-256 of `kokoro-v1.0.onnx` (325,532,387 bytes) from the kokoro-onnx `model-files-v1.0`
+/// release.
+pub const KOKORO_MODEL_SHA256: &str =
+    "7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5";
+/// SHA-256 of `voices-v1.0.bin` (28,214,398 bytes) from the same release.
+pub const KOKORO_VOICES_SHA256: &str =
+    "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d";
+const KOKORO_FILES: &[CheckedFile] = &[
+    CheckedFile {
         url: "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx",
         name: KOKORO_MODEL,
+        sha256: KOKORO_MODEL_SHA256,
     },
-    ModelFile {
+    CheckedFile {
         url: "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin",
         name: KOKORO_VOICES,
+        sha256: KOKORO_VOICES_SHA256,
     },
 ];
 
@@ -42,8 +52,8 @@ pub struct HelperFiles {
     pub voices: PathBuf,
 }
 
-/// Install the helper (verified against [`HELPER_SHA256`]) and the Kokoro files into
-/// `models_dir`. `percent` reports whichever download is running, so it may go 0-100 more than
+/// Install the helper (verified against [`HELPER_SHA256`]) and the Kokoro files (each verified
+/// against its pin) into `models_dir`. `percent` reports whichever download is running, so it may go 0-100 more than
 /// once (the helper, then the voice files).
 pub async fn ensure(
     models_dir: &Path,
@@ -61,6 +71,17 @@ pub async fn ensure_with(
     percent: &(dyn Fn(u8) + Send + Sync),
     helper_sha256: &str,
 ) -> Result<HelperFiles, String> {
+    ensure_inner(models_dir, dl, percent, helper_sha256, KOKORO_FILES).await
+}
+
+/// [`ensure_with`] with the voice files supplied too, so tests can pin their own fake bytes.
+async fn ensure_inner(
+    models_dir: &Path,
+    dl: &dyn Download,
+    percent: &(dyn Fn(u8) + Send + Sync),
+    helper_sha256: &str,
+    kokoro: &[CheckedFile],
+) -> Result<HelperFiles, String> {
     let helper_dir = ensure_archive_checked(
         models_dir,
         HELPER_DIR,
@@ -72,7 +93,7 @@ pub async fn ensure_with(
         percent,
     )
     .await?;
-    let voice_dir = ensure_files(models_dir, KOKORO_V1_DIR, KOKORO_FILES, dl, percent).await?;
+    let voice_dir = ensure_files_checked(models_dir, KOKORO_V1_DIR, kokoro, dl, percent).await?;
     Ok(HelperFiles {
         exe: helper_dir.join(HELPER_EXE),
         model: voice_dir.join(KOKORO_MODEL),
@@ -110,6 +131,17 @@ mod tests {
         Sha256::digest(bytes)
             .iter()
             .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// The two real Kokoro entries, with pins that match what `Fake` serves (the URL text).
+    fn fake_kokoro() -> Vec<CheckedFile> {
+        KOKORO_FILES
+            .iter()
+            .map(|f| CheckedFile {
+                sha256: Box::leak(hex(f.url.as_bytes()).into_boxed_str()),
+                ..*f
+            })
             .collect()
     }
 
@@ -154,12 +186,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dl = Fake::new();
         let hash = hex(&dl.archive);
-        let first = ensure_with(tmp.path(), &dl, &|_| {}, &hash).await.unwrap();
+        let first = ensure_inner(tmp.path(), &dl, &|_| {}, &hash, &fake_kokoro())
+            .await
+            .unwrap();
         assert!(first.exe.is_file() && first.exe.ends_with(HELPER_EXE));
         assert!(first.model.is_file() && first.voices.is_file());
         assert_eq!(dl.requests().len(), 3, "helper plus two voice files");
 
-        let second = ensure_with(tmp.path(), &dl, &|_| {}, &hash).await.unwrap();
+        let second = ensure_inner(tmp.path(), &dl, &|_| {}, &hash, &fake_kokoro())
+            .await
+            .unwrap();
         assert_eq!(second, first);
         assert_eq!(dl.requests().len(), 3, "the second call downloads nothing");
     }
@@ -168,7 +204,7 @@ mod tests {
     async fn a_helper_that_fails_its_check_stops_before_the_voice_files() {
         let tmp = tempfile::tempdir().unwrap();
         let dl = Fake::new();
-        let err = ensure_with(tmp.path(), &dl, &|_| {}, &"1".repeat(64))
+        let err = ensure_inner(tmp.path(), &dl, &|_| {}, &"1".repeat(64), &fake_kokoro())
             .await
             .unwrap_err();
         assert!(err.contains("integrity check"), "{err}");
@@ -185,6 +221,42 @@ mod tests {
             format!("the {HELPER_DIR} download failed its integrity check")
         );
         assert!(!tmp.path().join(HELPER_DIR).exists());
+    }
+
+    #[test]
+    fn the_kokoro_pins_are_real() {
+        for pin in [KOKORO_MODEL_SHA256, KOKORO_VOICES_SHA256] {
+            assert_eq!(pin.len(), 64);
+            assert!(pin
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+            assert_ne!(pin, "0".repeat(64));
+        }
+        let pairs: Vec<_> = KOKORO_FILES.iter().map(|f| (f.name, f.sha256)).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("kokoro-v1.0.onnx", KOKORO_MODEL_SHA256),
+                ("voices-v1.0.bin", KOKORO_VOICES_SHA256),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tampered_voice_file_fails_the_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = Fake::new();
+        let mut kokoro = fake_kokoro();
+        // The voices file's pin is for different bytes than the fake serves.
+        kokoro[1].sha256 = Box::leak(hex(b"something else").into_boxed_str());
+        let err = ensure_inner(tmp.path(), &dl, &|_| {}, &hex(&dl.archive), &kokoro)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            format!("the {KOKORO_V1_DIR} download failed its integrity check")
+        );
+        assert!(!tmp.path().join(KOKORO_V1_DIR).join(".complete").exists());
     }
 
     #[test]
