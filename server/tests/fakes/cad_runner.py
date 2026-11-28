@@ -11,7 +11,7 @@ and answers from a script:
 - a list: one entry per connection, in order (after the last, `answer_for`). An entry is an
   answer (a dict, sent as one JSON line), a callable taking the request and returning an entry,
   or a misbehaviour: `NEVER_ANSWER`, `CLOSE_EARLY`, `OVERLONG`, `NOT_JSON`, `Raw(bytes)`,
-  `Trickle(bytes, interval)`.
+  `HoldOpen(bytes)`, `Trickle(bytes, interval)`.
 - a callable: called with each request, returns an entry.
 
 Helpers build answers: `good_replay(request, failed=...)` (results in order, counts from the
@@ -93,6 +93,13 @@ NOT_JSON = _Misbehave("not json")  # one line that is not JSON
 @dataclass(frozen=True)
 class Raw:
     """These bytes, as they are, then close."""
+
+    data: bytes
+
+
+@dataclass(frozen=True)
+class HoldOpen:
+    """These bytes, then the connection is held open (never closed by the runner)."""
 
     data: bytes
 
@@ -328,6 +335,9 @@ class FakeRunner:
             sock.sendall(b"this is not json\n")
         elif isinstance(entry, Raw):
             sock.sendall(entry.data)
+        elif isinstance(entry, HoldOpen):
+            sock.sendall(entry.data)
+            self._stop.wait(60)
         elif isinstance(entry, Trickle):
             for i in range(len(entry.data)):
                 if self._stop.wait(entry.interval):

@@ -10,6 +10,7 @@ import json
 import logging
 import socket
 import time
+import tracemalloc
 from collections.abc import Callable
 from typing import Any
 
@@ -37,6 +38,7 @@ from .fakes.cad_runner import (
     PNG,
     SVG,
     FakeRunner,
+    HoldOpen,
     Raw,
     Trickle,
     b64,
@@ -243,7 +245,13 @@ def test_the_address_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch)
     assert cad_engine.address() == "cad:7411"
 
 
-@pytest.mark.parametrize("bad", ["cad", "cad:", ":7411", "cad:port", "cad:0", "cad:70000", ""])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "cad", "cad:", ":7411", "cad:port", "cad:0", "cad:70000", "", "cad:\u0667",
+        "a" * 300 + ":7411", "x" * 64 + ".example:7411", "a..b:7411", "\udcff:7411",
+    ],
+)  # fmt: skip
 def test_a_malformed_address_is_engine_down(bad: str) -> None:
     with pytest.raises(EngineDown):
         cad_engine.replay(_steps(), picture=False, address=bad)
@@ -452,7 +460,7 @@ def test_a_request_line_over_1000000_bytes_is_refused_before_connecting() -> Non
     with FakeRunner() as runner:
         with pytest.raises(EngineRefused) as caught:
             cad_engine.replay(steps, picture=False, address=runner.address)
-        assert caught.value.code == "too_large"
+        assert caught.value.code == "request_too_large"
     assert runner.connections == 0
 
 
@@ -593,13 +601,13 @@ def test_check_svg_counts_elements(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cad_engine.SVG_DEPTH_MAX == 32
     monkeypatch.setattr(cad_engine, "SVG_ELEMENTS_MAX", 10)
     check_svg(_svg('<rect width="1" height="1"/>' * 9))
-    with pytest.raises(BadPicture, match="elements"):
+    with pytest.raises(BadPicture, match=r"^count$"):
         check_svg(_svg('<rect width="1" height="1"/>' * 10))
 
 
 def test_check_svg_is_fine_at_depth_32_and_refuses_33() -> None:
     check_svg(_svg("<g>" * 31 + "</g>" * 31))  # the root is level 1
-    with pytest.raises(BadPicture, match="deep"):
+    with pytest.raises(BadPicture, match=r"^depth$"):
         check_svg(_svg("<g>" * 32 + "</g>" * 32))
 
 
@@ -610,3 +618,217 @@ def test_check_svg_refuses_what_is_not_bytes() -> None:
 
 def test_the_fake_runners_picture_passes_and_decodes() -> None:
     check_svg(base64.b64decode(good_replay({"steps": [], "picture": True})["svg_b64"]))
+
+
+# --- fixes from the independent review --------------------------------------------------------
+
+SURROGATE = "\udc80"
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda a: _results(a)[0].update(text=f"{SURROGATE} done"),
+        lambda a: a.update(texts=[f"Living {SURROGATE}"]),
+        lambda a: a.update(counts={f"Line{SURROGATE}": 3}),
+    ],
+    ids=["result text", "texts", "counts name"],
+)
+def test_a_lone_surrogate_in_a_replay_answer_is_engine_down(
+    edit: Callable[[dict[str, Any]], Any],
+) -> None:
+    with FakeRunner([_answer(edit)]) as runner, pytest.raises(EngineDown):
+        cad_engine.replay(_steps(), picture=False, address=runner.address)
+
+
+def test_a_lone_surrogate_in_a_catalogue_note_is_engine_down() -> None:
+    a = cad_runner.catalogue_answer()
+    a["commands"]["line"] = f"start, end {SURROGATE}"
+    with FakeRunner([a]) as runner, pytest.raises(EngineDown):
+        cad_engine.catalogue(address=runner.address)
+
+
+def test_every_string_of_a_good_answer_encodes_as_utf8() -> None:
+    def answer(request: dict[str, Any]) -> dict[str, Any]:
+        a = good_replay(request)
+        a["results"][0]["text"] = "Wall drawn: ok é中"  # fine non-ASCII
+        return a
+
+    with FakeRunner([answer]) as runner:
+        got = cad_engine.replay(_steps(), picture=False, address=runner.address)
+    for text in [r.text for r in got.results] + list(got.texts) + list(got.counts):
+        text.encode("utf-8")
+
+
+def test_step_from_refuses_lone_surrogates() -> None:
+    with pytest.raises(BadStep):
+        step_from({"label": f"Walls {SURROGATE}", "commands": [ROOM]})
+    with pytest.raises(BadStep):
+        step_from({"label": "Walls", "commands": [{"command": "text",
+                                                   "params": {SURROGATE: 1}}]})  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda a: a.update(failed=1),  # every result ok, one counted as failed
+        lambda a: _results(a)[1].update(ok=False),  # one failed, none counted
+        lambda a: a.update(failed=4),
+    ],
+    ids=["counted, none failed", "failed, none counted", "more than results"],
+)
+def test_failed_must_count_the_failed_results(edit: Callable[[dict[str, Any]], Any]) -> None:
+    """No picture asked, so the SVG rule cannot be what catches it."""
+    with FakeRunner([_answer(edit)]) as runner, pytest.raises(EngineDown):
+        cad_engine.replay(_steps(), picture=False, address=runner.address)
+
+
+def test_failed_counts_both_ways_when_right() -> None:
+    def two_failed(request: dict[str, Any]) -> dict[str, Any]:
+        return good_replay(request, failed=[(1, 1), (2, 2)])
+
+    with FakeRunner([two_failed]) as runner:
+        got = cad_engine.replay(_steps(), picture=False, address=runner.address)
+    assert got.failed == 2 and [r.ok for r in got.results] == [False, True, False]
+
+
+def _peak_mib(fn: Callable[[], Any]) -> float:
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        base = tracemalloc.get_traced_memory()[0]
+        fn()
+        return (tracemalloc.get_traced_memory()[1] - base) / (1024 * 1024)
+    finally:
+        tracemalloc.stop()
+
+
+@pytest.mark.parametrize("filler", [b"{},", b"[],", b"1,"])
+def test_a_hostile_answer_of_many_containers_costs_little(filler: bytes) -> None:
+    """8 MiB of `[{},{},...]` used to be parsed whole (about 220 MB); now it is refused first.
+    The fake runner's own 8 MiB line counts in the peak too, so the bound is generous."""
+    head, tail = b'{"v":1,"ok":true,"x":[', b"0]}\n"
+    line = head + filler * ((cad_engine.ANSWER_MAX_BYTES - 64) // len(filler)) + tail
+    assert len(line) <= cad_engine.ANSWER_MAX_BYTES
+
+    def run() -> None:
+        with FakeRunner([Raw(line)]) as runner, pytest.raises(EngineDown):
+            cad_engine.replay(_steps(), picture=False, address=runner.address)
+
+    peak = _peak_mib(run)
+    print(f"peak {peak:.1f} MiB for {filler!r}")
+    assert peak < 60
+
+
+def test_brackets_and_commas_inside_strings_do_not_count() -> None:
+    """A good answer for 2,000 commands whose texts are full of brackets and commas passes."""
+    many = [step_from({"label": f"Lines {i}", "commands": [ROOM] * 400}) for i in range(5)]
+
+    def answer(request: dict[str, Any]) -> dict[str, Any]:
+        a = good_replay(request)
+        for r in a["results"]:
+            r["text"] = "[{,}]" * 60  # 300 characters
+        a["texts"] = ['[,"{\\' * 16] * 80
+        return a
+
+    with FakeRunner([answer]) as runner:
+        got = cad_engine.replay(many, picture=False, address=runner.address)
+    assert len(got.results) == 2000
+
+
+def test_too_many_containers_is_engine_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert cad_engine.ANSWER_CONTAINERS_MAX == 5_000
+    monkeypatch.setattr(cad_engine, "ANSWER_CONTAINERS_MAX", 3)
+    with FakeRunner() as runner, pytest.raises(EngineDown):
+        cad_engine.replay(_steps(), picture=False, address=runner.address)
+
+
+def test_too_many_commas_is_engine_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert cad_engine.ANSWER_COMMAS_MAX == 20_000
+    monkeypatch.setattr(cad_engine, "ANSWER_COMMAS_MAX", 10)
+    with FakeRunner() as runner, pytest.raises(EngineDown):
+        cad_engine.replay(_steps(), picture=False, address=runner.address)
+
+
+def test_an_answer_is_read_up_to_its_newline_without_waiting_for_the_close() -> None:
+    line = json.dumps(failure("too_large")).encode() + b"\n"
+    with FakeRunner([HoldOpen(line)]) as runner:
+        started = time.monotonic()
+        with pytest.raises(EngineRefused):
+            cad_engine.replay(_steps(), picture=False, address=runner.address)
+        assert time.monotonic() - started < 2
+
+
+def test_bytes_after_the_newline_are_engine_down() -> None:
+    line = json.dumps(failure("too_large")).encode() + b"\nx"
+    with FakeRunner([HoldOpen(line)]) as runner, pytest.raises(EngineDown):
+        cad_engine.replay(_steps(), picture=False, address=runner.address)
+
+
+REAL_SHAPED = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8320.000000 7221.250000"'
+    b' width="1600" height="1389">\n'
+    b'<rect width="100%" height="100%" fill="white"/>\n'
+    b'<polyline points="'
+    + b" ".join(b"%d.000000,%d.500000" % (i, 7221 - i % 500) for i in range(4000))
+    + b'" fill="none" stroke="black" stroke-width="12.500000" stroke-linecap="round"'
+    b' stroke-linejoin="round"/>\n'
+    b'<path d="M 100.000000 200.000000 L 300.000000 200.000000 L 300.000000 400.000000 Z"'
+    b' fill="none" stroke="black" stroke-width="6.250000"/>\n'
+    b"</svg>\n"
+)
+
+
+def test_check_svg_accepts_the_engines_real_attribute_forms() -> None:
+    assert len(REAL_SHAPED) > 40_000
+    check_svg(REAL_SHAPED)
+
+
+REASONS = {"type", "size", "encoding", "markup", "xml", "element", "attribute", "value", "text",
+           "depth", "count"}  # fmt: skip
+
+
+@pytest.mark.parametrize("svg", REFUSED.values(), ids=REFUSED.keys())
+def test_bad_picture_reasons_are_fixed_codes(svg: bytes) -> None:
+    with pytest.raises(BadPicture) as caught:
+        check_svg(svg)
+    assert caught.value.reason in REASONS
+    assert str(caught.value) == caught.value.reason
+
+
+def test_a_bad_picture_reason_never_quotes_the_picture() -> None:
+    for svg in (
+        _svg("<Fictionalname/>"),
+        _svg('<rect width="1" height="1" fictionalattr="1"/>'),
+        _svg('<rect width="1" height="1" fill="url(fictional)"/>'),
+    ):
+        with pytest.raises(BadPicture) as caught:
+            check_svg(svg)
+        assert "ictional" not in str(caught.value) and "ictional" not in repr(caught.value)
+
+
+NEAR_LIMIT = _svg("<g/>" * (400_000 - 1))
+
+
+def test_check_svg_memory_stays_flat_near_the_element_limit() -> None:
+    peak = _peak_mib(lambda: check_svg(NEAR_LIMIT))
+    print(f"check_svg peak {peak:.1f} MiB on {len(NEAR_LIMIT):,} bytes")
+    assert peak < 40
+
+
+def test_check_svg_is_quick_near_the_element_limit() -> None:
+    started = time.monotonic()
+    check_svg(NEAR_LIMIT)
+    took = time.monotonic() - started
+    print(f"check_svg took {took:.2f} s")
+    assert took < 2
+
+
+def test_text_between_elements_is_still_found_when_children_are_freed() -> None:
+    with pytest.raises(BadPicture, match=r"^text$"):
+        check_svg(_svg("<g/>" * 100_000 + "x" + "<g/>" * 10))
+    with pytest.raises(BadPicture, match=r"^text$"):
+        check_svg(_svg("<g><g/><g/>x<g/></g>"))
+    with pytest.raises(BadPicture, match=r"^text$"):
+        check_svg(_svg("<g><g/><g/></g>x<g/>"))
+    check_svg(_svg("<g>\n  <g/>\n  <g><path d='M 0 0'/></g>\n</g>\n"))

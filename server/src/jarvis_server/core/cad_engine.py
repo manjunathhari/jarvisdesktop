@@ -67,6 +67,11 @@ CONNECT_TIMEOUT = 3  # seconds
 EXCHANGE_TIMEOUT = 20  # seconds, the whole exchange: the runner may wait 5 s, then replay 10 s
 ANSWER_MAX_BYTES = 8 * 1024 * 1024
 REQUEST_MAX_BYTES = 1_000_000  # under the runner's 1,048,576, with room to spare
+# The shape of an answer line, bounded before it is parsed (outside strings): a replay of 2,000
+# commands has about 2,006 objects and lists and about 10,200 commas.
+ANSWER_CONTAINERS_MAX = 5_000
+ANSWER_COMMAS_MAX = 20_000
+HOST_MAX = 253
 
 RESULT_TEXT_MAX = 300
 TEXTS_MAX = 80
@@ -82,8 +87,10 @@ _SVG_B64_MAX = (c.BOARD_PICTURE_MAX_BYTES + 2) // 3 * 4
 _ENGINE = re.compile(r"[a-z0-9-]{1,30}")
 _ENGINE_VERSION = re.compile(r"[0-9A-Za-z.+-]{1,30}")
 # One line: no C0, DEL or C1 control character, no Unicode line or paragraph separator.
-_NOT_ONE_LINE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+# A lone surrogate (which JSON's `\\udXXX` escapes can carry) cannot be encoded as UTF-8 later.
+_NOT_ONE_LINE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]")
 _LABEL: TypeAdapter[str] = TypeAdapter(c.StepLabel)
+_STRING = re.compile(rb'"[^"]*"')  # after escapes are removed: linear, never backtracks far
 
 _REFUSED = frozenset({"too_many_commands", "too_large", "not_allowed", "timeout"})
 _REPLAY_KEYS = frozenset(
@@ -109,8 +116,10 @@ class EngineDown(Exception):
 
 
 class EngineRefused(Exception):
-    """The runner refused the recipe: `code` is `too_many_commands`, `too_large`, `not_allowed`
-    or `timeout`."""
+    """The recipe was refused: `code` is the runner's `too_many_commands`, `too_large` (the
+    picture or the drawing came out too large), `not_allowed` or `timeout`, or the client's own
+    `request_too_large` (the recipe's request line would pass `REQUEST_MAX_BYTES`; Task 5 answers
+    it as an error result telling Claude the recipe is too long)."""
 
     def __init__(self, code: str) -> None:
         super().__init__(code)
@@ -118,7 +127,9 @@ class EngineRefused(Exception):
 
 
 class BadPicture(ValueError):
-    """A picture that must not reach the Board; `reason` says which rule it broke."""
+    """A picture that must not reach the Board. `reason` is a fixed code, never text from the
+    picture: `type`, `size`, `encoding`, `markup`, `xml`, `element`, `attribute`, `value`,
+    `text`, `depth` or `count`."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -193,6 +204,10 @@ def step_from(args: dict[str, Any]) -> Step:
             f"the label must be one line of 1 to {c.DRAWING_STEP_LABEL_MAX} characters"
         ) from None
     assert isinstance(label, str)
+    try:
+        label.encode("utf-8")
+    except UnicodeEncodeError:
+        raise BadStep("the label is not valid text") from None
     commands = args.get("commands")
     if not isinstance(commands, list) or not commands:
         raise BadStep("a step needs a list of at least one command")
@@ -230,53 +245,86 @@ def address() -> str:
 
 
 def _host_port(addr: str) -> tuple[str, int]:
+    """`host:port` (`[v6]:port` too). Anything else, or a host that is over-long or cannot be
+    looked up as a name, is `EngineDown`."""
     host, sep, port = addr.rpartition(":")
     if host.startswith("[") and host.endswith("]"):
         host = host[1:-1]
     if not (sep and host and port.isascii() and port.isdigit() and 1 <= int(port) <= 65535):
         raise EngineDown("the engine address is not host:port")
+    try:
+        ok = len(host) <= HOST_MAX and len(host.encode("idna")) <= HOST_MAX
+    except UnicodeError:
+        ok = False
+    if not ok:
+        raise EngineDown("the engine address is not host:port")
     return host, int(port)
 
 
 def _exchange(request: dict[str, Any], addr: str | None, op: str) -> Any:
-    """Send one request line, read one answer line, and return it parsed (not yet checked)."""
+    """Send one request line, read one answer line, and return it parsed (not yet checked).
+
+    The answer is read up to its first newline, and no further: the runner closes after it, but
+    the client does not wait for that. Bytes after the newline, in what was read, are
+    `EngineDown`. One deadline covers connecting, sending and reading; the name lookup inside
+    `socket.create_connection` is not bounded by it (the standard library has no timeout for
+    `getaddrinfo` short of a thread; the runner's name is resolved by Docker's local DNS)."""
     line = _json(request).encode("utf-8") + b"\n"
     host, port = _host_port(addr if addr is not None else address())
     deadline = time.monotonic() + EXCHANGE_TIMEOUT
+    buf = bytearray()
     try:
         with socket.create_connection(
             (host, port), timeout=min(CONNECT_TIMEOUT, EXCHANGE_TIMEOUT)
         ) as sock:
             _settimeout(sock, deadline)
             sock.sendall(line)  # the timeout bounds the whole send (Python 3.5 and later)
-            buf = bytearray()
             while True:
                 _settimeout(sock, deadline)
                 got = sock.recv(min(65536, ANSWER_MAX_BYTES + 2 - len(buf)))
                 if not got:
                     break
                 buf += got
+                if b"\n" in got:
+                    break
                 if len(buf) > ANSWER_MAX_BYTES + 1:
                     log.warning("cad %s: answer over %d bytes", op, ANSWER_MAX_BYTES)
                     raise EngineDown("the engine's answer is too long")
     except TimeoutError:
         log.warning("cad %s: no answer within %s s", op, EXCHANGE_TIMEOUT)
         raise EngineDown("the engine did not answer in time") from None
-    except OSError as e:
+    except (OSError, UnicodeError) as e:
         log.warning("cad %s: connection failed (%s)", op, type(e).__name__)
         raise EngineDown("no connection to the engine") from None
     log.info("cad %s: sent %d bytes, got %d bytes", op, len(line), len(buf))
-    # Exactly one line, then the close.
-    if not buf.endswith(b"\n") or buf.count(b"\n") != 1:
+    # Exactly one line, ended by the first newline, within the limit.
+    if buf.find(b"\n") != len(buf) - 1 or len(buf) > ANSWER_MAX_BYTES + 1:
         raise EngineDown("the engine's answer is not one line")
+    raw = bytes(buf)
+    del buf
+    _check_shape(raw, op)
     try:
         return json.loads(
-            bytes(buf[:-1]).decode("utf-8"),
+            raw[:-1].decode("utf-8"),
             parse_constant=_no_constant,
             object_pairs_hook=_no_repeats,
         )
     except (ValueError, RecursionError):
         raise EngineDown("the engine's answer is not JSON") from None
+
+
+def _check_shape(raw: bytes, op: str) -> None:
+    """Refuse, before parsing, a line with more objects, lists or commas outside strings than any
+    good answer has: parsing millions of tiny values would cost hundreds of megabytes. Escapes
+    go first (`\\\\` pairs, then `\\"`), so every `"` left opens or closes a string."""
+    plain = raw.replace(b"\\\\", b"").replace(b'\\"', b"")
+    outside = _STRING.sub(b"", plain)
+    del plain
+    containers = outside.count(b"{") + outside.count(b"[")
+    commas = outside.count(b",")
+    if containers > ANSWER_CONTAINERS_MAX or commas > ANSWER_COMMAS_MAX:
+        log.warning("cad %s: answer of %d containers and %d commas", op, containers, commas)
+        raise EngineDown("the engine's answer is malformed")
 
 
 def _settimeout(sock: socket.socket, deadline: float) -> None:
@@ -345,14 +393,14 @@ def replay(steps: Sequence[Step], *, picture: bool, address: str | None = None) 
     """Replay the whole recipe in a fresh engine. `picture`: ask for the SVG as well (it comes
     only when no command failed). Raises `EngineRefused` before connecting for a recipe over
     `RECIPE_MAX` commands (`too_many_commands`) or a request line over `REQUEST_MAX_BYTES`
-    (`too_large`); otherwise as the runner answers."""
+    (`request_too_large`); otherwise as the runner answers."""
     sent = [(s, n, cmd["command"]) for s, step in enumerate(steps, 1)
             for n, cmd in enumerate(step.commands, 1)]  # fmt: skip
     if len(sent) > RECIPE_MAX:
         raise EngineRefused("too_many_commands")
     request = {"v": 1, "op": "replay", "steps": [s.wire() for s in steps], "picture": picture}
     if len(_json(request).encode("utf-8")) + 1 > REQUEST_MAX_BYTES:
-        raise EngineRefused("too_large")
+        raise EngineRefused("request_too_large")
     answer = _exchange(request, address, "replay")
     _failure_or_none(answer, "replay")
     return _check_replay(answer, sent, picture)
@@ -499,67 +547,94 @@ _XML_SPACE = " \t\r\n"
 def check_svg(svg: bytes) -> None:
     """Raise `BadPicture` unless this is a picture of plain shapes, safe to show as an image."""
     if not isinstance(svg, bytes):
-        raise BadPicture("the picture is not bytes")
+        raise BadPicture("type")
     if not 1 <= len(svg) <= c.BOARD_PICTURE_MAX_BYTES:
-        raise BadPicture("the picture is empty or over 2,000,000 bytes")
+        raise BadPicture("size")
     # Bytes first: no other encoding, no markup declaration, no entity, no processing instruction.
     if svg.startswith(_BOMS) or b"\x00" in svg:
-        raise BadPicture("the picture is not plain UTF-8")
+        raise BadPicture("encoding")
     try:
         svg.decode("utf-8")
     except UnicodeDecodeError:
-        raise BadPicture("the picture is not UTF-8") from None
-    if b"<!" in svg:
-        raise BadPicture("a DOCTYPE, entity, CDATA section or comment")
+        raise BadPicture("encoding") from None
+    if b"<!" in svg:  # DOCTYPE, ENTITY, CDATA, comments
+        raise BadPicture("markup")
     body = svg
     if svg.startswith(b"<?"):
         decl = _XML_DECL.match(svg)
-        if decl is None:
-            raise BadPicture("an XML declaration other than version and UTF-8")
+        if decl is None:  # an XML declaration other than a version and UTF-8
+            raise BadPicture("markup")
         body = svg[decl.end() :]
-    if b"<?" in body:
-        raise BadPicture("a processing instruction")
-    if b"&" in svg:
-        raise BadPicture("an entity or character reference")
-    if b"xmlns:" in svg:
-        raise BadPicture("a namespace other than SVG's")
+    if b"<?" in body:  # a processing instruction
+        raise BadPicture("markup")
+    if b"&" in svg:  # an entity or character reference
+        raise BadPicture("markup")
+    if b"xmlns:" in svg:  # a namespace other than SVG's
+        raise BadPicture("markup")
     _walk(svg)
 
 
 def _walk(svg: bytes) -> None:
     """Parse in pieces and check each element as it starts and ends: an early refusal stops the
-    parse, and checked children are let go. Depth is counted, never recursed."""
+    parse. Depth is counted, never recursed. Memory stays flat: an element is let go of once its
+    tail is known (when its next sibling starts, or its parent ends)."""
     parser: ET.XMLPullParser[ET.Element] = ET.XMLPullParser(events=("start", "end"))
-    state = [0, 0]  # depth, elements seen
+    walk = _Walk()
     step = 65_536
     try:
         for at in range(0, len(svg), step):
             parser.feed(svg[at : at + step])
-            _events(parser, state)
+            walk.events(parser)
         parser.close()
-        _events(parser, state)
+        walk.events(parser)
     except ET.ParseError:
-        raise BadPicture("not well-formed XML") from None
+        raise BadPicture("xml") from None
 
 
-def _events(parser: ET.XMLPullParser[ET.Element], state: list[int]) -> None:
-    for event, elem in cast(Iterator[tuple[str, ET.Element]], parser.read_events()):
-        if event == "start":
-            state[0] += 1
-            state[1] += 1
-            if state[0] > SVG_DEPTH_MAX:
-                raise BadPicture("elements nested too deep")
-            if state[1] > SVG_ELEMENTS_MAX:
-                raise BadPicture("too many elements")
-            _check_element(elem, root=state[1] == 1)
-        else:
-            state[0] -= 1
-            if not _blank(elem.text):
-                raise BadPicture("text in the picture")
-            for child in elem:
-                if not _blank(child.tail):
-                    raise BadPicture("text in the picture")
-            del elem[:]  # checked: let them go
+class _Walk:
+    """The open elements, root first, each with how many of its children have started and are
+    still attached. When a child starts, the tail of the one before it is complete and checked;
+    every `_LET_GO` children, those before the newest are detached in one go (a deletion at the
+    front of a list moves the rest, so it is done in batches)."""
+
+    def __init__(self) -> None:
+        self.open: list[list[Any]] = []  # [element, children started and still attached]
+        self.seen = 0
+
+    def events(self, parser: ET.XMLPullParser[ET.Element]) -> None:
+        for event, elem in cast(Iterator[tuple[str, ET.Element]], parser.read_events()):
+            if event == "start":
+                self.seen += 1
+                if len(self.open) + 1 > SVG_DEPTH_MAX:
+                    raise BadPicture("depth")
+                if self.seen > SVG_ELEMENTS_MAX:
+                    raise BadPicture("count")
+                _check_element(elem, root=self.seen == 1)
+                if self.open:
+                    self._started_in(self.open[-1])
+                self.open.append([elem, 0])
+            else:
+                self.open.pop()
+                if not _blank(elem.text):
+                    raise BadPicture("text")
+                for child in elem:
+                    if not _blank(child.tail):
+                        raise BadPicture("text")
+                del elem[:]
+
+    @staticmethod
+    def _started_in(entry: list[Any]) -> None:
+        parent, attached = entry
+        if attached and not _blank(parent[attached - 1].tail):
+            raise BadPicture("text")
+        attached += 1
+        if attached >= _LET_GO:
+            del parent[: attached - 1]  # all but the one that just started
+            attached = 1
+        entry[1] = attached
+
+
+_LET_GO = 1024
 
 
 def _blank(text: str | None) -> bool:
@@ -568,22 +643,14 @@ def _blank(text: str | None) -> bool:
 
 def _check_element(elem: ET.Element, *, root: bool) -> None:
     ns, _, name = elem.tag.rpartition("}")
-    if ns != "{" + SVG_NS:
-        raise BadPicture("an element outside the SVG namespace")
-    if name not in SVG_ELEMENTS:
-        raise BadPicture(f"an element the check does not know ({name[:20]!r})")
-    if root and name != "svg":
-        raise BadPicture("the root is not svg")
+    if ns != "{" + SVG_NS or name not in SVG_ELEMENTS or (root and name != "svg"):
+        raise BadPicture("element")
     for attr, value in elem.attrib.items():
-        if attr.startswith("{"):
-            raise BadPicture("an attribute in a namespace")
-        if attr not in SVG_ATTRIBUTES:
-            raise BadPicture(f"an attribute the check does not know ({attr[:20]!r})")
+        if attr.startswith("{") or attr not in SVG_ATTRIBUTES:
+            raise BadPicture("attribute")
         most = SVG_LONG_VALUE_MAX if attr in _LONG_VALUES else SVG_VALUE_MAX
-        if len(value) > most:
-            raise BadPicture(f"the value of {attr} is too long")
-        if _NOT_ONE_LINE.search(value):
-            raise BadPicture("a control character in a value")
+        if len(value) > most or _NOT_ONE_LINE.search(value):
+            raise BadPicture("value")
         squeezed = "".join(value.lower().split())
         if any(bad in squeezed for bad in _BAD_IN_VALUE):
-            raise BadPicture(f"a value of {attr} that could reach outside the picture")
+            raise BadPicture("value")
