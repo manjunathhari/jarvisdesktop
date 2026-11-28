@@ -31,6 +31,7 @@ dev = [
 jarvis-core = "jarvis_server.core_main:main"
 jarvis-scheduler = "jarvis_server.scheduler_main:main"
 jarvis-gateway = "jarvis_server.gateway.app:main"
+jarvis-improver = "jarvis_server.improve.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -55,6 +56,11 @@ ignore = ["S101"]  # assert is fine in tests
 strict = true
 python_version = "3.12"
 files = ["src"]
+
+[[tool.mypy.overrides]]
+# Only the improve sandbox has the Agent SDK (deploy/improve/sandbox.Dockerfile); the server doesn't.
+module = ["claude_agent_sdk", "claude_agent_sdk.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

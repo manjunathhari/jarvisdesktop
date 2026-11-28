@@ -2,7 +2,8 @@
 #
 # Deployed as Docker project "jarvis" (Hostinger Docker manager or plain `docker compose`).
 # The image is built and published by CI (server.yml) as ghcr.io/manjunathhari/jarvis-server:<commit>.
-# JARVIS_REF is the only environment value; it is not secret. Secrets are files in
+# JARVIS_REF is the main environment value; the improve profile also reads the GitHub App ids.
+# None is secret. Secrets are files in
 # /etc/jarvis/secrets (root:10001, 0440), created by deploy/harden/harden.sh.
 #
 # No service publishes a port (CI fails the build if one appears). Everything sits on the
@@ -28,6 +29,13 @@
 #
 # Memory (ADR-010): the private git repo lives in volume `memory`, mounted only into core.
 # core also writes a daily git bundle into its own volume `memory_backups`.
+#
+# Profile "improve" (never started by default; `docker compose --profile improve up -d`): the
+# self-improvement team (improver, sandbox, claude-proxy, improve-egress, sandbox-db) on its own
+# internal network `jarvis_improve`. The sandbox holds no key; claude-proxy adds the team's own
+# Claude key (improve_claude_key), and improve-egress gives HTTPS to public hosts, logged. Neither
+# is core's proxy, and only the improver joins jarvis_internal. Their configs are inline too
+# (x-improve-egress-squid, x-claude-proxy-nginx; reviewable copies in deploy/improve/).
 
 name: jarvis
 
@@ -160,6 +168,120 @@ x-egress-proxy-squid: &egress_proxy_squid |
   forwarded_for delete
   httpd_suppress_version_string on
   shutdown_lifetime 1 seconds
+
+# The improve team's egress proxy config (reviewable copy: deploy/improve/squid.conf), passed
+# in as JARVIS_SQUID_CONF and written to /tmp/squid.conf at start, for the same reason.
+x-improve-egress-squid: &improve_egress_squid |
+  # JARVIS improve egress proxy (profile "improve"). The self-improvement team's only way to the
+  # internet: the sandbox and the improver reach it as HTTPS_PROXY=http://improve-egress:3128. The
+  # team has web access (it has a Researcher), so CONNECT to any public host on port 443 is allowed
+  # and every request is logged (docker logs). Refused: any other method or port, and every
+  # private, loopback, link-local, multicast or reserved address, the tailnet's 100.64.0.0/10 and
+  # the jarvis networks' subnets (jarvis_internal is 10.214.14.0/24, inside 10.0.0.0/8; Docker's
+  # own pools are inside 172.16.0.0/12 and 192.168.0.0/16). squid checks the address it will
+  # connect to, so a public name that resolves to an internal address is refused too. No cache.
+  # This is not core's proxy (deploy/egress-proxy/squid.conf), which still allows only Claude.
+  #
+  # The proxy's other network, jarvis_improve_egress, has no other member, so the private ranges
+  # in jarvis_improve below mean the containers on jarvis_improve.
+  #
+  # compose.yaml carries an inline copy of this file (x-improve-egress-squid), passed in as
+  # JARVIS_SQUID_CONF and written to /tmp/squid.conf at start, because the container is read-only
+  # and Compose can't place an inline config file in it. tests/test_compose.py checks the two match.
+
+  http_port 3128
+
+  acl jarvis_improve src 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+  acl connect_method method CONNECT
+  acl tls_port port 443
+  acl internal_dst dst 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4 ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8
+
+  http_access deny !connect_method
+  http_access deny !tls_port
+  http_access deny internal_dst
+  http_access allow jarvis_improve connect_method tls_port
+  http_access deny all
+
+  access_log stdio:/dev/stdout
+  cache deny all
+  cache_mem 0 MB
+  via off
+  forwarded_for delete
+  httpd_suppress_version_string on
+  shutdown_lifetime 1 seconds
+
+# claude-proxy's nginx config (reviewable copy: deploy/improve/claude-proxy.conf), passed in as
+# JARVIS_NGINX_CONF and written to /tmp/nginx.conf at start, for the same reason.
+x-claude-proxy-nginx: &claude_proxy_nginx |
+  # JARVIS claude-proxy (profile "improve"). The sandbox holds no key: the Claude Agent SDK there
+  # talks plain HTTP to ANTHROPIC_BASE_URL=http://claude-proxy:8080 with a placeholder key, and this
+  # proxy forwards /v1/ to https://api.anthropic.com with the team's own key (secret
+  # improve_claude_key, a Console workspace of its own, not core's anthropic_api_key). Nothing
+  # else is forwarded, and the sandbox's own Authorization header never passes.
+  #
+  # The key line is not in this file. The container's start command reads the secret file, checks
+  # it holds only key characters, and writes `proxy_set_header x-api-key "...";` to
+  # /tmp/claude-key.conf (tmpfs, mode 0600), which is included below.
+  #
+  # The container's only internet route is its own network, jarvis_claude_egress. The upstream is
+  # fixed here, so a client can't choose another host; the name is re-resolved through Docker's DNS.
+  #
+  # compose.yaml carries an inline copy of this file (x-claude-proxy-nginx, with $$$$ written as
+  # $$$$$$$$), passed in as JARVIS_NGINX_CONF and written to /tmp/nginx.conf at start, because the
+  # container is read-only and Compose can't place an inline config file in it.
+  # tests/test_compose.py checks the two match.
+
+  worker_processes 1;
+  pid /tmp/nginx.pid;
+  error_log /dev/stderr warn;
+
+  events {
+      worker_connections 256;
+  }
+
+  http {
+      access_log off;
+      server_tokens off;
+      client_body_temp_path /tmp/client_temp;
+      proxy_temp_path /tmp/proxy_temp;
+      fastcgi_temp_path /tmp/fastcgi_temp;
+      uwsgi_temp_path /tmp/uwsgi_temp;
+      scgi_temp_path /tmp/scgi_temp;
+      resolver 127.0.0.11 valid=60s ipv6=off;
+      client_max_body_size 64m;
+
+      server {
+          listen 8080;
+
+          location = /healthz {
+              return 200 "ok\n";
+          }
+
+          location /v1/ {
+              set $$claude https://api.anthropic.com;
+              proxy_pass $$claude;
+              proxy_http_version 1.1;
+              proxy_ssl_server_name on;
+              proxy_ssl_name api.anthropic.com;
+              proxy_ssl_verify on;
+              proxy_ssl_verify_depth 4;
+              proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+              proxy_set_header Host api.anthropic.com;
+              proxy_set_header Authorization "";
+              proxy_set_header X-Forwarded-For "";
+              proxy_set_header Connection "";
+              include /tmp/claude-key.conf;
+              proxy_buffering off;
+              proxy_request_buffering off;
+              proxy_read_timeout 600s;
+              proxy_send_timeout 600s;
+          }
+
+          location / {
+              return 404;
+          }
+      }
+  }
 
 x-app: &app
   image: ghcr.io/manjunathhari/jarvis-server:${JARVIS_REF:?set JARVIS_REF to a commit of manjunathhari/jarvisdesktop}
@@ -403,6 +525,162 @@ services:
     command: []
     secrets: [pg_app_password]
 
+  # --- The self-improvement team (profile "improve"; never started by default) -----------------
+  # improver runs the stages; each stage runs in a fresh sandbox container, where the Claude
+  # Agent SDK works on a checkout in volume improve_work. The sandbox holds no key at all:
+  # claude-proxy adds the team's own Claude key (improve_claude_key, not core's), and the only
+  # other way out is improve-egress (HTTPS to public hosts, logged). sandbox-db is a throwaway
+  # Postgres for the server's DB tests. All of them sit on jarvis_improve, which has no internet
+  # route; only the improver also joins jarvis_internal (it records runs in Postgres).
+  improver:
+    <<: *app
+    profiles: [improve]
+    entrypoint: ["jarvis-improver"]
+    command: ["run"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      init: { condition: service_completed_successfully }
+      improve-egress: { condition: service_healthy }
+    networks: [jarvis_internal, jarvis_improve]
+    environment:
+      JARVIS_DB_HOST: postgres
+      JARVIS_DB_NAME: jarvis
+      JARVIS_PROCESS: improver
+      HTTPS_PROXY: http://improve-egress:3128
+      TZ: Asia/Kolkata
+      # The GitHub App's numeric ids, from the server's .env (not secret). Compose reads .env
+      # only to fill ${...}, so each one is named here or it never reaches the improver.
+      JARVIS_IMPROVE_APP_ID: ${JARVIS_IMPROVE_APP_ID:-}
+      JARVIS_IMPROVE_INSTALLATION_ID: ${JARVIS_IMPROVE_INSTALLATION_ID:-}
+    # Its database password and the GitHub App's private key. Never a Claude key.
+    secrets: [pg_app_password, improve_github_app_key]
+    volumes:
+      - improve_work:/work   # writes each stage's request to /work/inbox, reads /work/outbox
+    mem_limit: 256m
+
+  # One stage per container: the runner reads /work/inbox, writes /work/outbox and exits, and
+  # `restart: always` brings up the next on a clean read-only root and empty tmpfs. No secret,
+  # no key: ANTHROPIC_API_KEY is a placeholder that claude-proxy replaces. The image is built by
+  # CI from deploy/improve/sandbox.Dockerfile and published from main with the server's tag.
+  sandbox:
+    image: ghcr.io/manjunathhari/jarvis-sandbox:${JARVIS_REF:?set JARVIS_REF to a commit of manjunathhari/jarvisdesktop}
+    profiles: [improve]
+    restart: always
+    user: "10001:10001"
+    depends_on:
+      claude-proxy: { condition: service_healthy }
+      improve-egress: { condition: service_healthy }
+      sandbox-db: { condition: service_healthy }
+    environment:
+      ANTHROPIC_BASE_URL: http://claude-proxy:8080
+      ANTHROPIC_API_KEY: placeholder-not-a-key
+      HTTPS_PROXY: http://improve-egress:3128
+      NO_PROXY: claude-proxy,sandbox-db
+      JARVIS_TEST_SUPERUSER_DSN: postgresql://postgres:sandbox-db-throwaway@sandbox-db:5432/postgres
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      HOME: /home/jarvis
+      CARGO_HOME: /cache/cargo
+      UV_CACHE_DIR: /cache/uv
+      npm_config_cache: /cache/npm
+      TZ: Asia/Kolkata
+    volumes:
+      - improve_work:/work
+    networks: [jarvis_improve]
+    read_only: true
+    tmpfs: ["/tmp:exec,mode=1777", "/cache:mode=1777", "/home/jarvis:exec,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 4g
+    logging: *logging
+
+  # Adds the team's Claude key and forwards /v1/ to https://api.anthropic.com, nothing else. The
+  # start command reads the key from its secret file into /tmp (never into the environment) and
+  # refuses to start if it is empty or holds anything but key characters.
+  claude-proxy:
+    image: nginxinc/nginx-unprivileged:1.30.6-alpine@sha256:f5116ed4606f3eb015dd4a8e28cb9b351476dc0ad4bc6e9f93b19cec130cdf03
+    profiles: [improve]
+    restart: unless-stopped
+    entrypoint:
+      - /bin/sh
+      - -c
+      - '[ -n "$${JARVIS_NGINX_CONF:-}" ] || { echo "claude-proxy: no config; refusing to start" >&2; exit 1; }; k="$$(cat /run/secrets/improve_claude_key)" || exit 1; case "$$k" in "" | *[!A-Za-z0-9_-]*) echo "claude-proxy: improve_claude_key is empty or not a key; refusing to start" >&2; exit 1 ;; esac; umask 077; printf "proxy_set_header x-api-key \"%s\";\n" "$$k" > /tmp/claude-key.conf && printf "%s" "$$JARVIS_NGINX_CONF" > /tmp/nginx.conf && exec nginx -e /dev/stderr -c /tmp/nginx.conf -g "daemon off;"'
+    command: []
+    environment:
+      JARVIS_NGINX_CONF: *claude_proxy_nginx
+      TZ: Asia/Kolkata
+    secrets: [improve_claude_key]
+    group_add: ["10001"]   # the image's user (101) reads the root:10001 0440 secret file
+    networks: [jarvis_improve, jarvis_claude_egress]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 64m
+    logging: *logging
+    healthcheck:
+      # Healthy only with the key line written and nginx answering on our config.
+      test: ["CMD-SHELL", "test -s /tmp/claude-key.conf && wget -q -O /dev/null http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # The team's web access: CONNECT to public hosts on 443 only, every request logged. Not core's
+  # proxy (egress-proxy), which still allows only Claude.
+  improve-egress:
+    image: ubuntu/squid:6.6-24.04_edge@sha256:d9c34c5ab74c6dd41cf1070d9b4221aac072e67e983527ca2d41512958f77506
+    profiles: [improve]
+    restart: unless-stopped
+    entrypoint:
+      - /bin/sh
+      - -c
+      - '[ -n "$${JARVIS_SQUID_CONF:-}" ] || { echo "improve-egress: no config; refusing to start" >&2; exit 1; }; printf "%s" "$$JARVIS_SQUID_CONF" > /tmp/squid.conf && exec /usr/sbin/squid -f /tmp/squid.conf -NYC'
+    command: []
+    environment:
+      JARVIS_SQUID_CONF: *improve_egress_squid
+      TZ: Asia/Kolkata
+    networks: [jarvis_improve, jarvis_improve_egress]
+    # The image's proxy user from the start (no root, no caps): Docker then gives it the stdout
+    # pipe, which the access log writes to. A squid started as root opens access_log only after
+    # dropping to proxy, and could not reopen a root-owned stdout.
+    user: "13:13"
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: ["/run:mode=1777", "/tmp:mode=1777", "/var/log/squid:mode=1777", "/var/spool/squid:mode=1777"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    logging: *logging
+    healthcheck:
+      test: ["CMD-SHELL", "grep -qx 'http_access deny internal_dst' /tmp/squid.conf && grep -qx 'http_access deny all' /tmp/squid.conf"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # A throwaway Postgres for the sandbox's DB tests (JARVIS_TEST_SUPERUSER_DSN). It holds no
+  # data (tmpfs), so its fixed password is not a secret.
+  sandbox-db:
+    image: postgres:17.12-trixie@sha256:97fb53376be3e4fb1a8a61421daa69dcc3bf2fa39bda3259f5245f9a455af1a9
+    profiles: [improve]
+    restart: unless-stopped
+    user: "999:999"   # the image's postgres user; the entrypoint then skips chown and gosu
+    environment:
+      POSTGRES_PASSWORD: sandbox-db-throwaway
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: Asia/Kolkata
+    networks: [jarvis_improve]
+    read_only: true
+    tmpfs: [/tmp, "/var/run/postgresql:mode=1777", "/var/lib/postgresql/data:mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    logging: *logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
 networks:
   jarvis_internal:
     internal: true
@@ -412,6 +690,10 @@ networks:
           ip_range: 10.214.14.128/25   # dynamic addresses; Postgres's fixed one is outside it
   jarvis_ts_egress: {}   # gateway-ts only: Tailscale coordination and DERP relays
   jarvis_egress: {}      # egress-proxy only: api.anthropic.com
+  jarvis_improve:         # the improve team; no internet route
+    internal: true
+  jarvis_improve_egress: {}   # improve-egress only: HTTPS to public hosts
+  jarvis_claude_egress: {}    # claude-proxy only: api.anthropic.com
 
 volumes:
   pgdata:
@@ -420,6 +702,7 @@ volumes:
   memory_backups:
   gateway_ts_state:
   ts_socket:
+  improve_work:
 
 secrets:
   pg_superuser_password: { file: /etc/jarvis/secrets/pg_superuser_password }
@@ -433,3 +716,7 @@ secrets:
   # Provided, not generated: harden.sh asks for them (runbook §8).
   tailscale_gateway_authkey: { file: /etc/jarvis/secrets/tailscale_gateway_authkey }
   anthropic_api_key: { file: /etc/jarvis/secrets/anthropic_api_key }
+  # The improve team (profile "improve"): its own Claude key (a separate Console workspace),
+  # mounted only into claude-proxy, and the GitHub App's private key, only into improver.
+  improve_claude_key: { file: /etc/jarvis/secrets/improve_claude_key }
+  improve_github_app_key: { file: /etc/jarvis/secrets/improve_github_app_key }

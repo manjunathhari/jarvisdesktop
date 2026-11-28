@@ -21,10 +21,12 @@ COPY alembic.ini ./
 COPY migrations ./migrations
 COPY config ./config
 COPY src ./src
+# /work: the improve team's volume (improver). Owned by 10001 as in the sandbox image, so the new
+# volume is 10001's whichever container mounts it first.
 RUN uv sync --locked --no-dev \
  && groupadd --system --gid 10001 jarvis \
  && useradd --system --uid 10001 --gid 10001 --no-create-home jarvis \
- && install -d -o 10001 -g 10001 -m 0700 /var/lib/jarvis/memory /backups/memory
+ && install -d -o 10001 -g 10001 -m 0700 /var/lib/jarvis/memory /backups/memory /work
 
 USER jarvis
 ENTRYPOINT ["jarvis-core"]

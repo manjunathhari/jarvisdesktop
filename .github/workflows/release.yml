@@ -1,9 +1,9 @@
 name: Windows installer
-# Builds JARVIS-setup.exe on every push to milestone-a/main (or on demand)
+# Builds JARVIS-setup.exe on every push to main (or on demand)
 # and publishes it as a pre-release on the repo's Releases page.
 on:
   push:
-    branches: [main, milestone-a]
+    branches: [main]
     paths-ignore: ['server/**', 'contracts/**', '.10x/**', '.github/workflows/server.yml', 'helper/**', '.github/workflows/helper.yml']
   workflow_dispatch:
 
@@ -12,6 +12,8 @@ permissions:
 
 jobs:
   build:
+    # Only main publishes, also when run by hand from another branch.
+    if: github.ref == 'refs/heads/main'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
