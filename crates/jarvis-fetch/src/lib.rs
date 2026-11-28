@@ -41,7 +41,13 @@ pub trait Download: Send + Sync {
 
 /// Is the voice already installed?
 pub fn is_ready(models_dir: &Path) -> bool {
-    models_dir.join(KOKORO_DIR).join(COMPLETE_MARKER).is_file()
+    is_complete(&models_dir.join(KOKORO_DIR), REQUIRED)
+}
+
+/// `dir` is marked complete and every entry in `names` is still there (a marker alone is not
+/// trusted: a file can be deleted or quarantined after the install).
+fn is_complete(dir: &Path, names: &[&str]) -> bool {
+    dir.join(COMPLETE_MARKER).is_file() && names.iter().all(|n| dir.join(n).exists())
 }
 
 /// Make sure the voice is installed; download and unpack it if not.
@@ -148,7 +154,7 @@ async fn install_archive(
     percent: &(dyn Fn(u8) + Send + Sync),
 ) -> Result<PathBuf, String> {
     let dir = models_dir.join(dir_name);
-    if dir.join(COMPLETE_MARKER).is_file() {
+    if is_complete(&dir, required) {
         return Ok(dir);
     }
     std::fs::create_dir_all(models_dir).map_err(|e| e.to_string())?;
@@ -274,9 +280,12 @@ async fn install_files(
     percent: &(dyn Fn(u8) + Send + Sync),
 ) -> Result<PathBuf, String> {
     let dir = models_dir.join(dir_name);
-    if dir.join(COMPLETE_MARKER).is_file() {
+    let names: Vec<&str> = files.iter().map(|(_, name, _)| *name).collect();
+    if is_complete(&dir, &names) {
         return Ok(dir);
     }
+    // A marker with a file missing is stale: drop it so a failed attempt can't look complete.
+    let _ = std::fs::remove_file(dir.join(COMPLETE_MARKER));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let n = files.len().max(1) as u64;
     let last = std::sync::atomic::AtomicU8::new(0);
@@ -467,6 +476,22 @@ mod tests {
         ensure(tmp.path(), "u", &dl, &|_| {}).await.unwrap();
         ensure(tmp.path(), "u", &dl, &|_| {}).await.unwrap();
         assert_eq!(dl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_marked_archive_folder_missing_a_required_file_is_installed_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = fake(Some(archive(REQUIRED)));
+        ensure(tmp.path(), "u", &dl, &|_| {}).await.unwrap();
+        let dir = tmp.path().join(KOKORO_DIR);
+        std::fs::remove_file(dir.join("model.onnx")).unwrap(); // e.g. quarantined
+        assert!(!is_ready(tmp.path()), "a marker alone is not ready");
+
+        let files = ensure(tmp.path(), "u", &dl, &|_| {}).await.unwrap();
+        assert!(files.model.is_file());
+        assert!(dir.join(COMPLETE_MARKER).is_file());
+        assert!(is_ready(tmp.path()));
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -819,6 +844,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*dl.urls.lock().unwrap(), vec!["https://x/decoder"]);
+    }
+
+    #[tokio::test]
+    async fn a_marked_file_set_missing_a_file_fetches_only_that_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl = Recording {
+            urls: Mutex::new(Vec::new()),
+        };
+        let dir = ensure_files(tmp.path(), "whisper", FILES, &dl, &|_| {})
+            .await
+            .unwrap();
+        std::fs::remove_file(dir.join("decoder.onnx")).unwrap();
+        dl.urls.lock().unwrap().clear();
+
+        ensure_files(tmp.path(), "whisper", FILES, &dl, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(*dl.urls.lock().unwrap(), vec!["https://x/decoder"]);
+        assert!(dir.join("decoder.onnx").is_file());
+        assert!(dir.join(COMPLETE_MARKER).is_file());
+    }
+
+    #[tokio::test]
+    async fn a_marked_checked_set_missing_a_file_still_hash_checks_the_new_download() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut files = [
+            pinned("https://x/encoder", "encoder.onnx"),
+            pinned("https://x/decoder", "decoder.onnx"),
+        ];
+        let dir = ensure_files_checked(tmp.path(), "whisper", &files, &echo(vec![]), &|_| {})
+            .await
+            .unwrap();
+        std::fs::remove_file(dir.join("decoder.onnx")).unwrap();
+
+        // The re-fetched file does not match its pin: it never gets its name.
+        let good_pin = files[1].sha256;
+        files[1].sha256 = "0".repeat(64).leak();
+        let err = ensure_files_checked(tmp.path(), "whisper", &files, &echo(vec![]), &|_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(err, MISMATCH);
+        assert!(!dir.join("decoder.onnx").exists());
+        assert!(!dir.join("decoder.onnx.part").exists());
+        assert!(!dir.join(COMPLETE_MARKER).exists(), "stale marker removed");
+        assert!(dir.join("encoder.onnx").is_file(), "verified file stays");
+
+        files[1].sha256 = good_pin;
+        let dl = Recording {
+            urls: Mutex::new(Vec::new()),
+        };
+        ensure_files_checked(tmp.path(), "whisper", &files, &dl, &|_| {})
+            .await
+            .unwrap();
+        assert_eq!(*dl.urls.lock().unwrap(), vec!["https://x/decoder"]);
+        assert!(dir.join(COMPLETE_MARKER).is_file());
     }
 
     #[tokio::test]
