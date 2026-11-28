@@ -27,7 +27,9 @@ One job runs one utterance (`conv.inbound`) through these steps:
    `board.make` job for the turn and issues nothing; `board_set_state` and `board_focus`
    resolve the panel's handle for the authenticated person, record the state, and issue a live
    action carrying the panel's ID. A handle that is not the person's panel is refused
-   (`unknown_panel`), like any refused call.
+   (`unknown_panel`), like any refused call. `board_draw` (CAD board slice 1) is `board_make`
+   for a technical drawing: it queues a `cad.make` job with the same payload. One Board job per
+   turn across both: a second `board_make` or `board_draw` in the turn is left out and logged.
 8. After the call: CONNECT failure -> `release`, hold, re-run (the turn may try again);
    SEND failure, any unplaceable exception, or a completed stream with no usage -> `lapse`
    now, which runs the indeterminate path once (Task 9); success -> `settle`, the final chunk,
@@ -141,6 +143,7 @@ REMEMBERED_TEXT = "I'll remember that."
 NOT_REMEMBERED_TEXT = "I couldn't remember that."
 # The Board. The reply when the brain queued Board work and said nothing itself.
 BOARD_ACK_TEXT = "On it. I'll put it on the board."
+DRAW_ACK_TEXT = "On it. I'll draw it on the board."  # the same, for a drawing (`board_draw`)
 NO_PANEL_TEXT = "I can't find that panel on the board."
 BOARD_UNCLEAR_TEXT = "I didn't catch what to do on the board."
 # A fact the person states about themselves: their own identity file (no domain or date needed).
@@ -449,6 +452,7 @@ class _Stream:
         self.pieces: list[str] = []
         self.acted = False  # a live action was issued in this reply
         self.queued = False  # Board work was queued in this reply
+        self.board_job: str | None = None  # the action kind that queued it, once per turn
         self._pending: str | None = None
         self._space_next = False  # after Jarvis's own words, the brain's next piece is spaced
 
@@ -476,7 +480,7 @@ class _Stream:
         reply = "".join(self.pieces)
         if not reply.strip():
             if self.queued:
-                reply = BOARD_ACK_TEXT
+                reply = DRAW_ACK_TEXT if self.board_job == "board.draw" else BOARD_ACK_TEXT
             else:
                 reply = ACTION_ONLY_TEXT if self.acted else NO_SPEECH_TEXT
             self._pending = reply if self._pending is None else self._pending
@@ -609,7 +613,9 @@ def _storable(text: str) -> bool:
     return not any(ord(ch) < 32 and ch not in "\t\n\r" for ch in text)
 
 
-_BOARD_KINDS = frozenset({"board.make", "board.set_state", "board.focus"})
+_BOARD_KINDS = frozenset({"board.make", "board.draw", "board.set_state", "board.focus"})
+# The job each Board request queues, keyed by the turn.
+_BOARD_JOBS = {"board.make": "board.make", "board.draw": "cad.make"}
 
 
 def _board(
@@ -622,7 +628,7 @@ def _board(
 ) -> None:
     """A Board tool call the policy allowed. Nothing in the call names a person: the panel is
     looked up among the authenticated person's own."""
-    if kind == "board.make":
+    if kind in _BOARD_JOBS:
         request = call.args.get("request")
         if not isinstance(request, str) or not request.strip() or not _storable(request):
             _refuse(c, turn, stream, told, "bad_args", kind, BOARD_UNCLEAR_TEXT)
@@ -634,8 +640,12 @@ def _board(
             "inbound_id": str(turn.id),
             "request": request.strip()[: prompt.BOARD_REQUEST_MAX],
         }
+        if stream.board_job is not None:  # one Board job per turn, of either kind
+            log.info("turn %s: Board work is already queued; a second request is left out", turn.id)
+            return
+        stream.board_job = kind
         with c.transaction():  # one Board job per turn: the turn is the job's key
-            queued = jobs.enqueue_once(c, "board.make", str(turn.id), payload)
+            queued = jobs.enqueue_once(c, _BOARD_JOBS[kind], str(turn.id), payload)
         if queued is None:
             log.info("turn %s: Board work is already queued; a second request is left out", turn.id)
         else:

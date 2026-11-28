@@ -161,6 +161,7 @@ def test_tool_table_has_the_three_board_tools() -> None:
         "board_make": "board.make",
         "board_set_state": "board.set_state",
         "board_focus": "board.focus",
+        "board_draw": "board.draw",  # CAD board slice 1, Task 6
     }
     make = tools["board_make"].input_schema
     assert make["required"] == ["request"]
@@ -877,3 +878,204 @@ def test_long_titles_are_cut_in_the_list() -> None:
     assert line == 'p1 text "' + "é" * 59 + '…" open'
     short = prompt.board_line(board.PanelLine("p1", uuid.uuid4(), "text", "é" * 60, "open"))
     assert short == 'p1 text "' + "é" * 60 + '" open'
+
+
+# --- CAD board slice 1, Task 6: the voice tool `board_draw` ----------------------------------
+
+
+def _cad_jobs(app: Conn, person: uuid.UUID) -> list[dict[str, Any]]:
+    rows = app.execute(
+        "SELECT payload FROM ops.job WHERE kind = 'cad.make' AND payload->>'person_id' = %s"
+        " ORDER BY id",
+        (str(person),),
+    ).fetchall()
+    return [dict(r[0]) for r in rows]
+
+
+def _drawing(app: Conn, person: uuid.UUID, session: uuid.UUID, title: str) -> board.Panel:
+    from jarvis_server import contracts
+
+    content = contracts.drawing_content(contracts.DrawingContent(
+        engine="cadcraft", engine_version="0.12.0", units="mm", items=3,
+        steps=("Fictional walls",),
+        picture=contracts.DrawingPicture(sha256="b" * 64, bytes=100, media_type="image/svg+xml"),
+    ))  # fmt: skip
+    return _make(app, person, session, title, kind="drawing", content=content)
+
+
+DRAW = "A fictional floor plan of a 3 m by 4 m study, with dimensions"
+
+
+def test_board_draw_tool_takes_a_request_like_board_make() -> None:
+    tools = {t.name: t for t in prompt.TOOLS}
+    assert tools["board_draw"].input_schema == tools["board_make"].input_schema
+    assert tools["board_draw"].description == (
+        "Make a technical drawing on the person's Board with the CAD engine: a floor plan, a "
+        "part, a schematic or a site layout, with real dimensions. The drawing is made after "
+        "this reply and appears as a panel."
+    )
+    assert "drawing" not in tools["board_make"].description
+    assert prompt.TOOL_ACTIONS["board_draw"] == "board.draw"
+
+
+def test_board_draw_queues_one_cad_job_and_says_working(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine
+) -> None:
+    turn.set_brain(Brains([ToolCall("board_draw", {"request": DRAW}),
+                           Speech("Very good, I'll draw it.")]))  # fmt: skip
+    tid = _turn(app, owner, node, person)
+    session = _session(app, tid)
+    [job] = _cad_jobs(app, person)
+    assert {k: job[k] for k in ("session_id", "person_id", "node_id", "inbound_id", "request")} == {
+        "session_id": str(session), "person_id": str(person), "node_id": str(node),
+        "inbound_id": str(tid), "request": DRAW,
+    }  # fmt: skip
+    assert job["job_key"] == str(tid)  # keyed by the turn
+    assert _board_jobs(app, person) == []
+    assert _actions(app, session) == [("board.working", {"state": "started"})]
+    assert board.listing(app, person) == []  # nothing is shown yet
+    assert _messages(app, tid)[-1] == ("JARVIS", "Very good, I'll draw it.")
+    assert _outcome(app, tid) == "ANSWERED"
+
+
+def test_board_draw_says_the_draw_acknowledgement_when_the_brain_is_silent(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine
+) -> None:
+    turn.set_brain(Brains([ToolCall("board_draw", {"request": DRAW})]))
+    tid = _turn(app, owner, node, person)
+    assert turn.DRAW_ACK_TEXT == "On it. I'll draw it on the board."
+    assert _messages(app, tid)[-1] == ("JARVIS", turn.DRAW_ACK_TEXT)
+    assert len(_cad_jobs(app, person)) == 1
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "queued"),
+    [
+        ("board_draw", "board_make", "cad.make"),
+        ("board_draw", "board_draw", "cad.make"),
+    ],
+)
+def test_draw_then_make_in_one_turn_queues_only_the_first(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine,
+    first: str, second: str, queued: str,
+) -> None:  # fmt: skip
+    turn.set_brain(Brains([
+        ToolCall(first, {"request": "First fictional request"}),
+        ToolCall(second, {"request": "Second fictional request"}),
+    ]))  # fmt: skip
+    tid = _turn(app, owner, node, person)
+    assert [j["request"] for j in _cad_jobs(app, person)] == ["First fictional request"]
+    assert _board_jobs(app, person) == []
+    assert _actions(app, _session(app, tid)) == [("board.working", {"state": "started"})]
+    assert _messages(app, tid)[-1] == ("JARVIS", turn.DRAW_ACK_TEXT)
+    assert _refusals(app, tid) == []  # left out and logged, not refused
+
+
+def test_make_then_draw_in_one_turn_queues_only_the_first(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine
+) -> None:
+    turn.set_brain(Brains([
+        ToolCall("board_make", {"request": "First fictional request"}),
+        ToolCall("board_draw", {"request": "Second fictional request"}),
+    ]))  # fmt: skip
+    tid = _turn(app, owner, node, person)
+    assert [j["request"] for j in _board_jobs(app, person)] == ["First fictional request"]
+    assert _cad_jobs(app, person) == []
+    assert _actions(app, _session(app, tid)) == [("board.working", {"state": "started"})]
+    assert _messages(app, tid)[-1] == ("JARVIS", turn.BOARD_ACK_TEXT)
+    assert _refusals(app, tid) == []
+
+
+@pytest.mark.parametrize("args", [{}, {"request": "  "}, {"request": 7}, {"request": ["a"]},
+                                  {"request": "a\x00b"}])  # fmt: skip
+def test_board_draw_without_a_request_is_refused(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine,
+    args: dict[str, Any],
+) -> None:  # fmt: skip
+    turn.set_brain(Brains([ToolCall("board_draw", args)]))
+    tid = _turn(app, owner, node, person)
+    assert _cad_jobs(app, person) == []
+    assert _refusals(app, tid) == [{"reason": "bad_args", "action_kind": "board.draw"}]
+    assert _messages(app, tid)[-1] == ("JARVIS", turn.BOARD_UNCLEAR_TEXT)
+    assert _actions(app, _session(app, tid)) == []
+
+
+def test_a_long_draw_request_is_cut_to_the_limit(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, engine: MemoryEngine
+) -> None:
+    turn.set_brain(Brains([ToolCall("board_draw", {"request": "é" * 1500})]))
+    _turn(app, owner, node, person)
+    [job] = _cad_jobs(app, person)
+    assert job["request"] == "é" * 1000
+
+
+def test_board_draw_from_a_phone_is_refused_like_board_make(
+    app: Conn, owner: Conn, person: uuid.UUID, engine: MemoryEngine
+) -> None:
+    phone = flow.new_node(owner, person, "PHONE")
+    turn.set_brain(Brains([
+        ToolCall("board_draw", {"request": DRAW}),
+        ToolCall("board_make", {"request": "A fictional chart"}),
+    ]))  # fmt: skip
+    tid = _turn(app, owner, phone, person)
+    assert _refusals(app, tid) == [
+        {"reason": "node_kind_not_allowed", "action_kind": "board.draw"},
+        {"reason": "node_kind_not_allowed", "action_kind": "board.make"},
+    ]
+    assert _cad_jobs(app, person) == [] and _board_jobs(app, person) == []
+    assert _actions(app, _session(app, tid)) == []
+    assert _messages(app, tid)[-1] == ("JARVIS", turn.REFUSED_TEXT)
+
+
+def test_the_prompt_tells_drawings_from_other_board_work() -> None:
+    text = prompt.SYSTEM_PROMPT
+    assert (
+        "A technical drawing with dimensions, such as a floor plan, a part, a schematic or a "
+        "site layout, goes to board_draw instead." in text
+    )
+    assert (
+        '"Open the CAD board" means maximise the newest panel of kind drawing; "back to the '
+        'board" means restore it.' in text
+    )
+    # The Board lines are otherwise as they were.
+    assert "call board_make with the request, and say only one short sentence" in text
+    assert text.index("board_draw") > text.index("board_make")
+    assert "{" not in text.replace("{name}", "")  # still formats with the name alone
+
+
+def test_a_drawing_panel_is_named_a_drawing_in_the_board_lines(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    engine: MemoryEngine,
+) -> None:  # fmt: skip
+    _make(app, person, session, "Trip notes")
+    _drawing(app, person, session, "Study floor plan")
+    brains = Brains()
+    turn.set_brain(brains)
+    _turn(app, owner, node, person)
+    [req] = brains.requests
+    assert req.board == ['p2 drawing "Study floor plan" open', 'p1 text "Trip notes" open']
+    assert "p2 drawing" in build_payload(req)["system"]
+
+
+def test_open_the_cad_board_is_a_maximise(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    engine: MemoryEngine,
+) -> None:  # fmt: skip
+    """ "Open the CAD board" is the existing maximise of the newest drawing; "back to the
+    board" its restore. Nothing new is issued or queued."""
+    _drawing(app, person, session, "Older fictional plan")
+    newest = _drawing(app, person, session, "Newest fictional plan")
+    _make(app, person, session, "A text panel after it")
+    turn.set_brain(Brains(
+        [ToolCall("board_set_state", {"panel": "p2", "state": "maximise"})],  # "open the CAD board"
+        [ToolCall("board_set_state", {"panel": "p2", "state": "restore"})],  # "back to the board"
+    ))  # fmt: skip
+    _turn(app, owner, node, person)
+    assert _state(app, newest.panel_id) == "maximised"
+    _turn(app, owner, node, person)
+    assert _state(app, newest.panel_id) == "open"
+    assert _actions(app, session) == [
+        ("board.set_state", {"panel_id": str(newest.panel_id), "state": "maximised"}),
+        ("board.set_state", {"panel_id": str(newest.panel_id), "state": "open"}),
+    ]
+    assert _cad_jobs(app, person) == [] and _board_jobs(app, person) == []
