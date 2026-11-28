@@ -1,7 +1,7 @@
 name: Voice helper
 # Tests the voice helper on Linux and Windows, freezes it with PyInstaller on Windows, proves the
-# FROZEN program can speak (its self-test), and publishes it as a release asset when a
-# voice-helper-v* tag is pushed.
+# FROZEN program can speak (its self-test), and, when a voice-helper-v* tag is pushed, publishes
+# it to the release for that tag (the release job creates the release if the owner has not).
 on:
   push:
     # `branches` must be listed too: with only `tags` set, branch pushes would not run at all.
@@ -141,10 +141,34 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
-          sha=$(sha256sum jarvis-voice-helper-win-x64.tar.bz2 | cut -d' ' -f1)
-          gh release create "$TAG" jarvis-voice-helper-win-x64.tar.bz2 \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
-            --title "JARVIS voice helper $TAG" \
-            --notes "Windows x64 build of the JARVIS voice helper.
+          set -euo pipefail
+          asset=jarvis-voice-helper-win-x64.tar.bz2
+          sha=$(sha256sum "$asset" | cut -d' ' -f1)
+          # Only this probe may fail. A network/auth error is indistinguishable from "no release"
+          # here, and then we try to create one: that is safe, because `gh release create
+          # --verify-tag` fails if the release does exist, so nothing is ever replaced.
+          exists=0
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || exists=1
+          if [ "$exists" -eq 0 ]; then
+            # No --clobber: if the asset is already there this fails, and so does the job.
+            gh release upload "$TAG" "$asset" --repo "$GITHUB_REPOSITORY"
+            notes_file=$(mktemp)
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$notes_file"
+            printf '\n\nSHA-256 of %s: %s\n' "$asset" "$sha" >> "$notes_file"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes_file"
+            how="uploaded to the existing release"
+          else
+            gh release create "$TAG" "$asset" \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
+              --title "JARVIS voice helper $TAG" \
+              --notes "Windows x64 build of the JARVIS voice helper.
 
           SHA-256 of jarvis-voice-helper-win-x64.tar.bz2: $sha"
+            how="created the release"
+          fi
+          {
+            echo "### Release $TAG"
+            echo ""
+            echo "- Result: $how"
+            echo "- SHA-256 of $asset: \`$sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
