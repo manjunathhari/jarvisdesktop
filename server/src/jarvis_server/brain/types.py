@@ -48,6 +48,9 @@ class BrainRequest:
     server_tools: list[dict[str, Any]] = field(default_factory=list)
     # Earlier rounds of the same job, sent after the utterance in order (`Exchange`).
     exchanges: list[Exchange] = field(default_factory=list)
+    # Seconds for the whole call, counted from when the request is sent; None: no limit. Not
+    # sent to the provider: a brain that passes it ends the call with a SEND-phase failure.
+    time_limit: float | None = None
 
 
 @dataclass(frozen=True)

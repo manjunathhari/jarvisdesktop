@@ -105,6 +105,9 @@ NOT_FINISHED_TEXT = "Not finished: a step in this turn was not kept, or nothing 
 # A cut-off reply that still carried whole tool calls: the brain dropped the one that was cut.
 CUT_WITH_CALLS_TEXT = "Your reply was cut off: a step after these may be missing. Send it again."
 CUT_FINISH_TEXT = "Not finished: your reply was cut off. Check the drawing and finish again."
+NO_PICTURE_TEXT = (
+    "The drawing as it now stands could not be replayed: its summary and picture are not available."
+)
 CAD_STEPS_PER_ROUND = 3  # steps replayed in one round; more are refused unreplayed
 TOO_MANY_STEPS_TEXT = (
     f"STEP NOT KEPT: too many steps in one turn: send at most {CAD_STEPS_PER_ROUND}."
@@ -112,9 +115,9 @@ TOO_MANY_STEPS_TEXT = (
 # Time. Core runs one job at a time and `jobs.claim` locks a job for five minutes; the
 # reservation's lease is the job's lock (`turn._lease`). So before reserving, the job extends
 # its lock to `CAD_JOB_SECONDS`, and the loop is bounded to fit inside it: no new Claude call
-# after `CAD_LOOP_SECONDS` from the job's start, and a call still streaming after
-# `CAD_CALL_SECONDS` is abandoned (a failed send). `test_the_time_limits_fit_the_lock` pins the
-# sum. `_clock` is replaced by tests.
+# after `CAD_LOOP_SECONDS` from the job's start, and each call carries `CAD_CALL_SECONDS` as
+# its `time_limit` (the brain ends it there, as a failed send).
+# `test_the_time_limits_fit_the_lock` pins the sum. `_clock` is replaced by tests.
 CAD_JOB_SECONDS = 540
 CAD_LOOP_SECONDS = 150
 CAD_CALL_SECONDS = 150
@@ -287,6 +290,7 @@ def _request(
         memory=[],
         tools=list(TOOLS),
         max_tokens=CAD_MAX_TOKENS,
+        time_limit=CAD_CALL_SECONDS,
     )
 
 
@@ -419,16 +423,23 @@ def _round(loop: _Loop, calls: list[ToolCall], text: str, cut: bool, call_no: in
     if tried:
         last = tried[-1]
         now: Replay | None = last.replay
+        state = ""
+        picture: bytes | None = None
         if not last.kept:  # the drawing as it stands without it: one replay for the round
             now = None
             if loop.recipe:
                 try:
                     now = cad_engine.replay(loop.recipe, picture=False)
-                except EngineRefused:
-                    now = None
+                except EngineRefused as exc:
+                    log.info("cad job: the kept recipe was refused on replay (%s)", exc.code)
+                    state = NO_PICTURE_TEXT
+                    picture = b""  # no picture now: an older one must not pass for current
+        if not state:
+            state = state_report(now, last.kept)
+            picture = (now.png if now is not None else None) or None
         results[last.call.call_id] = ToolResult(
-            last.call.call_id, last.text + "\n" + state_report(now, last.kept),
-            image_png=(now.png if now is not None else None) or None, is_error=not last.kept,
+            last.call.call_id, last.text + "\n" + state, image_png=picture,
+            is_error=not last.kept,
         )  # fmt: skip
     for call in finishes:
         if cut and not call.args:
@@ -452,7 +463,9 @@ def _round(loop: _Loop, calls: list[ToolCall], text: str, cut: bool, call_no: in
 
 
 def _one_picture(exchanges: list[Exchange]) -> list[Exchange]:
-    """The exchanges as sent: only the newest result that has a picture keeps it."""
+    """The exchanges as sent: only the newest result that has a picture keeps it. An empty
+    picture (`b""`: the drawing could not be shown) counts as the newest and sends nothing, so
+    no older picture is sent as if it were current (`build_payload` leaves an empty one out)."""
     out = list(exchanges)
     seen = False
     for i in range(len(out) - 1, -1, -1):
@@ -483,11 +496,9 @@ def _active(c: psycopg.Connection[Any], reservation: UUID) -> bool:
 def _call(
     brain: Brain, req: BrainRequest, job_id: int, call_no: int
 ) -> tuple[list[ToolCall], str, CallPhase | None]:
-    """`board_job._call`, bounded in time: the clock is checked between events, and a call
-    still streaming after `CAD_CALL_SECONDS` is abandoned (its stream closed) and reported as
-    a SEND failure, since what it cost is unknown. A silent stream is bounded by the brain's own
-    read timeout."""
-    deadline = _clock() + CAD_CALL_SECONDS
+    """`board_job._call`, for a request with a `time_limit`: the brain ends a call that runs
+    past it with a SEND-phase failure (what it cost is unknown). The stream is always closed
+    afterwards; an error while closing it is logged (its type only) and never escapes."""
     calls: list[ToolCall] = []
     text: list[str] = []
     received = False
@@ -499,13 +510,11 @@ def _call(
                 text.append(event.text)
             else:
                 calls.append(event)
-            if _clock() > deadline:
-                log.warning("cad job %s: call %d ran past %d s; abandoned", job_id, call_no,
-                            CAD_CALL_SECONDS)  # fmt: skip
-                return [], "", CallPhase.SEND
     except BrainCallFailed as failure:
         if failure.phase is CallPhase.CONNECT and not received:
             return [], "", CallPhase.CONNECT
+        log.warning("cad job %s: call %d failed while sending (%s)", job_id, call_no,
+                    "time limit" if failure.detail == "time limit" else "send")  # fmt: skip
         return [], "", CallPhase.SEND
     except Exception as exc:  # unplaceable: the send phase (fail closed)
         log.warning("cad job %s: unexpected %s during call %d", job_id, type(exc).__name__,
@@ -514,7 +523,11 @@ def _call(
     finally:
         close = getattr(stream, "close", None)
         if close is not None:
-            close()  # ends the HTTP stream of an abandoned call
+            try:
+                close()  # ends the HTTP stream of a call that did not finish
+            except Exception as exc:
+                log.warning("cad job %s: closing call %d's stream failed (%s)", job_id,
+                            call_no, type(exc).__name__)  # fmt: skip
     return calls, "".join(text), None
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
-from jarvis_server.brain.types import BrainCallFailed, BrainEvent, BrainRequest
+from jarvis_server.brain.types import BrainCallFailed, BrainEvent, BrainRequest, CallPhase
 
 
 @dataclass(frozen=True)
@@ -16,6 +16,9 @@ class FakeCall:
     script: Sequence[BrainEvent | BrainCallFailed]
     usage: tuple[int, int] | None = None
     truncated: bool = False
+    # After its script, the call ran past the request's `time_limit`: the SEND-phase failure
+    # `ClaudeBrain` raises then. A request with no limit would never end: an error in a test.
+    overran: bool = False
 
 
 class FakeBrain:
@@ -26,7 +29,8 @@ class FakeBrain:
     `usage` mirrors `ClaudeBrain.usage` for the caller to read after the stream ends.
 
     With `calls`, the k-th `think` replays `calls[k]` instead (its own script, usage and
-    `truncated`), for a job that calls more than once; a call past the last is an error.
+    `truncated`, or an overrun of the request's time limit), for a job that calls more than
+    once; a call past the last is an error.
     """
 
     def __init__(
@@ -83,6 +87,10 @@ class FakeBrain:
             if isinstance(item, BrainCallFailed):
                 raise item
             yield item
+        if call.overran:
+            if req.time_limit is None:
+                raise AssertionError("FakeBrain: an overrun call without a time limit never ends")
+            raise BrainCallFailed(CallPhase.SEND, detail="time limit")
         self.usage = call.usage
         self.truncated = call.truncated
         self.stop_reason = "max_tokens" if call.truncated else self._final_stop

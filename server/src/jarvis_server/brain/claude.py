@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -72,6 +73,8 @@ ANTHROPIC_VERSION = "2023-06-01"
 
 # Bounded on every axis. `read` is the longest silence allowed between two stream chunks.
 TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0)
+# The clock `BrainRequest.time_limit` is measured on; replaced by tests.
+_clock = time.monotonic
 # Idle connections are kept this long and reused by the next call, saving the proxy CONNECT and
 # the TLS handshake on each turn (live check, 25 Nov).
 KEEPALIVE_EXPIRY = 60.0
@@ -319,11 +322,12 @@ class ClaudeBrain:
             "anthropic-version": ANTHROPIC_VERSION,
             "content-type": "application/json",
         }
+        deadline = None if req.time_limit is None else _clock() + req.time_limit
         try:
             with self._client.stream("POST", API_URL, json=body, headers=headers) as response:
                 if not response.is_success:
                     raise BrainCallFailed(CallPhase.SEND, status=response.status_code)
-                yield from self._parse(response.iter_lines())
+                yield from self._parse(response.iter_lines(), deadline)
         except BrainCallFailed:
             raise
         except _CONNECT_ERRORS as exc:
@@ -337,7 +341,7 @@ class ClaudeBrain:
         # `.request` (the x-api-key header and the body). `failure` holds only safe fields.
         raise failure
 
-    def _parse(self, lines: Iterator[str]) -> Iterator[BrainEvent]:
+    def _parse(self, lines: Iterator[str], deadline: float | None = None) -> Iterator[BrainEvent]:
         input_tokens = 0
         output_tokens = 0
         tool_name: str | None = None
@@ -350,6 +354,11 @@ class ClaudeBrain:
         cut_tool = False  # a client tool's input did not parse
         in_client_tool = False
         for line in lines:
+            # Every line, of any kind (pings and pieces of a tool's input pass nothing up): past
+            # the request's time limit the call ends here, and leaving the `with` closes the
+            # stream. What it cost is unknown, so it is a SEND-phase failure.
+            if deadline is not None and _clock() > deadline:
+                raise BrainCallFailed(CallPhase.SEND, detail="time limit")
             if not line.startswith("data:"):
                 continue
             event = json.loads(line[5:].strip())

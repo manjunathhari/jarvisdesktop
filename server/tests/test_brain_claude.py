@@ -8,6 +8,7 @@ certificate generated here) and a real `httpx.Client` with no mock.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import datetime
 import ipaddress
 import json
@@ -40,6 +41,7 @@ from jarvis_server.brain import (
     Turn,
     count_input_tokens,
 )
+from jarvis_server.brain import claude as claude_module
 from jarvis_server.brain.claude import (
     API_URL,
     BYTES_PER_TOKEN_FLOOR,
@@ -47,6 +49,7 @@ from jarvis_server.brain.claude import (
     TOOL_PROMPT_ALLOWANCE,
     build_payload,
 )
+from jarvis_server.brain.fake import FakeCall
 
 API_KEY = "sk-test-key-must-never-leak"
 MODEL = "claude-test-model"
@@ -1219,3 +1222,116 @@ def test_tool_call_carries_the_api_id() -> None:
     sent = build_payload(_with(ex))["messages"]
     assert sent[1]["content"][1]["id"] == "toolu_01FictionalId"
     assert sent[2]["content"][0]["tool_use_id"] == "toolu_01FictionalId"
+
+
+# --- a time limit for a whole call (CAD board slice 1, Task 5 re-check A-1) ------------------
+
+
+class _Lines(httpx.SyncByteStream):
+    """A stream of SSE events sent one per chunk; records how many were sent and whether the
+    stream was closed."""
+
+    def __init__(self, events: list[tuple[str, dict[str, Any]]]) -> None:
+        self.events = events
+        self.sent = 0
+        self.closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        for event in self.events:
+            self.sent += 1
+            yield sse(event)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+PING = ("ping", {"type": "ping"})
+
+
+@pytest.fixture
+def ticking(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The brain's clock: one second later at every reading."""
+    now = [0.0]
+
+    def clock() -> float:
+        now[0] += 1.0
+        return now[0]
+
+    monkeypatch.setattr(claude_module, "_clock", clock)
+    return now
+
+
+def _limited(stream: _Lines, limit: float | None) -> tuple[ClaudeBrain, BrainRequest]:
+    brain = mock_brain(lambda r: httpx.Response(200, stream=stream))
+    return brain, make_request(tools=[DRAW_TOOL], time_limit=limit)
+
+
+def test_pings_alone_end_at_the_time_limit(ticking: list[float]) -> None:
+    stream = _Lines([start(), *[PING] * 10_000])
+    brain, req = _limited(stream, 30.0)
+    with pytest.raises(BrainCallFailed) as ei:
+        list(brain.think(req))
+    assert ei.value.phase is CallPhase.SEND and ei.value.detail == "time limit"
+    assert stream.sent < 100 and stream.closed  # the stream was closed, not read to the end
+    assert brain.usage is None
+
+
+def test_a_tool_input_in_a_hundred_pieces_ends_at_the_time_limit(ticking: list[float]) -> None:
+    pieces = ['{"label": "Plate", "commands": [', *(['{"command": "line", "params": {}},'] * 98),
+              '{"command": "line", "params": {}}]}']  # fmt: skip
+    stream = _Lines([start(), *tool_block(0, "cad_step", *pieces), *finish()])
+    brain, req = _limited(stream, 30.0)
+    got: list[Any] = []
+    with pytest.raises(BrainCallFailed) as ei:
+        for event in brain.think(req):
+            got.append(event)
+    assert ei.value.phase is CallPhase.SEND and got == []  # no tool call is yielded
+    assert stream.closed and stream.sent < 50
+
+
+def test_text_pieces_end_at_the_time_limit(ticking: list[float]) -> None:
+    stream = _Lines([start(), *text_block(0, *["word "] * 200), *finish()])
+    brain, req = _limited(stream, 30.0)
+    got: list[Any] = []
+    with pytest.raises(BrainCallFailed) as ei:
+        for event in brain.think(req):
+            got.append(event)
+    assert ei.value.phase is CallPhase.SEND
+    assert 0 < len(got) < 30 and stream.closed
+
+
+def test_a_call_that_finishes_inside_the_limit_is_untouched(ticking: list[float]) -> None:
+    tool = tool_block(1, "calendar.read", '{"day": "to', 'day", "n": 2}')
+    events = [start(), *text_block(0, "Hello", ", Manj."), PING, *tool, *finish()]
+    stream = _Lines(events)
+    # One reading at the start and one per line; each event is three lines.
+    brain, req = _limited(stream, float(3 * len(events) + 2))
+    assert list(brain.think(req)) == [
+        Speech("Hello"), Speech(", Manj."), ToolCall("calendar.read", {"day": "today", "n": 2}),
+    ]  # fmt: skip
+    assert brain.usage == (11, 7) and stream.sent == len(events)
+
+
+def test_no_time_limit_reads_the_whole_stream(ticking: list[float]) -> None:
+    stream = _Lines([start(), *[PING] * 500, *text_block(0, "Hi"), *finish()])
+    brain, req = _limited(stream, None)
+    assert list(brain.think(req)) == [Speech("Hi")]
+    assert stream.sent == len(stream.events) and ticking == [0.0]  # the clock is never read
+
+
+def test_a_time_limit_changes_neither_the_payload_nor_the_token_count() -> None:
+    for name, req in _baseline_requests().items():
+        tokens, payload = BASELINE_PAYLOADS[name]
+        limited = dataclasses.replace(req, time_limit=150.0)
+        assert build_payload(limited) == payload, name
+        assert count_input_tokens(limited) == tokens, name
+        assert json.dumps(build_payload(limited)) == json.dumps(build_payload(req)), name
+
+
+def test_fake_brain_overrun_needs_a_time_limit() -> None:
+    brain = FakeBrain([], calls=[FakeCall([Speech("x")], usage=(1, 1), overran=True)] * 2)
+    with pytest.raises(BrainCallFailed) as ei:
+        list(brain.think(make_request(time_limit=5.0)))
+    assert ei.value.phase is CallPhase.SEND and brain.usage is None
+    with pytest.raises(AssertionError):
+        list(brain.think(make_request()))

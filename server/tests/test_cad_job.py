@@ -1326,46 +1326,53 @@ def test_a_job_that_lost_its_lock_never_reserves_or_calls(
     _nothing_shown(app, person, session)
 
 
-class _Stalls:
-    """The scripted brain, but its call `at` keeps streaming past the per-call limit: the clock
-    jumps after the call's first event. Records whether the stream was closed."""
+class _Closing:
+    """The scripted brain; records whether each call's stream was closed, and can fail to
+    close (an error from closing must not escape)."""
 
-    def __init__(self, inner: FakeBrain, now: list[float], at: int) -> None:
-        self.inner, self.now, self.at = inner, now, at
-        self.closed = False
-        self.events_taken = 0
+    def __init__(self, inner: FakeBrain, *, close_fails: bool = False) -> None:
+        self.inner, self.close_fails = inner, close_fails
+        self.closed = 0
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.inner, name)
 
     def think(self, req: BrainRequest) -> Iterator[Any]:
-        try:
-            for event in self.inner.think(req):
-                self.events_taken += 1
-                yield event
-                if len(self.inner.requests) == self.at:
-                    self.now[0] += cad_job.CAD_CALL_SECONDS + 1
-        except GeneratorExit:
-            self.closed = True
-            raise
+        outer = self
+
+        class _Stream:
+            def __init__(self) -> None:
+                self.it = outer.inner.think(req)
+
+            def __iter__(self) -> _Stream:
+                return self
+
+            def __next__(self) -> Any:
+                return next(self.it)
+
+            def close(self) -> None:
+                outer.closed += 1
+                if outer.close_fails:
+                    raise OSError("fictional")
+
+        return _Stream()
 
 
+@pytest.mark.parametrize("close_fails", [False, True])
 def test_a_call_past_its_time_limit_is_abandoned_and_charged_as_a_failed_send(
     app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
-    engine: MemoryEngine, runner: FakeRunner, monkeypatch: pytest.MonkeyPatch,
+    engine: MemoryEngine, runner: FakeRunner, close_fails: bool,
 ) -> None:  # fmt: skip
-    now = [5_000.0]
-    monkeypatch.setattr(cad_job, "_clock", lambda: now[0])
     inner = FakeBrain([], calls=[
         _call(_step()),  # kept
-        _call(Speech("Now the doors "), Speech("and windows"), _step("Doors"), _finish()),
+        FakeCall([Speech("Now the doors ")], usage=USAGE, overran=True),
     ])  # fmt: skip
-    stalls = _Stalls(inner, now, at=2)
-    turn.set_brain(lambda: (stalls, MODEL))
+    closing = _Closing(inner, close_fails=close_fails)
+    turn.set_brain(lambda: (closing, MODEL))
     job_id = _queue(app, owner, node, person, session)
-    _run(app, job_id)
-    assert len(inner.requests) == 2 and stalls.closed
-    assert stalls.events_taken == 3  # call 1's step, then two words of call 2: no step read
+    _run(app, job_id)  # DONE: an error from closing the stream did not escape
+    assert len(inner.requests) == 2 and closing.closed == 2
+    assert [r.time_limit for r in inner.requests] == [cad_job.CAD_CALL_SECONDS] * 2
     assert _reservations(app, job_id) == [("LAPSED", cad_job.CAD_RESERVE_PAISE, None)]
     assert _spoken(app, session) == [cad_job.CAD_FAILED_TEXT]
     _nothing_shown(app, person, session)  # though a step was kept (review item 7)
@@ -1376,3 +1383,33 @@ def test_a_call_past_its_time_limit_is_abandoned_and_charged_as_a_failed_send(
     assert len(inner.requests) == 2
     assert _reservations(app, job_id) == [("LAPSED", cad_job.CAD_RESERVE_PAISE, None)]
     assert _spoken(app, session) == [cad_job.CAD_FAILED_TEXT] * 2
+
+
+def test_every_call_carries_the_time_limit(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    engine: MemoryEngine, runner: FakeRunner,
+) -> None:  # fmt: skip
+    brain = Scripted(_call(_step()), _call(_step("Doors")), _call(_finish()))
+    _make(app, owner, node, person, session, brain)
+    assert [r.time_limit for r in brain.requests] == [150, 150, 150]
+    payload = build_payload(brain.requests[0])
+    assert "time_limit" not in json.dumps(payload)  # never sent to the provider
+
+
+def test_no_picture_is_shown_when_the_kept_drawing_cannot_be_replayed(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    engine: MemoryEngine, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """Review A-3: round 1 keeps a step (with its picture); in round 2 the step fails and the
+    replay of the kept recipe is refused. Round 1's picture must not be sent as current."""
+    # The catalogue, round 1's replay, round 2's failed step, then the kept recipe: refused.
+    script: list[Any] = [None, None, lambda q: good_replay(q, failed=_bad), failure("timeout")]
+    with FakeRunner(script) as r:
+        monkeypatch.setenv("JARVIS_CAD_ADDR", r.address)
+        brain = Scripted(_call(_step()), _call(_step("Doors", bad=True)), _call(Speech(".")))
+        _make(app, owner, node, person, session, brain)
+    [told] = _results(brain.requests[2], 2)
+    assert told.is_error and cad_job.NO_PICTURE_TEXT in told.text
+    assert "Drawing now" not in told.text
+    assert _images(brain.requests[1]) == 1  # round 1's picture, while it was current
+    assert _images(brain.requests[2]) == 0  # and never after
