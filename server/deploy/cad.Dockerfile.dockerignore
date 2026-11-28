@@ -1,0 +1,10 @@
+# Build context for cad.Dockerfile (the repository root): the Rust workspace is needed,
+# build output, git history and downloads are not.
+.git
+target
+**/node_modules
+models
+**/.venv
+**/__pycache__
+.env
+**/*.local.toml

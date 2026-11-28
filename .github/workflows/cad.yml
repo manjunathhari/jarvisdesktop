@@ -1,0 +1,157 @@
+name: CAD engine
+# The `cad` image: the pinned CAD engine (CADCraft cadcraft-cli) and jarvis-cad-runner.
+# Plan: .10x/plans/2026-11-28-cad-board-slice-1.md, Task 2. The engine is third-party code: it
+# runs only on this runner (real-engine tests) and inside the locked-down container.
+on:
+  push:
+    paths: ['crates/jarvis-cad-runner/**', 'server/deploy/cad.Dockerfile', 'server/deploy/cad.Dockerfile.dockerignore', 'server/config/cad_commands.txt', '.github/workflows/cad.yml', 'Cargo.toml', 'Cargo.lock']
+  pull_request:
+    paths: ['crates/jarvis-cad-runner/**', 'server/deploy/cad.Dockerfile', 'server/deploy/cad.Dockerfile.dockerignore', 'server/config/cad_commands.txt', '.github/workflows/cad.yml', 'Cargo.toml', 'Cargo.lock']
+
+permissions:
+  contents: read
+
+env:
+  CADCRAFT_VERSION: "0.12.0"
+  # From the release's SHA256SUMS.txt, read on 27 Nov 2026. A different file fails the job.
+  CADCRAFT_SHA256: 6ae27b9eabc3608caef356a00f69b9fdccbf1e408d6308b5614b6e6b256308de
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy -p jarvis-cad-runner --all-targets -- -D warnings
+      - name: Tests (against the stand-in engine)
+        run: cargo test -p jarvis-cad-runner
+      - name: Download the pinned engine and verify its checksum
+        # Kept outside the checkout, unpacked in its own empty directory.
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/cadcraft"
+          mkdir -p "$dir/download" "$dir/unpack" "$dir/bin"
+          file="cadcraft-${CADCRAFT_VERSION}-linux-x86_64.tar.gz"
+          curl -fsSL --retry 3 -o "$dir/download/$file" \
+            "https://github.com/storytold/cadcraft/releases/download/v${CADCRAFT_VERSION}/${file}"
+          (cd "$dir/download" && echo "${CADCRAFT_SHA256}  ${file}" | sha256sum -c -)
+          tar -xzf "$dir/download/$file" -C "$dir/unpack"
+          cli="$(find "$dir/unpack" -type f -name cadcraft-cli | head -n 1)"
+          test -n "$cli"
+          install -m 0755 "$cli" "$dir/bin/cadcraft-cli"
+      - name: Tests against the real engine
+        run: cargo test -p jarvis-cad-runner --test real_engine -- --nocapture
+        env:
+          JARVIS_CAD_ENGINE: ${{ runner.temp }}/cadcraft/bin/cadcraft-cli
+
+  image:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Image builds
+        run: docker build --file server/deploy/cad.Dockerfile --tag jarvis-cad:ci .
+      - name: Start it locked down, on an internal network with no route out
+        run: |
+          docker network create --internal cad-smoke
+          docker run --detach --name cad --network cad-smoke \
+            --read-only --tmpfs /tmp:rw,size=64m,mode=1777 \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --memory 256m --pids-limit 128 --user 10001:10001 \
+            jarvis-cad:ci
+      - name: Replay the canned two-room plan from a second container
+        run: |
+          docker run --rm -i --network cad-smoke python:3.12-slim python - <<'PY'
+          import base64, json, socket, sys, time
+
+          def ask(request):
+              deadline = time.monotonic() + 20
+              while True:
+                  try:
+                      sock = socket.create_connection(("cad", 7411), timeout=5)
+                      break
+                  except OSError:
+                      if time.monotonic() > deadline:
+                          raise
+                      time.sleep(0.5)
+              with sock:
+                  sock.settimeout(30)
+                  sock.sendall(json.dumps(request).encode() + b"\n")
+                  data = b""
+                  while not data.endswith(b"\n"):
+                      chunk = sock.recv(65536)
+                      if not chunk:
+                          break
+                      data += chunk
+              return json.loads(data)
+
+          catalogue = ask({"v": 1, "op": "catalogue"})
+          print("catalogue:", catalogue.get("ok"), catalogue.get("engine_version"), len(catalogue.get("commands") or {}), "commands")
+          if catalogue.get("ok") is not True or len(catalogue.get("commands") or {}) != 37:
+              print(json.dumps(catalogue)[:2000])
+              sys.exit("the catalogue did not answer with the 37 allowed commands")
+
+          plan = [
+              {"command": "setvar", "params": {"name": "DIMSCALE", "value": 40}},
+              {"command": "line", "params": {"points": [[0, 0], [9000, 0], [9000, 7000], [0, 7000]], "closed": True}},
+              {"command": "line", "params": {"points": [[5000, 0], [5000, 7000]]}},
+              {"command": "text", "params": {"at": [600, 6200], "text": "LIVING ROOM", "height": 200}},
+              {"command": "text", "params": {"at": [5600, 6200], "text": "BEDROOM", "height": 200}},
+              {"command": "dimlinear", "params": {"p1": [0, 0], "p2": [9000, 0], "at": [4500, -900]}},
+              {"command": "dimlinear", "params": {"p1": [9000, 0], "p2": [9000, 7000], "at": [9900, 3500]}},
+          ]
+          began = time.monotonic()
+          answer = ask({"v": 1, "op": "replay", "picture": True, "steps": [{"label": "Whole plan", "commands": plan}]})
+          took = time.monotonic() - began
+          svg = base64.b64decode(answer.get("svg_b64") or "")
+          print("replay:", answer.get("ok"), "failed", answer.get("failed"), "counts", answer.get("counts"),
+                "texts", answer.get("texts"), "svg", len(svg), "bytes", f"{took:.2f} s")
+          if answer.get("ok") is not True or answer.get("failed") != 0 or not svg:
+              print(json.dumps(answer)[:2000])
+              sys.exit("the replay did not answer ok with an SVG")
+          PY
+      - name: Runner log
+        if: always()
+        run: docker logs cad || true
+
+  publish:
+    # After the tests and the image check pass on main, publish the image the server pulls,
+    # tagged with the commit (the server deploys by JARVIS_REF = commit SHA).
+    needs: [test, image]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/deploy/cad.Dockerfile
+          push: true
+          tags: ghcr.io/manjunathhari/jarvis-cad:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/manjunathhari/jarvisdesktop
+            org.opencontainers.image.description=JARVIS cad engine runner (CADCraft 0.12.0)
