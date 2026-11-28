@@ -2,9 +2,10 @@
 //! answer keeps.
 //!
 //! Parsing up to 4 MiB of untrusted JSON into a `serde_json::Value` can cost 30 times its size
-//! (`[0,0,...]` is 32 bytes a number): measured 120 MB of peak memory against a 256 MB
-//! container. These walk the text once with serde visitors instead and keep only the counts,
-//! the extents and the texts.
+//! (`[0,0,...]` is 32 bytes a number): with about 4 MiB of `[0,0,...]` as `inspect_drawing`
+//! text, the runner's peak (VmHWM, debug build) was 120 MB, against a 256 MB container. These
+//! walk the text once with serde visitors instead and keep only the counts, the extents and the
+//! texts.
 //!
 //! The rules are those of the slice 0 test (`summarise`, `find_extents` in
 //! `spikes/cad-engine/draw_test.py`), as the first version of this runner applied them to a

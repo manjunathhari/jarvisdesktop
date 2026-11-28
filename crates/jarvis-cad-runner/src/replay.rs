@@ -108,13 +108,12 @@ impl Config {
 
     /// Container mode: after every replay, SIGKILL to every other process, all zombies
     /// reaped, and everything in the work root (`/tmp`) removed. Refused unless this process
-    /// is pid 1 or a child of pid 1 (`container_mode_allowed`), so it cannot be switched on in
-    /// a test or on a developer's machine by mistake.
+    /// is pid 1 (`container_mode_allowed`); see there for what that does and does not prove.
     pub fn container_mode(mut self) -> Result<Config, String> {
-        let (pid, ppid) = own_pids();
-        if !crate::container_mode_allowed(true, pid, ppid) {
+        let pid = own_pid();
+        if !crate::container_mode_allowed(true, pid) {
             return Err(format!(
-                "--container is only for the cad container: this runner is pid {pid} with parent {ppid}, and container mode needs pid 1 or parent pid 1"
+                "--container is only for the cad container, where the runner is pid 1; this runner is pid {pid}"
             ));
         }
         self.container = true;
@@ -147,17 +146,17 @@ impl Config {
     }
 }
 
-/// This process's pid and its parent's (0 and 0 where there are none).
-fn own_pids() -> (u32, u32) {
+/// This process's pid (0 where there is none).
+fn own_pid() -> u32 {
     #[cfg(unix)]
     {
-        // SAFETY: plain system calls without arguments.
-        let (pid, ppid) = unsafe { (libc::getpid(), libc::getppid()) };
-        (pid as u32, ppid as u32)
+        // SAFETY: a plain system call without arguments.
+        let pid = unsafe { libc::getpid() };
+        pid as u32
     }
     #[cfg(not(unix))]
     {
-        (0, 0)
+        0
     }
 }
 
@@ -353,24 +352,148 @@ pub fn remove_tree(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// `chmod 0700` on every directory of the tree, depth first, without following links and
-/// without recursion (a deep tree cannot overflow the stack).
+/// `chmod 0700` on every directory of the tree (unix), so that it can be removed.
 fn make_removable(root: &Path) {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+    #[cfg(unix)]
+    chmod_walk::make_removable(root);
+    #[cfg(not(unix))]
+    let _ = root;
+}
+
+/// The walk behind [`make_removable`]: by descriptor, never by path. Each directory is opened
+/// relative to its parent's descriptor with `O_NOFOLLOW | O_DIRECTORY`, so a name swapped for a
+/// symlink is refused rather than followed, and the mode is set on the open descriptor
+/// (`fchmod`). Depth is capped at [`chmod_walk::MAX_DEPTH`]; a deeper tree is left for the
+/// removal to fail on, which is logged and retried.
+#[cfg(unix)]
+mod chmod_walk {
+    use std::ffi::{CStr, CString};
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    pub const MAX_DEPTH: usize = 64;
+
+    pub fn make_removable(root: &Path) {
+        let Ok(root) = CString::new(root.as_os_str().as_bytes()) else {
+            return;
         };
-        for entry in entries.flatten() {
-            // The entry's own type: a link to a directory is not a directory here.
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                stack.push(entry.path());
+        if let Ok(fd) = open_dir(libc::AT_FDCWD, &root) {
+            walk(&fd, 0);
+        }
+    }
+
+    /// Recursion bounded by `MAX_DEPTH` (so at most that many descriptors are open at once).
+    fn walk(dir: &OwnedFd, depth: usize) {
+        if depth >= MAX_DEPTH {
+            return;
+        }
+        for name in subdirs(dir) {
+            if let Ok(child) = open_dir(dir.as_raw_fd(), &name) {
+                walk(&child, depth + 1);
             }
+        }
+    }
+
+    fn openat(parent: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+        // SAFETY: a valid descriptor (or AT_FDCWD) and a NUL-terminated name.
+        let fd = unsafe { libc::openat(parent, name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just opened and is owned by nothing else.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Opens a directory (never a link) for reading and makes it `0700` through the descriptor.
+    fn open_dir(parent: RawFd, name: &CStr) -> io::Result<OwnedFd> {
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = match openat(parent, name, flags) {
+            Ok(fd) => fd,
+            Err(e) if e.raw_os_error() == Some(libc::EACCES) => unlock_unreadable(parent, name)?,
+            Err(e) => return Err(e),
+        };
+        // SAFETY: a plain system call on an open descriptor.
+        unsafe {
+            libc::fchmod(fd.as_raw_fd(), 0o700);
+        }
+        Ok(fd)
+    }
+
+    /// A directory without read permission (mode 000) cannot be opened for reading. Hold it by
+    /// `O_PATH | O_NOFOLLOW` (which pins the directory itself, not its name), set its mode
+    /// through `/proc/self/fd/N` (which names that same directory), then open it relative to
+    /// the held descriptor.
+    #[cfg(target_os = "linux")]
+    fn unlock_unreadable(parent: RawFd, name: &CStr) -> io::Result<OwnedFd> {
+        let held = openat(
+            parent,
+            name,
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )?;
+        let by_fd = CString::new(format!("/proc/self/fd/{}", held.as_raw_fd()))
+            .map_err(io::Error::other)?;
+        // SAFETY: a NUL-terminated path.
+        if unsafe { libc::chmod(by_fd.as_ptr(), 0o700) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        openat(
+            held.as_raw_fd(),
+            c".",
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn unlock_unreadable(_parent: RawFd, _name: &CStr) -> io::Result<OwnedFd> {
+        Err(io::Error::from_raw_os_error(libc::EACCES))
+    }
+
+    /// The names of the real directories in `dir` (not links to them).
+    fn subdirs(dir: &OwnedFd) -> Vec<CString> {
+        // `fdopendir` takes ownership of its descriptor: give it a duplicate.
+        // SAFETY: plain system calls; `stream` is checked before use and closed once.
+        unsafe {
+            let dup = libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
+            if dup < 0 {
+                return Vec::new();
+            }
+            let stream = libc::fdopendir(dup);
+            if stream.is_null() {
+                libc::close(dup);
+                return Vec::new();
+            }
+            let mut names = Vec::new();
+            loop {
+                let entry = libc::readdir(stream);
+                if entry.is_null() {
+                    break;
+                }
+                let name = CStr::from_ptr((*entry).d_name.as_ptr());
+                if name == c"." || name == c".." {
+                    continue;
+                }
+                let is_dir = match (*entry).d_type {
+                    libc::DT_DIR => true,
+                    libc::DT_UNKNOWN => {
+                        let mut st: libc::stat = std::mem::zeroed();
+                        libc::fstatat(
+                            dir.as_raw_fd(),
+                            name.as_ptr(),
+                            &mut st,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        ) == 0
+                            && st.st_mode & libc::S_IFMT == libc::S_IFDIR
+                    }
+                    _ => false,
+                };
+                if is_dir {
+                    names.push(name.to_owned());
+                }
+            }
+            libc::closedir(stream);
+            names
         }
     }
 }
@@ -397,13 +520,12 @@ fn empty_dir(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Container mode only: SIGKILL to every process this one may signal (all of them in the
-/// container but this one), then every zombie reaped. Checked again here, so that it can only
-/// ever run as pid 1 or a child of pid 1.
+/// container but this one), then every zombie reaped. The pid is checked again here, so that
+/// it can only ever run as pid 1.
 fn container_sweep() {
     #[cfg(unix)]
     {
-        let (pid, ppid) = own_pids();
-        if !crate::container_mode_allowed(true, pid, ppid) {
+        if !crate::container_mode_allowed(true, own_pid()) {
             return;
         }
         // SAFETY: plain system calls. kill(-1) never signals the caller itself.
@@ -476,7 +598,13 @@ pub async fn replay(cfg: &Config, req: Request) -> Answer {
         let work = work.as_ref().map(|w| w.path.clone()).unwrap_or_default();
         tokio::time::timeout_at(deadline, run(cfg, &req, &work, engine)).await
     };
-    // The engine is dead and reaped before its files are touched.
+    // The engine is dead and reaped before its files are touched. This order matters even
+    // though the read itself is safe against links, FIFOs and devices (openat with O_NOFOLLOW
+    // and O_NONBLOCK, fstat on the descriptor): a live engine, or a helper in its group, could
+    // still change the file while it is read, or race the removal of the directory. No test
+    // pins this order: without privileges, nothing the engine can do to the file before it is
+    // killed gives a different answer from what it can do while the runner reads it, so a
+    // "read first" mutation still passes. Keep it.
     cleanup.stop_processes().await;
     let answer = match ran {
         Err(_) => Answer::failure(ErrorCode::Timeout),
@@ -696,7 +824,8 @@ pub fn svg_file_check(regular: bool, len: u64) -> Result<(), ErrorCode> {
     Ok(())
 }
 
-/// [`svg_file_check`] on an open descriptor's `fstat`.
+/// [`svg_file_check`] on an open descriptor's `fstat` (unix: its only caller is unix-only).
+#[cfg(unix)]
 fn check_svg_meta(meta: &std::fs::Metadata) -> Result<(), ErrorCode> {
     svg_file_check(meta.file_type().is_file(), meta.len())
 }
@@ -903,6 +1032,60 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o755);
         remove_tree(&root).unwrap(); // already gone: fine
+    }
+
+    /// A helper keeps swapping a directory of the tree with a link to a directory outside it
+    /// while the tree is unlocked again and again: the outside directory's mode never changes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unlocking_never_follows_a_swapped_in_link() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(outside.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("d")).unwrap();
+        symlink(outside.path(), root.path().join("alt")).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = {
+            let stop = stop.clone();
+            let d = std::ffi::CString::new(root.path().join("d").as_os_str().as_bytes()).unwrap();
+            let alt =
+                std::ffi::CString::new(root.path().join("alt").as_os_str().as_bytes()).unwrap();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // SAFETY: valid NUL-terminated paths.
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_renameat2,
+                            libc::AT_FDCWD,
+                            d.as_ptr(),
+                            libc::AT_FDCWD,
+                            alt.as_ptr(),
+                            libc::RENAME_EXCHANGE,
+                        );
+                    }
+                }
+            })
+        };
+        let mode = || {
+            std::fs::metadata(outside.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let began = std::time::Instant::now();
+        while began.elapsed() < Duration::from_secs(2) {
+            make_removable(root.path());
+            if mode() != 0o755 {
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().unwrap();
+        assert_eq!(mode(), 0o755, "the walk followed a link out of the tree");
     }
 
     #[test]

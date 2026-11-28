@@ -26,7 +26,11 @@
 //! - `wrongflood`: writes 4 MiB lines with the wrong id for ever;
 //! - `biginspect`: `inspect_drawing` answers about 4 MiB of `[0,0,...]` text;
 //! - `bigpng`: `render` answers an image of over 2 MiB of base64; `noimage`: no image;
-//! - `manyitems`: `inspect_drawing` counts 100,001 lines.
+//! - `manyitems`: `inspect_drawing` counts 100,001 lines;
+//! - `emptyitems`: its reply's `content` is about 1.39 million empty items (`{}`);
+//! - `textitems`: its reply's `content` is about 150,000 tiny text items;
+//! - `nested`: a line of arrays nested about 2 million deep comes before its reply;
+//! - `tinystrings`: its reply line carries a `pad` of about a million one-letter strings.
 //!
 //! Started with a program name containing `badversion`, it reports version `0.12.0 (abc)`.
 
@@ -59,6 +63,10 @@ struct Drawing {
     bigpng: bool,
     noimage: bool,
     manyitems: bool,
+    /// The next reply line, written instead of the usual one (`emptyitems`, `textitems`).
+    raw_reply: Option<String>,
+    nested: bool,
+    tinystrings: bool,
 }
 
 fn text_reply(id: &Value, text: &str, is_error: bool) -> Value {
@@ -66,6 +74,20 @@ fn text_reply(id: &Value, text: &str, is_error: bool) -> Value {
         "content": [{"type": "text", "text": text}],
         "isError": is_error,
     }})
+}
+
+/// The body of a reply (without its id) whose `content` is `n` copies of `item`.
+fn items(item: &str, n: usize) -> String {
+    let mut s = String::with_capacity(n * (item.len() + 1) + 40);
+    s.push_str("\"result\":{\"content\":[");
+    for k in 0..n {
+        if k > 0 {
+            s.push(',');
+        }
+        s.push_str(item);
+    }
+    s.push_str("]}}");
+    s
 }
 
 fn zeros(bytes: usize) -> String {
@@ -227,6 +249,22 @@ fn execute(drawing: &mut Drawing, args: &Value) -> (String, bool) {
         }
         "manyitems" => {
             drawing.manyitems = true;
+            ("ok".into(), false)
+        }
+        "emptyitems" => {
+            drawing.raw_reply = Some(items("{}", 1_390_000));
+            ("ok".into(), false)
+        }
+        "textitems" => {
+            drawing.raw_reply = Some(items(r#"{"type":"text","text":"a"}"#, 150_000));
+            ("ok".into(), false)
+        }
+        "nested" => {
+            drawing.nested = true;
+            ("ok".into(), false)
+        }
+        "tinystrings" => {
+            drawing.tinystrings = true;
             ("ok".into(), false)
         }
         other => (format!("Unknown command: {other}"), true),
@@ -483,7 +521,19 @@ fn main() {
                 )
             };
         }
+        if std::mem::take(&mut drawing.nested) {
+            let depth = 2_000_000;
+            let line = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+            let _ = writeln!(stdout, "{line}");
+        }
         let mut reply = reply.to_string();
+        if let Some(body) = drawing.raw_reply.take() {
+            reply = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},{body}");
+        }
+        if std::mem::take(&mut drawing.tinystrings) {
+            let pad = vec!["\"a\""; 1_000_000].join(",");
+            reply = format!("{{\"pad\":[{pad}],{}", &reply[1..]);
+        }
         let pad = std::mem::take(&mut drawing.bigline);
         if pad > 0 {
             // `{"pad":[0,...],` in front of the reply's own fields.

@@ -2,7 +2,7 @@
 //!
 //! In the `cad` image: `--container --listen 0.0.0.0:7411 --engine /usr/local/bin/cadcraft-cli
 //! --commands /etc/jarvis/cad_commands.txt --work-root /tmp`. `--container` is refused unless
-//! the runner is pid 1 or a child of pid 1.
+//! the runner is pid 1.
 
 use std::process::ExitCode;
 
@@ -74,13 +74,7 @@ fn main() -> ExitCode {
         cfg = cfg.work_root(PathBuf::from(root));
     }
     if container {
-        if work_root
-            .as_deref()
-            .is_some_and(|r| Path::new(r) != Path::new("/tmp"))
-        {
-            eprintln!("jarvis-cad-runner: in container mode the work root is /tmp");
-            return ExitCode::from(2);
-        }
+        // The pid check first: it is the reason that matters.
         cfg = match cfg.container_mode() {
             Ok(cfg) => cfg,
             Err(e) => {
@@ -88,6 +82,13 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
+        if work_root
+            .as_deref()
+            .is_some_and(|r| Path::new(r) != Path::new("/tmp"))
+        {
+            eprintln!("jarvis-cad-runner: with --container the work root is /tmp");
+            return ExitCode::from(2);
+        }
     }
     if !cfg.work_root_value().is_dir() {
         eprintln!(

@@ -158,36 +158,49 @@ async fn a_grandchild_is_killed_on_timeout_too() {
 }
 
 #[test]
-fn container_mode_needs_the_flag_and_pid_1_or_parent_pid_1() {
-    assert!(container_mode_allowed(true, 1, 0));
-    assert!(container_mode_allowed(true, 7, 1));
-    assert!(!container_mode_allowed(true, 4242, 4241));
-    assert!(!container_mode_allowed(false, 1, 0));
-    assert!(!container_mode_allowed(false, 7, 1));
-    assert!(!container_mode_allowed(false, 4242, 4241));
+fn container_mode_needs_the_flag_and_pid_1() {
+    assert!(container_mode_allowed(true, 1));
+    assert!(!container_mode_allowed(true, 7));
+    assert!(!container_mode_allowed(true, 4242));
+    assert!(!container_mode_allowed(false, 1));
+    assert!(!container_mode_allowed(false, 4242));
 }
 
 #[test]
 fn the_runner_refuses_container_mode_outside_a_container() {
+    // The runner started here is never pid 1 (its parent is this test).
     let scratch = Scratch::new();
-    // The runner started here has this test as its parent, so neither its pid nor its parent's
-    // is 1 (unless this test is itself pid 1, when it is not run).
-    if std::process::id() == 1 {
-        return;
-    }
     let commands = scratch.file("commands.txt");
     std::fs::write(&commands, "line\n").unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_jarvis-cad-runner"))
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_jarvis-cad-runner"))
         .args(["--container", "--listen", "127.0.0.1:0", "--engine"])
         .arg(fake_engine())
         .arg("--commands")
         .arg(&commands)
+        // /tmp, as in the image: even a broken runner that started would get no replay here
+        // (so no kill and no clean-up), and is SIGKILLed below (so no SIGTERM handler either).
         .arg("--work-root")
         .arg("/tmp")
-        .output()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    let err = String::from_utf8_lossy(&out.stderr);
+    // A runner that wrongly starts would serve for ever: give it 10 s, then fail.
+    let began = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if began.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the runner accepted --container outside a container");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(2));
+    let mut err = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err).unwrap();
     assert!(err.contains("--container"), "{err}");
 }
 
@@ -330,6 +343,17 @@ async fn a_png_over_two_mib_of_base64_or_no_image_is_null() {
 }
 
 #[tokio::test]
+async fn odd_content_lists_and_deep_or_wide_lines_are_handled() {
+    let addr = start(config()).await;
+    for hostile in ["emptyitems", "textitems", "nested", "tinystrings"] {
+        let answer = ask_within(addr, one_step(vec![cmd(hostile, json!({}))], false), PROMPT).await;
+        assert_eq!(answer["ok"], true, "{hostile}: {answer}");
+        let text = answer["results"][0]["text"].as_str().unwrap();
+        assert!(text.chars().count() <= 300, "{hostile}");
+    }
+}
+
+#[tokio::test]
 async fn four_mib_of_inspect_text_is_handled() {
     let addr = start(config()).await;
     let req = one_step(vec![cmd("biginspect", json!({}))], false);
@@ -432,16 +456,20 @@ async fn sigterm_stops_the_runner_and_its_engine() {
     }
     let report = scratch.file("sleep.txt");
     let grand = scratch.file("grandchild.txt");
-    let pending = tokio::spawn(ask(
-        addr,
-        one_step(
-            vec![
-                cmd("spawn", json!({"seconds": 60, "report": grand})),
-                cmd("sleep", json!({"seconds": 30, "report": report})),
-            ],
-            false,
-        ),
-    ));
+    // The request is left pending: the runner may close the connection without an answer.
+    let mut line = serde_json::to_vec(&one_step(
+        vec![
+            cmd("spawn", json!({"seconds": 60, "report": grand})),
+            cmd("sleep", json!({"seconds": 30, "report": report})),
+        ],
+        false,
+    ))
+    .unwrap();
+    line.push(b'\n');
+    let mut pending = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut pending, &line)
+        .await
+        .unwrap();
     let engine: u32 = wait_for_file(&report)
         .await
         .lines()
@@ -463,7 +491,7 @@ async fn sigterm_stops_the_runner_and_its_engine() {
         gone(grandchild).await,
         "the grandchild {grandchild} is still running"
     );
-    pending.abort();
+    drop(pending);
 }
 
 // ---- memory: a hostile engine and hostile clients against the runner binary
@@ -519,9 +547,13 @@ async fn the_runner_stays_under_96_mb_against_a_hostile_engine_and_clients() {
         ("wrong-id flood", cmd("wrongflood", json!({}))),
         ("4 MiB inspect text", cmd("biginspect", json!({}))),
         ("PNG over the cap", cmd("bigpng", json!({}))),
+        ("1.39 M empty content items", cmd("emptyitems", json!({}))),
+        ("150 k tiny text items", cmd("textitems", json!({}))),
+        ("a line of deeply nested arrays", cmd("nested", json!({}))),
+        ("a million tiny strings", cmd("tinystrings", json!({}))),
     ] {
         let answer = ask_within(addr, one_step(vec![hostile], false), limit).await;
-        assert!(answer["v"] == 1, "{answer}");
+        assert!(answer["v"] == 1, "{name}: {answer}");
         report.push((name, peak()));
     }
     // One replay holds the slot; two 1 MiB requests wait; five more are refused.

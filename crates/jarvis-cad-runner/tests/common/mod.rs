@@ -42,16 +42,34 @@ pub const FAKE_COMMANDS: &[&str] = &[
     "bigpng",
     "noimage",
     "manyitems",
+    "emptyitems",
+    "textitems",
+    "nested",
+    "tinystrings",
 ];
 
 pub fn config() -> Config {
     Config::new(fake_engine(), allowed(FAKE_COMMANDS))
 }
 
+/// Starts the runner on a thread and runtime of its own, never joined: if a broken runner
+/// blocks (a FIFO opened without `O_NONBLOCK`, say), the test's own runtime is not stuck and its
+/// timeouts still fail the test instead of hanging it.
 pub async fn start(cfg: Config) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve(listener, cfg));
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let listener = TcpListener::from_std(listener).unwrap();
+            serve(listener, cfg).await;
+        });
+    });
     addr
 }
 

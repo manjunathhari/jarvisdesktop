@@ -35,11 +35,14 @@ pub const MAX_WAITING: usize = 2;
 const WRITE_LIMIT: Duration = Duration::from_secs(10);
 
 /// Whether container mode may be switched on: only when asked for (`--container`) and only
-/// when the runner is pid 1 (the container's init) or a child of pid 1 (under `docker run
-/// --init` or compose `init: true`). Anywhere else, `kill(-1)` and emptying /tmp would hit
-/// processes and files that are not the container's.
-pub fn container_mode_allowed(flag: bool, pid: u32, ppid: u32) -> bool {
-    flag && (pid == 1 || ppid == 1)
+/// when the runner is pid 1, as the `cad` image's entry point makes it (no init in front).
+///
+/// This is a guard against starting it by mistake, not a proof of being in a container: a
+/// process that is pid 1 of some other PID namespace passes too. In container mode `kill(-1)`
+/// and emptying the work root reach every process and file the runner's user can reach in that
+/// namespace.
+pub fn container_mode_allowed(flag: bool, pid: u32) -> bool {
+    flag && pid == 1
 }
 
 struct Shared {
@@ -136,9 +139,8 @@ mod tests {
 
     #[test]
     fn container_mode_gate() {
-        assert!(container_mode_allowed(true, 1, 0));
-        assert!(container_mode_allowed(true, 12, 1));
-        assert!(!container_mode_allowed(true, 12, 11));
-        assert!(!container_mode_allowed(false, 1, 0));
+        assert!(container_mode_allowed(true, 1));
+        assert!(!container_mode_allowed(true, 12));
+        assert!(!container_mode_allowed(false, 1));
     }
 }

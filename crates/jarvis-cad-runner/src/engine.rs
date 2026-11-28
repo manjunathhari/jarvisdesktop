@@ -260,12 +260,14 @@ impl Engine {
         Ok(tool_reply(&line))
     }
 
-    /// Kills the engine's process group, then the child, and waits for the child to go.
+    /// Kills the engine's process group, then the child, and waits for the child to go. The
+    /// stored group id is cleared before the wait: once the leader is reaped the id may be
+    /// reused, and the SIGTERM handler must not signal it then.
     pub async fn kill(mut self) {
         self.group.kill();
+        self.group.forget();
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
-        self.group.forget();
     }
 
     async fn send<M: Serialize>(&mut self, message: &M) -> Result<(), EngineError> {
@@ -456,9 +458,61 @@ struct ServerInfo {
 #[derive(Deserialize)]
 struct ToolResult {
     #[serde(default)]
-    content: Vec<ContentItem>,
+    content: Content,
     #[serde(rename = "isError", default)]
     is_error: LenientTrue,
+}
+
+/// Content items looked at; the rest of a longer list is skipped unread.
+pub const MAX_CONTENT_ITEMS: usize = 16;
+
+/// A `content` list, read one item at a time: the text items' texts joined with `\n` (at most
+/// [`MAX_TOOL_TEXT`] bytes) and the first image's data, from the first [`MAX_CONTENT_ITEMS`]
+/// items. Nothing is kept per item, so a list of a million `{}` costs nothing.
+#[derive(Debug, Default)]
+struct Content {
+    text: String,
+    image: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for Content {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Content, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Content;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a list of content items")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Content, A::Error> {
+                let mut content = Content::default();
+                let mut first = true;
+                let mut looked = 0;
+                while looked < MAX_CONTENT_ITEMS {
+                    let Some(item) = seq.next_element::<ContentItem>()? else {
+                        return Ok(content);
+                    };
+                    looked += 1;
+                    match (item.kind.0.as_deref(), item.text.0, item.data.0) {
+                        (Some("text"), Some(t), _) => {
+                            let room = MAX_TOOL_TEXT.saturating_sub(content.text.len() + 1);
+                            if !first && room > 0 {
+                                content.text.push('\n');
+                            }
+                            first = false;
+                            content.text.push_str(&cap(t, room));
+                        }
+                        (Some("image"), _, Some(data)) if content.image.is_none() => {
+                            content.image = Some(data)
+                        }
+                        _ => {}
+                    }
+                }
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(content)
+            }
+        }
+        d.deserialize_seq(V)
+    }
 }
 
 #[derive(Deserialize)]
@@ -539,30 +593,10 @@ fn tool_reply(line: &[u8]) -> ToolReply {
     let Ok(result) = serde_json::from_str::<ToolResult>(result.get()) else {
         return malformed("the engine's reply was malformed");
     };
-    let mut text = String::new();
-    let mut image = None;
-    let mut first = true;
-    for item in result.content {
-        match (item.kind.0.as_deref(), item.text.0, item.data.0) {
-            (Some("text"), Some(t), _) => {
-                if !first {
-                    text.push('\n');
-                }
-                first = false;
-                if text.len() + t.len() > MAX_TOOL_TEXT {
-                    text.push_str(&cap(t, MAX_TOOL_TEXT - text.len()));
-                    break;
-                }
-                text.push_str(&t);
-            }
-            (Some("image"), _, Some(data)) if image.is_none() => image = Some(data),
-            _ => {}
-        }
-    }
     ToolReply {
         is_error: result.is_error.0,
-        text: cap(text, MAX_TOOL_TEXT),
-        image,
+        text: result.content.text,
+        image: result.content.image,
     }
 }
 
@@ -641,6 +675,29 @@ mod tests {
         assert!(!r.is_error);
         assert_eq!(r.text, "kept");
         assert!(r.image.is_none());
+    }
+
+    #[test]
+    fn only_the_first_content_items_are_looked_at() {
+        let many: Vec<Value> = (0..100)
+            .map(|i| json!({"type": "text", "text": format!("t{i}")}))
+            .collect();
+        let r = tool_reply(&line(json!({"result": {"content": many}})));
+        assert_eq!(r.text.split('\n').count(), MAX_CONTENT_ITEMS);
+        assert!(r.text.ends_with(&format!("t{}", MAX_CONTENT_ITEMS - 1)));
+        // An image after the items looked at is not seen; a million empty items cost nothing.
+        let mut items: Vec<Value> = vec![json!({}); MAX_CONTENT_ITEMS];
+        items.push(json!({"type": "image", "data": "QQ=="}));
+        let r = tool_reply(&line(json!({"result": {"content": items}})));
+        assert!(r.image.is_none() && r.text.is_empty() && !r.is_error);
+        let empty = format!(
+            r#"{{"result":{{"content":[{}{{}}]}}}}"#,
+            "{},".repeat(1_000_000)
+        );
+        let r = tool_reply(empty.as_bytes());
+        assert!(!r.is_error && r.text.is_empty());
+        // `content` that is not a list makes the reply malformed.
+        assert!(tool_reply(&line(json!({"result": {"content": {"a": 1}}}))).is_error);
     }
 
     #[test]

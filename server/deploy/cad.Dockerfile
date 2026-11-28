@@ -42,7 +42,7 @@ COPY --from=runner /src/target/release/jarvis-cad-runner /usr/local/bin/jarvis-c
 COPY server/config/cad_commands.txt /etc/jarvis/cad_commands.txt
 USER 10001:10001
 EXPOSE 7411
-# Container mode: the runner is pid 1 here (or a child of pid 1 under an init); after every
-# replay it kills every other process, reaps them and empties /tmp. Outside a container the
-# runner refuses --container.
+# Container mode: the runner is pid 1 here (run it without an init: --container is refused
+# unless the runner is pid 1); after every replay it kills every other process, reaps them and
+# empties /tmp.
 ENTRYPOINT ["/usr/local/bin/jarvis-cad-runner", "--container", "--listen", "0.0.0.0:7411", "--engine", "/usr/local/bin/cadcraft-cli", "--commands", "/etc/jarvis/cad_commands.txt", "--work-root", "/tmp"]
