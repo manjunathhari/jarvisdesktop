@@ -71,6 +71,8 @@ REQUEST_MAX_BYTES = 1_000_000  # under the runner's 1,048,576, with room to spar
 # commands has about 2,006 objects and lists and about 10,200 commas.
 ANSWER_CONTAINERS_MAX = 5_000
 ANSWER_COMMAS_MAX = 20_000
+# A good answer for 2,000 commands has about 28,000 quotes.
+ANSWER_QUOTES_MAX = 100_000
 HOST_MAX = 253
 
 RESULT_TEXT_MAX = 300
@@ -318,6 +320,11 @@ def _check_shape(raw: bytes, op: str) -> None:
     good answer has: parsing millions of tiny values would cost hundreds of megabytes. Escapes
     go first (`\\\\` pairs, then `\\"`), so every `"` left opens or closes a string."""
     plain = raw.replace(b"\\\\", b"").replace(b'\\"', b"")
+    # Millions of empty strings would make the substitution below build a piece for each one.
+    quotes = plain.count(b'"')
+    if quotes > ANSWER_QUOTES_MAX:
+        log.warning("cad %s: answer of %d quotes", op, quotes)
+        raise EngineDown("the engine's answer is malformed")
     outside = _STRING.sub(b"", plain)
     del plain
     containers = outside.count(b"{") + outside.count(b"[")

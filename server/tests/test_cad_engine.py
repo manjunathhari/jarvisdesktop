@@ -703,6 +703,23 @@ def _peak_mib(fn: Callable[[], Any]) -> float:
         tracemalloc.stop()
 
 
+@pytest.mark.parametrize("filler", [b'"",', b'"" '])
+def test_a_hostile_answer_of_many_strings_costs_little(filler: bytes) -> None:
+    """8 MiB of empty strings made the pre-parse check itself build a piece per string (about
+    480 MB). The count of quotes is taken first, so it never gets that far."""
+    head, tail = b'{"v":1,"ok":true,"x":[', b'""]}\n'
+    line = head + filler * ((cad_engine.ANSWER_MAX_BYTES - 64) // len(filler)) + tail
+    assert len(line) <= cad_engine.ANSWER_MAX_BYTES
+
+    def run() -> None:
+        with FakeRunner([Raw(line)]) as runner, pytest.raises(EngineDown):
+            cad_engine.replay(_steps(), picture=False, address=runner.address)
+
+    peak = _peak_mib(run)
+    print(f"peak {peak:.1f} MiB for {filler!r}")
+    assert peak < 60
+
+
 @pytest.mark.parametrize("filler", [b"{},", b"[],", b"1,"])
 def test_a_hostile_answer_of_many_containers_costs_little(filler: bytes) -> None:
     """8 MiB of `[{},{},...]` used to be parsed whole (about 220 MB); now it is refused first.
@@ -822,6 +839,17 @@ def test_check_svg_is_quick_near_the_element_limit() -> None:
     took = time.monotonic() - started
     print(f"check_svg took {took:.2f} s")
     assert took < 2
+
+
+@pytest.mark.parametrize("k", [0, 1, 1022, 1023, 1024, 1025, 2047, 2048, 2998])
+def test_text_after_any_child_is_found_whichever_batch_it_is_freed_in(k: int) -> None:
+    """Children are freed 1,024 at a time; text that follows child k must be seen first."""
+    siblings = ["<g/>"] * 3000
+    siblings[k] += "x"
+    with pytest.raises(BadPicture, match=r"^text$"):
+        check_svg(_svg("".join(siblings)))
+    with pytest.raises(BadPicture, match=r"^text$"):
+        check_svg(_svg("<g>" + "".join(siblings) + "</g>"))
 
 
 def test_text_between_elements_is_still_found_when_children_are_freed() -> None:
