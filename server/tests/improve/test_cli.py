@@ -69,3 +69,11 @@ def test_manj_s_commands(capsys: pytest.CaptureFixture[str]) -> None:
     assert store.get(1).state is State.STOPPED
     assert cli.command(store, ["inbox"]) == 0
     assert capsys.readouterr().out.strip().endswith("Nothing needs you.")
+
+
+def test_the_inbox_says_to_seal_each_key_as_harden_sh_does(tmp_path: Path) -> None:
+    # The improver runs as 10001 and claude-proxy joins group 10001: a root-only 0400 file
+    # would be unreadable to both, so the steps must say root:10001, mode 0440.
+    text = inbox.render(cli.missing_keys({}, _secrets(tmp_path), proxy_up=lambda: False))
+    assert "0400" not in text
+    assert text.count("root:10001, mode 0440") == 2

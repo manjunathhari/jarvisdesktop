@@ -2,7 +2,8 @@
 #
 # Deployed as Docker project "jarvis" (Hostinger Docker manager or plain `docker compose`).
 # The image is built and published by CI (server.yml) as ghcr.io/manjunathhari/jarvis-server:<commit>.
-# JARVIS_REF is the only environment value; it is not secret. Secrets are files in
+# JARVIS_REF is the main environment value; the improve profile also reads the GitHub App ids.
+# None is secret. Secrets are files in
 # /etc/jarvis/secrets (root:10001, 0440), created by deploy/harden/harden.sh.
 #
 # No service publishes a port (CI fails the build if one appears). Everything sits on the
@@ -547,6 +548,10 @@ services:
       JARVIS_PROCESS: improver
       HTTPS_PROXY: http://improve-egress:3128
       TZ: Asia/Kolkata
+      # The GitHub App's numeric ids, from the server's .env (not secret). Compose reads .env
+      # only to fill ${...}, so each one is named here or it never reaches the improver.
+      JARVIS_IMPROVE_APP_ID: ${JARVIS_IMPROVE_APP_ID:-}
+      JARVIS_IMPROVE_INSTALLATION_ID: ${JARVIS_IMPROVE_INSTALLATION_ID:-}
     # Its database password and the GitHub App's private key. Never a Claude key.
     secrets: [pg_app_password, improve_github_app_key]
     volumes:

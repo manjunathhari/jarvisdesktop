@@ -887,3 +887,10 @@ def test_the_sandbox_image_blanks_the_base_image_s_build_values() -> None:
     final = text.split("\nFROM ", 2)[2]
     assert re.search(r"^\s*(ENV\s+)?GPG_KEY=\s*\\?$", final, re.MULTILINE)
     assert re.search(r"^\s*PYTHON_SHA256=\s*\\?$", final, re.MULTILINE)
+
+
+def test_the_improver_gets_the_app_ids_from_the_server_s_env_file(stack: dict[str, Any]) -> None:
+    # Compose reads .env only to fill ${...}; a variable the service doesn't name never reaches it.
+    env = _services(stack)["improver"]["environment"]
+    for k in ("JARVIS_IMPROVE_APP_ID", "JARVIS_IMPROVE_INSTALLATION_ID"):
+        assert env[k] == "${" + k + ":-}"

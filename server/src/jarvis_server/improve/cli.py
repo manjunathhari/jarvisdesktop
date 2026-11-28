@@ -60,7 +60,7 @@ def missing_keys(
                 (
                     "Create the GitHub App and install it on the repo, as the PR's setup steps say",
                     f"Save its private key on the server as /etc/jarvis/secrets/{APP_KEY}"
-                    " (owner root, mode 0400)",
+                    " (root:10001, mode 0440, as harden.sh seals secrets)",
                     "Put the App's numeric ids in the server's .env as JARVIS_IMPROVE_APP_ID and"
                     " JARVIS_IMPROVE_INSTALLATION_ID",
                     _RESTART,
@@ -76,7 +76,7 @@ def missing_keys(
                     "In the Claude Console, make a new workspace with a $30 monthly spend limit and"
                     " create an API key in it",
                     f"Save the key on the server as /etc/jarvis/secrets/{CLAUDE_KEY}"
-                    " (owner root, mode 0400)",
+                    " (root:10001, mode 0440, as harden.sh seals secrets)",
                     _RESTART,
                 ),
             )
