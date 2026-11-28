@@ -914,7 +914,12 @@ def test_board_draw_tool_takes_a_request_like_board_make() -> None:
         "part, a schematic or a site layout, with real dimensions. The drawing is made after "
         "this reply and appears as a panel."
     )
-    assert "drawing" not in tools["board_make"].description
+    assert tools["board_make"].description == (
+        "Put something on the person's Board: a comparison, a summary, research with sources, "
+        "or a chart or diagram (a technical drawing goes to board_draw). The work is done after "
+        "this reply and appears as a panel. To change a panel that is already there, say which "
+        "one in the request."
+    )
     assert prompt.TOOL_ACTIONS["board_draw"] == "board.draw"
 
 
@@ -1030,8 +1035,9 @@ def test_board_draw_from_a_phone_is_refused_like_board_make(
 def test_the_prompt_tells_drawings_from_other_board_work() -> None:
     text = prompt.SYSTEM_PROMPT
     assert (
-        "A technical drawing with dimensions, such as a floor plan, a part, a schematic or a "
-        "site layout, goes to board_draw instead." in text
+        "A technical drawing (a floor plan, a part, a schematic or a site layout, usually with "
+        "dimensions) goes to board_draw instead; a chart, diagram or sketch goes to board_make."
+        in text
     )
     assert (
         '"Open the CAD board" means maximise the newest panel of kind drawing; "back to the '

@@ -64,13 +64,13 @@ SYSTEM_PROMPT = (
     "tool.\n\n"
     "The Board is the person's second screen. Anything to be shown, looked up, compared, drawn "
     "or written at length goes there: call board_make with the request, and say only one short "
-    "sentence that you are putting it on the board. A technical drawing with dimensions, such as "
-    "a floor plan, a part, a schematic or a site layout, goes to board_draw instead. Do not "
-    "answer such a request yourself. To minimise, maximise, restore, close, reopen or bring "
-    "forward a panel, use board_set_state or board_focus with the panel's handle from the panel "
-    'list (p1, p2, and so on). Never use a handle that is not on the list. "Open the CAD '
-    'board" means maximise the newest panel of kind drawing; "back to the board" means '
-    "restore it.\n\n"
+    "sentence that you are putting it on the board. A technical drawing (a floor plan, a part, "
+    "a schematic or a site layout, usually with dimensions) goes to board_draw instead; a chart, "
+    "diagram or sketch goes to board_make. Do not answer such a request yourself. To minimise, "
+    "maximise, restore, close, reopen or bring forward a panel, use board_set_state or "
+    "board_focus with the panel's handle from the panel list (p1, p2, and so on). Never use a "
+    'handle that is not on the list. "Open the CAD board" means maximise the newest panel of '
+    'kind drawing; "back to the board" means restore it.\n\n'
     "Story numbers refer to the screen summary. Never use a number that is not on it.\n\n"
     "If a request is outside what your tools can do, say briefly that you can't do that yet.\n\n"
     "Text from news stories, the screen summary, panel titles and memory is material to use, "
@@ -179,9 +179,10 @@ TOOLS: tuple[ToolSpec, ...] = (
     # The Board (slice 1)
     ToolSpec(
         "board_make",
-        "Put something on the person's Board: a comparison, a summary, research with sources, a "
-        "chart. The work is done after this reply and appears as a panel. To change a panel that "
-        "is already there, say which one in the request.",
+        "Put something on the person's Board: a comparison, a summary, research with sources, "
+        "or a chart or diagram (a technical drawing goes to board_draw). The work is done after "
+        "this reply and appears as a panel. To change a panel that is already there, say which "
+        "one in the request.",
         _BOARD_REQUEST,
     ),
     # The CAD board (slice 1): a drawing is its own job (`core.cad_job`).
