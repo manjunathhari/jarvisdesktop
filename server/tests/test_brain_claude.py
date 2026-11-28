@@ -1312,6 +1312,16 @@ def test_a_call_that_finishes_inside_the_limit_is_untouched(ticking: list[float]
     assert brain.usage == (11, 7) and stream.sent == len(events)
 
 
+@pytest.mark.parametrize("limit", [float("nan"), float("inf"), 0.0, -1.0])
+def test_a_time_limit_must_be_positive_and_finite(ticking: list[float], limit: float) -> None:
+    """NaN or infinity would silently mean no limit; zero or less would fail after sending."""
+    stream = _Lines([start(), *text_block(0, "Hi"), *finish()])
+    brain, req = _limited(stream, limit)
+    with pytest.raises(ValueError):
+        list(brain.think(req))
+    assert stream.sent == 0  # refused before anything is sent
+
+
 def test_no_time_limit_reads_the_whole_stream(ticking: list[float]) -> None:
     stream = _Lines([start(), *[PING] * 500, *text_block(0, "Hi"), *finish()])
     brain, req = _limited(stream, None)

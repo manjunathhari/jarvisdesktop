@@ -436,7 +436,9 @@ def _round(loop: _Loop, calls: list[ToolCall], text: str, cut: bool, call_no: in
                     picture = b""  # no picture now: an older one must not pass for current
         if not state:
             state = state_report(now, last.kept)
-            picture = (now.png if now is not None else None) or None
+            # No picture this time (the engine gave none): an empty one, so that an older
+            # picture is dropped and never passes for the drawing as it now stands.
+            picture = (now.png if now is not None else None) or b""
         results[last.call.call_id] = ToolResult(
             last.call.call_id, last.text + "\n" + state, image_png=picture,
             is_error=not last.kept,

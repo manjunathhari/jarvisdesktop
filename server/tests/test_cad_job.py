@@ -1396,6 +1396,30 @@ def test_every_call_carries_the_time_limit(
     assert "time_limit" not in json.dumps(payload)  # never sent to the provider
 
 
+def test_an_older_picture_is_dropped_when_a_kept_step_comes_back_without_one(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    engine: MemoryEngine, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """Round 1 keeps a step with its picture; round 2 keeps a step but the engine gives no
+    picture. Round 1's picture must not be sent as the drawing as it now stands."""
+
+    def without_picture(request: dict[str, Any]) -> dict[str, Any]:
+        answer = good_replay(request)
+        answer["png_b64"] = None
+        return answer
+
+    # The catalogue, round 1's replay, then round 2's replay without a picture.
+    script: list[Any] = [None, None, without_picture]
+    with FakeRunner(script) as r:
+        monkeypatch.setenv("JARVIS_CAD_ADDR", r.address)
+        brain = Scripted(_call(_step()), _call(_step("Doors")), _call(Speech(".")))
+        _make(app, owner, node, person, session, brain)
+    [told] = _results(brain.requests[2], 2)
+    assert not told.is_error
+    assert _images(brain.requests[1]) == 1  # round 1's picture, while it was current
+    assert _images(brain.requests[2]) == 0  # and never after
+
+
 def test_no_picture_is_shown_when_the_kept_drawing_cannot_be_replayed(
     app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
     engine: MemoryEngine, monkeypatch: pytest.MonkeyPatch,

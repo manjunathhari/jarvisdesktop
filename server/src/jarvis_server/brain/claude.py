@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -322,6 +323,10 @@ class ClaudeBrain:
             "anthropic-version": ANTHROPIC_VERSION,
             "content-type": "application/json",
         }
+        if req.time_limit is not None and not (
+            math.isfinite(req.time_limit) and req.time_limit > 0
+        ):  # NaN or infinity would mean no limit at all; refused before anything is sent
+            raise ValueError("time_limit must be a positive, finite number of seconds")
         deadline = None if req.time_limit is None else _clock() + req.time_limit
         try:
             with self._client.stream("POST", API_URL, json=body, headers=headers) as response:
