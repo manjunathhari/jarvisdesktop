@@ -1,4 +1,5 @@
-//! The pipe link: a reader thread turns the helper's lines into events, writes go through a mutex.
+//! The pipe link: a reader thread turns the helper's lines into events, writes go through a
+//! queue to one writer thread.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
