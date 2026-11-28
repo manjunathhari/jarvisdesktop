@@ -75,7 +75,7 @@ jobs:
           JARVIS_REF: ${{ github.sha }}
       - name: Image builds
         run: docker build --tag jarvis-server:ci .
-      - name: Sandbox image builds (improve profile; built only, never pushed)
+      - name: Sandbox image builds (improve profile; the publish job pushes it from main)
         run: docker build -f deploy/improve/sandbox.Dockerfile --tag jarvis-sandbox:ci .
       # The next two run the sandbox image the way compose runs it (its own environment,
       # read-only root, tmpfs, uid 10001, no capabilities), without starting the other services.
@@ -117,3 +117,14 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/manjunathhari/jarvisdesktop
             org.opencontainers.image.description=JARVIS server (Architecture v2)
+      # The improve team's sandbox, with the same commit tag, since compose runs
+      # ghcr.io/manjunathhari/jarvis-sandbox:${JARVIS_REF} beside the server image.
+      - uses: docker/build-push-action@v6
+        with:
+          context: server
+          file: server/deploy/improve/sandbox.Dockerfile
+          push: true
+          tags: ghcr.io/manjunathhari/jarvis-sandbox:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/manjunathhari/jarvisdesktop
+            org.opencontainers.image.description=JARVIS improve team sandbox (no keys)

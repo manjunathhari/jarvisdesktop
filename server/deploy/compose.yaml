@@ -561,7 +561,7 @@ services:
   # One stage per container: the runner reads /work/inbox, writes /work/outbox and exits, and
   # `restart: always` brings up the next on a clean read-only root and empty tmpfs. No secret,
   # no key: ANTHROPIC_API_KEY is a placeholder that claude-proxy replaces. The image is built by
-  # CI from deploy/improve/sandbox.Dockerfile (not yet published).
+  # CI from deploy/improve/sandbox.Dockerfile and published from main with the server's tag.
   sandbox:
     image: ghcr.io/manjunathhari/jarvis-sandbox:${JARVIS_REF:?set JARVIS_REF to a commit of manjunathhari/jarvisdesktop}
     profiles: [improve]
