@@ -2,13 +2,14 @@
 
 Core owns every panel: what Jarvis shows on the Board is stored here first, then sent to the
 desktop as a signed live action. A panel belongs to one person. It has a stable number (Jarvis
-calls it `p<number>`), a kind (`text` or `canvas`), a state, and revisions: an update adds a
-revision and never changes an earlier one. Nothing is deleted; closing a panel is a state.
+calls it `p<number>`), a kind (`text`, `canvas` or `drawing`), a state, and revisions: an update
+adds a revision and never changes an earlier one. Nothing is deleted; closing a panel is a state.
 
 - `check_content` is the one gate for what may be stored: the limits of
   `contracts/messages/board.show.args` (a one-line title of at most 120 code points, content of
-  at most 30,000 bytes of UTF-8, no control characters but tab and line breaks). `create` and
-  `update` call it first; a panel that fails it is not stored.
+  at most 30,000 bytes of UTF-8, no control characters but tab and line breaks), and for a
+  `drawing` panel, content that is a drawing description (`contracts.parse_drawing_content`).
+  `create` and `update` call it first; a panel that fails it is not stored.
 - Every function takes the person and acts only on that person's panels: another person's
   panel, like one that does not exist, is `UnknownPanel`.
 - `listing` is what Jarvis is told is on the Board: every panel that is not closed, and the
@@ -111,6 +112,11 @@ def check_content(kind: str, title: str, content: str) -> None:
         _CONTENT.validate_python(content)
     except ValidationError as exc:
         raise BadPanel("title or content is not allowed") from exc
+    if kind == c.PanelKind.DRAWING:
+        try:
+            c.parse_drawing_content(content)
+        except ValueError as exc:  # pydantic's ValidationError is a ValueError
+            raise BadPanel("a drawing's content is not a drawing description") from exc
 
 
 _PANEL = (
