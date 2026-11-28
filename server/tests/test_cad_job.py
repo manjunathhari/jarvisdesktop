@@ -1170,7 +1170,7 @@ def test_no_call_is_started_after_the_time_limit(
 
     monkeypatch.setattr(cad_engine, "replay", slow)
     job_id = _make(app, owner, node, person, session, brain)
-    assert cad_job.CAD_LOOP_SECONDS == 200
+    assert cad_job.CAD_LOOP_SECONDS == 150
     assert len(brain.requests) == 2  # 202 s had passed before the third call
     [panel] = _panels(app, person)
     assert contracts.parse_drawing_content(panel.content).steps == (
@@ -1259,3 +1259,120 @@ def test_a_call_over_its_ceiling_is_logged(
     brain = Scripted(_call(_step(), _finish(), usage=(500_000, 0)))  # far above its worst case
     _make(app, owner, node, person, session, brain)
     assert any("over its ceiling" in r.getMessage() for r in caplog.records)
+
+
+# --- the job fits its lease -------------------------------------------------------------------
+
+
+def test_the_time_limits_fit_the_lock() -> None:
+    """The worst case from the job's start, with the real constants: the catalogue exchange, the
+    loop's limit, one call that started just before it, the longest silent gap before the clock
+    is checked again (the brain's read timeout), the replays of that call's round, and the final
+    replay. A change to any of them that breaks the sum fails here."""
+    from jarvis_server.brain import claude
+
+    exchange = cad_engine.EXCHANGE_TIMEOUT
+    read_gap = claude.TIMEOUT.read
+    assert (exchange, read_gap) == (20, 60.0)
+    worst = (
+        exchange
+        + cad_job.CAD_LOOP_SECONDS
+        + cad_job.CAD_CALL_SECONDS
+        + read_gap
+        + (cad_job.CAD_STEPS_PER_ROUND + 1) * exchange
+        + exchange
+    )
+    assert worst == 480
+    assert worst <= cad_job.CAD_JOB_SECONDS - 30
+
+
+def test_the_job_extends_its_lock_before_reserving(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    engine: MemoryEngine, runner: FakeRunner, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    order: list[str] = []
+    real_extend, real_reserve = jobs.extend, budget.reserve
+
+    def extend(*a: Any, **kw: Any) -> bool:
+        order.append("extend")
+        return real_extend(*a, **kw)
+
+    def reserve(*a: Any, **kw: Any) -> Any:
+        order.append("reserve")
+        return real_reserve(*a, **kw)
+
+    monkeypatch.setattr(jobs, "extend", extend)
+    monkeypatch.setattr(budget, "reserve", reserve)
+    job_id = _make(app, owner, node, person, session, Scripted(_call(_step(), _finish())))
+    assert order == ["extend", "reserve"]
+    row = app.execute(
+        "SELECT lease_until > now() + interval '500 seconds',"
+        " lease_until < now() + interval '541 seconds'"
+        " FROM ops.brain_reservation WHERE job_id = %s",
+        (job_id,),
+    ).fetchone()
+    assert row == (True, True)  # the reservation's lease is the extended lock
+
+
+def test_a_job_that_lost_its_lock_never_reserves_or_calls(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    engine: MemoryEngine, runner: FakeRunner, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    monkeypatch.setattr(jobs, "extend", lambda *a, **kw: False)
+    brain = Scripted(_call(_step()))
+    job_id = _make(app, owner, node, person, session, brain)
+    assert brain.requests == [] and _reservations(app, job_id) == []
+    assert _spoken(app, session) == []
+    _nothing_shown(app, person, session)
+
+
+class _Stalls:
+    """The scripted brain, but its call `at` keeps streaming past the per-call limit: the clock
+    jumps after the call's first event. Records whether the stream was closed."""
+
+    def __init__(self, inner: FakeBrain, now: list[float], at: int) -> None:
+        self.inner, self.now, self.at = inner, now, at
+        self.closed = False
+        self.events_taken = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+    def think(self, req: BrainRequest) -> Iterator[Any]:
+        try:
+            for event in self.inner.think(req):
+                self.events_taken += 1
+                yield event
+                if len(self.inner.requests) == self.at:
+                    self.now[0] += cad_job.CAD_CALL_SECONDS + 1
+        except GeneratorExit:
+            self.closed = True
+            raise
+
+
+def test_a_call_past_its_time_limit_is_abandoned_and_charged_as_a_failed_send(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    engine: MemoryEngine, runner: FakeRunner, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    now = [5_000.0]
+    monkeypatch.setattr(cad_job, "_clock", lambda: now[0])
+    inner = FakeBrain([], calls=[
+        _call(_step()),  # kept
+        _call(Speech("Now the doors "), Speech("and windows"), _step("Doors"), _finish()),
+    ])  # fmt: skip
+    stalls = _Stalls(inner, now, at=2)
+    turn.set_brain(lambda: (stalls, MODEL))
+    job_id = _queue(app, owner, node, person, session)
+    _run(app, job_id)
+    assert len(inner.requests) == 2 and stalls.closed
+    assert stalls.events_taken == 3  # call 1's step, then two words of call 2: no step read
+    assert _reservations(app, job_id) == [("LAPSED", cad_job.CAD_RESERVE_PAISE, None)]
+    assert _spoken(app, session) == [cad_job.CAD_FAILED_TEXT]
+    _nothing_shown(app, person, session)  # though a step was kept (review item 7)
+    # A re-run of the job never calls again, and charges nothing more.
+    app.execute("UPDATE ops.job SET status = 'QUEUED', locked_until = NULL WHERE id = %s",
+                (job_id,))  # fmt: skip
+    _run(app, job_id)
+    assert len(inner.requests) == 2
+    assert _reservations(app, job_id) == [("LAPSED", cad_job.CAD_RESERVE_PAISE, None)]
+    assert _spoken(app, session) == [cad_job.CAD_FAILED_TEXT] * 2

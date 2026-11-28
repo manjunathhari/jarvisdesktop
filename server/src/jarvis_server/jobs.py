@@ -111,6 +111,16 @@ def claim(
     return Job(id=row[0], kind=row[1], payload=row[2], attempts=row[3], max_attempts=row[4])
 
 
+def extend(conn: psycopg.Connection[Any], job_id: int, lease: timedelta) -> bool:
+    """Set a RUNNING job's lock to end `lease` from now. False if the job is not RUNNING."""
+    row = conn.execute(
+        "UPDATE ops.job SET locked_until = now() + %s WHERE id = %s AND status = 'RUNNING'"
+        " RETURNING id",
+        (lease, job_id),
+    ).fetchone()
+    return row is not None
+
+
 def complete(conn: psycopg.Connection[Any], job_id: int) -> None:
     conn.execute(
         "UPDATE ops.job SET status = 'DONE', finished_at = now(), locked_by = NULL,"

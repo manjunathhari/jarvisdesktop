@@ -49,6 +49,7 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
@@ -60,9 +61,11 @@ from jarvis_server.brain import budget, health, prices
 from jarvis_server.brain.claude import count_input_tokens
 from jarvis_server.brain.types import (
     Brain,
+    BrainCallFailed,
     BrainRequest,
     CallPhase,
     Exchange,
+    Speech,
     ToolCall,
     ToolResult,
     ToolSpec,
@@ -106,9 +109,15 @@ CAD_STEPS_PER_ROUND = 3  # steps replayed in one round; more are refused unrepla
 TOO_MANY_STEPS_TEXT = (
     f"STEP NOT KEPT: too many steps in one turn: send at most {CAD_STEPS_PER_ROUND}."
 )
-# No new Claude call once this long has passed since the job started (the job's lease is
-# five minutes, `jobs.claim`). `_clock` is replaced by tests.
-CAD_LOOP_SECONDS = 200
+# Time. Core runs one job at a time and `jobs.claim` locks a job for five minutes; the
+# reservation's lease is the job's lock (`turn._lease`). So before reserving, the job extends
+# its lock to `CAD_JOB_SECONDS`, and the loop is bounded to fit inside it: no new Claude call
+# after `CAD_LOOP_SECONDS` from the job's start, and a call still streaming after
+# `CAD_CALL_SECONDS` is abandoned (a failed send). `test_the_time_limits_fit_the_lock` pins the
+# sum. `_clock` is replaced by tests.
+CAD_JOB_SECONDS = 540
+CAD_LOOP_SECONDS = 150
+CAD_CALL_SECONDS = 150
 _clock = time.monotonic
 NOTE_MAX = 400  # characters of one engine note in the prompt
 NOTES_MAX = 16_000  # characters of all of them
@@ -471,6 +480,44 @@ def _active(c: psycopg.Connection[Any], reservation: UUID) -> bool:
     return row is not None and row[0] == "ACTIVE"
 
 
+def _call(
+    brain: Brain, req: BrainRequest, job_id: int, call_no: int
+) -> tuple[list[ToolCall], str, CallPhase | None]:
+    """`board_job._call`, bounded in time: the clock is checked between events, and a call
+    still streaming after `CAD_CALL_SECONDS` is abandoned (its stream closed) and reported as
+    a SEND failure, since what it cost is unknown. A silent stream is bounded by the brain's own
+    read timeout."""
+    deadline = _clock() + CAD_CALL_SECONDS
+    calls: list[ToolCall] = []
+    text: list[str] = []
+    received = False
+    stream = brain.think(req)
+    try:
+        for event in stream:
+            received = True
+            if isinstance(event, Speech):
+                text.append(event.text)
+            else:
+                calls.append(event)
+            if _clock() > deadline:
+                log.warning("cad job %s: call %d ran past %d s; abandoned", job_id, call_no,
+                            CAD_CALL_SECONDS)  # fmt: skip
+                return [], "", CallPhase.SEND
+    except BrainCallFailed as failure:
+        if failure.phase is CallPhase.CONNECT and not received:
+            return [], "", CallPhase.CONNECT
+        return [], "", CallPhase.SEND
+    except Exception as exc:  # unplaceable: the send phase (fail closed)
+        log.warning("cad job %s: unexpected %s during call %d", job_id, type(exc).__name__,
+                    call_no)  # fmt: skip
+        return [], "", CallPhase.SEND
+    finally:
+        close = getattr(stream, "close", None)
+        if close is not None:
+            close()  # ends the HTTP stream of an abandoned call
+    return calls, "".join(text), None
+
+
 def _loop(
     c: psycopg.Connection[Any],
     brain: Brain,
@@ -501,7 +548,7 @@ def _loop(
             log.info("cad job %s: call %d could pass the reservation (%d + %d paise); stopping",
                      job_id, call_no, loop.cost, worst)  # fmt: skip
             return loop
-        calls, text, phase = board_job._call(brain, req)
+        calls, text, phase = _call(brain, req, job_id, call_no)
         usage = brain.usage
         if phase is None and usage is None:  # completed but unmetered: fail closed
             phase = CallPhase.SEND
@@ -775,6 +822,11 @@ def run(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
         if first > CAD_RESERVE_PAISE:
             log.warning("cad job %s: the first call could pass the reservation; no call", job.id)
             actions.speak(c, work.session_id, CAD_FAILED_TEXT)
+            return
+        # The whole job must fit the reservation's lease, which is the job's lock: extend it
+        # first, in its own committed step, then take the lease from it.
+        if not jobs.extend(c, job.id, timedelta(seconds=CAD_JOB_SECONDS)):
+            log.warning("cad job %s: it no longer holds its lock; no reservation, no call", job.id)
             return
         db_now, lease_until = turn._lease(conn, job.id)
         owner, reservation = budget.reserve(

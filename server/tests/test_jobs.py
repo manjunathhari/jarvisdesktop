@@ -93,3 +93,19 @@ def test_on_server_smoke_check_passes(app: Conn) -> None:
     results = smoke.run(app)
     assert [name for name, ok, _ in results if not ok] == []
     assert len(results) == 5
+
+
+def test_extend_moves_the_lock_of_a_running_job_only(app: Conn) -> None:
+    job_id = jobs.enqueue(app, "noop")
+    assert not jobs.extend(app, job_id, timedelta(minutes=9))  # QUEUED: not extended
+    assert jobs.claim(app, "w1") is not None
+    assert jobs.extend(app, job_id, timedelta(minutes=9))
+    row = app.execute(
+        "SELECT locked_until > now() + interval '8 minutes' FROM ops.job WHERE id = %s",
+        (job_id,),
+    ).fetchone()
+    assert row == (True,)
+    jobs.complete(app, job_id)
+    assert not jobs.extend(app, job_id, timedelta(minutes=9))  # DONE: not extended
+    row = app.execute("SELECT locked_until FROM ops.job WHERE id = %s", (job_id,)).fetchone()
+    assert row == (None,)
