@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 /// The Release the helper archive is published under.
 pub const HELPER_TAG: &str = "voice-helper-v1";
 pub const HELPER_URL: &str = "https://github.com/manjunathhari/jarvisdesktop/releases/download/voice-helper-v1/jarvis-voice-helper-win-x64.tar.bz2";
-/// SHA-256 of the helper archive. PLACEHOLDER: 64 zeros, pinned once the release exists. Until
-/// then no real download can match, so every real install fails its integrity check; that is
-/// the safe behaviour for a program the app runs.
-pub const HELPER_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+/// SHA-256 of the `voice-helper-v1` archive (`jarvis-voice-helper-win-x64.tar.bz2`). A download
+/// that differs is deleted and never unpacked. A new helper version needs a new tag AND a new
+/// value here.
+pub const HELPER_SHA256: &str = "8e3ff1def8dc35930ce59a44aa849d62480395011d47a5d64b4dd303659fd8ae";
 /// The helper installs into `models_dir/<HELPER_TAG>`, so a later helper version (a new tag)
 /// is fetched instead of being hidden by an older complete folder.
 pub const HELPER_DIR: &str = HELPER_TAG;
@@ -212,7 +212,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_pinned_zero_hash_never_installs() {
+    async fn a_download_that_does_not_match_the_real_pin_never_installs() {
+        // The fake archive's hash is not the real pin, so the real `ensure` must refuse it.
+        assert_ne!(hex(&Fake::new().archive), HELPER_SHA256);
         let tmp = tempfile::tempdir().unwrap();
         let dl = Fake::new();
         let err = ensure(tmp.path(), &dl, &|_| {}).await.unwrap_err();
@@ -221,6 +223,21 @@ mod tests {
             format!("the {HELPER_DIR} download failed its integrity check")
         );
         assert!(!tmp.path().join(HELPER_DIR).exists());
+    }
+
+    #[test]
+    fn the_helper_hash_is_pinned() {
+        assert_eq!(HELPER_SHA256.len(), 64);
+        assert!(HELPER_SHA256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_ne!(HELPER_SHA256, "0".repeat(64));
+        // The SHA-256 of the published voice-helper-v1 archive. A later accidental edit of the
+        // constant must fail here.
+        assert_eq!(
+            HELPER_SHA256,
+            "8e3ff1def8dc35930ce59a44aa849d62480395011d47a5d64b4dd303659fd8ae"
+        );
     }
 
     #[test]
