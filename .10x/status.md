@@ -1,5 +1,7 @@
 # Status — JARVIS Desktop
 
+**Latest (28 Nov 2026): Voice slice 1 (the helper speaks) is built and reviewed on branch `voice-slice-1`, head `ed6e471`, CI green on Windows and Linux (run 46115401713). The helper release `voice-helper-v1` is published and pinned. The branch is NOT merged, NOT installed, and the live check on Manj's PC is NOT done; each needs his separate go-ahead. The one risk only his PC can settle is whether the helper is ready within 60 s on a cold first start; if not, he sees "Voice helper unavailable. Using my built-in voice." and George still speaks. Decision: ADR-015. Review: `.10x/reviews/2026-11-27-voice-slice-1.md`. See `handoff.md`.**
+
 **Latest (27 Nov 2026): Board slice 1 is built (nine tasks, each reviewed) on branch `board-slice-1`; not merged, not deployed; its live check on Manj's PC is the next step. The server runs `983c2cf`. See `handoff.md`.**
 
 **Latest (26 Nov 2026): Plan B is merged, deployed and live-checked (PR #7 to #9); the desktop follow-ups (single instance, wake word, reused Claude connection with Opus) are merged (PR #10 to #14); the receipt timeout (PR #15, migration 0015) is merged and deployed at `354f1fe`; its hardening and ruling R12-38 are PR #16. See `handoff.md` for what is in hand. The paragraph below is the history up to 25 Nov.**
