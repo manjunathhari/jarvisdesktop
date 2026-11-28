@@ -365,6 +365,8 @@ def _store_and_issue(
     with c.transaction():
         if call.name == "board_show":
             kind = args.get("kind")
+            if kind == contracts.PanelKind.DRAWING:  # only the drawing job makes drawings
+                raise _BadCall("a drawing panel")
             content = _with_sources(str(kind), content, sources)
             panel = board.create(
                 c, person_id=work.person_id, session_id=work.session_id, kind=kind,  # type: ignore[arg-type]
@@ -374,6 +376,8 @@ def _store_and_issue(
         elif call.name == "board_update":
             panel_id = board.resolve(c, work.person_id, args.get("panel"))  # type: ignore[arg-type]
             kind = board.get(c, work.person_id, panel_id).kind
+            if kind == contracts.PanelKind.DRAWING:  # changing a drawing is the CAD slice 2's
+                raise _BadCall("a drawing panel")
             content = _with_sources(kind, content, sources)
             board.check_content(kind, title, content)  # type: ignore[arg-type]
             panel = board.update(
@@ -569,8 +573,9 @@ def say_headline(conn: psycopg.Connection[Any], job: jobs.Job) -> None:
     nothing if none."""
     reply_id = UUID(str(job.payload["reply_id"]))
     row = conn.execute(
+        # A drawing's `board.content` chunks carry its picture, not a panel: never counted.
         "SELECT (SELECT count(*) FROM conv.stream_chunk WHERE reply_id = %(r)s"
-        "        AND type = 'ACTION'),"
+        "        AND type = 'ACTION' AND authz->'object'->>'action_kind' <> 'board.content'),"
         " (SELECT count(DISTINCT subject_id) FROM comm.event WHERE kind = 'board.rendered'"
         "  AND subject_type = 'stream' AND subject_id LIKE %(like)s)",
         {"r": reply_id, "like": f"{reply_id}:%"},

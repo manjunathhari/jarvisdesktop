@@ -9,6 +9,10 @@ panel counts as drawn only when the desktop's Board reported it.
   `board.mark_rendered`, and event `board.rendered`. `REFUSED` or `ERROR`: event
   `board.render_failed` with the node's check, and Jarvis says once that the panel could not
   be shown. Nothing is marked.
+- `board.content` (a chunk of a drawing's picture), in the shape of `board.content.receipt`.
+  `STORED` must name the picture and chunk issued. Recorded, never a panel answered: the
+  drawing's `board.show` receipt alone releases the headline. `REFUSED`: event
+  `board.content_refused`, logged, never said.
 - `board.set_state` / `board.focus`, in the shape of `board.set_state.receipt`. `OK` must name
   the panel issued. `REFUSED`: event `board.state_refused`, said once.
 - Anything else (another shape, other values, a revision the panel never had) is refused
@@ -42,6 +46,7 @@ BOARD_NOT_DONE_TEXT = "I couldn't do that on the board."
 _SHOWN = frozenset({"board.show", "board.update"})
 _STATE = frozenset({"board.set_state", "board.focus"})
 _WORKING = "board.working"
+_CONTENT = "board.content"
 
 
 def on_live_receipt(
@@ -85,6 +90,32 @@ def on_live_receipt(
         if said is None and drawn is None:  # once, and never about a chunk reported drawn
             actions.speak(conn, session_id, text)
         release_headline(conn, reply_id)
+
+    if action_kind == _CONTENT:
+        # One chunk of a drawing's picture: recorded, never a panel answered (the panel's own
+        # `board.show` receipt decides the headline). A refusal is noted and never said: the
+        # desktop then refuses the panel itself (`content_missing`), and that is said.
+        try:
+            chunk = contracts.BoardContentArgs.model_validate(args)
+            kept = contracts.BoardContentReceipt.model_validate(payload)
+        except ValidationError:
+            malformed()
+            return
+        if kept.result == "STORED" and (kept.evidence.sha256, kept.evidence.index) != (
+            chunk.sha256, chunk.index,
+        ):  # fmt: skip
+            malformed()
+            return
+        actions.set_outcome(conn, inbound_id, "ANSWERED")
+        if kept.result != "STORED":
+            log.info("board.content %s:%s refused (%s)", reply_id, seq,
+                     kept.evidence.check or "none")  # fmt: skip
+            comm.record_event(
+                conn, "board.content_refused", subject_type="stream",
+                subject_id=f"{reply_id}:{seq}", person_id=person_id,
+                details={"index": str(chunk.index), "check": kept.evidence.check or "none"},
+            )  # fmt: skip
+        return
 
     if action_kind == _WORKING:
         # A courtesy to the Board, not a record: taken quietly either way. A refusal in this
@@ -162,12 +193,14 @@ def on_live_receipt(
 
 
 # Whether the desktop has answered every panel of a Board job's reply: no ACTION chunk of the
-# reply is left without a `board.rendered` or `board.render_failed` event.
+# reply is left without a `board.rendered` or `board.render_failed` event. A drawing's
+# `board.content` chunks are not panels: only its `board.show` receipt counts.
 _RELEASE = """
 UPDATE ops.job SET run_at = now()
 WHERE kind = 'board.headline' AND status = 'QUEUED' AND payload->>'job_key' = %(reply)s
   AND NOT EXISTS (
       SELECT 1 FROM conv.stream_chunk k WHERE k.reply_id = %(reply)s::uuid AND k.type = 'ACTION'
+        AND k.authz->'object'->>'action_kind' <> 'board.content'
         AND NOT EXISTS (
             SELECT 1 FROM comm.event e WHERE e.subject_type = 'stream'
               AND e.subject_id = k.reply_id::text || ':' || k.seq::text

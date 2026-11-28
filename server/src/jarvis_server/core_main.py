@@ -48,6 +48,7 @@ from jarvis_server.brain import budget as _budget_jobs  # noqa: F401  registers 
 from jarvis_server.brain import health, prices
 from jarvis_server.brain.claude import ClaudeBrain, shared_client
 from jarvis_server.core import board_job as _board_jobs  # noqa: F401  registers job kinds
+from jarvis_server.core import cad_job as _cad_jobs  # noqa: F401  registers job kinds
 from jarvis_server.core import dispatch, keys, turn
 from jarvis_server.dbcall import Refused
 from jarvis_server.memory import checks as memory_checks

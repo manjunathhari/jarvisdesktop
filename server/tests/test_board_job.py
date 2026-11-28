@@ -808,3 +808,42 @@ def test_the_canvas_rules_say_the_page_is_silent() -> None:
     page written to use them would only show an error."""
     assert "no sound, speech or video" in board_job.BOARD_PROMPT
     assert "no network" in board_job.BOARD_PROMPT
+
+
+# --- CAD board slice 1, Task 5: only the drawing job makes drawing panels ---------------------
+
+
+def _drawing_description() -> str:
+    from jarvis_server import contracts
+
+    return contracts.drawing_content(contracts.DrawingContent(
+        engine="cadcraft", engine_version="0.12.0", units="mm", items=3,
+        steps=("Fictional walls",),
+        picture=contracts.DrawingPicture(sha256="a" * 64, bytes=100, media_type="image/svg+xml"),
+    ))  # fmt: skip
+
+
+def test_board_make_cannot_create_a_drawing_panel(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    engine: MemoryEngine,
+) -> None:  # fmt: skip
+    turn.set_brain(Brains([_show("A drawing", _drawing_description(), "drawing")]))
+    _make(app, owner, node, person, session)
+    assert _panels(app, person) == [] and _chunks(app, session)[0][0] == "SPEECH"
+    assert _spoken(app, session) == [board_job.BOARD_FAILED_TEXT]
+
+
+def test_board_make_cannot_change_a_drawing_panel(
+    app: Conn, owner: Conn, person: uuid.UUID, node: uuid.UUID, session: uuid.UUID,
+    engine: MemoryEngine,
+) -> None:  # fmt: skip
+    held = board.create(app, person_id=person, session_id=session, kind="drawing",
+                        title="Fictional plan", content=_drawing_description(),
+                        cost_paise=0)  # fmt: skip
+    turn.set_brain(Brains([ToolCall("board_update", {
+        "panel": "p1", "title": "Changed", "content": _drawing_description(),
+        "headline": "Done.",
+    })]))  # fmt: skip
+    _make(app, owner, node, person, session)
+    assert board.get(app, person, held.panel_id).revision == 1
+    assert _spoken(app, session) == [board_job.BOARD_FAILED_TEXT]
