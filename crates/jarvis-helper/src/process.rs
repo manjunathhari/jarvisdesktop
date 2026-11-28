@@ -29,17 +29,7 @@ pub fn spawn(
     on_event: Box<dyn Fn(LinkEvent) + Send>,
     on_stderr_line: Box<dyn Fn(String) + Send>,
 ) -> Result<Running, String> {
-    let mut cmd = Command::new(exe);
-    cmd.args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    let mut child = cmd
+    let mut child = command(exe, args)
         .spawn()
         .map_err(|e| format!("couldn't start the voice helper: {e}"))?;
     let (Some(stdin), Some(stdout), Some(stderr)) =
@@ -81,6 +71,23 @@ pub fn spawn(
     })
 }
 
+/// The helper's command line: piped stdin/stdout/stderr, no console window on Windows.
+fn command(exe: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Kokoro logs each sentence's phonemes at DEBUG via LOG_LEVEL; stderr reaches our log file.
+        .env_remove("LOG_LEVEL");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
 impl Running {
     /// Ask the helper to exit, wait up to 2 s, then kill it and reap it.
     pub fn shutdown(mut self) {
@@ -117,4 +124,21 @@ fn end_child(mut child: Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_helper_never_inherits_log_level() {
+        let cmd = command(Path::new("voice-helper"), &[]);
+        let removed = cmd
+            .get_envs()
+            .any(|(key, value)| key == "LOG_LEVEL" && value.is_none());
+        assert!(
+            removed,
+            "LOG_LEVEL must be removed from the helper's environment"
+        );
+    }
 }
