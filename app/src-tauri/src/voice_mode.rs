@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use jarvis_core::Speaks;
@@ -210,6 +210,7 @@ impl AppVoiceOps {
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         let phase = Arc::new(Mutex::new(Phase::Starting(tx)));
+        let started = Instant::now();
         let running = process::spawn(
             &files.exe,
             args,
@@ -218,7 +219,11 @@ impl AppVoiceOps {
             Box::new(|line: String| tracing::info!("helper: {line}")),
         )?;
         match wait_ready(&mut rx).await {
-            Ok(version) => self.hand_over(id, &phase, &mut rx, running, &version),
+            Ok(version) => {
+                let ready_ms = started.elapsed().as_millis() as u64;
+                tracing::info!(helper_ready_ms = ready_ms, "voice helper ready");
+                self.hand_over(id, &phase, &mut rx, running, &version)
+            }
             Err(e) => {
                 end_in_background(running);
                 Err(e)
