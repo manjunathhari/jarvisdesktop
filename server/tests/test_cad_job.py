@@ -438,7 +438,7 @@ def test_a_step_with_a_failed_command_is_not_kept_and_claude_is_told(
     )
     assert "  command 3 (text) FAILED: Error: text failed" in told.text
     assert "Drawing now (without this step):" in told.text
-    assert told.image_png is None  # nothing was kept yet, so there is no drawing to show
+    assert not told.image_png  # nothing was kept yet, so there is no drawing to show
     [kept] = _results(brain.requests[2], 2)
     assert not kept.is_error and kept.text.startswith("Step kept: all 2 commands worked.")
     assert "Drawing now (with this step):" in kept.text and kept.image_png == cad_runner.PNG
