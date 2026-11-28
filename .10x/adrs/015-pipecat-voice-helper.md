@@ -38,7 +38,6 @@ Pipecat is an open-source (BSD-2) Python toolkit for voice agents. Its talk-over
 |---|---|---|---|
 | Fix the Rust voice path only | One small app; same code could serve the phone | Talk-over and turn-taking would be new code, tuned from scratch | It was Claude's recommendation. Manj chose Pipecat because its talk-over logic is already proven |
 | Pipecat talks straight to Claude | Fastest demo | Skips the JARVIS server and needs a Claude key on the PC | Dropped in the design |
-| A hosted voice service | Nothing to run on the PC | Sound would leave the PC, and the voice path would no longer be free | ADR-004 keeps sound on the PC, and the design's goal is a free voice path on the PC |
 
 ## Consequences
 ### Positive
