@@ -28,6 +28,8 @@ const COMMANDS: &[&str] = &[
     "board_canvas_address",
     "board_canvas_served",
     "board_say",
+    "voice_status",
+    "retry_voice",
 ];
 
 fn main() {

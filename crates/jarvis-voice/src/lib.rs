@@ -4,7 +4,7 @@
 //! The engine and the speaker sit behind small traits so the queueing and
 //! interruption logic is tested without audio hardware or model files.
 
-pub mod model;
+pub use jarvis_fetch as model;
 pub mod speaker;
 
 #[cfg(windows)]
@@ -101,6 +101,20 @@ impl Voice {
     /// Stop what is playing and drop everything queued.
     pub fn stop(&self) {
         self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl jarvis_core::Speaks for Voice {
+    fn speak(&self, text: &str) {
+        Voice::speak(self, text)
+    }
+
+    fn stop(&self) {
+        Voice::stop(self)
+    }
+
+    fn is_speaking(&self) -> bool {
+        Voice::is_speaking(self)
     }
 }
 

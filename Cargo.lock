@@ -2235,10 +2235,12 @@ checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 name = "jarvis-app"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "jarvis-brain",
  "jarvis-core",
  "jarvis-ears",
+ "jarvis-helper",
  "jarvis-modules",
  "jarvis-node",
  "jarvis-voice",
@@ -2253,6 +2255,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "uuid",
 ]
@@ -2292,6 +2295,38 @@ dependencies = [
  "cpal",
  "sherpa-onnx",
  "sherpa-onnx-sys",
+ "tracing",
+]
+
+[[package]]
+name = "jarvis-fetch"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bzip2 0.5.2",
+ "futures",
+ "reqwest 0.12.28",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "jarvis-helper"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bzip2 0.5.2",
+ "jarvis-core",
+ "jarvis-fetch",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
  "tracing",
 ]
 
@@ -2347,16 +2382,11 @@ dependencies = [
 name = "jarvis-voice"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "bzip2 0.5.2",
- "futures",
- "reqwest 0.12.28",
+ "jarvis-core",
+ "jarvis-fetch",
  "rodio",
  "sherpa-onnx",
  "sherpa-onnx-sys",
- "tar",
- "tempfile",
- "tokio",
  "tracing",
 ]
 
@@ -4638,6 +4668,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "symlink"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
+
+[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5384,6 +5420,19 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-appender"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
+dependencies = [
+ "crossbeam-channel",
+ "symlink",
+ "thiserror 2.0.21",
+ "time",
+ "tracing-subscriber",
 ]
 
 [[package]]

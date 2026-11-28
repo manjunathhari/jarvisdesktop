@@ -24,8 +24,10 @@
 //!   because the link is down is logged, not retried.
 //! - No event of the followed reply for `SILENCE` fails the turn, as does losing events to a
 //!   lagging broadcast (they can't be recovered), even when the lost ones were another reply's.
-//! - The desktop runtime (`jarvis-core` `BRAIN_TIMEOUT`, 8 s) caps the whole `think`, so in
-//!   the app a reply whose `final` comes later than 8 s after the send is cut there.
+//! - The desktop runtime has two limits, both measured from the send: the first event
+//!   (speech or action) must come within 8 s (`jarvis-core` `BRAIN_FIRST_EVENT_TIMEOUT`), and
+//!   the whole `think` must return within 30 s (`BRAIN_TIMEOUT`), so in the app a reply whose
+//!   `final` comes later than 30 s after the send is cut there.
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -2,6 +2,7 @@
 // itself, and inserts text only via textContent — never HTML.
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { LatestVoiceStatus, statusArea, type StatusView } from "./voice_status";
 
 type Card = { number?: number; title: string; source: string; summary: string; link: string };
 type SlotView =
@@ -124,24 +125,35 @@ listen<ScreenView>("jarvis://screen", (e) => render(e.payload));
 listen<string>("jarvis://speak", (e) => speak(e.payload));
 listen<string>("jarvis://caption", (e) => (said.textContent = e.payload));
 const voiceStatus = $("voicestatus");
-listen<{ state: string; percent: number }>("jarvis://ears_status", ({ payload }) => {
-  const text: Record<string, string> = {
-    downloading: `Getting my hearing ready, ${payload.percent}%`,
-    loading: "Loading my hearing…",
-    no_mic: "I can't find a microphone. You can still type.",
-  };
-  voiceStatus.textContent = text[payload.state] ?? "";
-  voiceStatus.hidden = !text[payload.state];
+const voiceRetry = $<HTMLButtonElement>("voiceretry");
+// The status area under the orb (decided in voice_status.ts): a lasting voice line is never
+// hidden by the hearing's, and "Try again" follows the voice alone.
+let voiceNow: StatusView | null = null;
+let hearingNow: StatusView | null = null;
+const latestVoice = new LatestVoiceStatus();
+function showStatusArea() {
+  const { lines, retry } = statusArea(voiceNow, hearingNow);
+  voiceStatus.replaceChildren(...lines.map((line) => el("span", "line", line)));
+  voiceStatus.hidden = lines.length === 0;
+  voiceRetry.hidden = !retry;
+}
+function applyVoiceStatus(s: StatusView | null) {
+  if (!s) return;
+  voiceNow = s;
+  showStatusArea();
+}
+listen<StatusView>("jarvis://ears_status", ({ payload }) => {
+  hearingNow = payload;
+  showStatusArea();
   if (payload.state === "ready") input?.setAttribute("placeholder", "Speak, or type here and press Enter");
 });
-listen<{ state: string; percent: number }>("jarvis://voice_status", ({ payload }) => {
-  const text: Record<string, string> = {
-    downloading: `Getting my voice ready, ${payload.percent}%`,
-    loading: "Loading my voice…",
-  };
-  voiceStatus.textContent = text[payload.state] ?? "";
-  voiceStatus.hidden = !text[payload.state];
-});
+listen<StatusView>("jarvis://voice_status", ({ payload }) => applyVoiceStatus(latestVoice.event(payload)));
+voiceRetry.addEventListener("click", () => invoke("retry_voice"));
+// A status sent before this page was listening (helper_unavailable, say) is still shown,
+// unless a newer event has already arrived.
+invoke<StatusView>("voice_status")
+  .then((s) => applyVoiceStatus(latestVoice.snapshot(s)))
+  .catch(() => {});
 listen("jarvis://stop_speaking", () => synth?.cancel());
 listen<string>("jarvis://heard", (e) => {
   heard.textContent = e.payload;
@@ -203,7 +215,7 @@ if (await invoke<boolean>("needs_key")) {
 
 // Tapping anywhere wakes JARVIS (except inside the video, which keeps its own controls).
 document.addEventListener("pointerdown", (e) => {
-  if ((e.target as HTMLElement).closest("#devtype, #setup, #enrolment, #approvals, #notices")) return;
+  if ((e.target as HTMLElement).closest("#devtype, #setup, #enrolment, #approvals, #notices, #voiceretry")) return;
   invoke("tap");
 });
 // Esc always closes JARVIS; F11 switches between window and full screen.

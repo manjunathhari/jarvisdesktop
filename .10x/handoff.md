@@ -1,4 +1,21 @@
 # Handoff
+**Voice slice 1 (28 Nov):** branch `voice-slice-1` (head `ed6e471`) holds the whole of `.10x/plans/2026-11-27-voice-slice-1.md`: a Python voice helper (Pipecat) that speaks George's replies, with the built-in George as fallback. `main` (`a4276f1`) is merged into it. CI is green on Windows and Linux (run 46115401713). The helper release is tag `voice-helper-v1` (commit `cfa7d12`, published as a pre-release by Manj on 28 Nov), and its SHA-256 is pinned in `crates/jarvis-helper/src/install.rs`. An independent whole-branch review found 0 Critical and 2 Important issues; both are fixed and re-reviewed. **Nothing is merged or installed, and the live check is not done.**
+- **Read first:** the design `.10x/specs/2026-11-27-voice-upgrade-design.md` (revision 2), the plan `.10x/plans/2026-11-27-voice-slice-1.md`, `.10x/adrs/015-pipecat-voice-helper.md`, and the review record `.10x/reviews/2026-11-27-voice-slice-1.md` (it lists rulings R1 to R25).
+- **Needs Manj's go-ahead, in order:** (1) open the PR and merge; `release.yml` then builds the installer; (2) install it; (3) run the live check, the eight items in the plan's Task 9, Step 6, with fictional phrases only. Item 8's log file is `%LOCALAPPDATA%\in.mhsurgery.jarvis\logs\jarvis.<date>.log`, not `jarvis.log`.
+- **The branch `listen-60`** (the 60-second listening window) stays out of `main` and out of this merge (Manj, 28 Nov).
+- **Only `voice_engine` and `tts_speed` act** in this slice. The other `voice.toml` settings are read and held for slices 2 and 3.
+- **The risk only his PC can settle:** the helper has 60 s to say it is ready. The reviewer estimates 15 to 40 s for a first cold start with antivirus, and perhaps a 10 to 20% chance of passing 60 s the first time. If it does, he sees "Voice helper unavailable. Using my built-in voice.", George still speaks, and the next start tries again. The log line `helper_ready_ms` gives the real time.
+- **Known limits carried to slice 2:**
+  - the helper may report "finished speaking" 50 to 200 ms before the sound ends, so the ears may catch the tail;
+  - nothing notices a helper that is alive but stuck;
+  - on first start JARVIS is caption-only during the 440 MB download and up to 60 s of start-up;
+  - downloads have no idle timeout;
+  - the helper ends with the app only because its input closes (a Windows Job Object would guarantee it);
+  - before the next helper tag: `uv sync --locked` and pinned action versions;
+  - the Python half of the `LOG_LEVEL` fix needs a new helper build;
+  - `first_chunk_max_words` only if the log shows a slow first word.
+- **Slices 2 and 3** (the helper listens; speakers and staying awake) each get their own plan after the live check.
+
 **Board slice 1 (27 Nov):** branch `board-slice-1` holds all nine tasks of `.10x/plans/2026-11-26-board-slice-1.md`, each independently reviewed with the fixes applied. It is pushed and passes CI on Windows and Linux through Task 8; nothing is merged or deployed. **What is left is the live check on Manj's PC** (plan Task 9, Step 6): install the desktop build first, then deploy the server (migration 0016), each step with his approval. It includes the Canvas seal checklist in `.10x/reviews/2026-11-27-board-canvas-hostile-page.md`, which is the only proof of the seal on Windows, and the first real test of each window being limited to its own commands (a slip there shows as a button that does nothing). The server now runs `983c2cf`, not `354f1fe` as the next paragraph says. Open decisions for Manj are listed in the project docs `claude/board-task-2-handover.md` to `claude/board-task-9-handover.md`.
 
 **Now (26 Nov):** the server runs `354f1fe` (deployed 26 Nov; migration 0015; smoke 18/18). Phase 2 server and Plan B (the Rust desktop node) are merged, deployed and live-checked on Manj's PC (PR #7 to #9, 25 Nov); his desktop "Manj PC" is enrolled and runs in server mode. Since then, all merged: single instance, the "Hey Jarvis" / "Jarvis" wake word, a reused connection to Claude with Opus for conversation (PR #10 to #14), and the receipt timeout (PR #15). The desktop's own-brain mode stays in the code as a fallback (owner, 26 Nov); Manj has deleted the stored Claude key on his PC.

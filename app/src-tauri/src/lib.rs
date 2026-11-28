@@ -4,8 +4,11 @@ mod announce;
 mod approvals;
 mod board;
 mod key;
+mod logfile;
 mod node_config;
 mod server_mode;
+#[cfg(windows)]
+mod voice_mode;
 
 use chrono::Timelike;
 use jarvis_brain::ClaudeBrain;
@@ -13,8 +16,8 @@ use jarvis_core::action::Registry;
 use jarvis_core::brain::Brain;
 use jarvis_core::coordinator::{Event, Mode};
 use jarvis_core::runtime::{runtime, Handle, Ui, UiEvent};
+use jarvis_helper::supervisor::{Supervisor, VoiceSlot};
 use jarvis_modules::{HttpFetch, LiveTvModule, NewsModule, ScreenModule, SourcesConfig};
-use jarvis_voice::Voice;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -24,9 +27,48 @@ use tauri::{AppHandle, Emitter, Manager, State};
 const USER_NAME: &str = "Manj";
 const NEWS_REFRESH: Duration = Duration::from_secs(5 * 60);
 
-/// George's voice once it is downloaded and loaded; until then the UI's
-/// stand-in voice speaks.
-type VoiceSlot = Arc<Mutex<Option<Voice>>>;
+/// The voice supervisor (Windows; `None` elsewhere). It fills the `VoiceSlot` (the voice
+/// helper, or the built-in George voice); while the slot is empty, speech is a caption only on
+/// Windows and the UI's stand-in voice elsewhere.
+type VoiceSupervisor = Option<Arc<Supervisor>>;
+
+/// Where a line to be said goes.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SpeechRoute {
+    /// The voice in the slot.
+    Voice,
+    /// The page's stand-in voice (`jarvis://speak`), off Windows only.
+    StandIn,
+    /// Nothing speaks; the caption shows the line.
+    CaptionOnly,
+}
+
+/// No Windows voice on Windows: with no voice ready, a line is a caption only there.
+fn speech_route(has_voice: bool) -> SpeechRoute {
+    if has_voice {
+        SpeechRoute::Voice
+    } else if cfg!(windows) {
+        SpeechRoute::CaptionOnly
+    } else {
+        SpeechRoute::StandIn
+    }
+}
+
+/// Say `text` through the slot's voice, or as `speech_route` decides when there is none.
+/// The caller has already shown the caption.
+fn speak_or_caption(app: &AppHandle, voice: &VoiceSlot, text: &str) -> tauri::Result<()> {
+    let ready = voice.lock().ok().and_then(|slot| slot.clone());
+    match speech_route(ready.is_some()) {
+        SpeechRoute::Voice => {
+            if let Some(v) = ready {
+                v.speak(text);
+            }
+            Ok(())
+        }
+        SpeechRoute::StandIn => app.emit("jarvis://speak", text),
+        SpeechRoute::CaptionOnly => Ok(()),
+    }
+}
 
 /// The microphone and the ears, once their models are ready.
 struct Listening {
@@ -70,13 +112,7 @@ impl Ui for TauriUi {
                 board::spoke(&s);
                 self.clock.speaking();
                 let _ = app.emit("jarvis://caption", &s);
-                match self.voice.lock().ok().as_deref().and_then(Option::as_ref) {
-                    Some(v) => {
-                        v.speak(&s);
-                        Ok(())
-                    }
-                    None => app.emit("jarvis://speak", s),
-                }
+                speak_or_caption(app, &self.voice, &s)
             }
             UiEvent::StopSpeaking => {
                 if let Some(v) = self.voice.lock().ok().as_deref().and_then(Option::as_ref) {
@@ -190,7 +226,8 @@ fn say_text(
     jarvis.send(Event::Typed(text));
 }
 
-/// Say a line in George's voice (or the stand-in), outside the coordinator.
+/// Say a line in George's voice (or the stand-in, or as a caption only), outside the
+/// coordinator.
 fn speak_locally(app: &AppHandle, voice: &VoiceSlot, text: &str) {
     board::spoke(text);
     say_aloud(app, voice, text);
@@ -206,12 +243,7 @@ fn announce_locally(app: &AppHandle, voice: &VoiceSlot, text: &str) {
 
 fn say_aloud(app: &AppHandle, voice: &VoiceSlot, text: &str) {
     let _ = app.emit("jarvis://caption", text);
-    match voice.lock().ok().as_deref().and_then(Option::as_ref) {
-        Some(v) => v.speak(text),
-        None => {
-            let _ = app.emit("jarvis://speak", text);
-        }
-    }
+    let _ = speak_or_caption(app, voice, text);
 }
 
 /// The live player said this channel won't play here; try the next one.
@@ -266,53 +298,39 @@ struct VoiceStatus {
     percent: u8,
 }
 
-/// Download George's voice the first time, load it, and switch to it.
-#[cfg(windows)]
-async fn prepare_voice(app: AppHandle, slot: VoiceSlot, models_dir: PathBuf) {
-    use jarvis_voice::model::{self, HttpDownload, GEORGE, KOKORO_URL};
-    use jarvis_voice::{kokoro::Kokoro, speaker::Speaker, AudioOut};
-
-    let status = |state: &'static str, percent: u8| {
-        let _ = app.emit("jarvis://voice_status", VoiceStatus { state, percent });
-    };
-    let last = std::sync::atomic::AtomicU8::new(255);
-    let files = match model::ensure(&models_dir, KOKORO_URL, &HttpDownload::default(), &|p| {
-        if last.swap(p, std::sync::atomic::Ordering::Relaxed) != p {
-            status("downloading", p);
-        }
-    })
-    .await
-    {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(error = %e, "voice download failed; using the stand-in voice");
-            status("unavailable", 0);
-            return;
-        }
-    };
-    status("loading", 100);
-    let loaded = tokio::task::spawn_blocking(move || Kokoro::load(&files, GEORGE)).await;
-    match loaded {
-        Ok(Ok(engine)) => {
-            let voice = Voice::start(
-                Box::new(engine),
-                Box::new(|| Speaker::open().map(|s| Box::new(s) as Box<dyn AudioOut>)),
-            );
-            if let Ok(mut s) = slot.lock() {
-                *s = Some(voice);
+/// The voice's latest status, for a page that started listening late. Without a supervisor:
+/// `unavailable` on Windows (no data folder), `ready` elsewhere (the stand-in voice).
+#[tauri::command]
+fn voice_status(supervisor: State<'_, VoiceSupervisor>) -> VoiceStatus {
+    match supervisor.inner() {
+        Some(s) => {
+            let status = s.status();
+            VoiceStatus {
+                state: status.state(),
+                percent: status.percent(),
             }
-            tracing::info!("George's voice is ready");
-            status("ready", 100);
         }
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "couldn't load the voice; using the stand-in voice");
-            status("unavailable", 0);
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "voice loader crashed; using the stand-in voice");
-            status("unavailable", 0);
-        }
+        // Windows without a supervisor (no data folder): nothing can speak. Elsewhere the
+        // stand-in voice is always there.
+        None => VoiceStatus {
+            state: if cfg!(windows) {
+                "unavailable"
+            } else {
+                "ready"
+            },
+            percent: 0,
+        },
     }
+}
+
+/// "Try again" after the voice was unavailable.
+#[tauri::command]
+async fn retry_voice(supervisor: State<'_, VoiceSupervisor>) -> Result<(), String> {
+    let supervisor = supervisor.inner().clone();
+    if let Some(s) = supervisor {
+        s.retry().await;
+    }
+    Ok(())
 }
 
 /// Download the listening models the first time, load them, open the mic.
@@ -446,7 +464,7 @@ async fn prepare_ears(
         Box::new(whisper),
         speaking,
         Box::new(move |text| {
-            tracing::info!(%text, "heard");
+            tracing::debug!(%text, "heard");
             let (app, voice) = (decision_app.clone(), decision_voice.clone());
             if approvals::take_spoken_decision(&node, &text, true, move |line| {
                 speak_locally(&app, &voice, line)
@@ -495,15 +513,6 @@ async fn prepare_ears(
     let _: Option<Listening> = None;
 }
 
-/// Other platforms keep the stand-in voice for now.
-#[cfg(not(windows))]
-async fn prepare_voice(_app: AppHandle, _slot: VoiceSlot, _models_dir: PathBuf) {
-    let _ = VoiceStatus {
-        state: "unavailable",
-        percent: 0,
-    };
-}
-
 /// The installer's build number, set by the Windows installer workflow (`JARVIS_BUILD`).
 #[tauri::command]
 fn build_label() -> String {
@@ -523,11 +532,15 @@ fn bring_to_front(app: &AppHandle) {
 }
 
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // The context first: its identifier names the log folder, and logging starts before
+    // any app handle exists. The guard flushes the log file when `run` returns.
+    let context = tauri::generate_context!();
+    let log_dir = logfile::dir_for(&context.config().identifier);
+    let _log_guard = logfile::init(log_dir.as_deref());
+    match &log_dir {
+        Some(dir) => tracing::info!(path = %dir.display(), "log folder"),
+        None => tracing::warn!("no log folder: the per-user data folder is unknown"),
+    }
 
     tauri::Builder::default()
         // One JARVIS at a time (live check, 25 Nov): a second copy can't open the node's
@@ -544,7 +557,16 @@ pub fn run() {
                 .open_js_links_on_click(false)
                 .build(),
         )
-        .setup(|app| {
+        .setup(move |app| {
+            if let (Some(expected), Ok(data)) = (&log_dir, app.path().app_local_data_dir()) {
+                if *expected != data.join("logs") {
+                    tracing::warn!(
+                        log_folder = %expected.display(),
+                        app_data_logs = %data.join("logs").display(),
+                        "the log folder is not under the app data folder"
+                    );
+                }
+            }
             let cfg = SourcesConfig::default_config();
             let news = Arc::new(NewsModule::new(
                 cfg.feeds.clone(),
@@ -616,6 +638,17 @@ pub fn run() {
             };
             app.manage(mode);
             let voice: VoiceSlot = Arc::new(Mutex::new(None));
+            let clock = server_mode::TurnClock::default();
+            // The voice supervisor, built now and started below, before the ears.
+            #[cfg(windows)]
+            let voice_start = data_dir
+                .as_deref()
+                .map(|dir| voice_mode::start(app.handle(), voice.clone(), dir, clock.clone()));
+            #[cfg(windows)]
+            let supervisor: VoiceSupervisor = voice_start.as_ref().map(|(s, _)| s.clone());
+            #[cfg(not(windows))]
+            let supervisor: VoiceSupervisor = None;
+            app.manage(supervisor);
             let ears: EarsSlot = Arc::new(Mutex::new(None));
             let mode: ModeCell = Arc::new(Mutex::new(Mode::Idle));
             app.manage(mode.clone());
@@ -632,7 +665,7 @@ pub fn run() {
                 app: app.handle().clone(),
                 voice: voice.clone(),
                 ears: ears.clone(),
-                clock: server_mode::TurnClock::default(),
+                clock,
                 announcer: announcer.clone(),
                 mode: mode.clone(),
             });
@@ -654,10 +687,17 @@ pub fn run() {
                         (app.handle().clone(), handle.clone(), node.clone());
                     let models = dir.join("models");
                     tauri::async_runtime::spawn(async move {
-                        // Voice first (George), then hearing; one download at a time.
-                        prepare_voice(app_handle.clone(), voice.clone(), models.clone()).await;
+                        // Voice first (the helper, or George built in), then hearing; one
+                        // download at a time.
+                        #[cfg(windows)]
+                        if let Some((supervisor, engine)) = voice_start {
+                            supervisor.start(engine).await;
+                        }
                         prepare_ears(app_handle, ears, voice, models, jarvis, node, mode).await;
                     });
+                }
+                Err(e) if cfg!(windows) => {
+                    tracing::warn!(error = %e, "no data folder; JARVIS has no voice")
                 }
                 Err(e) => tracing::warn!(error = %e, "no data folder; using the stand-in voice"),
             }
@@ -697,9 +737,42 @@ pub fn run() {
             board::board_open_link,
             board::board_canvas_address,
             board::board_canvas_served,
-            board_say
+            board_say,
+            voice_status,
+            retry_voice
         ])
         .on_window_event(board::on_window_event)
-        .run(tauri::generate_context!())
-        .expect("error while running JARVIS");
+        .build(context)
+        .expect("error while running JARVIS")
+        .run(|app, event| {
+            // Every way out (Esc, "quit", closing the window) ends here: stop the voice helper.
+            // It also exits by itself when its stdin closes.
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(Some(supervisor)) = app.try_state::<VoiceSupervisor>().as_deref() {
+                    supervisor.shutdown();
+                }
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_ready_voice_always_speaks() {
+        assert_eq!(speech_route(true), SpeechRoute::Voice);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_voice_means_caption_only_never_the_windows_voice() {
+        assert_eq!(speech_route(false), SpeechRoute::CaptionOnly);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn no_voice_uses_the_stand_in_off_windows() {
+        assert_eq!(speech_route(false), SpeechRoute::StandIn);
+    }
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/jarvis-core", "crates/jarvis-modules", "crates/jarvis-brain", "crates/jarvis-voice", "crates/jarvis-ears", "crates/jarvis-node", "app/src-tauri"]
+members = ["crates/jarvis-core", "crates/jarvis-modules", "crates/jarvis-brain", "crates/jarvis-voice", "crates/jarvis-fetch", "crates/jarvis-ears", "crates/jarvis-node", "crates/jarvis-helper", "app/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,8 +20,10 @@ jarvis-core = { path = "crates/jarvis-core" }
 jarvis-brain = { path = "crates/jarvis-brain" }
 jarvis-modules = { path = "crates/jarvis-modules" }
 jarvis-voice = { path = "crates/jarvis-voice" }
+jarvis-fetch = { path = "crates/jarvis-fetch" }
 jarvis-ears = { path = "crates/jarvis-ears" }
 jarvis-node = { path = "crates/jarvis-node" }
+jarvis-helper = { path = "crates/jarvis-helper" }
 # The node protocol (Plan B): signing, shared vectors, wire types.
 # RFC 8785 JCS; sorts keys by UTF-16 code units (R12-35: replaces serde_jcs, whose key order is wrong).
 serde_json_canonicalizer = "0.4"

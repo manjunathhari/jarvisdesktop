@@ -11,7 +11,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-pub const BRAIN_TIMEOUT: Duration = Duration::from_secs(8);
+/// The brain must produce its first event (speech or action) within this time of the request.
+pub const BRAIN_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(8);
+/// The whole reply (until `think` returns) must finish within this time of the request,
+/// measured from the same start as [`BRAIN_FIRST_EVENT_TIMEOUT`].
+pub const BRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub const NO_KEY_REPLY: &str =
     "I don't have my Anthropic key yet, so for now I can only do simple things, \
                                 like clearing the screen.";
@@ -114,13 +118,16 @@ async fn run(
                     };
                     tokio::spawn(async move {
                         let (btx, mut brx) = mpsc::channel::<BrainEvent>(32);
+                        let started_at = tokio::time::Instant::now();
+                        let (first_tx, mut first_rx) = tokio::sync::oneshot::channel::<()>();
                         let forward = async {
                             let think = brain.think(req, btx);
                             let relay = async {
                                 let started = std::time::Instant::now();
-                                let mut first = true;
+                                let mut first_tx = Some(first_tx);
                                 while let Some(ev) = brx.recv().await {
-                                    if std::mem::take(&mut first) {
+                                    if let Some(f) = first_tx.take() {
+                                        let _ = f.send(());
                                         tracing::info!(
                                             brain_first_reply_ms =
                                                 started.elapsed().as_millis() as u64,
@@ -136,16 +143,32 @@ async fn run(
                             let (result, ()) = tokio::join!(think, relay);
                             result
                         };
-                        let done = match tokio::time::timeout(BRAIN_TIMEOUT, forward).await {
-                            Ok(Ok(())) => Event::BrainDone,
-                            Ok(Err(e)) => {
+                        tokio::pin!(forward);
+                        // Stage 1: the first event must come within BRAIN_FIRST_EVENT_TIMEOUT.
+                        // Stage 2: once it has, the reply may run to BRAIN_TIMEOUT in total.
+                        let result = tokio::select! {
+                            biased;
+                            r = &mut forward => Some(r),
+                            Ok(()) = &mut first_rx => {
+                                tokio::time::timeout_at(started_at + BRAIN_TIMEOUT, &mut forward)
+                                    .await
+                                    .map_err(|_| {
+                                        tracing::warn!("brain reply still running at 30 s");
+                                    })
+                                    .ok()
+                            }
+                            _ = tokio::time::sleep_until(started_at + BRAIN_FIRST_EVENT_TIMEOUT) => {
+                                tracing::warn!("brain gave no reply within 8 s");
+                                None
+                            }
+                        };
+                        let done = match result {
+                            Some(Ok(())) => Event::BrainDone,
+                            Some(Err(e)) => {
                                 tracing::warn!(error = %e, "brain failed");
                                 Event::BrainFailed
                             }
-                            Err(_) => {
-                                tracing::warn!("brain timed out");
-                                Event::BrainFailed
-                            }
+                            None => Event::BrainFailed,
                         };
                         let _ = tx.send(done);
                     });
@@ -341,6 +364,105 @@ mod tests {
             ui.spoken()
         );
         assert_eq!(ui.last_status(), Some(Mode::Idle));
+    }
+
+    /// Sends speeches at given offsets from the request, returns at `finish` (never if None).
+    struct TimedBrain {
+        speeches: Vec<(Duration, &'static str)>,
+        finish: Option<Duration>,
+    }
+    #[async_trait]
+    impl Brain for TimedBrain {
+        async fn think(
+            &self,
+            _: BrainRequest,
+            tx: mpsc::Sender<BrainEvent>,
+        ) -> Result<(), BrainError> {
+            let start = tokio::time::Instant::now();
+            for (at, text) in &self.speeches {
+                tokio::time::sleep_until(start + *at).await;
+                tx.send(BrainEvent::Speech((*text).into())).await.ok();
+            }
+            match self.finish {
+                Some(at) => {
+                    tokio::time::sleep_until(start + at).await;
+                    Ok(())
+                }
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    fn apologised(ui: &Recorder) -> bool {
+        ui.spoken()
+            .iter()
+            .any(|s| s.starts_with("Sorry, I can't reach my brain"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_that_starts_in_time_may_run_past_8_seconds() {
+        let brain = TimedBrain {
+            speeches: vec![
+                (Duration::from_secs(1), "First part."),
+                (Duration::from_secs(9), "Second part."),
+            ],
+            finish: Some(Duration::from_secs(12)),
+        };
+        let (h, ui) = start(Some(Arc::new(brain)));
+        h.send(Event::Utterance("tell me".into()));
+        tokio::time::sleep(Duration::from_secs(13)).await;
+        settle().await;
+        assert_eq!(ui.spoken(), vec!["First part.", "Second part."]);
+        assert!(!apologised(&ui));
+        assert_eq!(ui.last_status(), Some(Mode::FollowUp));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_brain_fails_at_8_seconds() {
+        let brain = TimedBrain {
+            speeches: vec![],
+            finish: None,
+        };
+        let (h, ui) = start(Some(Arc::new(brain)));
+        h.send(Event::Utterance("tell me".into()));
+        tokio::time::sleep(Duration::from_millis(7900)).await;
+        settle().await;
+        assert!(!apologised(&ui), "{:?}", ui.spoken());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        settle().await;
+        assert!(apologised(&ui), "{:?}", ui.spoken());
+        assert_eq!(ui.last_status(), Some(Mode::Idle));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_still_running_at_30_seconds_fails() {
+        let brain = TimedBrain {
+            speeches: vec![(Duration::from_secs(1), "Starting.")],
+            finish: None,
+        };
+        let (h, ui) = start(Some(Arc::new(brain)));
+        h.send(Event::Utterance("tell me".into()));
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        settle().await;
+        assert!(!apologised(&ui), "{:?}", ui.spoken());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        settle().await;
+        assert!(apologised(&ui), "{:?}", ui.spoken());
+        assert!(ui.spoken().contains(&"Starting.".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_brain_that_finishes_without_speaking_is_not_a_failure() {
+        let brain = TimedBrain {
+            speeches: vec![],
+            finish: Some(Duration::from_secs(2)),
+        };
+        let (h, ui) = start(Some(Arc::new(brain)));
+        h.send(Event::Utterance("tell me".into()));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        settle().await;
+        assert!(!apologised(&ui), "{:?}", ui.spoken());
+        assert_eq!(ui.last_status(), Some(Mode::FollowUp));
     }
 
     #[tokio::test(start_paused = true)]
