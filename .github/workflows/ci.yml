@@ -5,6 +5,9 @@ on:
   pull_request:
     paths-ignore: ['server/**', 'contracts/**', '.10x/**', '.github/workflows/server.yml']
 
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
