@@ -3,7 +3,11 @@
 #   docker build -f server/deploy/cad.Dockerfile -t jarvis-cad .
 # Run locked down (compose: service `cad`): internal network only, read-only, /tmp as tmpfs,
 # all capabilities dropped, non-root, 256 MB. The runner gives the engine no environment.
+# There are no ARGs in this file.
 # Plan: .10x/plans/2026-11-28-cad-board-slice-1.md, Task 2.
+
+# The base image tags below float (they move with upstream releases); they can be pinned by
+# digest later (FROM image:tag@sha256:...) if builds must be reproducible.
 
 # ---- the runner, built from this repository
 FROM rust:1-slim-trixie AS runner
@@ -13,19 +17,19 @@ RUN cargo build --release --locked -p jarvis-cad-runner --bin jarvis-cad-runner
 
 # ---- the engine: the pinned release, checked against its SHA-256 before it is unpacked
 FROM debian:trixie-slim AS engine
-ARG CADCRAFT_VERSION=0.12.0
-# From the release's SHA256SUMS.txt, read on 27 Nov 2026. A different file fails the build.
-ARG CADCRAFT_SHA256=6ae27b9eabc3608caef356a00f69b9fdccbf1e408d6308b5614b6e6b256308de
+# The engine is fixed here, not by build arguments: no --build-arg can change what is fetched.
+# Version 0.12.0; SHA-256 from the release's SHA256SUMS.txt, read on 27 Nov 2026. A different
+# file fails the build.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 RUN set -eu; \
-    file="cadcraft-${CADCRAFT_VERSION}-linux-x86_64.tar.gz"; \
+    file="cadcraft-0.12.0-linux-x86_64.tar.gz"; \
     mkdir -p /download /unpack; \
     curl -fsSL --retry 3 -o "/download/${file}" \
-      "https://github.com/storytold/cadcraft/releases/download/v${CADCRAFT_VERSION}/${file}"; \
+      "https://github.com/storytold/cadcraft/releases/download/v0.12.0/${file}"; \
     cd /download; \
-    echo "${CADCRAFT_SHA256}  ${file}" | sha256sum -c -; \
+    echo "6ae27b9eabc3608caef356a00f69b9fdccbf1e408d6308b5614b6e6b256308de  ${file}" | sha256sum -c -; \
     tar -xzf "/download/${file}" -C /unpack; \
     cli="$(find /unpack -type f -name cadcraft-cli | head -n 1)"; \
     test -n "$cli"; \
@@ -38,4 +42,7 @@ COPY --from=runner /src/target/release/jarvis-cad-runner /usr/local/bin/jarvis-c
 COPY server/config/cad_commands.txt /etc/jarvis/cad_commands.txt
 USER 10001:10001
 EXPOSE 7411
-ENTRYPOINT ["/usr/local/bin/jarvis-cad-runner", "--listen", "0.0.0.0:7411", "--engine", "/usr/local/bin/cadcraft-cli", "--commands", "/etc/jarvis/cad_commands.txt"]
+# Container mode: the runner is pid 1 here (or a child of pid 1 under an init); after every
+# replay it kills every other process, reaps them and empties /tmp. Outside a container the
+# runner refuses --container.
+ENTRYPOINT ["/usr/local/bin/jarvis-cad-runner", "--container", "--listen", "0.0.0.0:7411", "--engine", "/usr/local/bin/cadcraft-cli", "--commands", "/etc/jarvis/cad_commands.txt", "--work-root", "/tmp"]

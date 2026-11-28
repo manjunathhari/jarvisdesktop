@@ -45,10 +45,26 @@ const SVG_ATTRIBUTES: &[&str] = &[
     "stroke-opacity",
 ];
 
+/// The engine named by `JARVIS_CAD_ENGINE`, or `None` (the test is skipped). With
+/// `JARVIS_CAD_ENGINE_REQUIRED=1` (set in CI) a missing engine fails the test instead, so a
+/// mistake in the workflow cannot pass as green.
 fn engine() -> Option<PathBuf> {
-    let path = std::env::var_os("JARVIS_CAD_ENGINE")?;
+    let required = std::env::var_os("JARVIS_CAD_ENGINE_REQUIRED").is_some_and(|v| v == "1");
+    let Some(path) = std::env::var_os("JARVIS_CAD_ENGINE") else {
+        assert!(
+            !required,
+            "JARVIS_CAD_ENGINE_REQUIRED is 1 but JARVIS_CAD_ENGINE is not set"
+        );
+        return None;
+    };
     // Absolute: the engine starts in its own new directory.
-    Some(std::fs::canonicalize(&path).expect("JARVIS_CAD_ENGINE names a file"))
+    let path = std::fs::canonicalize(&path).expect("JARVIS_CAD_ENGINE names a file");
+    assert!(
+        path.is_file(),
+        "JARVIS_CAD_ENGINE is not a file: {}",
+        path.display()
+    );
+    Some(path)
 }
 
 fn commands_file() -> PathBuf {
@@ -212,6 +228,23 @@ async fn the_catalogue_names_every_allowed_command() {
     let missing: Vec<_> = cfg.allowed().difference(&named).collect();
     assert!(missing.is_empty(), "the engine does not list: {missing:?}");
     assert_eq!(&named, cfg.allowed());
+}
+
+#[tokio::test]
+async fn the_working_directory_is_left_empty() {
+    let engine = engine_or_skip!();
+    let root = tempfile::Builder::new()
+        .prefix("cad-real-root-")
+        .tempdir()
+        .unwrap();
+    let cfg = config(engine).work_root(root.path().to_path_buf());
+    let answer = replayed(replay(&cfg, two_room_plan(true)).await);
+    assert!(answer.svg_b64.is_some());
+    let left: Vec<_> = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
 }
 
 /// The element and attribute names in an SVG, by a plain scan of its tags. The engine's SVG is

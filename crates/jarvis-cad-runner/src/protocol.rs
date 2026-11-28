@@ -6,33 +6,37 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::value::RawValue;
 
 /// The only protocol version.
 pub const VERSION: u8 = 1;
 
 /// One drawing command, as Claude sent it: an engine command id and its parameters.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+///
+/// The parameters stay raw JSON text (checked to be an object) until they are passed to the
+/// engine: a request waiting for the slot holds no more memory than its own bytes.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Command {
     pub command: String,
-    pub params: Map<String, Value>,
+    pub params: Box<RawValue>,
 }
 
 /// One step of a recipe: a label and its commands, replayed in order.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Step {
     pub label: String,
     pub commands: Vec<Command>,
 }
 
 /// A request, as read from the request line.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(tag = "op", rename_all = "lowercase")]
+#[derive(Debug, Clone)]
 pub enum Request {
     Replay {
         v: u8,
         steps: Vec<Step>,
-        #[serde(default)]
+        /// Optional on the wire, default false.
         picture: bool,
     },
     Catalogue {
@@ -40,14 +44,46 @@ pub enum Request {
     },
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Op {
+    Replay,
+    Catalogue,
+}
+
+/// The request line's fields; anything else is refused.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Wire {
+    v: u8,
+    op: Op,
+    steps: Option<Vec<Step>>,
+    picture: Option<bool>,
+}
+
 impl Request {
-    /// Parses a request line; `None` for anything that is not a version 1 request.
+    /// Parses a request line; `None` for anything that is not a version 1 request of exactly
+    /// these fields (`bad_request`).
     pub fn parse(line: &[u8]) -> Option<Request> {
-        let request: Request = serde_json::from_slice(line).ok()?;
-        let v = match &request {
-            Request::Replay { v, .. } | Request::Catalogue { v } => *v,
-        };
-        (v == VERSION).then_some(request)
+        let wire: Wire = serde_json::from_slice(line).ok()?;
+        if wire.v != VERSION {
+            return None;
+        }
+        match (wire.op, wire.steps, wire.picture) {
+            (Op::Catalogue, None, None) => Some(Request::Catalogue { v: wire.v }),
+            (Op::Replay, Some(steps), picture) => {
+                let objects = steps
+                    .iter()
+                    .flat_map(|s| &s.commands)
+                    .all(|c| c.params.get().starts_with('{'));
+                objects.then_some(Request::Replay {
+                    v: wire.v,
+                    steps,
+                    picture: picture.unwrap_or(false),
+                })
+            }
+            _ => None,
+        }
     }
 
     /// The total number of commands in a replay request (0 for a catalogue).
@@ -145,7 +181,8 @@ impl Answer {
 
     /// The answer line, ending in `\n`.
     pub fn to_line(&self) -> Vec<u8> {
-        // Serialising these types cannot fail (string keys, finite numbers only).
+        // Serialising these types cannot fail: string keys, and `extents` is checked to be
+        // finite (a non-finite number would be written as null).
         let mut line = serde_json::to_vec(self)
             .unwrap_or_else(|_| br#"{"v":1,"ok":false,"error":"engine_failed"}"#.to_vec());
         line.push(b'\n');
@@ -160,7 +197,7 @@ mod tests {
     #[test]
     fn parses_both_requests() {
         let r = Request::parse(br#"{"v":1,"op":"catalogue"}"#).unwrap();
-        assert_eq!(r, Request::Catalogue { v: 1 });
+        assert!(matches!(r, Request::Catalogue { v: 1 }));
         let r = Request::parse(
             br#"{"v":1,"op":"replay","steps":[{"label":"a","commands":[{"command":"line","params":{"x":1}}]}]}"#,
         )
@@ -179,6 +216,23 @@ mod tests {
         .is_none());
         assert!(Request::parse(br#"{"v":1,"op":"replay","steps":[{"label":"a","commands":[{"command":"line","params":null}]}]}"#).is_none());
         assert!(Request::parse(b"[]").is_none());
+        assert!(Request::parse(br#"{"v":1,"op":"catalogue","x":1}"#).is_none());
+        assert!(Request::parse(br#"{"v":1,"op":"catalogue","steps":[]}"#).is_none());
+        assert!(Request::parse(br#"{"v":1,"op":"replay"}"#).is_none());
+        assert!(Request::parse(br#"{"v":1,"op":"replay","steps":[{"label":"a","commands":[{"command":"line","params":"{}"}]}]}"#).is_none());
+    }
+
+    #[test]
+    fn params_stay_raw_text() {
+        let r = Request::parse(
+            br#"{"v":1,"op":"replay","picture":true,"steps":[{"label":"a","commands":[{"command":"line","params": {"x" : [1, 2]}}]}]}"#,
+        )
+        .unwrap();
+        let Request::Replay { steps, picture, .. } = r else {
+            panic!("a replay")
+        };
+        assert!(picture);
+        assert_eq!(steps[0].commands[0].params.get(), r#"{"x" : [1, 2]}"#);
     }
 
     #[test]

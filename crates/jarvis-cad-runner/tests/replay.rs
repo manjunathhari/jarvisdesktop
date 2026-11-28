@@ -4,107 +4,15 @@
 //! working directory and process. The real engine is tested in `real_engine.rs`.
 #![cfg(unix)]
 
-use std::collections::BTreeSet;
-use std::net::SocketAddr;
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use common::*;
 use data_encoding::BASE64;
-use jarvis_cad_runner::{serve, Config};
+use jarvis_cad_runner::Config;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-
-fn fake_engine() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_fake-cadcraft"))
-}
-
-fn allowed(ids: &[&str]) -> BTreeSet<String> {
-    ids.iter().map(|s| s.to_string()).collect()
-}
-
-fn config() -> Config {
-    Config::new(
-        fake_engine(),
-        allowed(&[
-            "line",
-            "text",
-            "dimlinear",
-            "fail",
-            "sleep",
-            "probe",
-            "bloat",
-            "flood",
-            "chatty",
-        ]),
-    )
-}
-
-async fn start(cfg: Config) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve(listener, cfg));
-    addr
-}
-
-/// Sends raw bytes and reads the one answer line.
-async fn ask_raw(addr: SocketAddr, bytes: &[u8]) -> Value {
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let (read, mut write) = stream.into_split();
-    let bytes = bytes.to_vec();
-    let writer = tokio::spawn(async move {
-        let _ = write.write_all(&bytes).await;
-        // Keep the write half open until the answer is read: a closed half is not a signal.
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        drop(write);
-    });
-    let mut line = String::new();
-    BufReader::new(read).read_line(&mut line).await.unwrap();
-    writer.abort();
-    assert!(line.ends_with('\n'), "answer must be one line: {line:?}");
-    serde_json::from_str(&line).unwrap()
-}
-
-async fn ask(addr: SocketAddr, request: Value) -> Value {
-    let mut line = serde_json::to_vec(&request).unwrap();
-    line.push(b'\n');
-    ask_raw(addr, &line).await
-}
-
-fn cmd(command: &str, params: Value) -> Value {
-    json!({"command": command, "params": params})
-}
-
-fn replay_req(steps: Value, picture: bool) -> Value {
-    json!({"v": 1, "op": "replay", "steps": steps, "picture": picture})
-}
-
-fn error_of(answer: &Value) -> &str {
-    assert_eq!(answer["v"], 1);
-    assert_eq!(answer["ok"], false, "expected a failure: {answer}");
-    answer["error"].as_str().unwrap()
-}
-
-fn temp_file(name: &str) -> PathBuf {
-    let dir = tempfile::Builder::new()
-        .prefix("cad-runner-test-")
-        .tempdir()
-        .unwrap()
-        .keep();
-    dir.join(name)
-}
-
-async fn wait_for_file(path: &Path) -> String {
-    for _ in 0..100 {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            if text.ends_with('\n') {
-                return text;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("the fake engine never wrote {}", path.display());
-}
 
 #[tokio::test]
 async fn replays_steps_in_order_and_reports_each_command() {
@@ -238,12 +146,13 @@ async fn more_than_2000_commands_is_refused() {
 
 #[tokio::test]
 async fn a_replay_past_ten_seconds_is_killed_and_answers_timeout() {
+    let scratch = Scratch::new();
     assert_eq!(
         Config::new(fake_engine(), allowed(&[])).replay_limit_value(),
         Duration::from_secs(10)
     );
     let addr = start(config().replay_limit(Duration::from_secs(1))).await;
-    let report = temp_file("sleep.txt");
+    let report = scratch.file("sleep.txt");
     let steps = json!([{"label": "Slow", "commands": [
         cmd("sleep", json!({"seconds": 30, "report": report})),
     ]}]);
@@ -300,8 +209,10 @@ async fn a_request_line_over_one_mebibyte_is_bad_request() {
     assert!(began.elapsed() < Duration::from_secs(4));
 
     // A request of exactly 1,048,576 bytes before its newline is read whole (and parsed).
-    let mut line = br#"{"v":1,"op":"catalogue","pad":""#.to_vec();
-    let close = br#""}"#;
+    let mut line =
+        br#"{"v":1,"op":"replay","steps":[{"commands":[{"command":"line","params":{}}],"label":""#
+            .to_vec();
+    let close = br#""}]}"#;
     line.resize(1_048_576 - close.len(), b'x');
     line.extend_from_slice(close);
     assert_eq!(line.len(), 1_048_576);

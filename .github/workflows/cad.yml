@@ -2,9 +2,12 @@ name: CAD engine
 # The `cad` image: the pinned CAD engine (CADCraft cadcraft-cli) and jarvis-cad-runner.
 # Plan: .10x/plans/2026-11-28-cad-board-slice-1.md, Task 2. The engine is third-party code: it
 # runs only on this runner (real-engine tests) and inside the locked-down container.
+# Triggers: pull requests run only when these paths change; pushes run on every branch, and
+# the `changes` job below applies the same paths to every branch except main. A push to main
+# always runs, so an image is published for every main commit (the server deploys by commit).
 on:
   push:
-    paths: ['crates/jarvis-cad-runner/**', 'server/deploy/cad.Dockerfile', 'server/deploy/cad.Dockerfile.dockerignore', 'server/config/cad_commands.txt', '.github/workflows/cad.yml', 'Cargo.toml', 'Cargo.lock']
+    branches: ['**']
   pull_request:
     paths: ['crates/jarvis-cad-runner/**', 'server/deploy/cad.Dockerfile', 'server/deploy/cad.Dockerfile.dockerignore', 'server/config/cad_commands.txt', '.github/workflows/cad.yml', 'Cargo.toml', 'Cargo.lock']
 
@@ -17,7 +20,49 @@ env:
   CADCRAFT_SHA256: 6ae27b9eabc3608caef356a00f69b9fdccbf1e408d6308b5614b6e6b256308de
 
 jobs:
+  changes:
+    # Whether the rest runs: always for pull requests (filtered above) and pushes to main;
+    # for pushes to other branches, only when the paths in `pull_request` changed.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          paths='^(crates/jarvis-cad-runner/|server/deploy/cad\.Dockerfile(\.dockerignore)?$|server/config/cad_commands\.txt$|\.github/workflows/cad\.yml$|Cargo\.(toml|lock)$)'
+          run=true
+          if [ "$EVENT" = push ] && [ "$REF" != refs/heads/main ]; then
+            base=""
+            if [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ] \
+               && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+              base="$BEFORE"
+            else
+              base="$(git merge-base origin/main "$SHA" 2>/dev/null || true)"
+            fi
+            if [ -n "$base" ]; then
+              changed="$(git diff --name-only "$base" "$SHA")"
+              if grep -Eq "$paths" <<<"$changed"; then run=true; else run=false; fi
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "$EVENT on $REF: run=$run"
+
   test:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -54,9 +99,12 @@ jobs:
         run: cargo test -p jarvis-cad-runner --test real_engine -- --nocapture
         env:
           JARVIS_CAD_ENGINE: ${{ runner.temp }}/cadcraft/bin/cadcraft-cli
+          # The tests fail, not skip, if the engine above is missing.
+          JARVIS_CAD_ENGINE_REQUIRED: "1"
 
   image:
-    needs: test
+    needs: [changes, test]
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -126,13 +174,74 @@ jobs:
               print(json.dumps(answer)[:2000])
               sys.exit("the replay did not answer ok with an SVG")
           PY
+      - name: Nothing is left running after a replay
+        run: |
+          set -euo pipefail
+          docker top cad -eo pid,user,comm
+          count="$(docker top cad -eo pid | tail -n +2 | wc -l)"
+          if [ "$count" -ne 1 ]; then
+            echo "::error::the cad container runs $count processes after a replay; only the runner may be left"
+            exit 1
+          fi
+      - name: There is no route out of the container
+        run: |
+          set -euo pipefail
+          # A public address, looked up here on the CI runner (none is written in this file).
+          target="$(getent ahostsv4 github.com | awk 'NR == 1 { print $1 }')"
+          test -n "$target"
+          # The check itself must work: from the CI runner the same connection succeeds, and
+          # bash (with /dev/tcp) and timeout exist in the image.
+          timeout 5 bash -c "exec 3<>/dev/tcp/$target/443"
+          docker exec cad bash -c 'command -v timeout >/dev/null && echo "the check can run"'
+          if docker exec cad timeout 5 bash -c "exec 3<>/dev/tcp/$target/443"; then
+            echo "::error::the cad container opened a TCP connection to $target:443"
+            exit 1
+          fi
+          echo "no route out: the connection from inside cad failed, as it must"
+      - name: Three replays in a row leave /tmp empty
+        run: |
+          docker run --rm -i --network cad-smoke python:3.12-slim python - <<'PY'
+          import json, socket, sys
+
+          def ask(request):
+              with socket.create_connection(("cad", 7411), timeout=5) as sock:
+                  sock.settimeout(30)
+                  sock.sendall(json.dumps(request).encode() + b"\n")
+                  data = b""
+                  while not data.endswith(b"\n"):
+                      chunk = sock.recv(65536)
+                      if not chunk:
+                          break
+                      data += chunk
+              return json.loads(data)
+
+          plan = [
+              {"command": "line", "params": {"points": [[0, 0], [9000, 0], [9000, 7000], [0, 7000]], "closed": True}},
+              {"command": "text", "params": {"at": [600, 6200], "text": "LIVING ROOM", "height": 200}},
+          ]
+          for n in range(3):
+              answer = ask({"v": 1, "op": "replay", "picture": True, "steps": [{"label": "Room", "commands": plan}]})
+              print("replay", n + 1, ":", answer.get("ok"), "failed", answer.get("failed"), "svg", bool(answer.get("svg_b64")))
+              if answer.get("ok") is not True or answer.get("failed") != 0 or not answer.get("svg_b64"):
+                  print(json.dumps(answer)[:2000])
+                  sys.exit("a replay in the row did not answer ok with an SVG")
+          PY
+          left="$(docker exec cad ls -A /tmp)"
+          if [ -n "$left" ]; then
+            echo "::error::left in /tmp after the replays: $left"
+            exit 1
+          fi
+          echo "/tmp is empty"
+          count="$(docker top cad -eo pid | tail -n +2 | wc -l)"
+          test "$count" -eq 1
       - name: Runner log
         if: always()
         run: docker logs cad || true
 
   publish:
     # After the tests and the image check pass on main, publish the image the server pulls,
-    # tagged with the commit (the server deploys by JARVIS_REF = commit SHA).
+    # tagged with the commit (the server deploys by JARVIS_REF = commit SHA). Pushes to main
+    # are not path-filtered, so every main commit gets an image.
     needs: [test, image]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest

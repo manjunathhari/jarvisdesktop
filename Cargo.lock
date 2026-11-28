@@ -2278,6 +2278,7 @@ name = "jarvis-cad-runner"
 version = "0.1.0"
 dependencies = [
  "data-encoding",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
