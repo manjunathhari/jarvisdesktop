@@ -75,6 +75,23 @@ jobs:
           JARVIS_REF: ${{ github.sha }}
       - name: Image builds
         run: docker build --tag jarvis-server:ci .
+      - name: Sandbox image builds (improve profile; the publish job pushes it from main)
+        run: docker build -f deploy/improve/sandbox.Dockerfile --tag jarvis-sandbox:ci .
+      # The next two run the sandbox image the way compose runs it (its own environment,
+      # read-only root, tmpfs, uid 10001, no capabilities), without starting the other services.
+      - name: The sandbox can't see any key (improve key check, in the sandbox image)
+        run: |
+          docker tag jarvis-sandbox:ci "ghcr.io/manjunathhari/jarvis-sandbox:${JARVIS_REF}"
+          docker compose -f deploy/compose.yaml --profile improve run --rm --no-deps -T \
+            sandbox --check
+        env:
+          JARVIS_REF: ${{ github.sha }}
+      - name: Dry run of one ticket through the whole team (in the sandbox image)
+        run: |
+          docker compose -f deploy/compose.yaml --profile improve run --rm --no-deps -T \
+            --entrypoint /opt/agent-sdk/bin/python sandbox -m jarvis_server.improve.dry_run
+        env:
+          JARVIS_REF: ${{ github.sha }}
 
   publish:
     # After tests pass on main, publish the image the server pulls,
@@ -100,3 +117,14 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/manjunathhari/jarvisdesktop
             org.opencontainers.image.description=JARVIS server (Architecture v2)
+      # The improve team's sandbox, with the same commit tag, since compose runs
+      # ghcr.io/manjunathhari/jarvis-sandbox:${JARVIS_REF} beside the server image.
+      - uses: docker/build-push-action@v6
+        with:
+          context: server
+          file: server/deploy/improve/sandbox.Dockerfile
+          push: true
+          tags: ghcr.io/manjunathhari/jarvis-sandbox:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/manjunathhari/jarvisdesktop
+            org.opencontainers.image.description=JARVIS improve team sandbox (no keys)
