@@ -12,6 +12,7 @@
 
 pub mod engine;
 pub mod protocol;
+pub mod remove;
 pub mod replay;
 pub mod scan;
 
@@ -100,11 +101,14 @@ async fn handle(stream: TcpStream, shared: &Shared) {
         Some(request) => answer_request(request, shared).await,
         None => Answer::failure(ErrorCode::BadRequest),
     };
-    let stream = match reader.into_inner().reunite(write) {
-        Ok(stream) => stream,
-        Err(_) => return,
-    };
-    write_answer(stream, answer).await;
+    if let Ok(stream) = reader.into_inner().reunite(write) {
+        write_answer(stream, answer).await;
+    }
+    if shared.cfg.must_exit() {
+        // Container mode could not empty its work root (see `Config::must_exit`).
+        eprintln!("jarvis-cad-runner: exiting: the work root could not be emptied");
+        std::process::exit(3);
+    }
 }
 
 async fn answer_request(request: Request, shared: &Shared) -> Answer {

@@ -32,7 +32,14 @@
 //! - `nested`: a line of arrays nested about 2 million deep comes before its reply;
 //! - `tinystrings`: its reply line carries a `pad` of about a million one-letter strings.
 //!
+//! - `deepchain {depth}`: leaves a chain of `depth` nested directories in its directory;
+//! - `deeplock {depth, at}`: the same, with the directory at level `at` left mode 000.
+//!
 //! Started with a program name containing `badversion`, it reports version `0.12.0 (abc)`.
+//! `fake-cadcraft remove-tree PATH [SECONDS]` (for the tests, not an engine) removes PATH with
+//! the runner's own routine (time limit SECONDS, default the runner's own) on a thread with a
+//! 256 KiB stack, and exits 0 if it is gone: a removal that recursed per level would crash this
+//! process, not the test harness.
 
 use std::io::{BufRead, Write};
 use std::time::{Duration, Instant};
@@ -251,6 +258,14 @@ fn execute(drawing: &mut Drawing, args: &Value) -> (String, bool) {
             drawing.manyitems = true;
             ("ok".into(), false)
         }
+        "deepchain" | "deeplock" => {
+            let depth = params["depth"].as_u64().unwrap_or(50_000) as usize;
+            let at = params["at"].as_u64().map(|a| a as usize);
+            match deep(depth, at) {
+                Ok(()) => ("deep".into(), false),
+                Err(e) => (format!("deep failed: {e}"), true),
+            }
+        }
         "emptyitems" => {
             drawing.raw_reply = Some(items("{}", 1_390_000));
             ("ok".into(), false)
@@ -286,6 +301,36 @@ fn lock(target: &str) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn lock(_target: &str) -> std::io::Result<()> {
     Err(std::io::Error::other("unix only"))
+}
+
+#[cfg(unix)]
+fn deep(depth: usize, at: Option<usize>) -> std::io::Result<()> {
+    jarvis_cad_runner::remove::testing::chain(std::path::Path::new("."), depth, at).map(drop)
+}
+
+#[cfg(not(unix))]
+fn deep(_depth: usize, _at: Option<usize>) -> std::io::Result<()> {
+    Err(std::io::Error::other("unix only"))
+}
+
+/// `remove-tree PATH`: see the module comment.
+fn remove_tree_mode(path: &str, seconds: Option<f64>) -> std::process::ExitCode {
+    let path = std::path::PathBuf::from(path);
+    let limit = seconds
+        .map(Duration::from_secs_f64)
+        .unwrap_or(jarvis_cad_runner::remove::REMOVE_LIMIT);
+    let worker = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let began = Instant::now();
+            let result = jarvis_cad_runner::remove::remove_tree_within(&path, limit);
+            println!("{result:?} in {:?}", began.elapsed());
+            result.is_ok() && std::fs::symlink_metadata(&path).is_err()
+        });
+    match worker.map(|w| w.join()) {
+        Ok(Ok(true)) => std::process::ExitCode::SUCCESS,
+        _ => std::process::ExitCode::FAILURE,
+    }
 }
 
 /// Puts a symlink, a FIFO or a directory at `path` (replacing what is there).
@@ -442,20 +487,25 @@ fn tool(drawing: &mut Drawing, id: &Value, name: &str, args: &Value) -> Value {
     }
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     let mut args = std::env::args();
     let program = args.next().unwrap_or_default();
     match args.next().as_deref() {
+        Some("remove-tree") => {
+            let path = args.next().unwrap_or_default();
+            let seconds = args.next().and_then(|s| s.parse().ok());
+            return remove_tree_mode(&path, seconds);
+        }
         Some("sleeper") => {
             let seconds: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(30.0);
             std::thread::sleep(Duration::from_secs_f64(seconds));
-            return;
+            return std::process::ExitCode::SUCCESS;
         }
         Some("racer") => {
             let kind = args.next().unwrap_or_default();
             let target = args.next().unwrap_or_default();
             racer(&kind, &target);
-            return;
+            return std::process::ExitCode::SUCCESS;
         }
         _ => {}
     }
@@ -501,7 +551,7 @@ fn main() {
             );
             loop {
                 if stdout.write_all(junk.as_bytes()).is_err() || stdout.flush().is_err() {
-                    return;
+                    return std::process::ExitCode::SUCCESS;
                 }
             }
         }
@@ -543,4 +593,5 @@ fn main() {
             break;
         }
     }
+    std::process::ExitCode::SUCCESS
 }

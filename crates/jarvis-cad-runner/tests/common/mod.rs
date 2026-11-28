@@ -46,6 +46,8 @@ pub const FAKE_COMMANDS: &[&str] = &[
     "textitems",
     "nested",
     "tinystrings",
+    "deepchain",
+    "deeplock",
 ];
 
 pub fn config() -> Config {
@@ -153,8 +155,16 @@ impl Scratch {
 }
 
 impl Drop for Scratch {
+    /// Removed by the stand-in's `remove-tree` in a child process: a broken removal routine
+    /// (a mutation, say) then crashes that child, not this test harness.
     fn drop(&mut self) {
-        let _ = jarvis_cad_runner::replay::remove_tree(&self.0);
+        let _ = std::process::Command::new(fake_engine())
+            .arg("remove-tree")
+            .arg(&self.0)
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 }
 
@@ -195,4 +205,37 @@ pub async fn gone(pid: u32) -> bool {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     false
+}
+
+/// Starts the runner binary (a child process, killed on drop) with every stand-in command
+/// allowed and these extra arguments; waits until it listens.
+pub async fn spawn_runner(
+    scratch: &Scratch,
+    extra: &[&std::ffi::OsStr],
+) -> (tokio::process::Child, SocketAddr) {
+    let commands = scratch.file("commands.txt");
+    std::fs::write(&commands, FAKE_COMMANDS.join("\n")).unwrap();
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let listen = format!("127.0.0.1:{port}");
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_jarvis-cad-runner"))
+        .args(["--listen", &listen, "--engine"])
+        .arg(fake_engine())
+        .arg("--commands")
+        .arg(&commands)
+        .args(extra)
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let addr: SocketAddr = listen.parse().unwrap();
+    for _ in 0..200 {
+        if TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    (child, addr)
 }

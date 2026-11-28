@@ -63,6 +63,9 @@ pub struct Config {
     container: bool,
     /// Directories that could not be removed; retried before each replay.
     leftovers: Arc<Mutex<Vec<PathBuf>>>,
+    /// Container mode: the work root could not be emptied, so the process must exit after
+    /// answering (see [`Config::must_exit`]).
+    must_exit: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Config {
@@ -79,6 +82,7 @@ impl Config {
             work_root: std::env::temp_dir(),
             container: false,
             leftovers: Arc::new(Mutex::new(Vec::new())),
+            must_exit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -139,6 +143,14 @@ impl Config {
 
     pub fn is_container(&self) -> bool {
         self.container
+    }
+
+    /// Container mode only: something in the work root could not be removed after a replay.
+    /// The listener then exits the process (non-zero) once the current answer is written, so
+    /// that the container is replaced by a fresh one with an empty tmpfs: the deployment must
+    /// give the `cad` service a restart policy for that (Task 7).
+    pub fn must_exit(&self) -> bool {
+        self.must_exit.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn allowed(&self) -> &BTreeSet<String> {
@@ -298,20 +310,27 @@ impl Drop for Cleanup<'_> {
 fn remove_work(cfg: &Config, work: WorkDir) {
     let path = work.path.clone();
     drop(work);
-    let mut failed = Vec::new();
-    if let Err(e) = remove_tree(&path).or_else(|_| remove_tree(&path)) {
+    if cfg.container {
+        // The replay's directory is inside the work root: the wipe covers it.
+        let failed = empty_dir(&cfg.work_root);
+        let still = std::fs::read_dir(&cfg.work_root).map_or(true, |mut d| d.next().is_some());
+        if !failed.is_empty() || still {
+            eprintln!(
+                "jarvis-cad-runner: {} is not empty after the replay; exiting after this answer so that a fresh container replaces this one",
+                cfg.work_root.display()
+            );
+            cfg.must_exit
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        return;
+    }
+    if let Err(e) = remove_tree(&path) {
         eprintln!(
             "jarvis-cad-runner: could not remove {}: {e}",
             path.display()
         );
-        failed.push(path);
-    }
-    if cfg.container {
-        failed.extend(empty_dir(&cfg.work_root));
-    }
-    if !failed.is_empty() {
         if let Ok(mut leftovers) = cfg.leftovers.lock() {
-            leftovers.extend(failed);
+            leftovers.push(path);
         }
     }
 }
@@ -334,169 +353,7 @@ pub fn settle_leftovers(
     leftovers.is_empty()
 }
 
-/// Makes a tree removable (directories `0700`, walked without following links), then removes
-/// it. A link is removed, never followed. Missing is fine.
-pub fn remove_tree(path: &Path) -> std::io::Result<()> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    if !meta.file_type().is_dir() {
-        return std::fs::remove_file(path);
-    }
-    make_removable(path);
-    match std::fs::remove_dir_all(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        other => other,
-    }
-}
-
-/// `chmod 0700` on every directory of the tree (unix), so that it can be removed.
-fn make_removable(root: &Path) {
-    #[cfg(unix)]
-    chmod_walk::make_removable(root);
-    #[cfg(not(unix))]
-    let _ = root;
-}
-
-/// The walk behind [`make_removable`]: by descriptor, never by path. Each directory is opened
-/// relative to its parent's descriptor with `O_NOFOLLOW | O_DIRECTORY`, so a name swapped for a
-/// symlink is refused rather than followed, and the mode is set on the open descriptor
-/// (`fchmod`). Depth is capped at [`chmod_walk::MAX_DEPTH`]; a deeper tree is left for the
-/// removal to fail on, which is logged and retried.
-#[cfg(unix)]
-mod chmod_walk {
-    use std::ffi::{CStr, CString};
-    use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::Path;
-
-    pub const MAX_DEPTH: usize = 64;
-
-    pub fn make_removable(root: &Path) {
-        let Ok(root) = CString::new(root.as_os_str().as_bytes()) else {
-            return;
-        };
-        if let Ok(fd) = open_dir(libc::AT_FDCWD, &root) {
-            walk(&fd, 0);
-        }
-    }
-
-    /// Recursion bounded by `MAX_DEPTH` (so at most that many descriptors are open at once).
-    fn walk(dir: &OwnedFd, depth: usize) {
-        if depth >= MAX_DEPTH {
-            return;
-        }
-        for name in subdirs(dir) {
-            if let Ok(child) = open_dir(dir.as_raw_fd(), &name) {
-                walk(&child, depth + 1);
-            }
-        }
-    }
-
-    fn openat(parent: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
-        // SAFETY: a valid descriptor (or AT_FDCWD) and a NUL-terminated name.
-        let fd = unsafe { libc::openat(parent, name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `fd` was just opened and is owned by nothing else.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
-
-    /// Opens a directory (never a link) for reading and makes it `0700` through the descriptor.
-    fn open_dir(parent: RawFd, name: &CStr) -> io::Result<OwnedFd> {
-        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let fd = match openat(parent, name, flags) {
-            Ok(fd) => fd,
-            Err(e) if e.raw_os_error() == Some(libc::EACCES) => unlock_unreadable(parent, name)?,
-            Err(e) => return Err(e),
-        };
-        // SAFETY: a plain system call on an open descriptor.
-        unsafe {
-            libc::fchmod(fd.as_raw_fd(), 0o700);
-        }
-        Ok(fd)
-    }
-
-    /// A directory without read permission (mode 000) cannot be opened for reading. Hold it by
-    /// `O_PATH | O_NOFOLLOW` (which pins the directory itself, not its name), set its mode
-    /// through `/proc/self/fd/N` (which names that same directory), then open it relative to
-    /// the held descriptor.
-    #[cfg(target_os = "linux")]
-    fn unlock_unreadable(parent: RawFd, name: &CStr) -> io::Result<OwnedFd> {
-        let held = openat(
-            parent,
-            name,
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )?;
-        let by_fd = CString::new(format!("/proc/self/fd/{}", held.as_raw_fd()))
-            .map_err(io::Error::other)?;
-        // SAFETY: a NUL-terminated path.
-        if unsafe { libc::chmod(by_fd.as_ptr(), 0o700) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        openat(
-            held.as_raw_fd(),
-            c".",
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn unlock_unreadable(_parent: RawFd, _name: &CStr) -> io::Result<OwnedFd> {
-        Err(io::Error::from_raw_os_error(libc::EACCES))
-    }
-
-    /// The names of the real directories in `dir` (not links to them).
-    fn subdirs(dir: &OwnedFd) -> Vec<CString> {
-        // `fdopendir` takes ownership of its descriptor: give it a duplicate.
-        // SAFETY: plain system calls; `stream` is checked before use and closed once.
-        unsafe {
-            let dup = libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
-            if dup < 0 {
-                return Vec::new();
-            }
-            let stream = libc::fdopendir(dup);
-            if stream.is_null() {
-                libc::close(dup);
-                return Vec::new();
-            }
-            let mut names = Vec::new();
-            loop {
-                let entry = libc::readdir(stream);
-                if entry.is_null() {
-                    break;
-                }
-                let name = CStr::from_ptr((*entry).d_name.as_ptr());
-                if name == c"." || name == c".." {
-                    continue;
-                }
-                let is_dir = match (*entry).d_type {
-                    libc::DT_DIR => true,
-                    libc::DT_UNKNOWN => {
-                        let mut st: libc::stat = std::mem::zeroed();
-                        libc::fstatat(
-                            dir.as_raw_fd(),
-                            name.as_ptr(),
-                            &mut st,
-                            libc::AT_SYMLINK_NOFOLLOW,
-                        ) == 0
-                            && st.st_mode & libc::S_IFMT == libc::S_IFDIR
-                    }
-                    _ => false,
-                };
-                if is_dir {
-                    names.push(name.to_owned());
-                }
-            }
-            libc::closedir(stream);
-            names
-        }
-    }
-}
+pub use crate::remove::remove_tree;
 
 /// Removes everything inside `dir` (container mode: the whole of /tmp). Returns what could not
 /// be removed, after logging it.
@@ -508,7 +365,7 @@ fn empty_dir(dir: &Path) -> Vec<PathBuf> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if let Err(e) = remove_tree(&path).or_else(|_| remove_tree(&path)) {
+        if let Err(e) = remove_tree(&path) {
             eprintln!(
                 "jarvis-cad-runner: could not remove {}: {e}",
                 path.display()
@@ -1032,60 +889,6 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o755);
         remove_tree(&root).unwrap(); // already gone: fine
-    }
-
-    /// A helper keeps swapping a directory of the tree with a link to a directory outside it
-    /// while the tree is unlocked again and again: the outside directory's mode never changes.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn unlocking_never_follows_a_swapped_in_link() {
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::{symlink, PermissionsExt};
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let outside = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(outside.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("d")).unwrap();
-        symlink(outside.path(), root.path().join("alt")).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let swapper = {
-            let stop = stop.clone();
-            let d = std::ffi::CString::new(root.path().join("d").as_os_str().as_bytes()).unwrap();
-            let alt =
-                std::ffi::CString::new(root.path().join("alt").as_os_str().as_bytes()).unwrap();
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    // SAFETY: valid NUL-terminated paths.
-                    unsafe {
-                        libc::syscall(
-                            libc::SYS_renameat2,
-                            libc::AT_FDCWD,
-                            d.as_ptr(),
-                            libc::AT_FDCWD,
-                            alt.as_ptr(),
-                            libc::RENAME_EXCHANGE,
-                        );
-                    }
-                }
-            })
-        };
-        let mode = || {
-            std::fs::metadata(outside.path())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777
-        };
-        let began = std::time::Instant::now();
-        while began.elapsed() < Duration::from_secs(2) {
-            make_removable(root.path());
-            if mode() != 0o755 {
-                break;
-            }
-        }
-        stop.store(true, Ordering::Relaxed);
-        swapper.join().unwrap();
-        assert_eq!(mode(), 0o755, "the walk followed a link out of the tree");
     }
 
     #[test]

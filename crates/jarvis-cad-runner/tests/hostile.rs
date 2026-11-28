@@ -246,6 +246,33 @@ async fn a_locked_directory_is_removed_and_a_link_out_is_not_followed() {
     assert_eq!(answer["ok"], true, "{answer}");
 }
 
+/// A chain of 20,000 directories (which overflowed the stack of the first runner) and a
+/// mode-000 directory 5,000 levels down: the runner (a child process here, so a crash fails
+/// this test and not the harness) answers, the directory is gone, and the next request works.
+#[tokio::test]
+async fn a_deep_chain_or_a_deeply_buried_locked_directory_is_removed() {
+    let scratch = Scratch::new();
+    let root = scratch.dir();
+    let (_runner, addr) = spawn_runner(&scratch, &["--work-root".as_ref(), root.as_os_str()]).await;
+    for hostile in [
+        cmd("deepchain", json!({"depth": 20_000})),
+        cmd("deeplock", json!({"depth": 5_100, "at": 5_000})),
+    ] {
+        let answer = ask_within(
+            addr,
+            one_step(vec![hostile.clone()], false),
+            Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(answer["ok"], true, "{hostile}: {answer}");
+        assert_eq!(answer["results"][0]["ok"], true, "{hostile}: {answer}");
+        let left: Vec<_> = std::fs::read_dir(&root).unwrap().collect();
+        assert!(left.is_empty(), "{hostile}: left {left:?}");
+        let answer = ask_within(addr, one_step(vec![cmd("line", json!({}))], true), PROMPT).await;
+        assert_eq!(answer["ok"], true, "after {hostile}: {answer}");
+    }
+}
+
 #[tokio::test]
 async fn a_missing_work_root_is_engine_failed() {
     let scratch = Scratch::new();
